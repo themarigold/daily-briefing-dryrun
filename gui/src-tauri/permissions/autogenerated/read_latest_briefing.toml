@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-latest-briefing"
+description = "Enables the read_latest_briefing command without any pre-configured scope."
+commands.allow = ["read_latest_briefing"]
+
+[[permission]]
+identifier = "deny-read-latest-briefing"
+description = "Denies the read_latest_briefing command without any pre-configured scope."
+commands.deny = ["read_latest_briefing"]

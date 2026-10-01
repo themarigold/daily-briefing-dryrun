@@ -1,0 +1,288 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`every cluster corpus input clusters to its frozen output: file cluster with the day-53 denominator 1`] = `
+"[
+  {
+    "repo": "app",
+    "text": "prose aaaa111",
+    "evidence": "aaaa111",
+    "group": "dup.py — 2 of 5 commits touching it (grouped: Sep 6)"
+  },
+  {
+    "repo": "app",
+    "text": "prose bbbb222",
+    "evidence": "bbbb222",
+    "group": "dup.py — 2 of 5 commits touching it (grouped: Sep 6)"
+  },
+  {
+    "repo": "app",
+    "text": "prose cccc333",
+    "evidence": "cccc333"
+  },
+  {
+    "repo": "app",
+    "text": "prose dddd444",
+    "evidence": "dddd444"
+  },
+  {
+    "repo": "app",
+    "text": "prose eeee555",
+    "evidence": "eeee555"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: tier-2 campaign key merges two file clusters 1`] = `
+"[
+  {
+    "repo": "accountant_ai",
+    "text": "prose aaaa111",
+    "evidence": "aaaa111",
+    "group": "M7.5a — 4 commits (Sep 2–3)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose bbbb222",
+    "evidence": "bbbb222",
+    "group": "M7.5a — 4 commits (Sep 2–3)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose cccc333",
+    "evidence": "cccc333",
+    "group": "M7.5a — 4 commits (Sep 2–3)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose dddd444",
+    "evidence": "dddd444",
+    "group": "M7.5a — 4 commits (Sep 2–3)"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: tier-3 phrase key merges two file clusters 1`] = `
+"[
+  {
+    "repo": "accountant_ai",
+    "text": "prose aaaa111",
+    "evidence": "aaaa111",
+    "group": "provider seam — 4 commits (Sep 4)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose bbbb222",
+    "evidence": "bbbb222",
+    "group": "provider seam — 4 commits (Sep 4)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose cccc333",
+    "evidence": "cccc333",
+    "group": "provider seam — 4 commits (Sep 4)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose dddd444",
+    "evidence": "dddd444",
+    "group": "provider seam — 4 commits (Sep 4)"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: one-atom campaign reverts to its file cluster 1`] = `
+"[
+  {
+    "repo": "accountant_ai",
+    "text": "prose aaaa111",
+    "evidence": "aaaa111",
+    "group": "agent/context.py — 2 commits (Sep 4)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose bbbb222",
+    "evidence": "bbbb222",
+    "group": "agent/context.py — 2 commits (Sep 4)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose cccc333",
+    "evidence": "cccc333"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: readsAsSameDaySha refusal dissolves the campaign 1`] = `
+"[
+  {
+    "repo": "accountant_ai",
+    "text": "prose aaaa111",
+    "evidence": "aaaa111",
+    "group": "core/ledger.py — 2 commits (Sep 4)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose bbbb222",
+    "evidence": "bbbb222",
+    "group": "core/ledger.py — 2 commits (Sep 4)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose cccc333",
+    "evidence": "cccc333",
+    "group": "core/export.py — 2 commits (Sep 4)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose dddd444",
+    "evidence": "dddd444",
+    "group": "core/export.py — 2 commits (Sep 4)"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: one name per bracket dissolves tier-2 and tier-3 twins 1`] = `
+"[
+  {
+    "repo": "accountant_ai",
+    "text": "prose aaaa111",
+    "evidence": "aaaa111"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose bbbb222",
+    "evidence": "bbbb222"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose cccc333",
+    "evidence": "cccc333"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "prose dddd444",
+    "evidence": "dddd444"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: unresolved bullets stay flat beside a real cluster 1`] = `
+"[
+  {
+    "repo": "app",
+    "text": "no evidence at all"
+  },
+  {
+    "repo": "app",
+    "text": "evidence naming no commit in the window",
+    "evidence": "9f9f9f9"
+  },
+  {
+    "repo": "app",
+    "text": "one",
+    "evidence": "aaaa111",
+    "group": "f.ts — 2 commits (Sep 3)"
+  },
+  {
+    "repo": "app",
+    "text": "two",
+    "evidence": "bbbb222",
+    "group": "f.ts — 2 commits (Sep 3)"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: an ambiguous first cite ends the scan 1`] = `
+"[
+  {
+    "repo": "app",
+    "text": "ambiguous then unique",
+    "evidence": "abc1234, cccc333"
+  },
+  {
+    "repo": "app",
+    "text": "unique",
+    "evidence": "cccc333",
+    "group": "f.ts — 2 commits (Sep 3)"
+  },
+  {
+    "repo": "app",
+    "text": "unique too",
+    "evidence": "abc1234d",
+    "group": "f.ts — 2 commits (Sep 3)"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: an all-digit abbreviation resolves 1`] = `
+"[
+  {
+    "repo": "app",
+    "text": "one",
+    "evidence": "3316617",
+    "group": "agent/loop.py — 2 commits (Sep 3)"
+  },
+  {
+    "repo": "app",
+    "text": "two",
+    "evidence": "aaaa111",
+    "group": "agent/loop.py — 2 commits (Sep 3)"
+  },
+  {
+    "repo": "app",
+    "text": "three",
+    "evidence": "\`7343129\` (Sep 3)",
+    "group": "agent/spike_run.py — 2 commits (Sep 3)"
+  },
+  {
+    "repo": "app",
+    "text": "four",
+    "evidence": "cccc333",
+    "group": "agent/spike_run.py — 2 commits (Sep 3)"
+  },
+  {
+    "repo": "app",
+    "text": "five",
+    "evidence": "bbbb222"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: a zero-hit branch-tip token, then a resolving one 1`] = `
+"[
+  {
+    "repo": "app",
+    "text": "branch tip first, then the real sha",
+    "evidence": "eeee555, aaaa111",
+    "group": "f.ts — 2 commits (Sep 3)"
+  },
+  {
+    "repo": "app",
+    "text": "two",
+    "evidence": "bbbb222",
+    "group": "f.ts — 2 commits (Sep 3)"
+  }
+]"
+`;
+
+exports[`every cluster corpus input clusters to its frozen output: a cross-label split keeps git's denominator 1`] = `
+"[
+  {
+    "repo": "accountant_ai",
+    "text": "a",
+    "evidence": "aaaa111",
+    "group": "M8 — 2 of 3 commits naming it (grouped: Sep 4)"
+  },
+  {
+    "repo": "accountant_ai",
+    "text": "b",
+    "evidence": "bbbb222",
+    "group": "M8 — 2 of 3 commits naming it (grouped: Sep 4)"
+  },
+  {
+    "repo": "Accountant AI",
+    "text": "c",
+    "evidence": "cccc333"
+  }
+]"
+`;

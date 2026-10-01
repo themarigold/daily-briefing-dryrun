@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "macOS": {
+      "signingIdentity": null,
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.plist",
+      "dmg": {
+        "background": "branding/dmg-background.png",
+        "windowSize": { "width": 660, "height": 400 },
+        "appPosition": { "x": 180, "y": 210 },
+        "applicationFolderPosition": { "x": 480, "y": 210 }
+      }
+    }
+  }
+}

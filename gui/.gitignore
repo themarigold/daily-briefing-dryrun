@@ -1,0 +1,20 @@
+# Build products of the desktop shell. Everything here is REGENERABLE from tracked sources —
+# `bun install`, `vite build`, `cargo build`, `scripts/build-sidecar.sh`. Lockfiles are NOT
+# ignored: bun.lock and src-tauri/Cargo.lock are what make the pins in package.json and
+# Cargo.toml reproducible rather than aspirational.
+
+node_modules
+dist
+
+# Rust build tree
+src-tauri/target
+
+# Compiled engine sidecars (daily-briefing-<rust-triple>[.exe]). Produced by
+# scripts/build-sidecar.sh from the ENGINE source one directory up; a multi-hundred-MB
+# `bun build --compile` output has no business in git.
+src-tauri/binaries
+
+# Tauri's generated bundle/config scratch
+src-tauri/gen
+
+.DS_Store

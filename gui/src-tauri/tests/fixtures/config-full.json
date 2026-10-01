@@ -1,0 +1,111 @@
+{
+  "$comment": "hand-written note the app must keep, in place",
+  "repos": [
+    "/Users/x/code/alpha",
+    "~/code/beta"
+  ],
+  "discoverRoots": [
+    "/Users/x/code",
+    "~"
+  ],
+  "excludeRepos": [
+    "/Users/x/code/old-checkout",
+    "scratch"
+  ],
+  "author": {
+    "names": [
+      "X Example"
+    ],
+    "emails": [
+      "x@example.invalid"
+    ]
+  },
+  "provider": {
+    "cli": "claude",
+    "argv": [
+      "-p",
+      "--model",
+      "sonnet"
+    ],
+    "promptVia": "stdin",
+    "timeoutMs": 600000,
+    "harden": true,
+    "credential": "subscription",
+    "accounts": [
+      {
+        "label": "primary"
+      },
+      {
+        "label": "backup",
+        "configDir": "~/.claude-backup"
+      }
+    ],
+    "x-provider-extra": {
+      "kept": true
+    }
+  },
+  "auditJudgeArgv": [
+    "--model",
+    "opus"
+  ],
+  "tokenBudget": {
+    "maxChars": 200000
+  },
+  "lookbackCapDays": 7,
+  "x-middle": [
+    1,
+    2.5,
+    -3,
+    true,
+    null,
+    {},
+    [],
+    {
+      "deep": {
+        "deeper": []
+      }
+    }
+  ],
+  "excludeCommitPatterns": [
+    "^Merge branch",
+    "\\[skip ci\\]",
+    "^chore\\(deps\\):"
+  ],
+  "subprojects": [
+    {
+      "repo": "alpha",
+      "roots": []
+    },
+    {
+      "repo": "beta",
+      "roots": [
+        "packages/*",
+        "apps/web"
+      ]
+    }
+  ],
+  "morningTime": "07:20",
+  "transcripts": {
+    "enabled": false,
+    "root": "~/.claude/projects"
+  },
+  "networkProbeHosts": [
+    {
+      "host": "1.1.1.1",
+      "port": 443
+    },
+    {
+      "host": "8.8.8.8",
+      "port": 443
+    }
+  ],
+  "notify": {
+    "command": [
+      "/usr/local/bin/push",
+      "{title}",
+      "{body}",
+      "{path}"
+    ]
+  },
+  "zz-unicode": "tab\t quote\" backslash\\ e-acute é sun ☀️ ls  esc\u001b del nbsp  emoji 😀"
+}

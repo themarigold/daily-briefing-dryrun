@@ -1,0 +1,236 @@
+[package]
+name = "daily-briefing-gui"
+version = "0.1.1"
+description = "Desktop shell for the daily-briefing engine"
+authors = ["themarigold"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.98.1"
+# Nothing here is a library for anyone else, and publishing it would ship a shell with no engine.
+publish = false
+
+[lib]
+# Tauri 2's mobile entry point requires the app to live in a lib; the bin is a thin wrapper. It is
+# also what lets `cargo test` link the app's own code — the capability tests in tests/ need the
+# generated context and the shipped invoke handler, and a bin-only crate cannot hand them over.
+name = "daily_briefing_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+# Exact pins, not carets: the whole point of committing Cargo.lock next to a pinned toolchain is
+# that the shell builds the same way in six months. `2.11.5` alone would let cargo take 2.12 on a
+# fresh checkout, which is outside the 2.11.x line this was verified against.
+# ⚠ `tray-icon` IS A CORE FEATURE, NOT A PLUGIN (T11, appendix "Tauri 2 CORE (tray-icon
+# feature — not a plugin; verified)"). Verified against this exact version:
+# `tauri-2.11.5/Cargo.toml` `[features]` carries `tray-icon = ["dep:tray-icon"]`. The feature
+# makes the `plugin:tray|*` commands LIVE, so the capability must not reach them: it grants
+# only `core:event:allow-listen`/`allow-unlisten` plus this app's own commands — NOT
+# `core:default`, which (measured) admitted `plugin:tray|new`, `plugin:menu|set_as_app_menu`,
+# `plugin:event|emit` and more. `tests/capability.rs` refuses them behaviourally.
+# `image-png` is what makes `tauri::image::Image::from_bytes` exist at all
+# (`tauri-2.11.5/src/image/mod.rs:73` — `#[cfg(any(feature = "image-ico", feature =
+# "image-png"))]`), and the tray icon is a committed PNG rather than a raw RGBA blob so a
+# designer can open it.
+tauri = { version = "=2.11.5", features = ["tray-icon", "image-png"] }
+# ⚠ SECOND-LAUNCH FOCUS, NOT A SECOND TIMER (T11). MEASURED against 2.4.4: `src/` contains
+# NO `#[tauri::command]` and the crate ships no `permissions/` directory, so it contributes
+# nothing to the ACL and needs no grant — `tests/capability.rs`'s
+# `the_capability_grants_exactly_the_app_commands` pins that the only non-`allow-*` entries
+# are the two enumerated `core:event` grants.
+tauri-plugin-single-instance = "=2.4.4"
+# ⚠ WINDOW SIZE/POSITION, PERSISTED ENTIRELY RUST-SIDE. MEASURED against 2.4.1
+# (`src/lib.rs:385-508`): the plugin restores in `on_window_ready` and saves on
+# `RunEvent::Exit`; its three commands (`save_window_state`, `restore_state`, `filename`)
+# exist for a webview that wants to force a save, which this one never does. So
+# `window-state:default` is DELIBERATELY NOT GRANTED — see `capabilities/README.md`.
+tauri-plugin-window-state = "=2.4.1"
+# ⚠ T17's ONE NEW DEPENDENCY, AND IT IS NEVER REGISTERED ON THE BUILDER. `=2.5.5` is the newest
+# release of the 2.x line and the only one whose `tauri` requirement (`^2.10`, from 2.5.4 onward)
+# is the same 2.10+ floor this crate's pinned `=2.11.5` sits above; 2.5.3 and below ask for `^2.9.3`
+# or looser, which would have been satisfied too but is a wider window than the pin it lives beside.
+# 3.0.0-alpha.0 requires `tauri ^3.0.0-alpha.0` and is out of the question here.
+#
+# ⛔ `tauri_plugin_opener::init()` IS NOT CALLED. `open_url` and `reveal_item_in_dir` are FREE
+# functions (`src/open.rs`, `src/reveal_item_in_dir.rs`), so the two things T17 needs are reachable
+# without registering the plugin — and an unregistered plugin has no live commands at all, which is
+# a stronger statement than "granted nothing". ⚠ The refusal's SHAPE is the ACL's, not the shell's
+# `Plugin not found` (round 1, measured): being in `[dependencies]` means tauri-build collects the
+# crate's ACL manifest, so `plugin:opener|open_url` is refused as "opener.open_url not allowed.
+# Permissions associated with this command: …" one layer before the missing registration is even
+# consulted. `tests/capability.rs`'s `the_webview_cannot_reach_the_opener_plugin` pins the refusal
+# AND that shape, and `src/access.rs` routes every call through an injectable `OpenSink` so no test
+# ever opens anything. NO JS package was added: the webview has no opener client either.
+#
+# What it costs in the lock, MEASURED (`cargo build` reported "Locking 4 packages"): FOUR new
+# entries — `tauri-plugin-opener` 2.5.5 itself, `open` 5.4.4 (the launcher it wraps) and `open`'s own
+# `is-docker` 0.2.0 / `is-wsl` 0.4.0. Everything else it declares —
+# `objc2-app-kit`/`objc2-foundation` (the macOS reveal), `dunce`, `glob`, `thiserror`, `url`,
+# `windows`, `zbus` — was ALREADY in `Cargo.lock` through tauri and tauri-build, so those are new
+# edges rather than new crates.
+#
+# ⚠ `is-docker`/`is-wsl` ARE WHAT `open` USES TO DECIDE HOW TO LAUNCH, not network or telemetry.
+# Read, because a new transitive crate is a new thing running in this process: `is-docker` stats
+# `/.dockerenv` and greps `/proc/self/cgroup` (`src/lib.rs:5-14`); `is-wsl` returns false
+# immediately when `std::env::consts::OS != "linux"` (`src/lib.rs:11-13`), so on macOS both answer
+# false without finding anything. Neither opens a socket.
+tauri-plugin-opener = "=2.5.5"
+# ⚠ T18's plugin, REGISTERED (unlike the opener) because its Rust API resolves through managed
+# plugin state (`NotificationExt` → `Notification<R>`, which only `init()` manages). Registration
+# makes its commands LIVE, so the capability grants NO `notification:*` permission at all and
+# `tests/capability.rs` refuses `plugin:notification|*` behaviourally — the tray/menu pattern, not
+# the opener's. Every real post goes through `src/notifications.rs`'s injectable `NotifySink`; no
+# test posts anything (VM-gated, `docs/gui-seam.md` §12c). `=2.4.0` is the newest 2.x release and
+# the only one whose `tauri` requirement (`^2.10`) shares the opener's 2.10+ floor under the
+# `=2.11.5` pin; 2.3.x asks for `^2.8.2`, and 3.0.0-alpha.0 wants tauri 3.
+tauri-plugin-notification = "=2.4.0"
+# ⚠ T19's plugin, REGISTERED, `MacosLauncher::LaunchAgent` on macOS (`lib.rs`). Its three commands
+# ARE granted — `autostart:allow-enable` / `allow-disable` / `allow-is-enabled`, the whole shipped
+# permission set minus its `deny-*` twins, each justified in `capabilities/README.md` — because the
+# Settings toggle lives in the webview and reflects REAL state via `is_enabled()`. The REAL
+# `enable()` writes `~/Library/LaunchAgents/<Product Name>.plist`, so no test invokes it: the
+# default-ON decision is a pure rule (`src/autostart.rs`) behind an injectable `AutostartSink`,
+# and the real legs are VM-gated (§12c). `=2.5.1` is the newest 2.x release (tauri `^2.8.2` — no
+# 2.x asks for the 2.10 floor, so the newest is the tightest available under the pin).
+tauri-plugin-autostart = "=2.5.1"
+#
+# ⚠ WHAT B7'S TWO PLUGINS COST IN THE LOCK, MEASURED: SIXTEEN new entries, each read and
+# dispositioned in the B7 review (lens 2 audited all sixteen; none opens a socket — cited as
+# reviewed-in-B7-review rather than re-derived here):
+#   * `tauri-plugin-notification` 2.4.0 / `tauri-plugin-autostart` 2.5.1 — the two plugins above.
+#   * `notify-rust` 4.18.0 — the desktop post the notification plugin wraps; on macOS it defers
+#     to mac-notification-sys. No network.
+#   * `mac-notification-sys` 0.6.15 — compiles ObjC and swizzles NSBundle ONCE on the first real
+#     post (bundle-id attribution); no test reaches a real post, so the swizzle never runs in the
+#     suite. No network.
+#   * `auto-launch` 0.5.0 — the plist writer behind the autostart plugin. Its AppleScript branch
+#     carries an osascript SPAWN that is UNREACHABLE in this build (LaunchAgent mode only —
+#     `lib.rs`'s registration is test-pinned to it). No network.
+#   * `rand` 0.9.5 / `rand_chacha` 0.9.0 / `rand_core` 0.9.5 / `ppv-lite86` 0.2.21 /
+#     `zerocopy` 0.8.57 / `zerocopy-derive` 0.8.57 — notify-rust's id generation and its SIMD/cast
+#     support: pure compute. No I/O at all.
+#   * `dirs` 4.0.0 / `dirs-sys` 0.3.7 — path lookup for auto-launch (~/Library/LaunchAgents).
+#     Filesystem paths only, no network.
+#   * `redox_users` 0.4.6 — dirs-sys's Redox-OS arm; dead code on every target this app builds.
+#   * `tauri-winrt-notification` 0.7.3 / `winreg` 0.10.1 — the notification plugin's Windows arm;
+#     dead code on macOS.
+#
+# ⛔ `tauri-plugin-shell` IS DELIBERATELY ABSENT FROM EVERY TABLE IN THIS FILE (T8). B1 had it here
+# and the webview spoke to it directly. Two measured properties killed that: only the FIRST scope
+# entry for a sidecar name was ever consulted (so exactly one argv was reachable), and the plugin
+# forwarded frontend-supplied `cwd` and `env` straight past the scope to the child — and the engine
+# resolves BOTH of its directories from environment variables. Argv is now built in `src/engine.rs`
+# and spawned from there, so the plugin buys nothing and its IPC surface is pure exposure.
+#
+# It was briefly kept as a DEV-dependency so `tests/capability.rs` could register it on a mock app
+# and have the `plugin:shell|execute` refusal come from the capability rather than from the
+# plugin's absence. MEASURED: it never did — `tauri-build` collects ACL manifests from
+# `[dependencies]` only, so a dev-dependency plugin contributes no manifest and the refusal was
+# `Plugin not found` either way. The test asserts the refusal, whichever message carries it, and
+# the dependency is gone.
+#
+# The engine client's own needs. `serde` is no longer dev-only — this crate now has
+# `#[tauri::command]`s with typed arguments and typed errors, which is exactly what B1's note said
+# it did not have.
+serde = { version = "=1.0.229", features = ["derive"] }
+# ⚠ NO LONGER OPTIONAL, and the B2 note that made it optional is superseded rather than ignored.
+# That note gated it on `tcc-probe` because "src/probe.rs only exists under the feature", so an
+# unconditional entry would have put the crate back to declaring a dependency nothing used.
+# `src/engine.rs` parses every engine envelope with it in every build, so the honest declaration is
+# now the unconditional one. Tauri pulls the same version in for itself regardless, so this costs
+# nothing in the artifact.
+#
+# ⚠ `preserve_order` (T15, B5): the Settings save path re-serialises the user's config, and the
+# engine writes it as `JSON.stringify(x, null, 2)` — which keeps the keys in INSERTION order. Without
+# the feature `serde_json::Map` is a `BTreeMap` and every save would alphabetise a hand-ordered
+# config. The feature adds one edge (`serde_json` → `indexmap`); `indexmap` 2.14.2 was already in
+# `Cargo.lock` through tauri, so no crate is added to the graph. It unifies across the NORMAL
+# dependency graph (tauri's runtime maps keep insertion order too, which changes iteration order
+# only); `tauri-build` is a build-dependency and does not share it under resolver 2.
+#
+# ⚠ `float_roundtrip` (B5 round 1): the default float parser may land one ULP off for hard inputs
+# (`2.2250738585072011e-308`), so a config re-read after a save could re-serialise to different
+# digits and an untouched save would stop being a no-op. The feature only selects serde_json's
+# exact parser; it adds no dependency (`Cargo.lock` is byte-identical with and without it).
+serde_json = { version = "=1.0.151", features = ["preserve_order", "float_roundtrip"] }
+# The sidecar spawn. tokio rather than `std::process` because the stdout/stderr pipes are read
+# concurrently with the wait (stderr streams to the webview line by line while stdout is collected
+# whole), and because `kill_on_drop` lets the invocation future OWN its child: dropping the future
+# kills the spawned pid — which under `caffeinate -i` IS the sidecar (caffeinate `exec`s the
+# utility and forks its assertion holder as the utility's child; see `engine::CAFFEINATE`), so the
+# caffeinate child follows it down. What `kill_on_drop` alone does NOT reach is anything the sidecar
+# itself forked, which is why the spawn also gets `process_group(0)` and the drop SIGKILLs the whole
+# group (`engine::ProcessGroupKill`, unix). Command futures run detached and are never dropped (app
+# exit is `AppHandle::exit`, which drops none of them); the one shipped drop is
+# `shell::EngineSnapshots`' 30 s read timeout, which now takes a hung `status`/`schedule status`
+# sidecar AND a `launchctl` it forked (`docs/gui-seam.md` §8). Tauri already runs on this
+# exact version — this adds a direct edge to a crate that is in the graph either way.
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+# T10's state-dir watcher. `notify` ALONE, not `notify-debouncer-full`: the debounce this
+# watcher needs is a COALESCING SCHEDULER (quiet period + a ceiling, so a continuous write
+# stream still emits) whose whole job is to decide WHEN to re-run `status --json`, and it is
+# driven directly by `tests/watcher.rs` with synthetic `Instant`s rather than through the
+# filesystem. `notify-debouncer-full` additionally reconstructs renames by file id
+# (`file-id` + `walkdir`), which nothing here reads — this watcher re-reads the whole engine
+# state on any change. One dependency instead of three, and the part that can be wrong is a
+# pure struct with unit tests (`watcher::Debounce`).
+notify = "=8.2.0"
+# ⚠ FOR THINGS THE STANDARD LIBRARY DOES NOT EXPOSE AT ALL (deliberately not a count — the list has
+# already grown once):
+#   * `localtime_r` — the state machine is pure and takes `now` as an operand, but SOMETHING has to
+#     produce today's LOCAL date and the local minutes-since-midnight, and std has no local-time
+#     conversion. See `schedule_state::now_local`, the only impure function in that module,
+#     deliberately outside `derive`.
+#   * `getpgrp` + `killpg` + `SIGKILL` + `pid_t` — the process-group kill an abandoned engine
+#     invocation performs, and the refusal that keeps it off this process's own group. See
+#     `engine::ProcessGroupKill`. std can CREATE the group (`process_group`) but cannot signal it.
+#   * `ECHILD` — distinguishing "someone else reaped the child" from every other `wait()` failure,
+#     in `engine::EngineClient::invoke`. `std::io::ErrorKind` has no stable equivalent.
+# libc is already in `Cargo.lock` as a transitive dependency of tokio and tauri, so this adds no
+# crate to the graph — only a direct edge.
+libc = "=0.2.189"
+
+[dev-dependencies]
+# `tauri/test` provides MockRuntime + the IPC harness the capability tests drive. It is a
+# dev-dependency ONLY: enabling the feature in [dependencies] would compile the mock runtime into
+# the shipped app.
+tauri = { version = "=2.11.5", features = ["test"] }
+# The oracle for `src/engine.rs`'s hand-written operand validators. `tests/engine_client.rs`
+# compiles the regexes B1 encoded in the capability and requires the `--json-out` port to agree
+# with its regex over a corpus, and the `--file` validator to be wider than its regex EXACTLY where
+# the design says (space, dot-leading segments, non-ASCII) and never narrower — a differential test
+# with a stated divergence rather than a second copy of the rules written in the same style.
+regex = "=1.13.1"
+# `#[tokio::test]`, and the multi-threaded runtime the concurrency test needs.
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
+
+[features]
+# Tauri's own convention: the CLI passes this for a production build so the app cannot be
+# inspected with the webview devtools.
+custom-protocol = ["tauri/custom-protocol"]
+# SPK-1(b)'s `--tcc-probe <dir>` mode. OFF BY DEFAULT, and a cargo feature rather than
+# `debug_assertions` for a measured reason: SPK-2's Gatekeeper and DR legs need a RELEASE-profile
+# bundle, and a probe that existed only in debug builds could not be carried by the artifact those
+# legs measure. With the feature off, `src/probe.rs` is not compiled, `src/main.rs`'s dispatch call
+# is not compiled, and the literal `--tcc-probe` is absent from the binary —
+# `tests/probe_feature_gate.rs` asserts exactly that against the built executable, in both
+# directions. Spike bundles:
+#   bash gui/scripts/build-sidecar.sh
+#   (cd gui && cargo tauri build --debug --bundles app --features tcc-probe)
+#
+# It enables no dependency any more: `serde_json` moved to an unconditional `[dependencies]` entry
+# when `src/engine.rs` started using it in every build (see the note there). The feature still does
+# exactly what it did — gate `src/probe.rs` and its one dispatch call.
+#
+# ⛔ THERE IS NO `default` KEY IN THIS TABLE, AND THAT ABSENCE IS TESTED. Adding
+# `default = ["tcc-probe"]` here — or a `default` that reaches it through another feature — would
+# make "OFF BY DEFAULT" false while making the test that says so DISAPPEAR: both binary-scanning
+# tests in `tests/probe_feature_gate.rs` are `#[cfg]`'d on this feature, so the one asserting the
+# flag's ABSENCE is simply not compiled once the feature is on. MEASURED with that one line added:
+# plain `cargo test` reported 39 passed / 0 failed while
+# `strings -a target/debug/daily-briefing-gui | grep -c -- --tcc-probe` reported 1.
+# `the_probe_feature_is_not_a_default_feature` is ungated for exactly that reason and reads THIS
+# table; it fails if the key comes back.
+tcc-probe = []

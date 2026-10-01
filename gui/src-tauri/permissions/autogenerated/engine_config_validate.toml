@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-engine-config-validate"
+description = "Enables the engine_config_validate command without any pre-configured scope."
+commands.allow = ["engine_config_validate"]
+
+[[permission]]
+identifier = "deny-engine-config-validate"
+description = "Denies the engine_config_validate command without any pre-configured scope."
+commands.deny = ["engine_config_validate"]

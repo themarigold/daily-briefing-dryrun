@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cli-shim-status"
+description = "Enables the cli_shim_status command without any pre-configured scope."
+commands.allow = ["cli_shim_status"]
+
+[[permission]]
+identifier = "deny-cli-shim-status"
+description = "Denies the cli_shim_status command without any pre-configured scope."
+commands.deny = ["cli_shim_status"]

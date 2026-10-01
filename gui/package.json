@@ -1,0 +1,29 @@
+{
+  "name": "daily-briefing-gui",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "Desktop shell for the daily-briefing engine. A SEPARATE package on purpose: the engine keeps zero runtime dependencies, and nothing here is importable from it — the app spawns the engine binary as a sidecar and speaks argv + stdout (see ../docs/gui-seam.md).",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "sidecar": "bash scripts/build-sidecar.sh",
+    "tauri": "tauri",
+    "test": "bun test --preload ./tests-web/svelte-loader.ts ./tests-web/*.check.ts"
+  },
+  "comment:dependencies": "`@tauri-apps/plugin-shell` was here and is deliberately gone (T8). The webview no longer spawns anything: every engine invocation is a typed `#[tauri::command]` whose argv is constructed in src-tauri/src/engine.rs, the Rust crate does not depend on the shell plugin, and src-tauri/capabilities/default.json grants no `shell:*` permission. Re-adding the JS package would give the webview a client for an IPC surface the capability refuses — see src-tauri/capabilities/README.md.",
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.3.0",
+    "@tauri-apps/cli": "2.11.4",
+    "svelte": "5.57.0",
+    "svelte-check": "4.7.6",
+    "typescript": "5.9.3",
+    "vite": "8.3.0"
+  }
+}

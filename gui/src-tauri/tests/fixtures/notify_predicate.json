@@ -1,0 +1,18 @@
+[
+  { "platform": "darwin", "os": "macos", "notify": null, "expected": false },
+  { "platform": "darwin", "os": "macos", "notify": "off", "expected": false },
+  { "platform": "darwin", "os": "macos", "notify": "auto", "expected": true },
+  { "platform": "linux", "os": "linux", "notify": "auto", "expected": true },
+  { "platform": "win32", "os": "windows", "notify": "auto", "expected": false },
+  { "platform": "darwin", "os": "macos", "notify": "banner", "expected": false },
+  { "platform": "darwin", "os": "macos", "notify": 42, "expected": false },
+  { "platform": "darwin", "os": "macos", "notify": { "command": [] }, "expected": false },
+  { "platform": "darwin", "os": "macos", "notify": { "command": ["terminal-notifier", "-title", "{title}"] }, "expected": true },
+  { "platform": "win32", "os": "windows", "notify": { "command": ["snoretoast", "{body}"] }, "expected": true },
+  { "platform": "darwin", "os": "macos", "notify": { "command": [""] }, "expected": false },
+  { "platform": "darwin", "os": "macos", "notify": { "command": ["{title}"] }, "expected": true },
+  { "platform": "darwin", "os": "macos", "notify": { "command": "osascript" }, "expected": false },
+  { "platform": "darwin", "os": "macos", "notify": { "command": ["osascript", 3] }, "expected": false },
+  { "platform": "linux", "os": "linux", "notify": "off", "expected": false },
+  { "platform": "linux", "os": "linux", "notify": null, "expected": false }
+]

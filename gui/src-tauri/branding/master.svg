@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- T22 master icon — hand-authored (docs/gui-seam.md §14). Sun motif, matching the ☀️ the
+       briefing header already uses. Deliberately trivial: one rounded field, one disc, eight
+       round-capped rays; flat colors, no gradients. The 824×824 field centered on the 1024
+       canvas with rx 185 is the macOS Big Sur app-icon grid, so the Dock renders it at the
+       same footprint as native icons. Everything under gui/src-tauri/icons/ and this folder's
+       PNGs derive from this file via gui/scripts/generate-branding.sh — edit HERE, regenerate,
+       never hand-edit a derived PNG. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#234A73"/>
+  <g stroke="#FFC24B" stroke-width="58" stroke-linecap="round">
+    <line x1="764" y1="512" x2="846" y2="512"/>
+    <line x1="178" y1="512" x2="260" y2="512"/>
+    <line x1="512" y1="764" x2="512" y2="846"/>
+    <line x1="512" y1="178" x2="512" y2="260"/>
+    <line x1="690.2" y1="690.2" x2="748.2" y2="748.2"/>
+    <line x1="275.8" y1="275.8" x2="333.8" y2="333.8"/>
+    <line x1="690.2" y1="333.8" x2="748.2" y2="275.8"/>
+    <line x1="275.8" y1="748.2" x2="333.8" y2="690.2"/>
+  </g>
+  <circle cx="512" cy="512" r="172" fill="#FFC24B"/>
+</svg>

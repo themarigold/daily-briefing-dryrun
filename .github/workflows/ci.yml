@@ -1,0 +1,119 @@
+name: CI
+
+# Gates: install (frozen lockfile), strict type-check, full test suite — on Linux AND macOS
+# (macOS is the flagship scheduled-delivery platform; Linux keeps the core honest cross-platform).
+# Plus (Phase E, E6): actionlint over these workflows, the desktop GUI's own gates on Linux, and the
+# desktop shell's full `cargo test` on macOS. Standard runners cost nothing on a public repo.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here writes to the repo: read-only token for every job, and no checkout keeps it on disk.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14" # pinned for reproducibility (matches dev)
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+      - name: Type-check (strict, no emit)
+        run: bunx tsc --noEmit
+      - name: Test
+        run: bun test
+
+  # release.yml only ever runs on a tag, so a broken expression or step in it would otherwise surface
+  # at release time. Pinned image tag, same version as the local runbook's actionlint; the image ships
+  # shellcheck, so every `run:` block is checked too.
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+  # The desktop GUI's gates on Linux: its own suite, svelte-check, and the shell crate's `cargo test`
+  # with EXACTLY ONE skip — the size-budget stale-row test (gui/src-tauri/tests/packaging.rs), which
+  # cannot hold on Linux (src-tauri/binaries/ exists there without the recorded aarch64-apple-darwin
+  # sidecar). It is a release-gate input and is NOT modified; it runs unskipped in `cargo-macos` below.
+  # Every `cargo test` here is --no-fail-fast: cargo otherwise stops at the first failing test binary
+  # and every later one goes unmeasured (the job still fails if any test failed).
+  gui:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: System packages (Tauri 2 Linux prerequisites)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev build-essential curl wget file patchelf libfuse2 xdg-utils
+      - name: Install GUI deps (frozen lockfile)
+        run: bun install --frozen-lockfile
+      - name: Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          [ -n "$toolchain" ] || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          rustup toolchain install "$toolchain"
+      # tauri-build refuses to compile the crate without binaries/daily-briefing-<host triple>.
+      - name: Host sidecar
+        run: bash scripts/build-sidecar.sh
+      - name: Test (tests-web/*.check.ts)
+        run: bun run test
+      - name: Svelte check
+        run: bun run check
+      - name: cargo test (one skip, see above)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --skip the_recorded_actuals_match_a_re_stat_of_what_exists_here
+
+  # The shell crate's FULL `cargo test`, unskipped, on the platform it ships for.
+  cargo-macos:
+    runs-on: macos-14
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          [ -n "$toolchain" ] || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          rustup toolchain install "$toolchain"
+      - name: Host sidecar
+        run: bash scripts/build-sidecar.sh
+      - name: cargo test (full)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast

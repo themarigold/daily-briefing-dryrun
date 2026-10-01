@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-archived-briefing"
+description = "Enables the read_archived_briefing command without any pre-configured scope."
+commands.allow = ["read_archived_briefing"]
+
+[[permission]]
+identifier = "deny-read-archived-briefing"
+description = "Denies the read_archived_briefing command without any pre-configured scope."
+commands.deny = ["read_archived_briefing"]

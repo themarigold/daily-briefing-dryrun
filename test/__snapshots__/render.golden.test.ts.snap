@@ -1,0 +1,220 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`every render corpus struct renders its frozen bytes: rich 1`] = `
+"☀️  Daily briefing — 2026-09-16  (this machine: work-laptop)
+
+⚠️  No briefing for 2 days — account "backup" was at its usage limit.
+
+   (labels: accountant_ai, quant_stocks, daily_briefing_application, a4, a5, a6, a7, a8 (+2 more) are areas of repo personal_code; web is an area of repo mono)
+
+▶ Where you left off  (first wake past 07:20 · state as of 07:24)
+   • [quant_stocks] on feat/audit, 2 ahead of origin
+   — you wrote: "finish the sharpe audit"
+   • [quant_stocks] resume the deflated-sharpe audit
+   • [Accountant_AI.] wire the review queue
+
+▶ What you did — 4 of 8 commits
+   ⚠ 4 in-window commit(s) NOT shown above:
+     · [daily_briefing_application] abc1234 fix[31m the <img src=x onerror=alert(1)> render
+     · (+3 more)
+   — you wrote: "ship the "HITL" view"
+   • [accountant_ai] added the review queue  (d4e5f60)
+   • [mono] web/app.ts — 3 commits (09-14..09-15)
+      ◦ [mono] reworked the header  (0a1b2c3)
+      ◦ [Mono.] fixed the footer
+      ◦ [mono] tuned the grid  (1f2e3d4)
+   • [other] an unrelated fix
+   • [alpha] 🔀 1 PR merged (#9) (Sep 13)  (e5f6a7b)
+   • [zeta] 🔀 2 PRs merged (#12, #13) (Sep 14)  (a1b2c3d, c9d8e7f)
+   • [zeta] Merged #11 (feat/old) on 09-12
+
+▶ Today so far
+   • [quant_stocks] wip: audit notes
+
+▶ Suggested next
+   • [quant_stocks] run the audit on day 52  (from resume)
+   • [accountant_ai] review queue polish
+   • taband bell and C1 stripped
+
+⚠ provider output truncated; 2 repos unreadable
+
+— generated locally via claude"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: quiet day 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+▶ Where you left off
+   (nothing in progress)
+
+▶ What you did
+   (no commits in the window)
+
+▶ Suggested next
+   (none)
+
+— generated locally via anthropic-api"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: one missed day, no floor 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+⚠️  No briefing for 1 day — account "primary" was at its usage limit.
+
+▶ Where you left off  (first wake · state as of 09:01)
+   (nothing in progress)
+
+▶ What you did
+   (no commits in the window)
+
+▶ Suggested next
+   (none)
+
+— generated locally via anthropic-api"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: coverage over an empty recap 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+▶ Where you left off
+   (nothing in progress)
+
+▶ What you did — 0 of 1 commit
+   ⚠ 1 in-window commit(s) NOT shown above:
+     · [x] deadbee lost
+
+▶ Suggested next
+   (none)
+
+— generated locally via anthropic-api"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: one commit, a why with no recap home, legend at the cap 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+   (labels: 1, 2, 3, 4, 5, 6, 7, 8 are areas of repo big)
+
+▶ Where you left off
+   — you wrote: "why solo"
+   • [solo] keep going
+
+▶ What you did — 1 commit
+   • [other] one thing
+
+▶ Suggested next
+   • promoted, no repo  (from resume)
+
+⚠ only one
+
+— generated locally via anthropic-api"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: why on a cluster 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+▶ Where you left off
+   (nothing in progress)
+
+▶ What you did — 3 commits
+   — you wrote: "tidy the web app"
+   • [mono] web/app.ts — 2 commits
+      ◦ [mono] reworked the header  (0a1b2c3)
+      ◦ [mono] tuned the grid
+   • [mono] an ungrouped fix
+
+▶ Suggested next
+   (none)
+
+— generated locally via anthropic-api"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: merges, quiet recap 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+▶ Where you left off
+   (nothing in progress)
+
+▶ What you did
+   (no commits in the window)
+   • [a] 🔀 2 PRs merged (#1, #3) (Sep 13–Sep 15)  (aaaa111, cccc333)
+   • [b] 🔀 1 PR merged (#2) (Sep 14)  (bbbb222)
+
+▶ Suggested next
+   (none)
+
+— generated locally via anthropic-api"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: image-shaped text 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+▶ Where you left off
+   (nothing in progress)
+
+▶ What you did
+   (no commits in the window)
+
+▶ Suggested next
+   • see ![diagram](https://example.com/d.png) first
+
+— generated locally via anthropic-api"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: stash suggestions 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+▶ Where you left off
+   (nothing in progress)
+
+▶ What you did
+   (no commits in the window)
+
+▶ Suggested next
+   • [accountant_ai] model-written, no label
+   • [personal_code] Pop or drop stash@{0}  (from stash · no branch · 14 days old)
+   • [personal_code] Pop or drop stash@{1}  (from stash · 1 day old)
+   • [mono] Pop or drop stash@{2}  (from stash · made today)
+   • [mono] Pop or drop stash@{3}  (from stash)
+   • [mono] Pop or drop stash@{4}  (from stash · 2 days old)
+
+— generated locally via anthropic-api"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: verdict-path marker 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+▶ Where you left off
+   (nothing in progress)
+
+▶ What you did
+   (no commits in the window)
+
+▶ Suggested next
+   • [quant_stocks] sign off the sigma-integrity change
+     ⚑ human gate: cites a commit on a configured verdict path
+   • [quant_stocks] plain suggestion beside it
+
+— generated locally via anthropic-api"
+`;
+
+exports[`every render corpus struct renders its frozen bytes: Mono/mono label pair 1`] = `
+"☀️  Daily briefing — 2026-09-15  (this machine: mac)
+
+▶ Where you left off
+   • [Mono] on feat/tidy, 1 ahead of origin
+   • [Mono] resume the tidy-up
+
+▶ What you did — 4 commits
+   — you wrote: "tidy the app"
+   • [mono] web/app.ts — 3 commits (Sep 14–15)
+      ◦ [mono] reworked the header  (0a1b2c3)
+      ◦ [Mono.] fixed the footer  (1f2e3d4)
+      ◦ [Mono] tuned the grid
+   • [other] an unrelated fix  (9f8e7d6)
+   • [Mono] 🔀 2 PRs merged (#1, #2) (Sep 14)  (aaaa111, bbbb222)
+
+▶ Suggested next
+   • [mono] ship the tidy-up
+
+— generated locally via anthropic-api"
+`;

@@ -1,0 +1,6 @@
+set -euo pipefail
+mkdir -p dist
+for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+  bun build --compile --target="bun-$t" --outfile "dist/daily-briefing-$t" src/main.ts
+done
+bun build --compile --target=bun-windows-x64 --outfile dist/daily-briefing-windows-x64.exe src/main.ts

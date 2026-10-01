@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-engine-schedule-status"
+description = "Enables the engine_schedule_status command without any pre-configured scope."
+commands.allow = ["engine_schedule_status"]
+
+[[permission]]
+identifier = "deny-engine-schedule-status"
+description = "Denies the engine_schedule_status command without any pre-configured scope."
+commands.deny = ["engine_schedule_status"]

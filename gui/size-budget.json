@@ -1,0 +1,60 @@
+{
+  "comment": "T23 (B23) artifact size budget — docs/gui-seam.md §15. Ceilings are appendix T23's, in DECIMAL bytes (the appendix's 61,677,922-byte sidecar anchor reads 61.7 MB, so MB is decimal here). measuredBytes are ACTUALS from a release build on the machine/date recorded; null = honestly UNMEASURED (no builder for that platform/arch here — §15c registers each). Current measured governs; the anchors are recorded constants. Enforced by gui/src-tauri/tests/packaging.rs: schema + ceilings always; a re-stat of every artifact that exists locally — SYMMETRIC: measuredBytes and the on-disk size must be within 20% of each other in BOTH directions (an inflated baseline disarms the gate as surely as a grown artifact), and over-ceiling fails. A measured row whose path is missing while its artifact ROOT exists (src-tauri/target/release/bundle; src-tauri/binaries for the sidecar) FAILS as STALE — the paths carry the version string, so a version bump orphans a row by construction, and libtest swallows stdout on pass, so there is no loud-skip channel (B23 round-1 H1); only a fresh clone with no root at all skips, and null rows are ceiling-only. T24's CI, which builds every artifact, re-measures and is the release-time enforcer. An .app row is the sum of regular-file bytes in its tree; file artifacts are their file size.",
+  "sidecar": {
+    "appendixAnchorBytes": 61677922,
+    "b22FloorBytes": 61810018,
+    "measuredBytes": 61810018,
+    "measuredAt": "2026-09-17",
+    "path": "src-tauri/binaries/daily-briefing-aarch64-apple-darwin"
+  },
+  "artifacts": {
+    "app-aarch64-apple-darwin": {
+      "budgetBytes": null,
+      "measuredBytes": 75230547,
+      "measuredAt": "2026-09-17",
+      "path": "src-tauri/target/release/bundle/macos/Daily Briefing.app",
+      "note": "informational — no appendix ceiling for the uncompressed .app; the DMG is the shipped artifact"
+    },
+    "app-x86_64-apple-darwin": {
+      "budgetBytes": null,
+      "measuredBytes": null,
+      "measuredAt": null,
+      "path": null,
+      "note": "x86_64-apple-darwin rust std not installed here (rustup target list --installed: aarch64 only) — §15c"
+    },
+    "dmg-aarch64-apple-darwin": {
+      "budgetBytes": 45000000,
+      "measuredBytes": 26264487,
+      "measuredAt": "2026-09-17",
+      "path": "src-tauri/target/release/bundle/dmg/Daily Briefing_0.1.1_aarch64.dmg"
+    },
+    "dmg-x86_64-apple-darwin": {
+      "budgetBytes": 45000000,
+      "measuredBytes": null,
+      "measuredAt": null,
+      "path": null,
+      "note": "x86_64-apple-darwin rust std not installed here — §15c; T24's macOS job measures"
+    },
+    "deb-x86_64-unknown-linux-gnu": {
+      "budgetBytes": 80000000,
+      "measuredBytes": null,
+      "measuredAt": null,
+      "path": null,
+      "note": "no Linux builder here — §15c; T24's ubuntu job measures"
+    },
+    "appimage-x86_64-unknown-linux-gnu": {
+      "budgetBytes": 160000000,
+      "measuredBytes": null,
+      "measuredAt": null,
+      "path": null,
+      "note": "no Linux builder here — §15c; the appendix flags AppImage as the likely budget-blower (bundles webkit2gtk)"
+    },
+    "nsis-x86_64-pc-windows-msvc": {
+      "budgetBytes": 70000000,
+      "measuredBytes": null,
+      "measuredAt": null,
+      "path": null,
+      "note": "no Windows builder here — §15c; CI-only experimental leg"
+    }
+  }
+}

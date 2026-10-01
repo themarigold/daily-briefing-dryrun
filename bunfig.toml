@@ -1,0 +1,4 @@
+# Bun configuration for daily_briefing_application. Only the test runner is configured.
+[test]
+# Run-wide hooks (temp-dir cleanup) — see test/preload.ts for why this must be a preload.
+preload = ["./test/preload.ts"]

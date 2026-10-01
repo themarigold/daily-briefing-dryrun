@@ -1,0 +1,624 @@
+name: Release
+
+# Tag-triggered release (Phase E, E5). Ships the 5 CLI binaries (the floor: they ship even when every
+# desktop bundle fails), two macOS DMGs (arm64, x64), a Linux AppImage + .deb (x86_64) and SHA256SUMS
+# over all of them. A Windows NSIS installer is built as an informational workflow artifact and is
+# NEVER attached (C3).
+#
+#   gate ─┬─► cli-binaries ────────────────┐
+#         ├─► bundle-macos (arm64, x64) ───┤
+#         ├─► bundle-linux ────────────────┼─► release
+#         └─► bundle-windows ──────────────┘
+#
+# The bundle-status contract (docs/RELEASE.md §Assets, "Bundle-status contract") is what this file and
+# scripts/release-collect.sh are both built against: each bundle leg derives ONE marker token from an
+# enumerated list of step outcomes, uploads its bundle only when that token is `built`, and always
+# uploads the marker; the release job downloads everything and collect decides, fail-closed.
+#
+# INVARIANTS (test/release-workflow.test.ts pins each one):
+#   - The trigger stays `on: push: tags: ["v*"]` with NO pull_request leg: secrets stay unreachable
+#     from forks.
+#   - bun-version "1.3.14", in exactly that quoted form, in every job that sets up bun (`release` runs
+#     no bun — collect is bash; keeping third-party actions out of the only contents:write job).
+#   - The 5-target cross-compile loop (`Build binaries`) is byte-identical to the frozen copy in
+#     test/fixtures/release-build-binaries.frozen.txt, which was extracted mechanically from the
+#     pre-v2 release.yml (941221ec1) — never retyped.
+#   - Workflow-level permissions are `contents: read`; only `release` gets `contents: write`.
+#   - No step ever sets APPLE_CERTIFICATE*/APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID/APPLE_API_*: signing
+#     goes through a workflow-owned keychain + APPLE_SIGNING_IDENTITY, and notarization secrets are
+#     mapped only to DBA_NOTARIZE_* names (gui/scripts/ci-tauri-build.sh owns the rest).
+#   - TAURI_BUNDLER_DMG_IGNORE_CI is never set: v0.2.0 ships a brandless DMG (CI=true makes the
+#     bundler pass --skip-jenkins, so no Finder AppleScript runs on the runner).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Engine-only gate. GUI tests run inside the bundle legs (a failing GUI test fails that leg's bundle,
+  # never the CLI floor); the local release check runs them before any tag.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      signing: ${{ steps.signing-mode.outputs.mode }}
+      identity: ${{ steps.signing-mode.outputs.identity }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+      - name: Gate (typecheck + tests)
+        run: |
+          bunx tsc --noEmit
+          bun test
+      # Four carriers (package.json, gui/package.json, gui/src-tauri/Cargo.toml, the Cargo.lock entry)
+      # plus the versioned size-budget paths. Replaces the old package.json-only guard.
+      - name: Versions must match tag
+        run: bash scripts/check-versions.sh "${GITHUB_REF_NAME#v}"
+      # The signing mode, computed ONCE. The secrets are compared inside the expression, so only `true`
+      # or `false` ever reaches the script; no secret value is materialised into the environment.
+      # Exactly one of the two set is a misconfiguration, never a silent fallback to unsigned.
+      - name: Signing mode
+        id: signing-mode
+        env:
+          IDENTITY_VAR: ${{ vars.DBA_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          has_p12="${{ secrets.DBA_SIGNING_P12 != '' }}"
+          has_password="${{ secrets.DBA_SIGNING_P12_PASSWORD != '' }}"
+          if [ "$has_p12" = true ] && [ "$has_password" = true ]; then
+            mode=signed
+          elif [ "$has_p12" = false ] && [ "$has_password" = false ]; then
+            mode=unsigned
+          else
+            echo "signing-mode: exactly one of DBA_SIGNING_P12 / DBA_SIGNING_P12_PASSWORD is set — set both (signed) or neither (unsigned)" >&2
+            exit 1
+          fi
+          identity="${IDENTITY_VAR:-Daily Briefing Release Signing}"
+          case "$identity" in
+            *$'\n'*|*$'\r'*) echo "signing-mode: the DBA_SIGNING_IDENTITY variable contains a line break" >&2; exit 1 ;;
+          esac
+          echo "signing-mode: $mode (identity: $identity)"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+
+  cli-binaries:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+      # FROZEN: byte-identical to test/fixtures/release-build-binaries.frozen.txt. Do not edit.
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            bun build --compile --target="bun-$t" --outfile "dist/daily-briefing-$t" src/main.ts
+          done
+          bun build --compile --target=bun-windows-x64 --outfile dist/daily-briefing-windows-x64.exe src/main.ts
+      - name: Upload CLI binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-binaries
+          path: dist/daily-briefing-*
+          if-no-files-found: error
+
+  bundle-macos:
+    needs: gate
+    runs-on: macos-14
+    timeout-minutes: 90
+    strategy:
+      # One failing leg must never cancel the other: a cancelled leg drops a healthy DMG or leaves its
+      # required marker absent, which fails the whole release.
+      fail-fast: false
+      matrix:
+        include:
+          - leg: macos-arm64
+            triple: aarch64-apple-darwin
+            asset-arch: arm64
+            lipo-arch: arm64
+            dmg-row: dmg-aarch64-apple-darwin
+            app-row: app-aarch64-apple-darwin
+          - leg: macos-x64
+            triple: x86_64-apple-darwin
+            asset-arch: x64
+            lipo-arch: x86_64
+            dmg-row: dmg-x86_64-apple-darwin
+            app-row: app-x86_64-apple-darwin
+    defaults:
+      run:
+        working-directory: gui
+    env:
+      TRIPLE: ${{ matrix.triple }}
+      LEG: ${{ matrix.leg }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install GUI deps (frozen lockfile)
+        run: bun install --frozen-lockfile
+      # Explicit, from gui/rust-toolchain.toml, independent of the runner's rustup version. The x64 leg
+      # cross-compiles from the arm64 runner, so it adds that target's std.
+      - name: Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          [ -n "$toolchain" ] || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          rustup toolchain install "$toolchain"
+          if [ "$TRIPLE" = x86_64-apple-darwin ]; then
+            rustup target add x86_64-apple-darwin --toolchain "$toolchain"
+          fi
+      # tauri-build refuses to compile the crate without binaries/daily-briefing-<host triple>, and
+      # binaries are not tracked; `cargo test` below needs it. The target-triple sidecar for the bundle
+      # is built by `tauri build --target` itself (beforeBuildCommand -> scripts/build-sidecar.sh).
+      - name: Host sidecar
+        run: bash scripts/build-sidecar.sh
+      # GUI gates, in BOTH legs: a GUI failure marks every macOS leg build-failed, never just one.
+      # `cargo test` runs unskipped here (the size-budget stale-row test holds on macOS).
+      - name: GUI tests (suite, svelte-check, cargo test)
+        id: gui-tests
+        run: |
+          set -euo pipefail
+          bun run test
+          bun run check
+          cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast
+      # Signed mode only. Mirrors Tauri's own import sequence (tauri-macos-sign keychain.rs) into a
+      # NAMED keychain under $RUNNER_TEMP — never Tauri's APPLE_CERTIFICATE path, which accepts only
+      # Apple-issued certificates — then hands the identity to the build via $GITHUB_ENV (a plain
+      # `export` would not survive into the next step).
+      - name: Import signing identity (signed mode only)
+        if: needs.gate.outputs.signing == 'signed'
+        env:
+          P12_BASE64: ${{ secrets.DBA_SIGNING_P12 }}
+          P12_PASSWORD: ${{ secrets.DBA_SIGNING_P12_PASSWORD }}
+          IDENTITY: ${{ needs.gate.outputs.identity }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/dba-signing.keychain-db"
+          p12="$RUNNER_TEMP/dba-signing.p12"
+          trap 'rm -f "$p12"' EXIT
+          # Absolute tool paths: setup-bun, earlier in this job, prepends to $GITHUB_PATH.
+          keychain_password="$(/usr/bin/openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$P12_BASE64" | /usr/bin/base64 --decode > "$p12"
+          /usr/bin/security create-keychain -p "$keychain_password" "$keychain"
+          /usr/bin/security unlock-keychain -p "$keychain_password" "$keychain"
+          # Lock timeout longer than the job's 90-minute bound, so the keychain cannot relock mid-build.
+          /usr/bin/security set-keychain-settings -t 7200 -u "$keychain"
+          /usr/bin/security import "$p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          /usr/bin/security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          # Add it to the user search list, keeping what is already there (codesign finds the identity
+          # through the search list: Tauri signs with `-s <identity>` and no --keychain on this path).
+          existing=()
+          while IFS= read -r line; do
+            line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')"
+            [ -n "$line" ] && existing+=("$line")
+          done < <(/usr/bin/security list-keychains -d user)
+          /usr/bin/security list-keychains -d user -s "$keychain" ${existing[@]+"${existing[@]}"}
+          # The identity must be LISTED in the CI keychain (a failed import or a wrong
+          # DBA_SIGNING_IDENTITY name fails here, named, instead of mid-build). Deliberately NOT -v:
+          # a self-signed identity is untrusted and lists as "0 valid", yet codesign signs with it —
+          # measured, docs/spikes/spk-2-gatekeeper-signing.md §2.2(ii) (the installed engine carries
+          # Authority=Daily Briefing (local) Signing while the -v listing reports 0 valid). Whether
+          # codesign uses an identity from a SCRATCH keychain on a runner is UNVERIFIED until a signed
+          # dry run. Nothing here changes trust settings.
+          listed="$(/usr/bin/security find-identity -p codesigning "$keychain")"
+          printf '%s\n' "$listed"
+          printf '%s\n' "$listed" | grep -Fq "\"$IDENTITY\"" || {
+            echo "signing identity '$IDENTITY' is not a codesigning identity in the CI keychain — check the p12 and the DBA_SIGNING_IDENTITY variable" >&2
+            exit 1
+          }
+          echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+      # Notarization: parameterized and EMPTY until Apple enrollment. The secrets are mapped only to
+      # DBA_NOTARIZE_* names (never the APPLE_* names Tauri reads); ci-tauri-build.sh exports Tauri's
+      # variables only from one complete set, and only in signed mode.
+      - name: Build (tauri)
+        id: build
+        env:
+          SIGNING: ${{ needs.gate.outputs.signing }}
+          DBA_NOTARIZE_APPLE_ID: ${{ secrets.APPLE_ID }}
+          DBA_NOTARIZE_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          DBA_NOTARIZE_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          DBA_NOTARIZE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          DBA_NOTARIZE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          DBA_NOTARIZE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: bash scripts/ci-tauri-build.sh "$TRIPLE" "$SIGNING"
+      - name: Stage (frozen asset name)
+        id: stage
+        run: bash scripts/stage-bundles.sh "src-tauri/target/$TRIPLE/release/bundle" "${GITHUB_REF_NAME#v}" "$RUNNER_TEMP/stage" dmg
+      - name: Size gate
+        id: size
+        env:
+          ASSET_ARCH: ${{ matrix.asset-arch }}
+          DMG_ROW: ${{ matrix.dmg-row }}
+          APP_ROW: ${{ matrix.app-row }}
+        run: |
+          set -uo pipefail
+          rc=0
+          bun ../scripts/check-size-budget.ts "$RUNNER_TEMP/stage/daily-briefing-${GITHUB_REF_NAME#v}-darwin-$ASSET_ARCH.dmg" "$DMG_ROW" || rc=1
+          bun ../scripts/check-size-budget.ts "src-tauri/target/$TRIPLE/release/bundle/macos/Daily Briefing.app" "$APP_ROW" || rc=1
+          exit "$rc"
+      # Proves the artifact the release will attach: mounted from the STAGED DMG, copied out, and
+      # checked as shipped. `codesign -dvv` (verbosity 2: `-dv` prints no Authority= line; it writes to
+      # stderr) must show the hardened runtime and NOT `linker-signed` (every arm64 binary carries a
+      # linker-only ad-hoc signature, which must never pass for Tauri's), plus the mode the notes will
+      # state: `Authority=<identity>` when signed, `Signature=adhoc` when not.
+      - name: Smoke (mount, arch, signature, --version)
+        id: smoke
+        env:
+          ASSET_ARCH: ${{ matrix.asset-arch }}
+          LIPO_ARCH: ${{ matrix.lipo-arch }}
+          SIGNING: ${{ needs.gate.outputs.signing }}
+          IDENTITY: ${{ needs.gate.outputs.identity }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          dmg="$RUNNER_TEMP/stage/daily-briefing-$version-darwin-$ASSET_ARCH.dmg"
+          mnt="$RUNNER_TEMP/dmg"
+          copy="$RUNNER_TEMP/smoke"
+          mkdir -p "$mnt" "$copy"
+          /usr/bin/hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+          # A failed copy (or any later exit) must never leave the image attached. The trap is cleared
+          # as soon as the detach below succeeds, so the forced detach never runs against a path that
+          # is no longer a mount; its own failure is ignored because it only ever runs on a failure.
+          trap '/usr/bin/hdiutil detach "$mnt" -force >/dev/null 2>&1 || true' EXIT
+          cp -R "$mnt/Daily Briefing.app" "$copy/"
+          # A transient "resource busy" just after the copy gets ONE forced retry; a second failure fails.
+          /usr/bin/hdiutil detach "$mnt" || { sleep 2; /usr/bin/hdiutil detach "$mnt" -force; }
+          trap - EXIT
+          app="$copy/Daily Briefing.app"
+          main="$app/Contents/MacOS/daily-briefing-gui"
+          sidecar="$app/Contents/MacOS/daily-briefing"
+          fail() { echo "smoke: $*" >&2; exit 1; }
+          for bin in "$main" "$sidecar"; do
+            archs="$(lipo -archs "$bin")"
+            [ "$archs" = "$LIPO_ARCH" ] || fail "$bin is '$archs', expected '$LIPO_ARCH'"
+          done
+          codesign --verify --deep --strict "$app"
+          [ -f "$app/Contents/_CodeSignature/CodeResources" ] || fail "the bundle is not sealed (no Contents/_CodeSignature/CodeResources)"
+          for bin in "$main" "$sidecar"; do
+            info="$(codesign -dvv "$bin" 2>&1)"
+            printf '%s\n' "$info"
+            flags="$(printf '%s\n' "$info" | sed -n 's/.*flags=0x[0-9a-fA-F]*(\([^)]*\)).*/\1/p' | head -n 1)"
+            case ",$flags," in *,runtime,*) ;; *) fail "$bin: flags ($flags) lack runtime" ;; esac
+            case ",$flags," in *,linker-signed,*) fail "$bin: flags ($flags) are linker-signed, not Tauri-signed" ;; esac
+            if [ "$SIGNING" = signed ]; then
+              printf '%s\n' "$info" | grep -Fxq "Authority=$IDENTITY" || fail "$bin: no 'Authority=$IDENTITY' line (signed mode)"
+            else
+              printf '%s\n' "$info" | grep -Fxq "Signature=adhoc" || fail "$bin: no 'Signature=adhoc' line (unsigned mode)"
+            fi
+          done
+          if [ "$LIPO_ARCH" = arm64 ]; then
+            got="$("$sidecar" --version)"
+            [ "$got" = "$version" ] || fail "sidecar --version printed '$got', expected '$version'"
+          elif arch -x86_64 /usr/bin/true 2>/dev/null; then
+            got="$(arch -x86_64 "$sidecar" --version)"
+            [ "$got" = "$version" ] || fail "sidecar --version (Rosetta) printed '$got', expected '$version'"
+          else
+            echo "SKIP: x86_64 sidecar --version — Rosetta is not available on this runner (arch -x86_64 /usr/bin/true failed)"
+          fi
+          echo "smoke: ok ($LEG, $SIGNING)"
+      # The bundle-status derivation. Reads .outcome (never .conclusion) of exactly these step ids and
+      # nothing else; none of them carries continue-on-error, so no failure can hide outside it.
+      - name: Bundle status marker
+        id: marker
+        if: always()
+        env:
+          GUI_TESTS: ${{ steps.gui-tests.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          STAGE: ${{ steps.stage.outcome }}
+          SIZE: ${{ steps.size.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$SIZE" = failure ]; then
+            status=size-rejected
+          elif [ "$GUI_TESTS" = success ] && [ "$BUILD" = success ] && [ "$STAGE" = success ] && [ "$SIZE" = success ] && [ "$SMOKE" = success ]; then
+            status=built
+          else
+            status=build-failed
+          fi
+          echo "marker: $LEG = $status (gui-tests=$GUI_TESTS build=$BUILD stage=$STAGE size=$SIZE smoke=$SMOKE)"
+          mkdir -p "$RUNNER_TEMP/marker"
+          printf '%s\n' "$status" > "$RUNNER_TEMP/marker/$LEG.status"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - name: Upload bundle
+        if: always() && steps.marker.outputs.status == 'built'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.leg }}
+          path: ${{ runner.temp }}/stage/*
+          if-no-files-found: error
+      - name: Upload marker
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marker-${{ matrix.leg }}
+          path: ${{ runner.temp }}/marker/${{ matrix.leg }}.status
+          if-no-files-found: error
+      # Last step, unconditional, outside the derivation: the named keychain never outlives the job.
+      - name: Delete signing keychain
+        if: always()
+        run: |
+          keychain="$RUNNER_TEMP/dba-signing.keychain-db"
+          if [ -e "$keychain" ]; then
+            /usr/bin/security delete-keychain "$keychain"
+            echo "deleted $keychain"
+          else
+            echo "no signing keychain to delete"
+          fi
+
+  bundle-linux:
+    needs: gate
+    # Pinned, not -latest: the AppImage and .deb link against this image's glibc and webkit2gtk-4.1,
+    # so this line sets the oldest distro the Linux bundles run on.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: gui
+    env:
+      TRIPLE: x86_64-unknown-linux-gnu
+      LEG: linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      # Tauri 2's Linux prerequisites, plus libfuse2 (AppImage tooling on 22.04) and xdg-utils.
+      - name: System packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev build-essential curl wget file patchelf libfuse2 xdg-utils
+      - name: Install GUI deps (frozen lockfile)
+        run: bun install --frozen-lockfile
+      - name: Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          [ -n "$toolchain" ] || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          rustup toolchain install "$toolchain"
+      - name: Host sidecar
+        run: bash scripts/build-sidecar.sh
+      # EXACTLY ONE skip: the size-budget stale-row test (gui/src-tauri/tests/packaging.rs) cannot hold
+      # on Linux, where src-tauri/binaries/ exists without the recorded aarch64-apple-darwin sidecar. It
+      # is a release-gate input, so it is NOT modified; it runs unskipped on both macOS legs. Skipping it
+      # keeps the rest of the crate's tests (including the Linux-only ones) running here.
+      # --no-fail-fast (both legs): without it cargo stops at the first failing test BINARY, and every
+      # later binary goes unmeasured; the step still fails if any test failed.
+      - name: GUI tests (suite, svelte-check, cargo test)
+        id: gui-tests
+        run: |
+          set -euo pipefail
+          bun run test
+          bun run check
+          cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --skip the_recorded_actuals_match_a_re_stat_of_what_exists_here
+      - name: Build (tauri)
+        id: build
+        run: bash scripts/ci-tauri-build.sh x86_64-unknown-linux-gnu unsigned
+      - name: Stage (frozen asset names)
+        id: stage
+        run: bash scripts/stage-bundles.sh "src-tauri/target/$TRIPLE/release/bundle" "${GITHUB_REF_NAME#v}" "$RUNNER_TEMP/stage" appimage,deb
+      - name: Size gate
+        id: size
+        run: |
+          set -uo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          rc=0
+          bun ../scripts/check-size-budget.ts "$RUNNER_TEMP/stage/daily-briefing-$version-linux-x86_64.AppImage" appimage-x86_64-unknown-linux-gnu || rc=1
+          bun ../scripts/check-size-budget.ts "$RUNNER_TEMP/stage/daily-briefing_${version}_amd64.deb" deb-x86_64-unknown-linux-gnu || rc=1
+          exit "$rc"
+      # In $RUNNER_TEMP/smoke, never the staged dir: the extraction must leave nothing beside the assets
+      # that get uploaded.
+      - name: Smoke (AppImage sidecar --version, deb metadata and contents)
+        id: smoke
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          fail() { echo "smoke: $*" >&2; exit 1; }
+          work="$RUNNER_TEMP/smoke"
+          mkdir -p "$work"
+          cp "$RUNNER_TEMP/stage/daily-briefing-$version-linux-x86_64.AppImage" "$work/app.AppImage"
+          chmod +x "$work/app.AppImage"
+          (cd "$work" && ./app.AppImage --appimage-extract >/dev/null)
+          got="$("$work/squashfs-root/usr/bin/daily-briefing" --version)"
+          [ "$got" = "$version" ] || fail "AppImage sidecar --version printed '$got', expected '$version'"
+          deb="$RUNNER_TEMP/stage/daily-briefing_${version}_amd64.deb"
+          info="$(dpkg-deb --info "$deb")"
+          printf '%s\n' "$info"
+          printf '%s\n' "$info" | grep -Fxq " Package: daily-briefing" || fail "deb: Package is not daily-briefing"
+          printf '%s\n' "$info" | grep -Fxq " Version: $version" || fail "deb: Version is not $version"
+          printf '%s\n' "$info" | grep -Fxq " Architecture: amd64" || fail "deb: Architecture is not amd64"
+          # One member name per line, from the data tarball itself (no `ls -l` metadata to strip), with any
+          # leading "./" removed: tauri-bundler writes BARE member names (debian.rs, `strip_prefix`) while
+          # dpkg-deb --build writes "./"-prefixed ones, and both must compare equal to the bare names below.
+          paths="$(dpkg-deb --fsys-tarfile "$deb" | tar -tf - | sed -e 's|^\./||')"
+          printf '%s\n' "$paths"
+          for path in usr/bin/daily-briefing-gui usr/bin/daily-briefing "usr/share/applications/Daily Briefing.desktop"; do
+            printf '%s\n' "$paths" | grep -Fxq "$path" || fail "deb: $path is missing from the package contents"
+          done
+          echo "smoke: ok ($LEG)"
+      - name: Bundle status marker
+        id: marker
+        if: always()
+        env:
+          GUI_TESTS: ${{ steps.gui-tests.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          STAGE: ${{ steps.stage.outcome }}
+          SIZE: ${{ steps.size.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$SIZE" = failure ]; then
+            status=size-rejected
+          elif [ "$GUI_TESTS" = success ] && [ "$BUILD" = success ] && [ "$STAGE" = success ] && [ "$SIZE" = success ] && [ "$SMOKE" = success ]; then
+            status=built
+          else
+            status=build-failed
+          fi
+          echo "marker: $LEG = $status (gui-tests=$GUI_TESTS build=$BUILD stage=$STAGE size=$SIZE smoke=$SMOKE)"
+          mkdir -p "$RUNNER_TEMP/marker"
+          printf '%s\n' "$status" > "$RUNNER_TEMP/marker/$LEG.status"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - name: Upload bundle
+        if: always() && steps.marker.outputs.status == 'built'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-linux-x86_64
+          path: ${{ runner.temp }}/stage/*
+          if-no-files-found: error
+      - name: Upload marker
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marker-linux-x86_64
+          path: ${{ runner.temp }}/marker/linux-x86_64.status
+          if-no-files-found: error
+
+  # C3: the Windows NSIS installer is built for information only. It is uploaded as `windows-nsis`,
+  # which matches no download pattern in `release`, so it is never attached; its marker is read only
+  # for the notes. The job-level continue-on-error keeps a Windows failure from failing the run.
+  bundle-windows:
+    needs: gate
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: gui
+    env:
+      LEG: windows-x64
+    steps:
+      # BEFORE the checkout: the repo tracks no .gitattributes, and Git for Windows' runner default
+      # (core.autocrlf=true; UNVERIFIED on a live runner) would check the shell scripts and
+      # rust-toolchain.toml out with CRLF endings. In the workspace root: gui/ does not exist yet.
+      - name: Check out with LF line endings
+        working-directory: .
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install GUI deps (frozen lockfile)
+        run: bun install --frozen-lockfile
+      - name: Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          [ -n "$toolchain" ] || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          rustup toolchain install "$toolchain"
+      - name: Host sidecar
+        run: bash scripts/build-sidecar.sh
+      - name: Build (tauri, NSIS)
+        id: build
+        run: bash scripts/ci-tauri-build.sh x86_64-pc-windows-msvc unsigned
+      # Informational marker: the derivation reads `build` alone.
+      - name: Bundle status marker
+        id: marker
+        if: always()
+        env:
+          BUILD: ${{ steps.build.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD" = success ]; then status=built; else status=build-failed; fi
+          echo "marker: $LEG = $status (build=$BUILD)"
+          mkdir -p "$RUNNER_TEMP/marker"
+          printf '%s\n' "$status" > "$RUNNER_TEMP/marker/$LEG.status"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - name: Upload NSIS installer (workflow artifact only, never attached)
+        if: always() && steps.marker.outputs.status == 'built'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis
+          path: gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
+      - name: Upload marker
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marker-windows-x64
+          path: ${{ runner.temp }}/marker/windows-x64.status
+          if-no-files-found: error
+
+  # Runs whenever the gate and the CLI floor succeeded, whatever the bundle legs did: collect decides,
+  # fail-closed, from the markers. No secret enters this job (GH_TOKEN is the run's own token).
+  release:
+    needs: [gate, cli-binaries, bundle-macos, bundle-linux, bundle-windows]
+    if: always() && !cancelled() && needs.gate.result == 'success' && needs.cli-binaries.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download CLI binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-binaries
+          merge-multiple: true
+          path: dist
+      # continue-on-error: zero matching artifacts (no leg built) may be a download error. Collect keeps
+      # it fail-closed: this step's outcome is passed in, and `failure` while any marker says built FAILS.
+      - name: Download bundles
+        id: dl-bundles
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          merge-multiple: true
+          path: dist
+      # A missing markers/ directory reads as every required marker absent, which collect FAILS.
+      - name: Download markers
+        id: dl-markers
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: marker-*
+          merge-multiple: true
+          path: markers
+      - name: Collect (attach-set gate, SHA256SUMS, notes)
+        env:
+          SIGNING: ${{ needs.gate.outputs.signing }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          bash scripts/release-collect.sh dist markers "${TAG#v}" "$SIGNING" "${{ steps.dl-bundles.outcome }}" "$RUNNER_TEMP/notes.md"
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" dist/* --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"

@@ -1,0 +1,18 @@
+# Toolchain pin for the desktop shell (T6).
+#
+# PLACEMENT: cargo resolves rust-toolchain.toml by walking UP from the directory the build is
+# invoked in. `cargo build` runs in `gui/src-tauri`, so this file — one level up, at the gui
+# package root — is the nearest one it finds. It deliberately does NOT sit at the monorepo root:
+# `daily_briefing_application/` is one project among many in that checkout and a toolchain pin
+# there would silently retarget every other Rust tree in the repo.
+#
+# Verify the resolution (not the file's mere existence) with:
+#   (cd gui/src-tauri && rustup show active-toolchain)
+# which names both the toolchain and the file that selected it.
+#
+# The version is written out rather than left as the floating word `stable`: a scaffold whose
+# compiler changes under it is not a scaffold, and the Cargo.lock committed next to it was
+# resolved by this exact compiler.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

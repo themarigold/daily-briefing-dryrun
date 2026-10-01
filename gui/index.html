@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Daily Briefing</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <!-- Module script only. The CSP in src-tauri/tauri.conf.json is `script-src 'self'`: no
+         inline script, no remote script, no eval. A <script> body added here would be refused by
+         the webview at runtime, not caught at build time. -->
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

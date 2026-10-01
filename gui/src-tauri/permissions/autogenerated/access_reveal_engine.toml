@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-access-reveal-engine"
+description = "Enables the access_reveal_engine command without any pre-configured scope."
+commands.allow = ["access_reveal_engine"]
+
+[[permission]]
+identifier = "deny-access-reveal-engine"
+description = "Denies the access_reveal_engine command without any pre-configured scope."
+commands.deny = ["access_reveal_engine"]

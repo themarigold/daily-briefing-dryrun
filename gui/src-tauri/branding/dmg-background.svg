@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="400" viewBox="0 0 660 400">
+  <!-- T22 DMG background — hand-authored (docs/gui-seam.md §14). ASSET ONLY here: T23 wires
+       bundle.macOS.dmg (background path, windowSize, appPosition, applicationFolderPosition).
+       Drawn for the layout this file's geometry assumes and §14 records for that handoff:
+       window 660×400, 128px icons, app icon centered at (180, 210), Applications folder at
+       (480, 210) — the arrow spans the gap between those two footprints. NO TEXT anywhere on
+       purpose: sips/CoreSVG would set text with system fonts, which render differently across
+       macOS versions and would churn the committed PNGs; the drag-to-Applications arrow is the
+       universally understood instruction. @2x is rendered from this same file by doubling
+       width/height (the viewBox pins the geometry), so the two PNGs cannot drift. -->
+  <rect width="660" height="400" fill="#F4F6F9"/>
+  <!-- the sun mark, small and quiet at the top center -->
+  <g stroke="#F0B429" stroke-width="7" stroke-linecap="round">
+    <line x1="373" y1="84" x2="387" y2="84"/>
+    <line x1="273" y1="84" x2="287" y2="84"/>
+    <line x1="330" y1="127" x2="330" y2="141"/>
+    <line x1="330" y1="27" x2="330" y2="41"/>
+    <line x1="360.4" y1="114.4" x2="370.3" y2="124.3"/>
+    <line x1="289.7" y1="43.7" x2="299.6" y2="53.6"/>
+    <line x1="360.4" y1="53.6" x2="370.3" y2="43.7"/>
+    <line x1="289.7" y1="124.3" x2="299.6" y2="114.4"/>
+  </g>
+  <circle cx="330" cy="84" r="21" fill="#F0B429"/>
+  <!-- drag-to-Applications arrow: app icon sits at (180,210), Applications at (480,210) -->
+  <line x1="262" y1="210" x2="374" y2="210" stroke="#AEB9C6" stroke-width="14" stroke-linecap="round"/>
+  <path d="M 372 184 L 372 236 L 412 210 Z" fill="#AEB9C6"/>
+</svg>

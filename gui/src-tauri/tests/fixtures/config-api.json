@@ -1,0 +1,25 @@
+{
+  "discoverRoots": [
+    "~"
+  ],
+  "provider": {
+    "api": {
+      "kind": "anthropic",
+      "model": "claude-sonnet-5",
+      "baseUrl": "https://api.anthropic.com",
+      "maxTokens": 4096,
+      "apiKey": "sk-ant-SENTINEL-DO-NOT-LEAK-0000"
+    }
+  },
+  "notify": "off",
+  "tokenBudget": {
+    "maxChars": 200000
+  },
+  "lookbackCapDays": 14,
+  "networkProbeHosts": [
+    {
+      "host": "api.anthropic.com",
+      "port": 443
+    }
+  ]
+}

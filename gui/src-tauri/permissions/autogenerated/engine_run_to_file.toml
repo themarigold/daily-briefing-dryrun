@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-engine-run-to-file"
+description = "Enables the engine_run_to_file command without any pre-configured scope."
+commands.allow = ["engine_run_to_file"]
+
+[[permission]]
+identifier = "deny-engine-run-to-file"
+description = "Denies the engine_run_to_file command without any pre-configured scope."
+commands.deny = ["engine_run_to_file"]
