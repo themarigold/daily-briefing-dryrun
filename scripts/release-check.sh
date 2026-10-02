@@ -328,6 +328,9 @@ if [ -f "$WD/scripts/export-public.sh" ]; then
   echo "  then sync \"$OUT\" into the public repo checkout, commit, check the commit's tree and record its sha"
   echo "  (docs/RELEASE.md, step 5), push it (yes), and tag that sha: git tag v$VERSION <sha>; git push --no-follow-tags origin v$VERSION (yes)"
 else
-  echo "  git tag v$VERSION $HEAD_SHA"
-  echo "  git push --no-follow-tags origin v$VERSION     (yes; the output must show [new tag] for v$VERSION)"
+  # The exported tree has no identity sweep (export-public.sh does not ship), so a commit made here is
+  # never tagged: only the commit step 5 builds from a monorepo export is (docs/RELEASE.md step 5).
+  echo "  this checkout is the exported tree: do not tag it. Never tag a commit made directly in the public repo:"
+  echo "  tag only the sha docs/RELEASE.md step 5 recorded for the monorepo export of v$VERSION, following"
+  echo "  steps 5-7 there (sync the export, commit, check the commit's tree, push, then tag that sha; each push its own yes)."
 fi

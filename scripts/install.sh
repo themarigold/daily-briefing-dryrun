@@ -72,17 +72,18 @@ if ensure_identity; then
   # --identifier pins the designated requirement so the TCC grant is stable across rebuilds.
   # Guarded: a signing hiccup must not abort the install under set -e — the unsigned binary still
   # runs and the launchd load below matters more (the TCC grant just may need re-adding).
-  if codesign --force --sign "$SIGN_ID" --identifier local.daily-briefing "$BIN"; then
+  # --timestamp=none on both signatures, as src/schedule/install.ts: no timestamp server is asked.
+  if codesign --force --sign "$SIGN_ID" --timestamp=none --identifier local.daily-briefing "$BIN"; then
     echo "Signed with local identity '$SIGN_ID' — the macOS folder-access grant will persist across re-installs."
   else
     echo "WARN: codesign with '$SIGN_ID' failed — falling back to an ad-hoc signature; the grant may not persist." >&2
-    codesign -s - -f "$BIN" || true
+    codesign -s - -f --timestamp=none "$BIN" || true
   fi
 else
   echo "WARN: could not create/find a stable signing identity — falling back to an ad-hoc signature." >&2
   echo "      macOS may re-prompt for folder access after each rebuild. Install a real 'openssl'" >&2
   echo "      (e.g. \`brew install openssl\`) and re-run to get a persistent grant." >&2
-  codesign -s - -f "$BIN" || true
+  codesign -s - -f --timestamp=none "$BIN" || true
 fi
 
 # ── THE PLIST HALF IS DELEGATED TO THE BINARY (Slice 4 T2).

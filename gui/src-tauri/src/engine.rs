@@ -57,12 +57,13 @@
 //!     validates with `config validate`; creating the first config is the wizard's (T16, B8) and
 //!     its shape is not designed yet — an operation the UI cannot drive is a surface nobody
 //!     reviewed (`docs/gui-seam.md` §10e).
-//!   * **No `calendar`, no `update --check`.** R1's forward list carries both; the ENGINE does not
-//!     (`src/main.ts`'s `KNOWN_COMMANDS` is `run | init | status | doctor | config | help |
-//!     schedule`, and anything else exits 2). This enum is exhaustive over the operations the app
-//!     may perform — the engine surface minus `init` and `help` — not over R1's forward list,
-//!     because a typed operation that cannot run is a command that reports failure for a reason the
-//!     user cannot act on.
+//!   * **No `calendar`.** R1's forward list carries it; the ENGINE does not (`src/main.ts`'s
+//!     `KNOWN_COMMANDS` is `run | init | status | doctor | config | help | schedule | update`, and
+//!     anything else exits 2). This enum is exhaustive over the operations the app may perform —
+//!     the engine surface minus `init` and `help` — not over R1's forward list, because a typed
+//!     operation that cannot run is a command that reports failure for a reason the user cannot act
+//!     on. (`update --check` was in this bullet until Phase E's E11 gave the engine the subcommand;
+//!     it is [`Operation::UpdateCheck`] now — see the section below.)
 //!
 //! ## What B6 ADDED here, and the one thing that did not change
 //!
@@ -76,6 +77,17 @@
 //! Nothing else in this module moved. The spawn path, the environment plan
 //! ([`EngineClient::env_plan`], [`FORWARDED_ENV`], [`launchd_path`]), the process-group kill and
 //! both operand validators are untouched by B6.
+//!
+//! ## What Phase E (E12) ADDED: `update --check --json`
+//!
+//! [`Operation::UpdateCheck`] is the Settings screen's "Check now": the engine's MANUAL update
+//! check, which always fetches (the config's `intervalHours` gates only the engine's own automatic
+//! path) and prints its result object. It is **not mutating** — it touches no schedule and no
+//! briefing state, and its one write is the engine's own atomic `<state>/update-check.json` — so it
+//! takes no in-flight guard and "Check now" works while a run is in flight. Like every other
+//! operation it takes no operand: the argv is three fixed literals, and the request it makes is the
+//! engine's (`src/updateCheck.ts`), never the webview's — the webview's CSP permits no remote
+//! connection at all.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -149,6 +161,15 @@ pub enum Operation {
     /// `3` the scheduler refused the kick. `2` is never used here, so [`Outcome::ConfigError`]
     /// cannot arise from it.
     ScheduleVerify,
+    /// `update --check --json` (Phase E, E12) — the engine's MANUAL, notify-only update check: one
+    /// anonymous request for the project's latest GitHub release, compared with the running
+    /// version, the answer printed as JSON and written to `<state>/update-check.json`.
+    ///
+    /// ⚠ NOT MUTATING (plan §5 decision 16). It changes no schedule and no briefing state — its one
+    /// write is the engine's own atomic state file — so it takes no in-flight guard, and "Check
+    /// now" works while a run is in flight. Exit 0 whatever the answer; `unknown` in the payload is
+    /// the engine reporting that the check could not complete, not a failure of this invocation.
+    UpdateCheck,
 }
 
 impl Operation {
@@ -216,6 +237,11 @@ impl Operation {
                 argv.push("verify".into());
                 argv.push("--json".into());
             }
+            Operation::UpdateCheck => {
+                argv.push("update".into());
+                argv.push("--check".into());
+                argv.push("--json".into());
+            }
         }
         argv
     }
@@ -231,6 +257,7 @@ impl Operation {
             Operation::ScheduleUninstall { .. } => "schedule-uninstall",
             Operation::ScheduleStatus => "schedule-status",
             Operation::ScheduleVerify => "schedule-verify",
+            Operation::UpdateCheck => "update-check",
         }
     }
 
@@ -259,6 +286,12 @@ impl Operation {
     /// registered trigger, so the engine runs under launchd and may deliver a briefing and stamp
     /// the day — a `schedule verify` racing a `Run Now` is two generations, which is the one thing
     /// this guard exists to prevent. `schedule status` remains a read and remains unguarded.
+    ///
+    /// ⚠ `UpdateCheck` IS NOT IN THIS SET, AND THAT IS A DECISION (plan §5 decision 16): it touches no
+    /// schedule and no briefing state — its one write is the engine's own atomic update-check record
+    /// — so a "Check now" refused with `Busy` because a briefing is generating would be a refusal
+    /// guarding nothing. `tests/engine_client.rs` pins both halves: the partition, and the check
+    /// succeeding while a run is in flight.
     pub fn is_mutating(&self) -> bool {
         matches!(
             self,
@@ -626,6 +659,17 @@ pub fn launchd_path(home: &Path) -> String {
 /// directory from `HOME` (`src/marker.ts`), git reads `HOME` for its config, and the rest are
 /// locale/temp conveniences that cost nothing and whose absence produces confusing failures.
 pub const FORWARDED_ENV: &[&str] = &["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "TZ"];
+
+/// Set (never forwarded) on every spawn: turns off the Bun runtime's own crash reporter.
+///
+/// The engine is a `bun build --compile` binary, and Bun (v1.3.14,
+/// `src/crash_handler/crash_handler.zig`, `isReportingEnabled`) uploads a crash trace to
+/// `bun.report` when the RUNTIME itself panics or segfaults — by default on macOS and Windows. It
+/// reads `BUN_ENABLE_CRASH_REPORTING` through libc `getenv` when it decides, and `"0"` turns the
+/// upload off; only a set `BUN_CRASH_REPORT_URL` outranks it, and `env_clear` guarantees the child
+/// has none. The scheduled runs carry the same pair (`src/schedule/units.ts`,
+/// `BUN_CRASH_REPORTING_OFF`), and the README's Privacy section promises both.
+pub const BUN_CRASH_REPORTING_OFF: (&str, &str) = ("BUN_ENABLE_CRASH_REPORTING", "0");
 
 /// The idle-sleep guard the plist wraps the engine in: `/usr/bin/caffeinate -i <bin> run`
 /// (`src/schedule/units.ts`, `launchdPlist`).
@@ -1074,7 +1118,7 @@ impl EngineClient {
     }
 
     /// The environment the child gets: cleared, then [`FORWARDED_ENV`] from this process, then
-    /// PATH, then the harness overrides.
+    /// PATH, then [`BUN_CRASH_REPORTING_OFF`], then the harness overrides.
     ///
     /// ⚠ PATH IS SET LAST AMONG THE INHERITED ONES AND IS NEVER FORWARDED. That ordering is the
     /// whole of T9's first half: inheriting the developer's shell PATH is the failure that does not
@@ -1091,6 +1135,8 @@ impl EngineClient {
             .clone()
             .unwrap_or_else(|| launchd_path(&home_dir()));
         plan.push((OsString::from("PATH"), OsString::from(path)));
+        let (key, value) = BUN_CRASH_REPORTING_OFF;
+        plan.push((OsString::from(key), OsString::from(value)));
         plan.extend(self.extra_env.iter().cloned());
         plan
     }
@@ -1432,7 +1478,7 @@ pub fn classify(
 // ONE COMMAND PER OPERATION, and that is the design decision the capability rests on: the grant is
 // per command name, so `capabilities/default.json` can say "this webview may read status and
 // validate a config" distinctly from "this webview may generate a briefing and install a
-// schedule". A single command taking the operation as a parameter would collapse all nine into
+// schedule". A single command taking the operation as a parameter would collapse all ten into
 // one grant and put the distinction back inside application code, which is where B1's ceiling
 // measurement found it was not enforceable.
 //
@@ -1450,7 +1496,7 @@ pub fn classify(
 ///     with the path it looked at, instead of the app refusing to launch or the click producing an
 ///     exit-127 to decode.
 ///   * **The client is injectable.** `tests/capability.rs` manages an [`Engine`] over a fake
-///     sidecar under a tempdir and drives all nine commands through real IPC, so every command
+///     sidecar under a tempdir and drives all ten commands through real IPC, so every command
 ///     BODY is executed by a test rather than only reached. The previous shape — the commands
 ///     calling `EngineClient::bundled()` inline — left six of the (then) eight bodies unreachable by any
 ///     test, which a mutation (`engine_schedule_install` replaced by a constant `Ok`) confirmed
@@ -1603,6 +1649,20 @@ pub async fn engine_schedule_verify<R: Runtime>(
     run_op!(app, engine, Operation::ScheduleVerify)
 }
 
+/// `update --check --json` (Phase E, E12) — the Settings screen's "Check now".
+///
+/// ⚠ A READ AS FAR AS THE GUARD IS CONCERNED, so it is admitted while a run is in flight (see
+/// [`Operation::UpdateCheck`]). No operand: the webview cannot shape the request, which the engine
+/// builds (`src/updateCheck.ts`). The payload is the engine's result object —
+/// `{ status, current, latest?, url?, checkedAt }` — and exit 0 is the norm whatever it says.
+#[tauri::command]
+pub async fn engine_update_check<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+) -> Result<EngineOutcome, EngineError> {
+    run_op!(app, engine, Operation::UpdateCheck)
+}
+
 /// Every command name this module exposes, in the order `lib.rs` registers them.
 ///
 /// `build.rs` autogenerates one `allow-<command>` permission per entry and
@@ -1619,4 +1679,5 @@ pub const COMMANDS: &[&str] = &[
     "engine_schedule_uninstall",
     "engine_schedule_status",
     "engine_schedule_verify",
+    "engine_update_check",
 ];

@@ -206,6 +206,9 @@ fn argv_matches_the_engine_grammar() {
             Operation::ScheduleVerify,
             vec!["schedule", "verify", "--json"],
         ),
+        // Phase E (E12). `update`'s whole vocabulary is `--check` plus `--json` (`src/main.ts`,
+        // UPDATE_VERBS/UPDATE_FLAGS); a bare `update` exits 2, so `--check` is never optional here.
+        (Operation::UpdateCheck, vec!["update", "--check", "--json"]),
     ];
 
     for (op, expected) in cases {
@@ -249,7 +252,8 @@ fn every_operation() -> Vec<Operation> {
             }),
             Operation::ScheduleUninstall { .. } => Some(Operation::ScheduleStatus),
             Operation::ScheduleStatus => Some(Operation::ScheduleVerify),
-            Operation::ScheduleVerify => None,
+            Operation::ScheduleVerify => Some(Operation::UpdateCheck),
+            Operation::UpdateCheck => None,
         }
     }
     let mut all = vec![Operation::Run {
@@ -284,14 +288,16 @@ fn every_operation_variant_is_accounted_for() {
             "schedule-uninstall",
             "schedule-verify",
             "status",
+            "update-check",
         ],
-        "the operation set changed. `init`, `calendar` and `update --check` are deliberately \
-         absent — the first because first-config creation (T16) is undesigned, the other two \
-         because the ENGINE does not have them (`src/main.ts`'s KNOWN_COMMANDS). `schedule verify` \
-         WAS in that list until B6: the kickstart is still engine-side inside `schedule install` \
-         (plan R1), and this operation is the re-run of that same engine-side kick, which is what \
-         keeps the app's exec surface engine-only. Adding one needs a grant in the capability and \
-         a reason in the same change."
+        "the operation set changed. `init` and `calendar` are deliberately absent — the first \
+         because first-config creation (T16) is undesigned, the second because the ENGINE does not \
+         have it (`src/main.ts`'s KNOWN_COMMANDS). `schedule verify` WAS in that list until B6: the \
+         kickstart is still engine-side inside `schedule install` (plan R1), and this operation is \
+         the re-run of that same engine-side kick, which is what keeps the app's exec surface \
+         engine-only. `update --check` WAS in it until Phase E: E11 gave the engine the subcommand \
+         and E12 granted it (notify-only, not mutating). Adding one needs a grant in the capability \
+         and a reason in the same change."
     );
     assert_eq!(
         all.len(),
@@ -373,6 +379,10 @@ fn the_in_flight_guard_covers_exactly_the_state_changing_operations() {
             file: config_file_path("/tmp/candidate.json").expect("a valid path"),
         },
         Operation::ScheduleStatus,
+        // Phase E (E12). ⚠ NOT MUTATING, by decision (plan §5 #16): no schedule, no briefing state —
+        // its one write is the engine's own atomic update-check record. A "Check now" refused with
+        // Busy because a briefing is generating would be a refusal guarding nothing.
+        Operation::UpdateCheck,
     ];
     for op in &mutating {
         assert!(
@@ -1549,6 +1559,18 @@ async fn a_second_mutating_invocation_is_refused_as_busy() {
     assert!(
         read.is_ok(),
         "a read-only operation was blocked by an in-flight run: {read:?}"
+    );
+    // Phase E (E12): "Check now" works while a run is in flight — `update --check` takes no guard.
+    // `Ok` with the fake's own exit 0 means the check really SPAWNED and completed (not merely "was
+    // not refused"), and it did so while `first` still holds the guard.
+    let checked = reader.invoke(Operation::UpdateCheck, &NoProgress).await;
+    let checked = checked.unwrap_or_else(|e| {
+        panic!("an update check was refused while a run was in flight: {e:?}")
+    });
+    assert_eq!(
+        (checked.operation.as_str(), checked.exit_code),
+        ("update-check", Some(0)),
+        "the update check did not run to completion while a run was in flight: {checked:?}"
     );
 
     // Dropping a running invocation must release the guard, or a cancelled run would wedge the app

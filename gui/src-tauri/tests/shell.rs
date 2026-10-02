@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{appending_ipc_sidecar, fake_sidecar, state_sidecar, ScratchDir};
+use common::{appending_ipc_sidecar, code_only, fake_sidecar, state_sidecar, ScratchDir};
 use daily_briefing_gui_lib::engine::{Engine, EngineClient};
 use daily_briefing_gui_lib::schedule_state::{
     derive, local_hhmm_from_iso, now_local, utc_civil, LastSkip, MorningTime, Now, Phase,
@@ -727,31 +727,61 @@ fn the_quit_copy_is_the_delegated_wording_for_each_state() {
         );
     }
 
-    // No usable config: the scheduler may run, but it generates nothing.
-    for what in ["not-configured", "config-error"] {
-        let state = state_of(what);
-        assert_eq!(
-            QuitCopy::for_state(Some(&state)),
-            QuitCopy::NoWorkingConfig,
-            "{what}"
-        );
-        let dialog = quit_dialog(Some(&state));
+    // A config that does not load: the scheduler may run, but it generates nothing.
+    let state = state_of("config-error");
+    assert_eq!(QuitCopy::for_state(Some(&state)), QuitCopy::NoWorkingConfig);
+    let dialog = quit_dialog(Some(&state));
+    assert!(!dialog.body.contains(keeps_generating), "{}", dialog.body);
+    assert!(dialog.body.contains("no usable config"), "{}", dialog.body);
+    assert_eq!(dialog.schedule_label.as_deref(), Some("Open Schedule"));
+    assert!(dialog.offer_label.is_some());
+
+    // ⚠ NOT SET UP YET (Phase E final harden, VM-measured UX finding): no config at all is the
+    // state the setup wizard opens on, and a first-run quit there used to warn "no briefing is
+    // being generated … the engine has no usable config" beside a disabled engine-notifications
+    // offer. The notice is now PLAIN: setup will be offered again; no engine-status claim, no
+    // offer section, no Schedule button.
+    let not_set_up = quit_dialog(Some(&state_of("not-configured")));
+    assert_eq!(
+        QuitCopy::for_state(Some(&state_of("not-configured"))),
+        QuitCopy::NotSetUp
+    );
+    assert_eq!(
+        not_set_up.body,
+        "Setup isn't finished yet. You can quit now — setup will be offered again the next time \
+         you open Daily Briefing."
+    );
+    for alarming in [
+        "usable config",
+        "no briefing",
+        "generat",
+        "engine",
+        "schedule",
+        "wrong",
+    ] {
         assert!(
-            !dialog.body.contains(keeps_generating),
-            "{what}: {}",
-            dialog.body
-        );
-        assert!(
-            dialog.body.contains("no usable config"),
-            "{what}: {}",
-            dialog.body
-        );
-        assert_eq!(
-            dialog.schedule_label.as_deref(),
-            Some("Open Schedule"),
-            "{what}"
+            !not_set_up.body.to_lowercase().contains(alarming),
+            "the not-set-up notice says {alarming:?}: {}",
+            not_set_up.body
         );
     }
+    assert_eq!(
+        not_set_up.offer_label, None,
+        "no notifications control before setup is finished"
+    );
+    assert_eq!(
+        not_set_up.schedule_label, None,
+        "no Schedule button before setup is finished"
+    );
+    assert!(!not_set_up.offer_available);
+    assert_eq!(not_set_up.title, "Quit Daily Briefing?");
+    assert_eq!(
+        (
+            not_set_up.confirm_label.as_str(),
+            not_set_up.cancel_label.as_str()
+        ),
+        ("Quit", "Keep running")
+    );
 
     // No state yet: no guess either way.
     assert_eq!(QuitCopy::for_state(None), QuitCopy::Unknown);
@@ -790,8 +820,13 @@ fn the_quit_copy_is_the_delegated_wording_for_each_state() {
             "the app-owned-tick warning is back: {}",
             dialog.body
         );
-        assert!(dialog.offer_label.to_lowercase().contains("auto"));
-        assert!(dialog.offer_label.to_lowercase().contains("notification"));
+        let offer = dialog
+            .offer_label
+            .as_deref()
+            .expect("every notice but the not-set-up one has an offer section")
+            .to_lowercase();
+        assert!(offer.contains("auto"));
+        assert!(offer.contains("notification"));
         assert!(!dialog.title.is_empty());
         assert!(!dialog.confirm_label.is_empty());
         assert!(!dialog.cancel_label.is_empty());
@@ -1236,111 +1271,6 @@ fn the_plugins_the_menu_and_the_run_callback_are_wired() {
         hide.contains(".hide()"),
         "`hide_main` no longer hides:\n{hide}"
     );
-}
-
-/// Source with every comment removed — `//` line, doc and inner-doc comments and `/* … */` blocks
-/// (nesting included, newlines kept so line shapes survive) — and everything else kept verbatim.
-///
-/// ⚠ A LEXER, NOT A SEARCH-AND-DELETE. String literals (`"…"` with escapes, raw `r"…"` /
-/// `r#"…"#`, and their `b` forms) and char literals are copied through whole, so a `"/*"` or a
-/// `"https://…"` in code cannot open a comment that swallows the pinned code after it. MEASURED in
-/// review round 3: with a `"/*"` literal in `shell.rs`, the previous version dropped everything
-/// that followed, and a predefined Quit added below it passed the "no predefined Quit" pin.
-/// A `'` is a char literal only when it is one (`'x'`, `'\n'`, `'\u{..}'`); otherwise it is a
-/// lifetime or a label and is copied as code.
-fn code_only(source: &str) -> String {
-    let chars: Vec<char> = source.chars().collect();
-    let at = |i: usize| chars.get(i).copied();
-    let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match (c, at(i + 1)) {
-            // A block comment, to its matching close. Only its newlines survive.
-            ('/', Some('*')) => {
-                let mut depth = 0usize;
-                while i < chars.len() {
-                    match (chars[i], at(i + 1)) {
-                        ('/', Some('*')) => {
-                            depth += 1;
-                            i += 2;
-                        }
-                        ('*', Some('/')) => {
-                            depth -= 1;
-                            i += 2;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        ('\n', _) => {
-                            out.push('\n');
-                            i += 1;
-                        }
-                        _ => i += 1,
-                    }
-                }
-            }
-            // A line comment, to (not including) its newline.
-            ('/', Some('/')) => {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-            }
-            // A string: to the first unescaped `"`.
-            ('"', _) => {
-                let start = i;
-                i += 1;
-                while i < chars.len() && chars[i] != '"' {
-                    i += if chars[i] == '\\' { 2 } else { 1 };
-                }
-                i = (i + 1).min(chars.len());
-                out.extend(&chars[start..i]);
-            }
-            // A raw string (`r`, or `br`, not inside an identifier): to `"` plus as many `#`.
-            ('r', Some('"' | '#'))
-                if !ident(i.checked_sub(1).and_then(at))
-                    || (at(i - 1) == Some('b') && !ident(i.checked_sub(2).and_then(at))) =>
-            {
-                let hashes = chars[i + 1..].iter().take_while(|c| **c == '#').count();
-                if at(i + 1 + hashes) != Some('"') {
-                    // `r#ident` — a raw identifier, not a string.
-                    out.push(c);
-                    i += 1;
-                    continue;
-                }
-                let start = i;
-                i += hashes + 2;
-                let close: Vec<char> = std::iter::once('"')
-                    .chain(std::iter::repeat_n('#', hashes))
-                    .collect();
-                while i < chars.len() && !chars[i..].starts_with(&close) {
-                    i += 1;
-                }
-                i = (i + close.len()).min(chars.len());
-                out.extend(&chars[start..i]);
-            }
-            // A char literal — `'\…'` or `'x'` — and otherwise a lifetime or label.
-            ('\'', Some('\\')) => {
-                let start = i;
-                i += 3;
-                while i < chars.len() && chars[i] != '\'' {
-                    i += 1;
-                }
-                i = (i + 1).min(chars.len());
-                out.extend(&chars[start..i]);
-            }
-            ('\'', Some(_)) if at(i + 2) == Some('\'') => {
-                out.extend(&chars[i..i + 3]);
-                i += 3;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    out
 }
 
 /// `s` with every run of whitespace collapsed to one space.

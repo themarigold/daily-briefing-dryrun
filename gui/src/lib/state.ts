@@ -149,12 +149,15 @@ export interface Snapshot {
 export interface QuitDialog {
   title: string;
   body: string;
-  offerLabel: string;
+  /** The engine-notification offer's label; `null` when the notice has NO offer section — before
+   *  setup is finished (Rust's `QuitCopy::NotSetUp`), where there is no engine setting to offer. */
+  offerLabel: string | null;
   /** True where the offer can work (B5: not on Windows, not without a usable config or a state). */
   offerAvailable: boolean;
   offerUnavailableReason: string | null;
   /** A button that opens the Schedule screen instead of quitting — present when the body points
-   *  there (nothing scheduled, a broken unit, no usable config, or no state yet). */
+   *  there (nothing scheduled, a broken unit, a config that does not load, or no state yet); never
+   *  before setup is finished. */
   scheduleLabel: string | null;
   confirmLabel: string;
   cancelLabel: string;

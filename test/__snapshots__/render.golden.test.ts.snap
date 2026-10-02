@@ -38,7 +38,7 @@ exports[`every render corpus struct renders its frozen bytes: rich 1`] = `
 
 ⚠ provider output truncated; 2 repos unreadable
 
-— generated locally via claude"
+— generated via claude"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: quiet day 1`] = `
@@ -53,7 +53,7 @@ exports[`every render corpus struct renders its frozen bytes: quiet day 1`] = `
 ▶ Suggested next
    (none)
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: one missed day, no floor 1`] = `
@@ -70,7 +70,7 @@ exports[`every render corpus struct renders its frozen bytes: one missed day, no
 ▶ Suggested next
    (none)
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: coverage over an empty recap 1`] = `
@@ -86,7 +86,7 @@ exports[`every render corpus struct renders its frozen bytes: coverage over an e
 ▶ Suggested next
    (none)
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: one commit, a why with no recap home, legend at the cap 1`] = `
@@ -106,7 +106,7 @@ exports[`every render corpus struct renders its frozen bytes: one commit, a why 
 
 ⚠ only one
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: why on a cluster 1`] = `
@@ -125,7 +125,7 @@ exports[`every render corpus struct renders its frozen bytes: why on a cluster 1
 ▶ Suggested next
    (none)
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: merges, quiet recap 1`] = `
@@ -142,7 +142,7 @@ exports[`every render corpus struct renders its frozen bytes: merges, quiet reca
 ▶ Suggested next
    (none)
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: image-shaped text 1`] = `
@@ -157,7 +157,7 @@ exports[`every render corpus struct renders its frozen bytes: image-shaped text 
 ▶ Suggested next
    • see ![diagram](https://example.com/d.png) first
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: stash suggestions 1`] = `
@@ -177,7 +177,7 @@ exports[`every render corpus struct renders its frozen bytes: stash suggestions 
    • [mono] Pop or drop stash@{3}  (from stash)
    • [mono] Pop or drop stash@{4}  (from stash · 2 days old)
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: verdict-path marker 1`] = `
@@ -194,7 +194,7 @@ exports[`every render corpus struct renders its frozen bytes: verdict-path marke
      ⚑ human gate: cites a commit on a configured verdict path
    • [quant_stocks] plain suggestion beside it
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;
 
 exports[`every render corpus struct renders its frozen bytes: Mono/mono label pair 1`] = `
@@ -216,5 +216,5 @@ exports[`every render corpus struct renders its frozen bytes: Mono/mono label pa
 ▶ Suggested next
    • [mono] ship the tidy-up
 
-— generated locally via anthropic-api"
+— generated via anthropic-api"
 `;

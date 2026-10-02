@@ -29,7 +29,7 @@ passes a bare name (§1a), so the file is always `<state>/<name>`; the engine ad
 names it owns there (`briefing.log`, `last-run`, `run.lock`, …).
 
 ⚠ **Tier B (recap campaigns) adds one state file, `<state>/recap-campaigns.jsonl`** — the trial record
-(README, *Recap campaigns*). `status --json` lists it as `paths.recapCampaignsPath` (`src/json.ts`,
+(docs/CONFIG.md, *Recap campaigns, in full*; formerly the README's *Recap campaigns*). `status --json` lists it as `paths.recapCampaignsPath` (`src/json.ts`,
 `statePaths()`), and `engineOwns` refuses it as a `--json-out` target (`"recap-campaigns record"`). It is
 written only when the config's `recapCampaigns.mode` is `trial` or `on` — one appended JSON line per run
 that reaches the grouping step — and never under the default `off`. The app reads nothing from it. Its
@@ -56,6 +56,7 @@ dependency of the shell crate and the capability grants no `shell:*` permission.
 | `engine_schedule_uninstall` | `schedule uninstall --invoker app [--take-over]` |
 | `engine_schedule_status` | `schedule status --json` |
 | `engine_schedule_verify` | `schedule verify --json` — B6/T20; **mutating** (§11) |
+| `engine_update_check` | `update --check --json` — Phase E (E12); **not** mutating, so never blocked by a run in flight (below) |
 
 Slice 5's shell adds three more (T10/T11/T14). They spawn nothing of their own; `state_snapshot` is
 the only one that reaches the engine, and it does so through the same `EngineClient`:
@@ -105,6 +106,15 @@ but the two reads:
 | `cli_shim_install` | writes the symlink (exclusive; temp+rename to repair a stale one of OURS); refuses a foreign file; a permission refusal carries the exact manual `sudo ln -sfn …` line rather than escalating |
 | `cli_shim_remove` | removes only a symlink `classify` calls ours; foreign refused; absent is a no-op |
 
+Phase E M5b adds two more (T19 reworked, §12d), and with them withdraws two PLUGIN grants
+(`autostart:allow-enable` / `allow-disable`). Neither takes a path, and nothing at launch calls
+either:
+
+| Command | What it does |
+| --- | --- |
+| `autostart_set_enabled` | takes one boolean. ON: the autostart plugin's `enable()`, then — macOS — `AssociatedBundleIdentifiers` = the bundle id added to the plist it wrote (`autostart::brand_launch_agent`). OFF: its `disable()`. Records that a login-item choice was made. The Settings toggle and the wizard's Finish |
+| `autostart_wizard_default` | READS the login-item record and `is_enabled()`: the wizard's pre-tick (ON for a fresh install, else the real state). Enables nothing |
+
 ⚠ **The pinned spellings, as of B8: SEVEN module `COMMANDS` lists concatenated into one, compared
 against four external spellings.** `engine::COMMANDS`, `shell::COMMANDS`,
 `briefing_files::COMMANDS`, `config_save::COMMANDS` (which B8 grows by `config_create`),
@@ -141,7 +151,7 @@ diagnostics are the user-facing explanation, and §5's rendering warnings apply 
 not streamed**: for the JSON operations it is one envelope that means nothing until it is complete,
 and for the narrating ones it arrives whole in `EngineOutcome.stdout`.
 
-**Busy semantics.** Five of the nine engine commands are **mutating** — `engine_run`,
+**Busy semantics.** Five of the ten engine commands are **mutating** — `engine_run`,
 `engine_run_to_file`, `engine_schedule_install`, `engine_schedule_uninstall` and (since B6)
 `engine_schedule_verify` (four `Operation` variants: `Run` is both run commands, since `--json-out`
 is a field on it) — and at most one of them may be in flight in the app process at a time.
@@ -149,8 +159,10 @@ is a field on it) — and at most one of them may be in flight in the app proces
 trigger, so launchd runs the engine and a briefing can be generated and the day stamped (§11). A second one does **not queue**: it is refused
 immediately with `{ kind: "busy", running: "<the operation already running>" }`, because a second
 briefing generation must not be *delayed* into happening. `engine_status`, `engine_doctor`,
-`engine_config_validate` and `engine_schedule_status` are **never** blocked by it — a panel that
-stopped refreshing while a run was in flight would go quiet exactly when it has the most to show.
+`engine_config_validate`, `engine_schedule_status` and — the tenth command, added in Phase E (E12) —
+`engine_update_check` (`update --check --json`) are **never** blocked by it — a panel that
+stopped refreshing while a run was in flight would go quiet exactly when it has the most to show,
+and "Check now" works while a run is in flight.
 The guard is **in-process only**: a `daily-briefing run` started in a terminal is outside it, and
 the engine's own `run.lock` is what covers that. The partition is pinned literally by
 `the_in_flight_guard_covers_exactly_the_state_changing_operations`, so adding a mutating operation
@@ -188,11 +200,11 @@ One surface the app deliberately does not carry: **`init`**. It has no command a
 validated `config_create` path (§13), rather than spawning the engine's do-not-clobber writer,
 because `init`'s template cannot carry the wizard's choices (its discovery roots would be the APP
 process's cwd, its provider only what `--provider` can spell, no floor, no repos selection) and a
-post-init edit would be the two-write shape the write-once rule forbids. `calendar` and
-`update --check` are in plan R1's forward list and are **not in
-the engine**, so the enum — which is exhaustive over the operations the app may perform, i.e. the
-engine surface minus `init` and `help`, each excluded deliberately (§1c deviation 4) — has no
-variant for them either.
+post-init edit would be the two-write shape the write-once rule forbids. `calendar` is in plan
+R1's forward list and is **not in the engine**, so the enum — which is exhaustive over the
+operations the app may perform, i.e. the engine surface minus `init` and `help`, each excluded
+deliberately (§1c deviation 4) — has no variant for it either. (`update --check` was on that
+list too until Phase E M4 added it to the engine; it is now `engine_update_check`, above.)
 
 ⚠ **`schedule verify` WAS on that list until B6, and the reason it left is not that R1 changed.**
 The kickstart is still engine-side: `schedule install` performs it as its final step, and this
@@ -218,6 +230,8 @@ does not have to reconstruct it from a commit message:
    **AMENDED IN B8: that design point is CLOSED** — the first config is `config_create` (§13d),
    a create mode beside the save path; `init` STAYS out of the enum (the engine's template cannot
    carry the wizard's choices — §13d's rejected alternative — and :165's reasoning is unchanged).
+   **AMENDED IN PHASE E M4:** `update --check` is now in the engine (`KNOWN_COMMANDS` gained
+   `update`) and has a typed command, `engine_update_check` (§1a); `calendar` is still dropped.
    **AMENDED IN B6:** this entry read "minus `init`, `help` and
    `schedule verify`" until T20 added `Operation::ScheduleVerify`; the kickstart is still
    engine-side and the new operation re-issues it (§11, deviation 76).
@@ -569,7 +583,8 @@ phase, because `not-scheduled` is two different truths:
 | a loaded schedule and a usable config (`delivered`, `waiting-*`, `skipped`, `agent-stale`, `unknown-tick`) | *Quitting does not stop your briefings — the background scheduler keeps generating them while this app is closed. What stops is any notification this app itself would post when one arrives; whether you are told then depends on the engine's own notification setting — and on whether your setup shows its banner — neither of which quitting changes.* (reworded in B7 — T11 rework: since T18 the app posts the arrival notification behind its own opt-in, so this is what quitting actually stops; "would post" keeps it true while the opt-in is off. Hedged in the B7 fix round — deviation 119: "depends ONLY on the setting" promised a banner the engine's own header doubts from a launchd agent) | no |
 | `not-scheduled` with no unit present or registered, `scheduler-broken` | nothing is generating briefings in the background, and quitting changes nothing about that; set the scheduler up first | yes |
 | `not-scheduled` with a unit present or registered (no ownership record beside it) | a scheduler unit exists but has no ownership record, so the app cannot say whether briefings keep arriving; quitting does not change that unit — the same hedge the Schedule screen makes | yes |
-| `not-configured`, `config-error` | quitting changes nothing about the schedule, but nothing is being generated: no usable config | yes |
+| `not-configured` — setup is not finished (`QuitCopy::NotSetUp`, Phase E final harden — §17) | *Setup isn't finished yet. You can quit now — setup will be offered again the next time you open Daily Briefing.* No engine-status claim, and NO offer section (`offerLabel: null`) | no |
+| `config-error` | quitting changes nothing about the schedule, but nothing is being generated: no usable config | yes |
 | no state yet | the app cannot say whether briefings keep arriving; quitting does not change the schedule | yes |
 
 None of them claims to know the engine's `notify` value — `status --json` does not report it, and
@@ -582,9 +597,10 @@ until you reopen") is false under R1 and a test refuses its return. The `notify:
 TAKEABLE since B5 (`config_offer_notify_auto`, §10) — except on Windows, where the engine's `"auto"`
 resolves to NO notifier at all (`src/notify.ts`, `notifyArgv`: `return null` for win32), and where
 the app has no usable config or no state yet; there the dialog states the offer and says why
-(`shell::offer_unavailable_reason`). Where it is available, App.svelte reads the config when the
-dialog opens (`config_read`) and the offer is a button only where taking it would change something
-(§10e, *The Quit offer*). ⚠ Like every save, taking it re-writes the WHOLE file in the save format:
+(`shell::offer_unavailable_reason`). Before setup is finished (`not-configured`) there is no offer
+section at all: `offerLabel` is `null` and `QuitDialog.svelte` renders none (§17). Where it is
+available, App.svelte reads the config when the dialog opens (`config_read`) and the offer is a
+button only where taking it would change something (§10e, *The Quit offer*). ⚠ Like every save, taking it re-writes the WHOLE file in the save format:
 a config indented some other way comes back two-space indented.
 
 **Time.** The watcher keeps the last envelopes and wakes at the instant
@@ -605,7 +621,10 @@ open. What a wake DOES depends on what the clock crossed:
   load/unload changes with no file event at all — or is degraded (no state, or a failed read).
 
 `state:changed` goes out for a time-driven wake **only when the snapshot changed**. Every served
-file-event batch is ALSO a real read of both envelopes, and is always emitted.
+file-event batch is ALSO a real read of both envelopes, and is always emitted. Which backend events
+make a batch is ONE function, `watcher::counts_as_change`: a change to a watched path, or a rescan
+notice that can cover the state dir — no path, the state dir, an ancestor of it, or a watched path
+(§17).
 
 **What that costs** (each read is `status --json` + `schedule status --json`, two spawns):
 
@@ -666,8 +685,9 @@ its three commands are refused (`the_window_state_plugin_commands_are_not_grante
 at runtime; `tauri-plugin-notification` (B7) is registered for the Rust-side post and granted
 NOTHING (its three live commands are refused —
 `the_webview_cannot_reach_the_notification_plugin`); and `tauri-plugin-autostart` (B7) is the ONE
-granted plugin — exactly its three-member shipped allow-set, justified grant by grant in
-`capabilities/README.md` (§12).
+granted plugin — B7 granted exactly its three-member shipped allow-set; Phase E M5b keeps only
+`autostart:allow-is-enabled` and routes ON/OFF through the app's `autostart_set_enabled` (§12d),
+justified grant by grant in `capabilities/README.md` (§12).
 
 **The capability** is thirty-two entries since B8 (§13 adds `allow-config-create` and the three
 `allow-cli-shim-*`; through B7 it was twenty-eight — §12: B7 adds `allow-notify-status` /
@@ -715,7 +735,8 @@ interface Snapshot {
 interface QuitDialog {
   title: string;
   body: string;                    // worded for the last announced state (§8, *Quit*)
-  offerLabel: string;              // the engine `notify: "auto"` offer
+  offerLabel: string | null;       // the engine `notify: "auto"` offer; null = NO offer section
+                                   //   (before setup is finished — §17)
   offerAvailable: boolean;         // B5: false only on Windows, with no usable config, or no state
   offerUnavailableReason: string | null; // never null while offerAvailable is false
   scheduleLabel: string | null;    // "Open Schedule" when the body points there; else null
@@ -972,7 +993,10 @@ test); that is that entry's own wording, not this convention.
 31. **`Snapshot.lastSkip` comes from `status` only.** The fallback to the schedule envelope's copy
     is dropped: `status` is read in every batch and carries the same record, and a cached schedule
     envelope could resurrect a skip the engine had already cleared.
-32. **The Quit notice has five bodies, chosen by the last announced STATE, and may offer the
+32. *Amended in the Phase E final harden (§17): SIX bodies — `not-configured` (setup not finished)
+    is its own plain notice with no offer section and no Schedule button; `config-error` keeps the
+    no-usable-config body.*
+    **The Quit notice has five bodies, chosen by the last announced STATE, and may offer the
     Schedule screen** (§8, *Quit*). "The background scheduler keeps generating them" is said only
     where a loaded schedule and a usable config exist; "nothing is generating briefings" only where
     no unit is present or registered either — a `not-scheduled` state with a unit beside it gets the
@@ -1088,10 +1112,14 @@ session rather than trusting that sentence.
   real sidecar. **Since Phase E's E1** the envelope's `struct`, `warnings` and `discIssues` are
   redacted by `redactStruct` (`src/json.ts`, via `redactEnvelope`, applied once in `emit` before the
   stdout / `--json-out` split). The check below STAYS as the fail-closed fallback: an engine older
-  than E1 still ships the raw struct, and per-leaf redaction is measured not to render byte-equal to
-  the redacted file in one shape (`test/envelope-redaction.test.ts`, D2: an `env-assignment` value
-  that ends a leaf swallows the renderer's following punctuation only in the post-render scan). The
-  text comparison is fail-closed and carries no copy of the engine's credential patterns: any
+  than E1 still ships the raw struct, and per-leaf redaction does not render byte-equal to the
+  redacted file in TWO known shapes, both failing closed to the file: D2
+  (`test/envelope-redaction.test.ts`: an `env-assignment` value that ends a leaf swallows the
+  renderer's following punctuation only in the post-render scan), and KEY over-redaction (§17,
+  Phase E final harden: `redactStruct` redacts object keys case-insensitively, so a `whys` key such
+  as `myapi_token=…` is redacted where the file's case-sensitive pass leaves the label
+  `MyAPI_TOKEN=…`, and the struct render loses that why line — `lib/today.ts:23-30`). The text
+  comparison is fail-closed and carries no copy of the engine's credential patterns: any
   difference, whatever its cause, shows the file. `tests-web/today.check.ts` builds its fixture with
   the engine's own `redactCredentials` (imported read-only). The engine-side stderr exposure the same
   review saw is a separate engine task.
@@ -2029,7 +2057,10 @@ Numbered from 105, continuing §11e. §9's retire-in-place convention applies.
      notification as what quitting stops — conditionally ("would post"), because the opt-in may
      be off — and the engine-setting offer as the fallback. §8's table carries the new text;
      `tests/shell.rs` pins it and retires the pre-T18 "what stops is …" refusal.
-114. **Autostart default-ON is a first-launch ONE-SHOT** (`autostart::startup`), recorded in
+114. *Superseded in Phase E M5b (§12d, user-directed): there is no launch-time one-shot any more —
+     the default-ON is the setup wizard's last step, and the record below now decides only the
+     wizard's pre-tick. The record-loss split is kept, for the same reason one step later.*
+     **Autostart default-ON is a first-launch ONE-SHOT** (`autostart::startup`), recorded in
      `<app_data_dir>/autostart-state.json`. The record — never the plist — is the rule's input,
      so the default can never re-enable over a user who turned it off; a failed enable is logged,
      unrecorded, and retried next launch (idempotent). *Amended in the B7 fix round (a MED —
@@ -2038,9 +2069,12 @@ Numbered from 105, continuing §11e. §9's retire-in-place convention applies.
      re-created a login item the user had deleted — contradicting this entry's own promise.
      `read_record` now splits the cases: ABSENT = genuine first launch (apply the default);
      PRESENT-but-unusable = `{ defaulted: true }` (fail toward the user's last known choice).
-     Pinned by `a_corrupt_record_never_reenables_autostart`; the cost of the safe direction is
+     Pinned by `a_corrupt_record_never_reenables_autostart` (M5b: now
+     `a_corrupt_record_never_pre_ticks_a_removed_login_item`); the cost of the safe direction is
      one skipped default after a half-written first-launch record, recoverable by the toggle.
-115. **The autostart toggle is the webview calling the PLUGIN's three commands directly** — the
+115. *Superseded in Phase E M5b (§12d): the toggle's ON/OFF is the app command
+     `autostart_set_enabled`; only `is_enabled` is still a plugin grant.*
+     **The autostart toggle is the webview calling the PLUGIN's three commands directly** — the
      first plugin grants in the capability, and exactly its shipped allow-set
      (`capabilities/README.md`). Real state via `is_enabled()` per render, never cached. The OFF
      path offers engine `notify: "auto"` through the existing offer command and wording
@@ -2133,7 +2167,10 @@ The entries from 118 are the B7 fix round's (round-1 review findings, resolved a
      fix: they are small local files read once per snapshot, and the engine spawn beside them
      dwarfs them; lifting them to `spawn_blocking` would complicate the one shipping sink for an
      unmeasured stall.
-125. **The default-ON plist's program path is `current_exe()` — a dev/debug bundle's first
+125. *Amended in Phase E M5b (§12d): it is no longer the first LAUNCH but the wizard's Finish
+     (with the box ticked) that registers the login item; the program-path consequence below is
+     unchanged.*
+     **The default-ON plist's program path is `current_exe()` — a dev/debug bundle's first
      launch registers a login item pointing at the BUILD DIRECTORY.** Derivation:
      `autostart::startup` → plugin `enable()` → `auto-launch 0.5.0` writes `ProgramArguments =
      [app_path, ...args]` with `app_path = current_exe()` (its macOS LaunchAgent branch; args
@@ -2160,11 +2197,12 @@ Beyond §1b, §9, §10f and §11f, all unchanged:
   ever be honoured on this plugin version (deviation 105).
 - **A real `enable()` / `disable()` / `is_enabled()` against the live plugin state.** The plist
   write/remove in `~/Library/LaunchAgents` and the stat that reads it back are never called; the
-  one-shot and the toggle are driven through recording sinks, and the autostart grants' IPC
-  admission is asserted against a mock app with no plugin registered. `~/Library/LaunchAgents`
+  one-shot (M5b: the two autostart commands) and the toggle are driven through recording sinks,
+  and the autostart grants' IPC admission is asserted against a mock app with no plugin
+  registered. M5b's branding rewrite of that real plist is never run either (§12d). `~/Library/LaunchAgents`
   is stat-identical before and after the whole B7 build+test run (measured by the builder).
-- **The default-ON one-shot in a real bundled app at a real login**, and the login item actually
-  launching the app.
+- **The default-ON one-shot in a real bundled app at a real login** (M5b: the wizard's Finish with
+  the box ticked), and the login item actually launching the app.
 - **The label non-collision against a LIVE launchd domain** — both agents loaded at once. The
   test proves the names are distinct; launchd's own behaviour with both present is unexercised.
 - **The notification plugin's `js_init_script` in a real webview.** Its real surface, read from
@@ -2182,6 +2220,96 @@ Beyond §1b, §9, §10f and §11f, all unchanged:
   lands in the plist (deviation 125); what launchd does when that path later disappears is
   UNVERIFIED beyond auto-launch's source.
 
+### 12d. Phase E M5b — the login item moves to the wizard's last step, and is branded
+
+Two user-directed changes (2026-10-01), recorded here rather than by rewriting 114/115/125, which
+carry *Superseded/Amended* notes pointing here.
+
+**Nothing at launch.** `lib.rs`'s setup no longer calls anything in `autostart` — B7's
+first-launch one-shot (`autostart::startup`) is deleted, and `tests/autostart.rs`'s
+`nothing_registers_a_login_item_at_launch` reads the setup closure out of `lib.rs` and refuses any
+`autostart`/`autolaunch`/`enable`/`startup` token in it (a SOURCE pin: the real setup builds a
+windowed app with the real plugin, which no test may run). Checkpoint fix: that pin read only the
+closure's own text, so an enable one call deeper (in `shell::setup`) stayed green;
+`nothing_outside_the_on_command_can_turn_the_login_item_on` now reads EVERY file under `src/`
+(comments stripped by `tests/common`'s lexer) — only `src/autostart.rs` may contain `enable_now(`,
+`enable_via_plugin(`, `.autolaunch()`, `AutoLaunchManager`, `brand_launch_agent(` or
+`autostart_set_enabled(`, and there each is called only from named functions (the ON command →
+`enable_now` → `enable_via_plugin` → the plugin and the branding). The default-ON (plan R1) now lives in
+the setup wizard's LAST step (§13): a "Start Daily Briefing at login" checkbox, pre-ticked from
+`autostart_wizard_default`, applied by `autostart_set_enabled` when the user presses **Finish** —
+and only then. Checkpoint fix (`lib/wizard.ts`'s `loginItemPlan`): the wizard keeps the default
+read (pending / answered / failed) and the user's own tick (null until touched) apart. While the
+read is pending and the box untouched, Finish is DISABLED — the first shape started the box ticked
+and let Finish apply that before the read answered. If the read FAILED and the box is untouched,
+Finish does not call `autostart_set_enabled` at all and the copy says the current state could not
+be read — the first shape turned a failed read into an OFF that Finish applied as an active
+removal. A touched box is applied as the user set it. So the wizard's "nothing is installed until you confirm at the last step" holds for
+the login item. A user who leaves the wizard without pressing Finish, or who configured the engine
+from a terminal and never sees the wizard, gets no login item until they turn it on under
+**Settings › This app**.
+
+**The record.** `<app_data_dir>/autostart-state.json` keeps its one key, `defaulted`; its meaning
+widens to "a login-item choice has been applied in this app" (B7's one-shot on an existing
+install, the wizard's Finish, the Settings toggle — every successful `autostart_set_enabled`). Its
+one reader is `autostart::wizard_default`: no record ⇒ pre-tick ON; a record ⇒ the REAL state
+(`is_enabled()`), so a re-run of the wizard never re-creates a login item the user removed and
+never removes one they kept; a record with an unreadable state ⇒ an ERROR (checkpoint fix: it
+answered OFF, which the wizard's Finish then applied as a removal of an item whose state nobody could
+read; the wizard now treats the error as unknown and changes nothing). Dev 114's record-loss split
+is kept: a PRESENT-but-unusable record reads as `defaulted: true`, so a corrupt record shows the
+real state rather than pre-ticking a removed item (`a_corrupt_record_never_pre_ticks_a_removed_login_item`).
+A failed enable is returned to the wizard and NOT recorded. **Existing installs** keep exactly what
+they have: nothing at launch reads or writes either the record or the plist.
+
+**The branding (macOS).** `auto-launch 0.5.0` writes `ProgramArguments = [current_exe()]`, so
+macOS lists the login item under the inner executable's name, "daily-briefing-gui". After the
+plugin's `enable()`, `autostart::brand_launch_agent` parses that plist with the `plist` crate
+(1.10.1 — already tauri's own macOS dependency, so an edge and no new crate), refuses it unless
+its `Label` is this app's (and refuses a symlink, a hard link, or an oversized file), adds
+`AssociatedBundleIdentifiers` = `["com.themarigold.daily-briefing"]` (`tauri.conf.json`'s
+`identifier`, read as `app.config().identifier`), and replaces the file with temp+`rename` — the
+temp CREATED with `create_new` (`O_CREAT|O_EXCL`, `config_save::write_new_file`), never opened, so a
+symlink or hard link planted at its predictable name is never written through (a clash tries the next
+name, at most 8), and the result is mode 0644 whatever the umask (checkpoint fix). Every
+key the plugin wrote is kept, so the plugin's own `is_enabled()` (a stat) and `disable()` (a
+remove) of the same path, and the label test, are unchanged. A branding failure is logged, not
+returned — the login item the user asked for exists either way. To make the branding the ONLY
+ON, the webview lost `autostart:allow-enable` / `allow-disable`; the toggle and the wizard reach
+ON/OFF through `autostart_set_enabled`. **Existing installs' plists**, written unbranded by B7's
+one-shot, stay unbranded until the next ON through the app (no launch-time rewrite — that would be
+the kind of unrequested action this milestone removes). Linux has no equivalent key:
+`~/.config/autostart/Daily Briefing.desktop` is written exactly as before.
+
+**One change at a time (checkpoint fix).** ON is `enable()` → branding (read, temp, `rename`) →
+record; an OFF's `disable()` landing between ON's `enable()` and its `rename` was RE-CREATED by that
+rename. `AutostartState` now holds one lock (`autostart::lock_changes`): `autostart_set_enabled`
+holds it across the whole ON or OFF including the record, the uninstall's leg 1 across its read and
+`disable()`, and `enable_now` / `disable_now` take the guard as an argument, so no caller can skip
+it. A std `Mutex` held across no `.await`.
+
+What is tested: the key, its value, every other key surviving, idempotence, the refusals (absent,
+foreign `Label`, symlink, hard link, oversized, binary plist — `tests/autostart.rs`'s `branding`
+module, on scratch files written byte-for-byte as `auto-launch 0.5.0` writes them), the 0644 mode,
+the planted-temp-name cases (symlink, dangling symlink, hard link, every name taken), the bundle id
+and plist path inputs, a source pin that the real ON calls the branding with those inputs AFTER the
+plugin's `enable()`, the change lock (observed from inside the sink's `enable()`/`disable()` for the
+commands and the uninstall, and an OFF driven while an ON is paused mid-enable), and a malformed
+`autostart_set_enabled` call (`{}`, `{"enabled":"yes"}`) enabling nothing (`tests/capability.rs`).
+
+**UNVERIFIED (until the Phase F VM):** that macOS 13+ shows the login item as "Daily Briefing"
+with the app's icon in System Settings › General › Login Items, and in the "background item
+added" notification, for this ad-hoc-signed, not-notarized bundle. The rewrite of the real
+`~/Library/LaunchAgents/Daily Briefing.plist` and what Background Task Management does with the
+added key are never run by this suite. Also UNVERIFIED, and specific to the two-step write: (a) the
+plugin's unbranded write and the branded `rename` are two file events, so BTM's "background item
+added" banner may show the UNBRANDED name (the first event) even when the list later shows the
+branded one; (b) the `rename` replaces the file with a new inode — whether BTM keeps a user's
+System-Settings OFF across that replacement is unknown; and (c) on macOS 13+ switching the item off
+in System Settings may only disable it without deleting the plist, in which case `is_enabled()` (a
+stat) still reads ON — the Settings toggle and a wizard re-run would then show ON
+(`docs/TROUBLESHOOTING.md` §"The app's login item" tells the user to turn it off in the app too).
+
 ## 13. The first-run wizard, the first-config path and the CLI shim (T16 + dev 63, B8)
 
 ### 13a. The wizard: six steps, one write
@@ -2195,7 +2323,9 @@ mirror is pinned against the Rust source by `wizard.check.ts`) · background del
 (UNCONDITIONAL; `ScheduleInstall.svelte` IS the install, the foreign-owner dialog keeps
 KEEP-EXISTING first, `ScheduleVerify.svelte` is the live test — the install's own engine-side
 kickstart IS the verification, no second run path exists — then the notifications ask, dev 107's
-same command and copy, then `doctor --json`'s provider verdict).
+same command and copy, then `doctor --json`'s provider verdict and any per-repo note it carries —
+today only the partial-clone one, since the Phase E final harden (§17) — and, since Phase E M5b, the
+"Start Daily Briefing at login" choice, pre-ticked and applied only when Finish is pressed, §12d).
 
 **The one write.** Steps 1–5 build a DRAFT in webview memory; `lib/wizard.ts` performs no IPC at
 all (pinned by source scan), and the single write happens at the step-5 → step-6 gate:
@@ -3082,7 +3212,7 @@ comment), so the cites above are spelled the way the pin enforces them (round-1 
 numbers here could rot with the suite green) — plus behaviour: a delivering sandbox run stamps
 today, a refused one stamps nothing.
 
-**The four user-facing facts, stated for the README and asserted here:** the app is OPTIONAL; the
+**The four user-facing facts, stated for users (README → docs/INSTALL.md, *The desktop app and the command-line tool together*) and asserted here:** the app is OPTIONAL; the
 CLI is the engine (the app spawns the same binary and speaks argv + stdout — §1); both read the
 SAME config at the same path and write the SAME state dir (the app resolves both from
 `status --json`, never from Tauri's own dirs — §10a); and nothing the app does changes briefing
@@ -3098,10 +3228,10 @@ tempdirs: HOME + XDG_CONFIG_HOME + DAILY_BRIEFING_STATE_DIR + DBA_TEST_UNIT_DIR,
 1. **Byte-identical**: `run --force` in a pre-GUI baseline sandbox vs two GUI-present sandboxes
    (app-owned record; CLI-owned record + full app-data presence). Stdout, stderr and
    `briefing-latest.md` compared as BYTES under a minute guard for the one real-clock
-   `state as of HH:MM` stamp (`src/core.ts:538`); one measured stderr timing line normalised
+   `state as of HH:MM` stamp (`src/core.ts`, `stateAsOf` — cited by name: the engine branch moves its line); one measured stderr timing line normalised
    (dev 160). The planted presence follows the SOURCES, not the appendix (dev 158).
 2. **Corpus**: two launchd-shaped appends (stdout+stderr → one `briefing.log`), then the
-   engine's OWN `audit.lastBriefing` (`src/audit.ts:218`, imported read-only — never
+   engine's OWN `audit.lastBriefing` (`src/audit.ts`, `lastBriefing` — cited by name: the engine branch moves its line; imported read-only — never
    re-implemented) returns exactly the last block, byte-equal to `briefing-latest.md`.
 3. **Audit**: `bun run audit --no-judge`, offline, in both sandboxes — finds
    `briefing-latest.md (today's)`, grades clean (the fixture cites a real SHA), writes
@@ -3121,7 +3251,7 @@ tempdirs: HOME + XDG_CONFIG_HOME + DAILY_BRIEFING_STATE_DIR + DBA_TEST_UNIT_DIR,
 | Both installed, GUI delegating | owner `"cli"` record + FULL app presence: byte-identical, corpus, audit all hold | the delegated watcher against a real tick |
 | Transition CLI→app (take-over) | engine's foreign-owner exit-2 + `--take-over` argv covered by the engine's own tests and `tests/capability.rs`'s IPC legs (§1b) | the real `launchctl` swap (plan line 70's live-domain register) |
 | Transition app→CLI (handback) | same coverage class (§1b) | same |
-| Uninstall | `tests/uninstall.rs`: script parity, consent gate, never-recursive, survivors, T19-disable reuse — real `SystemFs` on scratch | the real removal legs + login item (§16c) |
+| Uninstall | `tests/uninstall.rs`: script parity, consent gate, never-recursive, survivors, T19-disable reuse, the schedule-record and record-less-unit refusal (§17) — real `SystemFs` on scratch | the real removal legs + login item (§16c) |
 
 ### 16b. Deviations recorded by T25 (B25)
 
@@ -3145,10 +3275,16 @@ Numbered from 157, continuing §15b. §9's retire-in-place convention applies.
      (`~/.config/<id>` vs `~/.local/share/<id>`), so `uninstall.rs` carries TWO directories and
      the single-dir shape the appendix implies would strand the window-state file on exactly the
      platform where nobody would look.
-159. **The app's uninstall never touches the launchd domain, and the consented engine list DOES
+159. *Amended in the Phase E final harden (§17): while `<state>/schedule.json` exists the consented
+     leg removes NOTHING of the engine's — the trigger that record describes runs the engine copy
+     and would re-create what was removed — and reports ONE refusal (`engineRefused`) naming the way
+     out; the consent label says so up front (`scheduleRecordPresent`). Round 1 kept only
+     `daily-briefing` and removed the rest; round 2 replaced that (A-M1). Round 3 extended the
+     refusal to a record-less scheduler unit file and added the stale-record way out.*
+     **The app's uninstall never touches the launchd domain, and the consented engine list DOES
      include the managed binary.** `scripts/uninstall.sh`'s `$PLIST` lines (unload + rm) are
      `schedule uninstall`'s territory — the Schedule panel's existing flow — so the parity set is
-     the `$SUPPORT`-rooted subset (`uninstall.sh:11-24`'s class), and the Settings copy points at
+     the `$SUPPORT`-rooted subset (the script's `rm … "$SUPPORT"/<token>` lines), and the Settings copy points at
      the Schedule screen rather than implying a total uninstall. Within that subset,
      `daily-briefing` (the managed engine copy) IS removed on consent because the script removes
      it: consent means what `bash scripts/uninstall.sh` means. The bounded list is pinned by
@@ -3162,7 +3298,7 @@ Numbered from 157, continuing §15b. §9's retire-in-place convention applies.
 160. **The stderr comparison normalises exactly ONE measured timing line; stdout is compared
      raw.** With `networkProbeHosts: []` the probe answers instantly, but `waitedMs` is a
      `Date.now()` difference (`src/net.ts::waitForNetwork`) that jitters between 0 and 1 ms, and
-     `src/main.ts:95` prints `waited ~0s for the network to come up` only when it lands ≥ 1 —
+     `src/main.ts` (`emitNetMessage`, :99 at the round-4 fix commit) prints `waited ~0s for the network to come up` only when it lands ≥ 1 —
      measured at roughly one run in ten (a 40-iteration paired probe; stdout never diverged).
      The line is pre-header, so the audit's `lastBriefing` slice never contains it. Every other
      stderr byte is compared exactly.
@@ -3303,3 +3439,530 @@ restored by `git checkout` and re-run clean (11 / 0).
 | B25-20 | `run()` truncates `$XDG_CONFIG_HOME/<id>/.window-state.json` to 0 bytes | byte-identical: `…/.window-state.json changed after run --force` |
 | B25-21 | `run()` deletes the window-state file only when `schedule.json` says owner `"cli"` (the delegating sandbox) | byte-identical: `byte-cli-0/…/.window-state.json vanished after run --force` |
 | B25-22 | darwin: `run()` deletes `<unit dir>/Daily Briefing.plist` | byte-identical: `…/units/Daily Briefing.plist vanished after run --force` |
+
+## 17. Phase E final harden, rounds 1 to 4 and the cap round — what changed at the seam (GUI)
+
+Recorded here rather than by rewriting §8's Quit table, §8a's `QuitDialog`, deviations 32 and 159,
+§10b and §13a, which carry *Amended* notes or one-line pointers here. Line numbers are this
+branch's; the engine's `src/json.ts` and `scripts/uninstall.sh` are cited by symbol, because the
+engine's and the pipeline's own rounds move them. Round 2 REPLACED round 1's uninstall rule and
+TIGHTENED its watcher rule; both paragraphs below describe the round-2 behaviour and say what round
+1 did. Round 3's changes are collected in their own block below (*Round 3*), and so are round 4's
+(*Round 4*) and the cap round's after round 5 (*Cap round*); the round-2 paragraphs carry *Round 3:*
+and *Round 4:* notes where a later round changed what they describe. Line numbers were re-checked
+at the round-4 fix commit; the cap-round block's, and the two paragraphs it corrects, at its own.
+
+**The uninstall removes nothing of the engine's while a schedule record exists** (round 2, A-M1 —
+superseding round 1's M3-verifier-item-6 rule; `uninstall.rs` module header :38-54, round 3's two
+additions :56-71, round 4's one-look paragraph :73-74).
+`scripts/uninstall.sh` removes nothing while `$RECORD` (`<state>/schedule.json`) exists until the
+engine has removed its own schedule, and refuses when it cannot (its `if [ -f "$RECORD" ]` block),
+because the trigger that record describes — the CLI's or this app's; both install the same
+`local.daily-briefing` unit — runs the managed binary, calls the provider and writes the state dir
+every time it delivers. Round 1 made the app's consented leg keep only `daily-briefing` (a `kept`
+outcome) and remove the rest; the schedule then went on running the kept copy every morning —
+provider calls included — and RE-CREATED the archive and log the user had consented to delete, and
+the docs' "(or uninstall the app)" advice led straight into it.
+
+- `remove_engine_state` (:665) checks the record ONCE, before the first removal, with
+  `fs.exists` — an `lstat`, so a dangling symlink or an unreadable record still counts — and when it
+  is there removes NOTHING and returns `Err(REFUSED_FOR_SCHEDULE)` (:193). *Round 3:* the `Err` is
+  now a `String`, and with no record a scheduler unit file refuses too (below). *Round 4:* the check
+  is one `ScheduleSeen::look` (:285-290) and the refusal its `refusal()` (:294-299, applied at :685);
+  and `SystemFs::exists` (:344) now counts as present any `lstat` failure but `NotFound` and
+  `NotADirectory` (A4-L3 — it used to read `EACCES` on a non-searchable parent as absent). The
+  record's owner is not read: the refusal names both ways out, so an app-owned, a CLI-owned and an
+  unparseable record refuse alike.
+- `uninstall_execute` reports it ONCE, in a new report field `engineRefused: string | null` (:540;
+  `lib/app-uninstall.ts` :65) — with `engine: []`, `engineStateRemoved: false`, `engineError: null`
+  and `engineStateDir` still set (the directory whose record refused) — and still runs the
+  login-item and app-file legs exactly as before. `Outcome::Kept` and the webview's `kept` arm are
+  gone: nothing produces them.
+- The words are the rule sentence — the same RULE `docs/INSTALL.md` and the pipeline's
+  `scripts/uninstall.sh` state in their own words (*cap round, B5-L2:* this said it was INSTALL.md's
+  sentence; only the stale-record clause below is INSTALL.md's word for word): *"Uninstall removes
+  none of the engine's data while a background schedule is installed: remove the schedule first
+  (Schedule screen → Remove background scheduler…), or run `daily-briefing schedule uninstall` if
+  you installed it from the terminal, then run Uninstall again."* *Round 3:* the sentence now ends
+  with the shared stale-record clause (below). The webview holds it as `SCHEDULE_RECORD_RULE`
+  (`app-uninstall.ts` :135, built from its way-out clause `SCHEDULE_WAY_OUT`, :113, and
+  `STALE_RECORD_CLAUSE`, :124), the button label as `REMOVE_SCHEDULE_BUTTON` (:108), and Rust's
+  `REFUSED_FOR_SCHEDULE` contains it.
+- `uninstall_preview`'s `scheduleRecordPresent` (:495, computed :790) drives the consent label
+  (`consentLabel`, :188-231; *round 3:* with `scheduleUnitFile`, through `scheduleBlocks`, :161): with a record it says, BEFORE consent, that ticking the box removes
+  nothing while the schedule is installed, with the way out, and makes no parity claim; without
+  one, its parity claim is about the LIST and is qualified ("none of them while a background
+  schedule is installed" — one may be installed after the preview). *Round 4 (B4-L5):* the parity
+  claim is made on macOS only — `scripts/uninstall.sh` is a macOS source-checkout script — and
+  elsewhere the label keeps only the qualification ("None of the engine's data is removed while a
+  background schedule is installed; …"). `SCHEDULER_NOTE` names the
+  button. The done view (`AppSettings.svelte`) draws `engine data: nothing removed —
+  <engineRefused>` in its per-entry list.
+- **A schedule outlives the app — said ticked or not** (round 2, R4). Uninstall never removes the
+  schedule, and its trigger runs the engine copy, not the app, so deleting the app leaves it
+  running. Whenever the PREVIEW the user consented from saw a record (`scheduleRecordPresent`,
+  captured as `uninstallScheduled` before `uninstallExecute`) — or the leg was refused at execute
+  time for a schedule installed after the preview — the done view's closing words
+  (`app-uninstall.ts` `doneNotes`, :314) are a WARNING first — *"A background schedule is still
+  installed, and it keeps running the engine after the app is deleted: "* + `SCHEDULE_WAY_OUT`, the
+  rule sentence's own clause — and only then the finish: `FINISH_LINE` (drag to the Trash),
+  preceded after a refusal by "Then run Uninstall again — the engine's data was not removed". With
+  no record, ticked or not, there is no warning. The flag is the preview's, so a schedule removed in
+  between still warns; that errs toward telling. *Round 3 (A3-L2) replaced the preview's flag with
+  the report's EXECUTE-time facts, `FINISH_LINE` with `finishLine(os)`, and the warning's wording —
+  below.*
+- Pins: `tests/uninstall.rs` `a_schedule_record_refuses_the_whole_engine_leg_whoever_owns_it`
+  (app-owned, CLI-owned, unparseable and dangling-symlink records: the state dir is byte-for-byte
+  unchanged; then, the record removed, the bounded list goes), `a_consented_uninstall_under_a_schedule_record_refuses_the_engine_leg_only`
+  (preview then execute through the command bodies: the refusal, the untouched tree, the other two
+  legs run, and the wire `engineRefused` / `engine: []` / `scheduleRecordPresent`) and
+  `the_refusal_names_the_real_way_out` (the label read from `ScheduleUninstall.svelte`'s source);
+  `tests-web/coexistence.check.ts` *under a schedule record the label says the box removes
+  NOTHING…* and *the way out names the Schedule screen's REAL button, and Rust's refusal says the
+  same sentence* (the RENDERED button; `REFUSED_FOR_SCHEDULE` parsed from the Rust source must
+  contain `SCHEDULE_RECORD_RULE`), and the R4 pair — renamed in round 3, when their facts moved from
+  the preview to the report: *R4 + round 3: the done view warns that a schedule outlives the app
+  whenever the EXECUTE-time check found one — ticked or not — before the finish line* (all four
+  ticked × record cases, plus a refusal the facts did not foresee) and *R4 + round 3: AppSettings
+  draws doneNotes' words from the REPORT, the warning BEFORE the finish, and the refusal line
+  verbatim* (by source: the done view is reachable only by clicking). Mutation rows R2-U1 … R2-U7
+  and R4-1 … R4-5 below.
+
+**The Quit notice before setup is finished** (VM-measured UX finding; `shell.rs` header :49-55). A
+first-run quit — no config file, the state the wizard opens on — used to read "no briefing is
+being generated right now: the engine has no usable config" beside a disabled "Switch engine
+notifications to auto". `Phase::NotConfigured` now maps to its own `QuitCopy::NotSetUp` (:385-388,
+:409); `config-error` keeps `NoWorkingConfig`. Its body (:467-470) is *"Setup isn't finished yet.
+You can quit now — setup will be offered again the next time you open Daily Briefing."* — no
+engine-status claim. `offerLabel` is now NULLABLE and is `null` only for this notice (:484-485), and
+`QuitDialog.svelte` (:89) renders no offer section when it is; `scheduleLabel` is `null` too
+(:488-489). `offerAvailable` is `false` and `offerUnavailableReason` keeps its never-null-while-
+unavailable rule even though nothing shows it (:330-334). Pin: `tests/shell.rs`
+`the_quit_copy_is_the_delegated_wording_for_each_state`.
+
+**Today's fail-closed fallback has TWO known redaction divergences, not one** (`lib/today.ts:23-30`;
+§10b). Beside D2, KEY over-redaction: `redactStruct` (`src/json.ts`, its *OBJECT KEYS ARE REDACTED
+TOO* note, and `redactKey = redactCredentialsAnyCase`) redacts object keys case-insensitively, because
+`whys` is keyed by `norm(label)`, which lowercases. A key such as `myapi_token=…` is therefore redacted
+where the file's case-sensitive pass leaves its label `MyAPI_TOKEN=…` alone; the struct render loses
+that why line, the block comparison differs, and Today shows the file. Nothing in the app changed —
+the comparison already caught it; this records the second shape so nobody "fixes" the fallback away
+on the belief that D2 was the last one.
+
+**The watcher counts a rescan notice as a change when it can cover the state dir** (M2 verifier
+items 1, 2, 4; tightened in round 2 — B-M4, D-L1, A-L2, A-L3). The loop's whole per-event rule is one
+function, `watcher::counts_as_change` (`watcher.rs:172-224`, called once in the loop at :1109): a
+change (`is_change`, :159) to an interesting path, OR a rescan notice (`event.need_rescan()`) that
+has no path or whose path is the state dir, an ancestor of it (`WatchTargets::encloses_state_dir`,
+:286 — either spelling, component-wise) or an interesting path. inotify reports a queue overflow
+(`IN_Q_OVERFLOW`) as a PATHLESS `Other` + `Flag::Rescan` (`notify-8.2.0/src/inotify.rs:212-214`);
+FSEvents' `MustScanSubDirs` arrives as `Other` + `Rescan` (`fsevent.rs:116-125`) on the directory
+events were coalesced or dropped under (`:572`). Before round 1 both failed `is_interesting` and
+were dropped, so a burst that overflowed the queue could leave the app stale until the next boundary
+or periodic read. Round 1 then counted EVERY rescan, whatever its path — but `notify` keeps an
+FSEvents path only if it IS a watched root, lies under a recursively watched one, or is a direct
+child of a non-recursively watched one (`fsevent.rs:549-566`; roots keyed canonically, :392, :407),
+and this loop watches the state dir's PARENT non-recursively. So the rescans that reach it include
+every SIBLING of the state dir — another app's folder in `~/Library/Application Support` — and round
+1 served each as a spurious re-read. (A-L3 corrected the round-1 comment's reasoning, not its
+conclusion: a rescan on the parent does arrive — the parent is a watched root, and it counts here as
+an ancestor — but nothing above the watched roots ever does.) A rescan notice that counts goes
+through the debounce like any change and is served as one real read of both envelopes. It cannot
+feed itself: the engine's reads are `Access` events, which are not changes. Three event kinds missing
+from `tests/watcher.rs`'s enumeration were added in round 1 (`Access(Open(Other))`,
+`Modify(Data(Other))`, `Modify(Name(Other))`). Pin: `a_rescan_notice_counts_only_when_it_can_cover_the_state_dir`
+(pathless, the state dir, ancestors in both spellings and interesting paths count; siblings,
+component-wise near-misses such as `/tmp/sta`, and uninteresting paths inside the state dir do not).
+
+**Real rescans are counted, and the exact-count tests discount them** (round 2, B-M4). Nothing a
+test does can stop FSEvents coalescing events onto a watched directory, and a counted rescan is a
+correct served batch — one read, one announcement — that no file write caused. So the loop counts
+the REAL (not injected) rescan notices it counted (`Progress::rescans_counted`, incremented at
+:1126; `StateWatcher::rescans_counted()`, :826), and `tests/watcher.rs`'s
+`assert_discounting_rescans` holds an observed count to `[expected, expected + rescans]` — exact
+when there were none, and never below what the test's own file change must produce. Applied in
+`one_debounced_event_carries_the_state_the_files_describe` and (until round 3, which isolated it —
+below) `the_loop_judges_each_event_by_counts_as_change`, and (R4) as the same arithmetic on the UPPER
+bound of `twenty_rapid_writes_coalesce_to_a_bounded_number_of_events` (its floor of one event and
+its exact read/emit pairing unchanged, both now read after the stop). The eight hand-clock tests
+(`timed_watcher`) are NOT discounted but RE-RUN (`exact_unless_rescanned`, R4): there a batch a
+rescan starts after the hand clock moves re-reads the engine at the new instant and re-bases the
+loop's clock, so it can ABSORB the boundary or periodic read under test (`boundary_reads` 0, a
+period gap the period did not cause) or supply the payload in its place — which could also PASS a
+broken boundary read. A discount would have to lower what the boundary itself must produce, so an
+attempt with any real rescan counted (recorded by `Timed`'s `Drop`, so a panicking attempt reports
+it too) is inconclusive whatever its outcome and is run again, up to three times; an attempt with
+none is final, its failure re-raised unchanged. Pinned on scripted attempts by
+`the_rescan_retry_re_raises_a_clean_failure_and_re_runs_only_a_rescanned_attempt`.
+
+**The watcher's test seam** (`#[doc(hidden)]`, test harness only — it changes nothing about how an
+event is judged). `watcher::spawn_injectable` (:966) is `spawn_with` plus a second sender into the
+loop's own event channel; `StateWatcher::inject(event)` (:837) sends an event tagged `INJECTED`
+(`"daily-briefing:injected"`, :230), and `injected_seen()` / `injected_counted()` (:865, :872) say
+how many the loop judged and how many it counted (*Round 4:* plus `injected_stamps()`, :881, and
+`seen` is now bumped last — below). The app's watcher is started by `spawn_with`
+(`shell.rs:1267`) and holds no injector (:787, set only by `spawn_injectable` via `spawn_inner`), so
+its channel still disconnects exactly when the backend's sender goes. The point is macOS: FSEvents
+never emits an `Access` kind or a `Rescan` on demand, so no file write there can show that the loop
+consults the rule — measured at M2 and recorded in `tests/watcher.rs`'s header: with the guard
+removed from the loop, that file stayed green on macOS. Pins:
+`a_rescan_notice_counts_only_when_it_can_cover_the_state_dir` (the function) and
+`the_loop_judges_each_event_by_counts_as_change` (the wiring, by injection, on every platform). Round
+2 (C2-M1): after its two REJECTED injections that test now waits a FULL debounce window
+(`ABSENCE_WINDOW`, asserted longer than ceiling + quiet) before asserting nothing was announced and
+only the first read was taken. Asserted straight after the judging, as in round 1, a refresh
+queued for a rejected event was still pending, and the next counted injection coalesced with it
+and hid it (mutation row R2-W4).
+
+**The wizard's last step shows `doctor --json`'s per-repo notes** (engine known item 1, "A+"). The
+engine's round adds `partialClone: true` and `notes: [<one sentence>]` to a `repos[]` row that is a
+partial clone (`git clone --filter`: git itself may download missing file contents from that repo's
+remote while the engine reads its history); a normal row keeps the old shape, and an older engine
+sends neither key. **Where:** the wizard's last step, inside the *Provider check* block that already
+draws `doctor()`'s payload (`Wizard.svelte:611-651`) — one line per note, `<path>: <note>`
+(:647-649), the note VERBATIM and `{}`-interpolated, `muted small` like `provider.notes` beside it.
+`lib/wizard.ts`'s `doctorRepoNotes` (:660) is the parse: pure, every string in a row's `notes` in
+the engine's order, and nothing for a payload with no `repos`, a row with no `notes`, or a value
+that is not a string — no wording of the app's own. **Why not the Schedule screen:** its only
+per-repo doctor display is `ScheduleAccess`, which is about macOS's protected roots — the paths that
+put each root in scope, and the `tcc-denied` ones with the engine's advice — and off macOS
+`access_snapshot` does not run doctor at all (`access.rs:916`); a partial clone in `~/code`, or any
+on Linux, would never appear there. The wizard step runs doctor on every platform. **The gap this
+leaves:** the wizard is first-run only (§13a), so a repo that becomes a partial clone later is noted
+only in `doctor --json` (the engine has no other `doctor` form). **Rust:** `access.rs`'s
+`DoctorRepo` (:250) ignores both keys — it has no `deny_unknown_fields`, and must not get one:
+`scope_of` turns a failed parse of the envelope into an EMPTY view, so a strict row type would drop
+every denied repo's advice as soon as one repo is a partial clone. Pins: `tests-web/wizard.check.ts`
+*the last step shows doctor's per-repo notes verbatim* (a payload with the note, one from an older
+engine without it, malformed rows, and the component's wiring by source, since a server render
+cannot reach the last step) and `tests/access.rs`
+`a_doctor_row_carrying_the_partial_clone_keys_still_reads`.
+
+**The briefing footer** (lands with the engine's footer commit). `src/render.ts` now writes
+`— generated via <provider>` ("locally" was false for an API provider and for the default CLI
+provider); briefings already on disk keep `— generated locally via <provider>`. `lib/briefing-md.ts`
+classifies EITHER prefix as the footer (`FOOTER_PREFIXES`, :88, used at :200), and
+`lib/briefing-struct.ts` mirrors the new form (:266). Pin: `tests-web/briefing.check.ts` *an
+archived briefing with the pre-0.2.0 footer (`— generated locally via`) still shows its footer*.
+
+**Round 3 (the fix pass before round 4).** Line numbers as above, this branch's.
+
+- **A stale record has a way out** (B3-L1). An unparseable record, or a dangling symlink, refuses the
+  engine leg (it fails toward not deleting), but then the Schedule screen draws no removal button and
+  `daily-briefing schedule uninstall` exits "Nothing installed" before it unlinks the record
+  (`src/schedule/install.ts`, `uninstallSchedule`) — the refusal's way out was a dead end. The rule
+  sentence now ends with the SHARED clause, word for word the one `docs/INSTALL.md` carries: *"If the
+  Schedule screen shows no schedule and `daily-briefing schedule uninstall` reports nothing installed,
+  the record is stale: delete `schedule.json` from the engine's folder, then run Uninstall again."*
+  It is `STALE_RECORD_CLAUSE` (`app-uninstall.ts` :124), appended to `SCHEDULE_RECORD_RULE` (:135),
+  and the tail of Rust's `REFUSED_FOR_SCHEDULE` (`uninstall.rs` :193), so the refusal, the consent
+  label and the done view all carry it. Neither the refusal nor the label says "a schedule is
+  installed" any more: the refusal opens "a background schedule's record (schedule.json) or unit
+  file is there, and while that schedule is installed …", the label "A background schedule record
+  (schedule.json) is there right now, so ticking this removes nothing". *Round 4 (B4-L6):* the
+  refusal opens "a background schedule's record (schedule.json) is there, …" — a record-less unit
+  has its own refusal now (below), so the record's no longer names a unit file.
+- **A record-less scheduler unit refuses the leg too** (D3-L4). An older install can leave the unit
+  the engine writes with no record, and that unit runs the very copy the box deletes.
+  `schedule_unit_files(os, home, xdg_config_home)` (`uninstall.rs` :238) is the engine's
+  `unitPaths` (`src/schedule/install.ts`) — `~/Library/LaunchAgents/local.daily-briefing.plist` on
+  macOS; `daily-briefing.service` and `.timer` under `systemd/user` in `$XDG_CONFIG_HOME` (when the
+  app has one) AND `~/.config` on Linux, because the engine this app spawns never sees
+  `XDG_CONFIG_HOME` (`engine::FORWARDED_ENV`) while one run from a terminal may have. With no record,
+  the first of those that EXISTS (`lstat` — `present_unit`, :265; never `launchctl`/`systemctl`)
+  refuses the whole leg with `refused_for_unit(path)` (:217): `REFUSED_FOR_SCHEDULE` plus the unit's
+  path and "which `daily-briefing schedule uninstall` removes" (it unlinks a present unit with no
+  record). *Round 4 (B4-L6) replaced that wording — below.* The names are `LAUNCHD_UNIT` /
+  `SYSTEMD_UNITS` (:178, :182). The home is `HOME`
+  (`engine::home_dir`'s rule) unless a test overrides it with `UninstallState::with_home_dir` (:410),
+  and the mechanical pin `every_default_uninstall_state_in_tests_overrides_its_real_paths` (renamed
+  from `…_overrides_both_app_dirs`) now demands that override too: the real home holds the
+  developer's live unit. The preview and the report carry `scheduleUnitFile`; the consent label
+  names it and the command.
+- **The done view's schedule facts are the execute-time ones** (A3-L2). `uninstall_execute` now
+  resolves the state dir and reads the record whether or not the box was ticked (one read-only
+  `status --json` spawn, :850-868 — *round 4:* one look, below) and reports
+  `scheduleRecordPresent: boolean | null` (`null`: the engine could not name the dir) and
+  `scheduleUnitFile` (:556, :559). `doneNotes(report)` (:314) warns
+  from those — a schedule removed between preview and execute no longer warns, and an unknown state
+  dir gets a HEDGED warning ("The engine could not say whether a background schedule is installed")
+  rather than none. `AppSettings.svelte` no longer carries `uninstallScheduled`. The ticked button no
+  longer promises engine data under a schedule: `executeLabel` (:240) says "Remove app pieces (engine
+  data stays while a schedule is there)" (`AppSettings.svelte` :423).
+- **The platform words** (B3-L6). The preview and the report carry `os` (`std::env::consts::OS`).
+  The consent label claims the engine copy only on macOS, where `managedBinPath` puts it in the state
+  folder; on Linux it says the copy is in `~/.local/share/daily-briefing/` by default and is not
+  removed (`engineCopyNote`, :171). `FINISH_LINE` became `finishLine(os)` (:287) — the Trash on
+  macOS, `sudo apt remove daily-briefing` or deleting the `.AppImage` on Linux (`docs/INSTALL.md`'s
+  words). `UNINSTALL_EXPLANATION` (:96), shown before the preview tells the webview its platform,
+  names both.
+- **The refusal line is pinned** (B3-L5): `AppSettings.svelte` :385, `engine data: nothing removed —
+  {uninstallReport.engineRefused}`, by source, inside the report list and behind its guard.
+- **The Wizard's save notes are keyed by index** (D3-L3; `Wizard.svelte` :607 and, the same shape,
+  `saveErrors` :736): the engine redacts every note (`src/json.ts`, `redactNote`), two different
+  notes can arrive alike, and a duplicate each-key is a Svelte runtime error.
+- **The watcher's exact counts run with no backend in the room** (G3-4, B3-L2). The rescan allowance
+  (`assert_discounting_rescans`) cannot tell a loop that serves every event from one that coalesces
+  when the burst itself raised rescans, so the exact pins run over `isolated_state` (a state dir
+  whose parent does not exist: the loop holds no watch, `arms()` is 0, and every judged event came
+  through the seam). `an_isolated_burst_is_served_as_exactly_one_batch`: 20 ordinary changes, then 20
+  rescan notices, each burst inside one quiet period, cost EXACTLY one read and one announcement
+  each. `the_loop_judges_each_event_by_counts_as_change` now runs isolated, its absence checks and
+  totals equalities. `rescans_counted_counts_only_real_counted_rescans` pins the counter through a
+  new seam, `StateWatcher::inject_as_backend` (`watcher.rs` :852, `#[doc(hidden)]` — `inject` without
+  the tag): an ordinary counted change leaves it 0, a counted rescan adds exactly 1, a sibling's
+  rescan and a tagged one add nothing.
+- Pins: `tests/uninstall.rs` `the_unit_files_are_the_engines` (names PARSED from
+  `src/schedule/units.ts`, directories held to `install.ts`'s `unitDir`, both platforms' answers),
+  `a_record_less_unit_file_refuses_the_whole_engine_leg` (each unit, as a file and as a dangling
+  symlink: nothing removed, the unit untouched; then the list goes),
+  `a_consented_uninstall_under_a_record_less_unit_refuses_and_names_it`,
+  `the_report_carries_the_execute_time_schedule_facts_ticked_or_not`, and
+  `the_refusal_names_the_real_way_out` (now with the stale clause); `tests-web/coexistence.check.ts`
+  the per-platform label and finish, the record-less-unit label, `executeLabel`, the execute-time
+  `doneNotes`, the shared clause word for word, and the AppSettings source pin (refusal line,
+  `doneNotes(uninstallReport)`, `executeLabel`); `tests-web/wizard.check.ts` *saveWarnings and
+  saveErrors key on the index*. Mutation rows R3-* below.
+
+**Round 4 (the fix pass before round 5).** Line numbers as above, this branch's.
+
+- **The injected counters are final once `injected_seen` says so** (G4-3). The loop bumped
+  `injected_seen` BEFORE `injected_counted`, and the isolated tests wait on `seen` and then read
+  `counted` as exact — a preemption between the two failed a correct loop. Now `counted` and the new
+  stamp go first and `seen` LAST (`watcher.rs` :1114-1124), and `Progress::injected_seen` (:760-774)
+  and the accessors (:860-887) say so. Not mutation-pinned: reverting the order reopens a race no
+  deterministic test reaches.
+- **The isolated burst's premise is judged where the debounce is** (G4-4). Round 3 timed the
+  SENDING (`took < QUIET`), but the loop stamps the debounce when it PROCESSES an event, so a loop
+  thread descheduled for a quiet period between one event's `record` and its `due` check split a
+  burst the test had sent in a millisecond. The loop now keeps the very `Instant` it records for
+  each counted injected event (`injected_stamps()`, :881; `Progress::injected_stamps`, :774; test
+  harness only — only `inject` grows it), and `tests/watcher.rs`
+  `an_isolated_burst_is_served_as_exactly_one_batch` (:676) judges each burst's span from them: a
+  split needs a `due` check at least `QUIET` after some stamp and before the next, so a span under
+  `QUIET` rules one out (a slow sender is a gap between stamps too). A span of `QUIET` or more is
+  INCONCLUSIVE: `retry_inconclusive` (:781) re-runs the attempt (`isolated_burst_attempt`, :682) on a
+  fresh watcher, up to 3 times, and fails loudly if no attempt's premise held; a count that fails
+  with the premise held is an assertion that panics straight through — the harness has no
+  `catch_unwind` — so it is never retried. Pinned on scripted attempts by
+  `the_burst_retry_re_runs_only_an_inconclusive_attempt` (:802). MEASURED by fault injection on the
+  disposable copy (a one-time 600 ms stall between the 10th event's `record` and its `due` check):
+  round 3's loop and test FAILED (*left: 2, right: 1*); this round's passed, its first attempt
+  reported inconclusive (*judged … over 610.2 ms*).
+- **The isolated watcher re-asserts its parent's absence** (B4-I1). `arms()` counts only the
+  state-dir watch; the parent watch is attempted once in `spawn_inner` and counted nowhere, and it is
+  ruled out only because the parent does not exist. `isolated_watcher` (:514) now re-asserts that
+  after the spawn, and the `arms()` premise message says what it covers.
+- **One look feeds the gate and the report** (G4-L1). `uninstall_execute` sampled the unit BEFORE its
+  `status --json` spawn and the record after it, while the gate looked again before the first
+  removal: a unit appearing in between was refused on and reported absent, and `doneNotes` gave the
+  stale-RECORD warning for a unit refusal. Now `ScheduleSeen` (`uninstall.rs` :276; `look`, :285;
+  `refusal`, :294) is taken ONCE after the spawn (:860-868), the gate refuses on it
+  (`remove_engine_state_as_seen`, :680, called at :878 — nothing awaited between) and the report
+  states it; with no state dir the units are still looked for (:866). The gate's look is as fresh as
+  it was. `remove_engine_state` (:665) is `look` + that gate, its signature unchanged; the
+  `remove_engine_state_leg` alias is gone.
+- **Only "no such entry" is absent** (A4-L3). `SystemFs::exists` (:344) was
+  `symlink_metadata(path).is_ok()`, so `EACCES` from a parent that cannot be searched read as
+  absent; now `NotFound` and `NotADirectory` are absent and any other failure is PRESENT, so the
+  record and unit gates refuse on what they cannot rule out.
+- **A record-less unit has its own words** (B4-L6). Its refusal used to be `REFUSED_FOR_SCHEDULE`
+  with the unit appended: a stale-RECORD clause for a case with no record, and the way out that
+  applies last. `refused_for_unit` (:217) is now the unit, why it refuses, and
+  `REFUSED_FOR_UNIT_RULE` (:209) — *"Uninstall removes none of the engine's data while a background
+  scheduler unit file is there: run `daily-briefing schedule uninstall` in a terminal, which removes
+  that unit file, then run Uninstall again."* — which is the webview's `SCHEDULE_UNIT_RULE`
+  (`app-uninstall.ts` :155, built from `UNIT_WAY_OUT`, :146), word for word. The unit label ends with
+  it, and `doneNotes`' unit warning names `UNIT_WAY_OUT` (*cap round:* on Linux the exact command
+  for the unit's own directory follows the rule in all three, and an UNKNOWN record no longer gets
+  the record-less wording — below). No Schedule-screen button in any of them:
+  `routes/Schedule.svelte` draws `ScheduleUninstall` only under `recordPresent`. The RECORD case is
+  unchanged — `SCHEDULE_RECORD_RULE` is still the tail of `REFUSED_FOR_SCHEDULE`, byte for byte, and
+  the same rule as `docs/INSTALL.md`'s, whose stale-record clause is word for word the one it ends
+  with (*cap round, B5-L2:* this said INSTALL.md's sentence, byte for byte — INSTALL.md words the
+  rule its own way); only `REFUSED_FOR_SCHEDULE`'s opening lost "or unit file".
+- **The script-parity claim is macOS-only** (B4-L5; `consentLabel`, :188-231): on Linux the
+  record-free label said "the same files `bash scripts/uninstall.sh` removes" about a macOS
+  source-checkout script.
+- **The ticked button does not promise engine data with the state dir unresolved** (B4-L7;
+  `executeLabel`, :240-247): "Remove app pieces (engine data stays while the engine cannot say where
+  it is)" — the view's own note says the box "will not remove anything until it can". A schedule
+  block keeps its own words first.
+- **The execute-time unit read is pinned unticked** (B4-L8): `the_report_carries_the_execute_time_schedule_facts_ticked_or_not`
+  plants a unit before an UNTICKED execute, and before both executes over an engine that cannot name
+  its state dir.
+- Pins: `tests/uninstall.rs` `a_record_less_units_refusal_names_its_own_way_out_first`,
+  `a_path_lstat_cannot_answer_for_counts_as_present` (a mode-000 unit directory, restored before
+  any assertion), `the_report_states_the_look_the_gate_refused_on` (`AppearsFs`: a unit, then a
+  record, appearing on the 1st, 2nd or 3rd presence check), the extended
+  `the_report_carries_the_execute_time_schedule_facts_ticked_or_not`, and the updated
+  `the_refusal_names_the_real_way_out` / `a_record_less_unit_file_refuses_the_whole_engine_leg`;
+  `tests/watcher.rs` `the_burst_retry_re_runs_only_an_inconclusive_attempt` and the reworked burst
+  test; `tests-web/coexistence.check.ts` *round 4 (B4-L5): the script-parity claim is
+  macOS-only …*, *round 3 (D3-L4) + round 4 (B4-L6): a record-less scheduler unit file blocks the box
+  too …*, *round 4 (B4-L7): with the state dir unresolved …*, the Rust-parse equality of
+  `REFUSED_FOR_UNIT_RULE` and `SCHEDULE_UNIT_RULE` inside *the way out names the Schedule screen's
+  REAL button …*, and the unit `doneNotes` case inside *round 3 (A3-L2): the warning follows the
+  EXECUTE-time facts …*. No wire field was added or removed; `scheduleRecordPresent` and
+  `scheduleUnitFile` keep their types and now carry the gate's look when the leg ran. Mutation rows
+  P4-* below.
+
+**Cap round (the fix pass after round 5).** Line numbers are this pass's commit's.
+
+- **A Linux unit's way out is a command for the unit's own directory** (G5-2). The app looks under
+  both `$XDG_CONFIG_HOME/systemd/user` and `~/.config/systemd/user` (`schedule_unit_files`,
+  `uninstall.rs` :280), but `daily-briefing schedule uninstall` looks only under the one its own
+  environment names (`src/schedule/install.ts`, `unitDir`: `XDG_CONFIG_HOME ?? ~/.config`), and the
+  engine this app spawns never sees `XDG_CONFIG_HOME` (`engine::FORWARDED_ENV`) — so from a terminal
+  with another `XDG_CONFIG_HOME` the rule's command reported nothing installed and the unit kept
+  refusing. The rule constants cannot carry a path, so `REFUSED_FOR_UNIT_RULE` (:209) and
+  `SCHEDULE_UNIT_RULE` are unchanged and the exact command goes beside them:
+  `unit_uninstall_command` (:248) turns `<config>/systemd/user/<name>` into
+  `XDG_CONFIG_HOME='<config>' daily-briefing schedule uninstall` — the value single-quoted for a
+  POSIX shell, each `'` as `'\''` — and `unit_command_note` (:262) wraps it as *"To remove this unit
+  file from a terminal, run `<command>`: "* + `UNIT_DIR_CLAUSE` (:233). `refused_for_unit` (:217)
+  appends it after the rule; the macOS plist gets none (its command is the rule's own). The webview's
+  `unitUninstallCommand` (`app-uninstall.ts` :176) is the same rule and its `unitCommandNote` (:185)
+  the same sentence, its `UNIT_DIR_CLAUSE` (:161) held to Rust's word for word by the source parse;
+  the consent label's two unit branches (:244-259) and `doneNotes` (:380) add it only where they name
+  the unit. Text only: `{}`-interpolated as before, never `{@html}` (`AppSettings.svelte` unchanged).
+- **An unknown record is not "no record"** (A5-L1 = B5-L1, a round-4 regression). The preview's
+  `scheduleRecordPresent` is `false` when the engine could not name its state dir (`engineError` set;
+  the field's doc says so now, :35), and the report's is `null` then; round 4's unit wording read both
+  as "no record" and gave the record-less unit's way out — false for an app-owned record, which
+  `schedule uninstall` refuses as foreign. Now `consentLabel` words a unit with `engineError` set
+  hedged (:249-254): the unit named, "the engine could not say whether a schedule record is there
+  too", then `SCHEDULE_RECORD_RULE`, never "with no schedule record"; `doneNotes` takes the
+  record-less way out only when `scheduleRecordPresent === false` (:370), and with `null` names the
+  unit, hedged, with `SCHEDULE_WAY_OUT` and the stale-record clause. No wire field changed.
+- **Docs and a test premise.** `engine_refused`'s doc (`uninstall.rs` :579-582) says a record-less
+  unit sets it too (D5-L1), and `engine_state_dir`'s (:589-590) no longer says only a record refuses.
+  `SCHEDULE_RECORD_RULE` is the same RULE as `docs/INSTALL.md`'s, with the stale-record clause word
+  for word — not INSTALL.md's sentence byte for byte (B5-L2; corrected in the two paragraphs above
+  that said so, and in `app-uninstall.ts`'s own doc, :130-133).
+  `a_path_lstat_cannot_answer_for_counts_as_present` (`tests/uninstall.rs` :881) restores its mode-000
+  directory through a drop guard, and SKIPS only its EACCES subcase, saying why, when a probe shows
+  `lstat` succeeding through mode 000 (root, or `CAP_DAC_OVERRIDE` — G5-L2); any other `lstat`
+  failure still fails the premise, and `NotFound` / `NotADirectory` always run.
+- Pins: `tests/uninstall.rs` `a_linux_units_refusal_names_the_command_for_its_own_directory` (:658 —
+  both directories, one spelled with a space, a quote and a `$`; the quoting MEASURED through a real
+  `/bin/sh`, running only the `XDG_CONFIG_HOME=…` prefix in front of `printenv`, the engine's
+  subcommand stripped off first), the macOS plist's `None` in
+  `a_record_less_units_refusal_names_its_own_way_out_first`, and
+  `a_record_less_unit_file_refuses_the_whole_engine_leg`'s tail, now platform-aware;
+  `tests-web/coexistence.check.ts` *cap round (A5-L1): an UNKNOWN record is not 'no record' …*, *cap
+  round (G5-2): a Linux unit's way out is the command for the unit's OWN directory …* (the same
+  `/bin/sh` measure, and the sentence byte for byte as Rust's), and the `UNIT_DIR_CLAUSE` Rust-source
+  parse inside *the way out names the Schedule screen's REAL button …*. Mutation rows C5-* below.
+
+**The round-2 mutation ledger** (§15d's convention: an rsync copy of the whole
+`daily_briefing_application` subtree at a fresh `/private/tmp/dba-hf-gui-mut-*`, `node_modules`
+symlinked; each mutation applied to the copy only, confirmed applied by `cmp`, the verdict taken
+from that mutated run, the file restored byte-identical; the copy deleted by name afterwards). The
+clean copy first ran green: `--test uninstall` 15/15, `--test watcher` 40/40, the uninstall-wording
+web tests 5/5. Every row RED:
+
+| # | target (file → mutation) | killed by |
+| --- | --- | --- |
+| R2-U1 | `uninstall.rs` → the record gate disabled (`if false && fs.exists(…)`) | `a_schedule_record_refuses_the_whole_engine_leg_whoever_owns_it`, `a_consented_uninstall_under_a_schedule_record_refuses_the_engine_leg_only` |
+| R2-U2 | `uninstall.rs` → `SystemFs::exists` follows symlinks (`path.exists()`) | the record test's `dangling-symlink` case |
+| R2-U3 | `uninstall.rs` → the command drops the refusal (`engine_refused: None`) | the command test |
+| R2-U4 | `uninstall.rs` → round 1's A-M1 shape: under a record, keep only `daily-briefing` and remove the rest | both record tests (`app-owned: a schedule record must refuse the whole engine leg`) |
+| R2-U5 | `app-uninstall.ts` → the record label loses `SCHEDULE_RECORD_RULE` | *under a schedule record the label says the box removes NOTHING…* |
+| R2-U6 | `ScheduleUninstall.svelte` → the button renamed `Remove the background schedule…` | `the_refusal_names_the_real_way_out` AND *the way out names the Schedule screen's REAL button…* |
+| R2-U7 | `uninstall.rs` → `REFUSED_FOR_SCHEDULE` ends "then run it again." | `the_refusal_names_the_real_way_out` AND the web test's Rust-source parse |
+| R2-W1 | `watcher.rs` → round 1's rule: every rescan counts | `a_rescan_notice_counts_only_when_it_can_cover_the_state_dir` (`/tmp/other-app`) |
+| R2-W2 | `watcher.rs` → the ancestor clause dropped | same test (`/tmp`) |
+| R2-W3 | `watcher.rs` → the pathless clause dropped | same test (the pathless notice) |
+| R2-W4 | `watcher.rs` → the loop records a refresh for every INJECTED event, rejected ones too (C2-M1) | `the_loop_judges_each_event_by_counts_as_change`: *an uncounted event was announced: observed 1, expected exactly 0 (+ at most 0 …)*. Against round 1's version of that test the same mutant SURVIVED 3 runs in 3 |
+
+R4's rows, same convention, on a fresh copy whose clean run was green first (`--test uninstall`
+15/15, `--test watcher` 41/41, the uninstall-wording web tests 7/7). Every row RED (titles as they were
+then — round 3 renamed the two R4 web tests; the round-2 *Pins* bullet above gives today's):
+
+| # | target (file → mutation) | killed by |
+| --- | --- | --- |
+| R4-1 | `app-uninstall.ts` → `doneNotes` warns only after a refusal (ignores the preview's record) | *the done view warns that a schedule outlives the app…* (the unticked-with-record case) |
+| R4-2 | `app-uninstall.ts` → the warning loses `SCHEDULE_WAY_OUT` | same test |
+| R4-3 | `AppSettings.svelte` → the finish drawn BEFORE the warning | *AppSettings draws doneNotes' words, the warning BEFORE the finish…* |
+| R4-4 | `AppSettings.svelte` → `uninstallScheduled = false` instead of the preview's flag | same test |
+| R4-5 | `AppSettings.svelte` → `doneNotes(uninstallReport, false)` | same test |
+| R4-W1 | `tests/watcher.rs` → the harness swallows a clean failure | `the_rescan_retry_re_raises_a_clean_failure_and_re_runs_only_a_rescanned_attempt` |
+| R4-W2 | `tests/watcher.rs` → the harness takes a pass under a rescan as final | same test |
+| R4-W3 | `watcher.rs` → the boundary read disabled (`false && crosses_read_boundary(…)`) | through the harness, re-raised on the first attempt (the suite took 6.3 s — no re-runs): `crossing_the_floor_reads_the_engine`, `the_stale_deadline_read_finds_an_unloaded_unit`, `a_waiting_state_goes_stale_when_the_clock_passes_the_deadline`, `a_delivered_day_rolls_over_at_local_midnight_with_the_engines_new_day_count` |
+| R4-W4 | `watcher.rs` → the debounce always due (no coalescing) | `twenty_rapid_writes_coalesce_to_a_bounded_number_of_events` (with its discounted bound), `one_debounced_event_carries_the_state_the_files_describe`, and the three pure `Debounce` tests |
+
+Round 3's rows, same convention (copy `/private/tmp/dba-hf-gui-mut-1dc404b3`, deleted by name
+afterwards), on a copy whose clean run was green first (`--test uninstall` 19/19, `--test watcher`
+43/43, `--test capability` 22/22; `coexistence`, `notify` and `wizard` web tests 93/93). Every row
+RED, each by the test named:
+
+| # | target (file → mutation) | killed by |
+| --- | --- | --- |
+| R3-W1 | `watcher.rs` → every event served at once (`if true` for `debounce.due`) | `an_isolated_burst_is_served_as_exactly_one_batch`: *20 ordinary changes inside one quiet period must be served as EXACTLY one batch — left 20, right 1* |
+| R3-W2 | `watcher.rs` → a refresh recorded for every INJECTED event, rejected ones too (R2-W4's mutant, now isolated) | `the_loop_judges_each_event_by_counts_as_change`: *an uncounted event was announced — left 1, right 0* |
+| R3-W3 | `watcher.rs` → every counted event is a "real rescan" (`else if counted`) | `rescans_counted_counts_only_real_counted_rescans` (*an ordinary change was counted as a rescan*) |
+| R3-W4 | `watcher.rs` → the `rescans_counted` increment removed | same test (*a counted real rescan must add exactly one*) |
+| R3-W5 | `watcher.rs` → tagged rescans counted too (the `else` dropped) | same test (*… or a tagged one was counted as a real rescan — left 2*) |
+| R3-W6 | `watcher.rs` → uncounted rescans counted too (`else if event.need_rescan()`) | same test (left 2) |
+| R3-U1 | `uninstall.rs` → the unit check given no units (`present_unit(fs, &[])`) | `a_record_less_unit_file_refuses_the_whole_engine_leg`, `a_consented_uninstall_under_a_record_less_unit_refuses_and_names_it` |
+| R3-U2 | `uninstall.rs` → `present_unit` follows symlinks (`p.exists()`) | the unit test's `dangling-symlink` case |
+| R3-U3 | `uninstall.rs` → Linux drops `~/.config` | `the_unit_files_are_the_engines` |
+| R3-U4 | `uninstall.rs` → the state dir resolved only under consent (A3-L2's shape) | `the_report_carries_the_execute_time_schedule_facts_ticked_or_not` (*left None, right Some(false)*) |
+| R3-U5 | `uninstall.rs` → `REFUSED_FOR_SCHEDULE` loses the stale-record clause | `the_refusal_names_the_real_way_out` AND the web test's Rust-source parse |
+| R3-U6 | `tests/capability.rs` → its fixture loses `with_home_dir` | `every_default_uninstall_state_in_tests_overrides_its_real_paths` |
+| R3-T1 | `app-uninstall.ts` → `doneNotes` ignores the execute-time record | *the done view warns … whenever the EXECUTE-time check found one* |
+| R3-T2 | `app-uninstall.ts` → `executeLabel` promises engine data under a schedule | *the execute button says what clicking WILL do* |
+| R3-T3 | `app-uninstall.ts` → `SCHEDULE_RECORD_RULE` loses `STALE_RECORD_CLAUSE` | *under a schedule record the label says …*, *the way out names … Rust's refusal says the same sentence* |
+| R3-T4 | `app-uninstall.ts` → the record label says "A background schedule is installed right now" | *under a schedule record …*, *a record-less scheduler unit file blocks the box too …* |
+| R3-T5 | `app-uninstall.ts` → the engine-copy claim on every platform | *off macOS the label does NOT claim the engine copy* |
+| R3-T6 | `app-uninstall.ts` → Linux gets the generic finish | *the last step is per platform* |
+| R3-T7 | `app-uninstall.ts` → the unknown-state-dir warning never drawn | *the warning follows the EXECUTE-time facts …* |
+| R3-S1 | `AppSettings.svelte` → the button's old consent ternary | the AppSettings source test AND `notify.check.ts`'s uninstall-block pin |
+| R3-S2 | `AppSettings.svelte` → the refusal line as `{@html …}` without "nothing removed" | *AppSettings draws doneNotes' words from the REPORT … and the refusal line verbatim* |
+| R3-S3 | `AppSettings.svelte` → `doneNotes` fed a record flag of its own | same test |
+| R3-Z1 | `Wizard.svelte` → `saveWarnings` keyed by `field + message` again | *saveWarnings and saveErrors key on the index* |
+
+Round 4's rows (P4-*), same convention (copy `/private/tmp/dba-hf-gui-mut-ea26e552`, deleted by name
+afterwards), on a copy whose clean run was green first (`--test uninstall` 22/22, `--test watcher`
+44/44; `coexistence` + `notify` web tests 50/50). Every row RED, each by the test named — P4-U3 after
+a first spelling that did not compile (the operand shadows the function; recorded, not counted):
+
+| # | target (file → mutation) | killed by |
+| --- | --- | --- |
+| P4-W1 | `watcher.rs` → every event served at once (R3-W1 replayed against the consumer-side premise) | `an_isolated_burst_is_served_as_exactly_one_batch` on its FIRST attempt (no inconclusive line): *left 20, right 1* |
+| P4-W2 | `tests/watcher.rs` → `retry_inconclusive` catches a panicking attempt and re-runs it | `the_burst_retry_re_runs_only_an_inconclusive_attempt` (*a failure was retried*) |
+| P4-W3 | `tests/watcher.rs` → `retry_inconclusive` returns when every attempt was inconclusive | same test (*no attempt could judge, and it passed anyway*) |
+| P4-W4 | `tests/watcher.rs` → `isolated_state`'s parent created and its own check dropped | the three isolated tests, at `isolated_watcher`'s new parent re-assert |
+| P4-U1 | `uninstall.rs` → `SystemFs::exists` back to `symlink_metadata(path).is_ok()` | `a_path_lstat_cannot_answer_for_counts_as_present` (*an lstat that failed with EACCES read as absent*) |
+| P4-U2 | `uninstall.rs` → `NotADirectory` no longer absent | same test (*NotADirectory: nothing can be under a regular file*) |
+| P4-U3 | `uninstall.rs` → the gate looks again (`self::remove_engine_state`) instead of refusing on the reported look | `the_report_states_the_look_the_gate_refused_on` (*unit appearing at check 2: refused on a unit the report does not name*; the record variant run alone: *refused on a record the report does not state*) |
+| P4-U4 | `uninstall.rs` → the unit read only under consent | `the_report_carries_the_execute_time_schedule_facts_ticked_or_not` (*UNTICKED, the execute-time unit check still ran … left None*) |
+| P4-U5 | `uninstall.rs` → `refused_for_unit` carries `REFUSED_FOR_SCHEDULE` again | `a_record_less_units_refusal_names_its_own_way_out_first` |
+| P4-T1 | `app-uninstall.ts` → the unit label carries `SCHEDULE_RECORD_RULE` | *round 3 (D3-L4) + round 4 (B4-L6): a record-less scheduler unit file blocks the box too …* |
+| P4-T2 | `app-uninstall.ts` → `doneNotes`' unit case names `SCHEDULE_WAY_OUT` | *round 3 (A3-L2): the warning follows the EXECUTE-time facts …* |
+| P4-T3 | `app-uninstall.ts` → `UNIT_WAY_OUT` loses "in a terminal" (TS drifts from Rust) | the unit-label test AND *the way out names … Rust's refusal says the same sentence* (the `REFUSED_FOR_UNIT_RULE` parse) |
+| P4-T4 | `app-uninstall.ts` → the parity claim on every platform | *round 4 (B4-L5): the script-parity claim is macOS-only …* |
+| P4-T5 | `app-uninstall.ts` → `executeLabel` ignores `engineError` | *round 4 (B4-L7): with the state dir unresolved …* |
+
+The cap round's rows (C5-*), same convention (copy `/private/tmp/dba-hf-gui-mut-42ec83f3`, deleted by
+name afterwards), on a copy whose clean run was green first (`--test uninstall` 23/23; the
+uninstall-wording web tests 16/16). Every C5-U and C5-T row RED, each by the test named. The three
+C5-P rows are not kills: they measure the changed test's own harness.
+
+| # | target (file → mutation) | killed by / measured |
+| --- | --- | --- |
+| C5-U1 | `uninstall.rs` → `refused_for_unit` drops the command note | `a_linux_units_refusal_names_the_command_for_its_own_directory` |
+| C5-U2 | `uninstall.rs` → the `'` escape dropped (`config.to_string()`) | same test (*left: `XDG_CONFIG_HOME='/x/my cfg/it's $HOME' …`*) |
+| C5-U3 | `uninstall.rs` → the command names the unit's own directory (`…/systemd/user`), not its config dir | same test |
+| C5-U4 | `uninstall.rs` → `UNIT_DIR_CLAUSE` drifts ("when it is unset") | the web test's Rust-source parse AND the Rust test |
+| C5-U5 | `uninstall.rs` → `SystemFs::exists` back to `symlink_metadata(path).is_ok()` (P4-U1 replayed) | `a_path_lstat_cannot_answer_for_counts_as_present` (*an lstat that failed with EACCES read as absent*): the EACCES subcase still runs here, unskipped |
+| C5-T1 | `app-uninstall.ts` → no command note | *cap round (G5-2) …* |
+| C5-T2 | `app-uninstall.ts` → the `'` escape dropped | same test |
+| C5-T3 | `app-uninstall.ts` → `doneNotes`' `unitOnly` back to `!record` (round 4's shape) | *cap round (A5-L1) …* and *cap round (G5-2) …* |
+| C5-T4 | `app-uninstall.ts` → `consentLabel` ignores `engineError` | the same two |
+| C5-T5 | `app-uninstall.ts` → the note added where the unit is not named (a record there) | *cap round (G5-2) …* |
+| C5-T6 | `app-uninstall.ts` → an unknown record gets `UNIT_WAY_OUT` | *cap round (A5-L1) …* and *cap round (G5-2) …* |
+| C5-P1 | `tests/uninstall.rs` → the directory made 0700, not 000 (`lstat` succeeds: the root case, simulated) | PASSED, printing its SKIPPED line, with `NotFound` / `NotADirectory` run |
+| C5-P2 | `tests/uninstall.rs` → a panic injected while the directory is mode 000 | failed as injected; NO scratch dir left behind (the guard restored the mode) |
+| C5-P3 | control for C5-P2: the guard pointed at another path | failed as injected; the scratch dir WAS left, its unit directory still mode 000 |

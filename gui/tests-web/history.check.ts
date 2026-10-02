@@ -233,8 +233,10 @@ test("no command the webview invokes can remove or prune a briefing — except t
   for (const name of ["access_snapshot", "access_probe", "access_reveal_engine", "access_open_settings"]) {
     expect(invoked).toContain(name);
   }
-  // B7 (T18/T19): the two notify commands, and EXACTLY the three granted autostart plugin
-  // commands — no other plugin is invoked from the webview at all.
+  // B7 (T18/T19): the two notify commands, and — since Phase E M5b — EXACTLY ONE autostart
+  // plugin command, the real-state read; ON/OFF and the wizard's pre-tick are the app's own
+  // `autostart_set_enabled` / `autostart_wizard_default` (the plugin's enable/disable are no
+  // longer granted: its enable writes an unbranded plist). No other plugin is invoked at all.
   for (const name of ["notify_status", "notify_set_enabled"]) {
     expect(invoked).toContain(name);
   }
@@ -243,7 +245,8 @@ test("no command the webview invokes can remove or prune a briefing — except t
   for (const name of ["uninstall_preview", "uninstall_execute"]) {
     expect(invoked).toContain(name);
   }
-  expect(new Set(invoked.filter((n) => n.includes("|")))).toEqual(
-    new Set(["plugin:autostart|is_enabled", "plugin:autostart|enable", "plugin:autostart|disable"]),
-  );
+  for (const name of ["autostart_set_enabled", "autostart_wizard_default"]) {
+    expect(invoked).toContain(name);
+  }
+  expect(new Set(invoked.filter((n) => n.includes("|")))).toEqual(new Set(["plugin:autostart|is_enabled"]));
 });

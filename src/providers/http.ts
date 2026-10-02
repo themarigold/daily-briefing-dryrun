@@ -289,15 +289,38 @@ export async function postJson(input: ApiPostInput): Promise<unknown> {
   const timer = setTimeout(() => ctl.abort(), input.timeoutMs);
   let res: Response;
   try {
+    // `redirect: "error"`, never fetch's default `"follow"` (Phase E M5b checkpoint) — the same rule
+    // as src/updateCheck.ts's request, for a sharper reason. MEASURED (bun 1.3.14, two loopback
+    // ports, i.e. cross-origin): a followed 307/308 RE-SENDS this POST — the whole prompt — with
+    // Anthropic's `x-api-key` header to whatever the Location names, and a 301/302 turns into a GET
+    // that still carries `x-api-key` (bun drops only `authorization` cross-origin). A redirect now
+    // REJECTS instead (an Error, code `UnexpectedRedirect`), and the catch below words it as a
+    // permanent failure (`missing-binary`, see there).
+    // ⚠ THE TRADE-OFF, stated in docs/CONFIG.md: an endpoint that redirects (an `http://` URL whose
+    // server answers with a redirect to `https://`, a moved gateway) now fails every attempt instead
+    // of silently following — `baseUrl` must name the final URL.
     res = await doFetch(input.url, {
       method: "POST",
       headers: { "content-type": "application/json", ...input.headers },
       body: JSON.stringify(input.body),
       signal: ctl.signal,
+      redirect: "error",
     });
   } catch (e) {
     clearTimeout(timer);
     if (ctl.signal.aborted) throw new ProviderError("timeout", `${input.label} timed out after ${input.timeoutMs}ms`);
+    // ⚠ A REFUSED REDIRECT IS WORDED HERE, NOT QUOTED: bun's message for it names the WIRE URL
+    // ("UnexpectedRedirect fetching \"<url>\"…", measured), query and all — exactly what
+    // `printableTarget` exists to withhold.
+    // ⚠ PERMANENT, NOT RETRIED (Phase E M5b fix round 2): `missing-binary`, the code `mapStatus` gives a
+    // permanent 4xx — "permanent for this run, do not retry" (see the misnomer note there). Nothing a
+    // retry 45 s or 90 s later can change: the endpoint is configured to a URL that redirects, and
+    // only a `baseUrl` edit fixes that. As the retryable `nonzero-exit` it cost every tick ~135 s of
+    // backoff and two more requests that could only fail the same way. The next tick still tries
+    // again, as it does after any permanent failure.
+    if ((e as { code?: unknown } | null)?.code === "UnexpectedRedirect") {
+      throw new ProviderError("missing-binary", `${input.label}: ${printableTarget(input.url)} answered with a redirect, which is not followed — the prompt and the key are never re-sent to another address. Set baseUrl to the final URL.`);
+    }
     // Connect refused, DNS failure, TLS failure. Retryable: a wake-before-wifi morning looks exactly
     // like this, and it is the case the whole retry schedule exists for.
     // ⚠ `printableTarget`, NEVER `input.url` — the wire URL keeps the configured query, which can carry

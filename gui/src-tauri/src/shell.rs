@@ -46,6 +46,13 @@
 //! validated, atomic save path the Settings screen uses (see [`NOTIFY_OFFER_WRITABLE`]). Where it
 //! cannot be taken — Windows, no usable config, no state yet — the dialog says why instead of
 //! showing a control ([`offer_unavailable_reason`]).
+//!
+//! ⚠ BEFORE SETUP IS FINISHED THE NOTICE IS PLAIN (Phase E final harden, VM-measured UX finding).
+//! A first-run quit — no config yet, the state the wizard opens on — used to read "no briefing is
+//! being generated right now: the engine has no usable config. The Schedule screen shows what is
+//! wrong" beside a disabled "Switch engine notifications to auto": an engine-health warning and an
+//! engine setting, to someone who has not finished setting anything up. [`QuitCopy::NotSetUp`]
+//! now says only that setup will be offered again, with no offer section and no Schedule button.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -320,6 +327,11 @@ pub fn offer_unavailable_reason(copy: QuitCopy, os: &str) -> Option<&'static str
         );
     }
     match copy {
+        // Never SHOWN — a not-set-up notice has no offer section ([`QuitDialog::offer_label`] is
+        // `None`) — but the field keeps its rule: never `null` while the offer is unavailable.
+        QuitCopy::NotSetUp => {
+            Some("Setup is not finished, so there is no engine setting to change yet.")
+        }
         QuitCopy::NoWorkingConfig => Some(
             "The engine has no usable config to change right now; the Schedule screen shows \
              what is wrong.",
@@ -341,13 +353,15 @@ pub struct QuitDialog {
     /// Plan R1's delegated meaning, worded for the state the app last derived ([`QuitCopy`]) and
     /// so it is true whatever the engine's `notify` is.
     pub body: String,
-    pub offer_label: String,
+    /// The engine-notification offer's label — `None` when the notice has NO offer section at all
+    /// ([`QuitCopy::NotSetUp`]: setup is not finished, so there is no engine setting to offer).
+    pub offer_label: Option<String>,
     /// Whether the offer can be acted on here and now. See [`offer_unavailable_reason`].
     pub offer_available: bool,
     /// Why not, when it is not. Never `null` while `offer_available` is false.
     pub offer_unavailable_reason: Option<String>,
     /// A button that opens the Schedule screen instead of quitting, when the body points there
-    /// (every [`QuitCopy`] but `Scheduled`). `null` otherwise.
+    /// (every [`QuitCopy`] but `Scheduled` and `NotSetUp`). `null` otherwise.
     pub schedule_label: Option<String>,
     pub confirm_label: String,
     pub cancel_label: String,
@@ -368,7 +382,11 @@ pub enum QuitCopy {
     /// it). Something may still fire it and nothing says what it runs — the Schedule screen says it
     /// "cannot tell what it will do", and this says the same rather than "nothing is generating".
     UnrecordedUnit,
-    /// No config, or one that does not load: the scheduler may run, but it generates nothing.
+    /// No config file at all ([`Phase::NotConfigured`]) — the state the setup wizard opens on
+    /// (`App.svelte`), i.e. setup is not finished. The notice is PLAIN: no engine-status warning,
+    /// no notification offer, no Schedule button (module header).
+    NotSetUp,
+    /// A config that does not load: the scheduler may run, but it generates nothing.
     NoWorkingConfig,
     /// No state yet (or the engine could not be read): the app does not know which of the above
     /// is true, and must not guess.
@@ -388,7 +406,8 @@ impl QuitCopy {
                 QuitCopy::UnrecordedUnit
             }
             Phase::NotScheduled | Phase::SchedulerBroken => QuitCopy::NothingScheduled,
-            Phase::NotConfigured | Phase::ConfigError { .. } => QuitCopy::NoWorkingConfig,
+            Phase::NotConfigured => QuitCopy::NotSetUp,
+            Phase::ConfigError { .. } => QuitCopy::NoWorkingConfig,
             _ => QuitCopy::Scheduled,
         }
     }
@@ -445,6 +464,10 @@ pub fn quit_dialog_for(state: Option<&ScheduleState>, os: &str) -> QuitDialog {
              is closed. Quitting does not change that unit; the Schedule screen shows what is known \
              about it."
         }
+        QuitCopy::NotSetUp => {
+            "Setup isn't finished yet. You can quit now — setup will be offered again the next \
+             time you open Daily Briefing."
+        }
         QuitCopy::NoWorkingConfig => {
             "Quitting changes nothing about your schedule, but no briefing is being generated \
              right now: the engine has no usable config. The Schedule screen shows what is wrong."
@@ -458,10 +481,12 @@ pub fn quit_dialog_for(state: Option<&ScheduleState>, os: &str) -> QuitDialog {
     QuitDialog {
         title: "Quit Daily Briefing?".into(),
         body: body.into(),
-        offer_label: "Switch engine notifications to auto".into(),
+        offer_label: (copy != QuitCopy::NotSetUp)
+            .then(|| "Switch engine notifications to auto".to_string()),
         offer_available: unavailable.is_none(),
         offer_unavailable_reason: unavailable.map(str::to_string),
-        schedule_label: (copy != QuitCopy::Scheduled).then(|| "Open Schedule".to_string()),
+        schedule_label: (!matches!(copy, QuitCopy::Scheduled | QuitCopy::NotSetUp))
+            .then(|| "Open Schedule".to_string()),
         confirm_label: "Quit".into(),
         cancel_label: "Keep running".into(),
     }

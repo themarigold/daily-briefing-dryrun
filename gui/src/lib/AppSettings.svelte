@@ -23,6 +23,8 @@
   import {
     autostartLine,
     consentLabel,
+    doneNotes,
+    executeLabel,
     outcomeLine,
     uninstallExecute,
     uninstallPreview,
@@ -40,8 +42,7 @@
     type CliShimStatus,
   } from "./shim";
   import {
-    autostartDisable,
-    autostartEnable,
+    autostartSetEnabled,
     engineNotifyLine,
     notifySetEnabled,
     suppressedLine,
@@ -95,9 +96,9 @@
       if (enabled) {
         offerToken += 1; // invalidate any in-flight offer read; its answer is for a dead OFF
         offer = null;
-        await autostartEnable();
+        await autostartSetEnabled(true);
       } else {
-        await autostartDisable();
+        await autostartSetEnabled(false);
         // The offer is decided from the config AS IT IS (the Quit dialog's rule, §10e): the
         // button appears only where taking it would change something.
         const mine = ++offerToken;
@@ -377,13 +378,24 @@
                `status --json` answer, so the consented target is auditable after the fact. -->
           <li>engine state directory: {uninstallReport.engineStateDir}</li>
         {/if}
+        {#if uninstallReport.engineRefused !== null}
+          <!-- Phase E final harden round 2: a schedule record refuses the WHOLE engine leg — the
+               schedule would keep running the engine copy and re-create what was removed — so the
+               one line says nothing was removed and names the way out (`uninstall.rs`). -->
+          <li class="bad">engine data: nothing removed — {uninstallReport.engineRefused}</li>
+        {/if}
         {#if uninstallReport.engineError !== null}
           <li class="bad">engine data: not removed — {uninstallReport.engineError}</li>
         {/if}
       </ul>
-      <p class="muted">
-        To finish, quit the app and drag it from Applications to the Trash.
-      </p>
+      <!-- R4: the warning that a schedule outlives the app comes BEFORE the finish line; both are
+           `doneNotes`'s words, from the report's EXECUTE-time schedule facts (round 3, A3-L2), and
+           pinned in `tests-web/coexistence.check.ts`. -->
+      {@const notes = doneNotes(uninstallReport)}
+      {#if notes.warning !== null}
+        <p class="bad">{notes.warning}</p>
+      {/if}
+      <p class="muted">{notes.finish}</p>
     {:else if uninstall === null}
       <p>{UNINSTALL_EXPLANATION}</p>
       <div class="row">
@@ -404,9 +416,11 @@
       {/if}
       <div class="row">
         <!-- B6's ScheduleUninstall affordance (round-1 fix M2): the destructive action is marked
-             as one — this button's consented leg can remove the briefing archive. -->
+             as one — this button's consented leg can remove the briefing archive. Its words say
+             what clicking WILL do (`executeLabel`, round 3): ticked under a schedule, engine data
+             stays. -->
         <button class="danger" disabled={uninstallBusy} onclick={() => void runUninstall()}>
-          {consent ? "Remove app pieces and engine data" : "Remove app pieces"}
+          {executeLabel(consent, uninstall)}
         </button>
         <button disabled={uninstallBusy} onclick={cancelUninstall}>Cancel</button>
       </div>

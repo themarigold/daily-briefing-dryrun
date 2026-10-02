@@ -352,7 +352,13 @@ fn unique() -> String {
 /// ⚠ IT CLEANS UP ONLY WHAT IT CREATED. A name that already exists fails the `create_new` open and
 /// is left exactly as it was — the caller must not `remove_file` it on error either, because a
 /// clash means the file is somebody else's. A failure AFTER the create removes the partial file.
-fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+///
+/// `pub(crate)` for ONE other caller, `autostart::replace_atomically` (Phase E M5b checkpoint fix):
+/// its temp file had been a `File::create`, which writes THROUGH a symlink planted at the
+/// predictable temp name and truncates a hard link's target. `create_new` (`O_CREAT|O_EXCL`) fails
+/// on any existing name — a symlink included, dangling or not — so the same guarantee is reused
+/// rather than re-written.
+pub(crate) fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]

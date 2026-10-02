@@ -8,12 +8,15 @@
  * `docs/gui-seam.md` §4 warns about — `notifyStatus().engine.willNotify` IS the predicate's
  * answer, computed once, in Rust.
  *
- * ⚠ THE AUTOSTART CALLS ARE THE PLUGIN'S OWN COMMANDS — the three grants
- * `autostart:allow-enable` / `allow-disable` / `allow-is-enabled` (the plugin's whole shipped
- * allow-set; `capabilities/README.md`). `isEnabled()` is the REAL state (a stat of the
- * LaunchAgent plist), which is why the toggle re-asks on every render instead of caching a
- * boolean. There is no `@tauri-apps/plugin-autostart` JS package in this build — three
- * `invoke("plugin:autostart|…")` calls do not need a client library.
+ * ⚠ THE AUTOSTART CALLS (Phase E M5b): the READ is the plugin's own `is_enabled` (the one
+ * autostart plugin grant left, `autostart:allow-is-enabled`) — the REAL state, a stat of the
+ * LaunchAgent plist, which is why the toggle re-asks on every render instead of caching a
+ * boolean. ON/OFF are the APP command `autostart_set_enabled`, which on macOS also brands the
+ * plist the plugin writes (`AssociatedBundleIdentifiers`, `src-tauri/src/autostart.rs`) — the
+ * plugin's own `enable`/`disable` are no longer granted, so there is no unbranded ON. The wizard's
+ * last step reads its pre-tick from `autostart_wizard_default`. There is no
+ * `@tauri-apps/plugin-autostart` JS package in this build — plain `invoke` calls need no client
+ * library.
  */
 import { invoke } from "@tauri-apps/api/core";
 
@@ -51,22 +54,29 @@ export function notifySetEnabled(enabled: boolean): Promise<{ enabled: boolean |
   return invoke<{ enabled: boolean | null }>("notify_set_enabled", { enabled });
 }
 
-/* ── the autostart plugin, through its three granted commands ─────────────────────────────────── */
+/* ── the login item: the plugin's read, and the app's two commands ───────────────────────────── */
 
 /** REAL state: a stat of `~/Library/LaunchAgents/<app name>.plist` — never cached app-side. */
 export function autostartIsEnabled(): Promise<boolean> {
   return invoke<boolean>("plugin:autostart|is_enabled");
 }
 
-/** Writes the login-item plist. */
-export function autostartEnable(): Promise<void> {
-  return invoke<void>("plugin:autostart|enable");
+/** Turn the login item on (writes the plist and, on macOS, labels it as this app) or off
+ *  (removes it), and record that a choice was made. The Settings toggle and the wizard's last
+ *  step both come through here. After an OFF from Settings the caller offers engine
+ *  `notify: "auto"` (T11 rework): with autostart off, the app may not be running at 07:20 to
+ *  notify. */
+export function autostartSetEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>("autostart_set_enabled", { enabled });
 }
 
-/** Removes the login-item plist. The caller then offers engine `notify: "auto"` (T11 rework):
- *  with autostart off, the app may not be running at 07:20 to notify. */
-export function autostartDisable(): Promise<void> {
-  return invoke<void>("plugin:autostart|disable");
+/** The wizard's initial "Start Daily Briefing at login" value: ON for a fresh install (plan R1),
+ *  otherwise the REAL current state — so finishing the wizard again never re-creates a login item
+ *  the user removed. A READ: it enables nothing. It REJECTS when a choice is recorded but the
+ *  current state cannot be read; the wizard then changes nothing unless the user chooses
+ *  (`lib/wizard.ts`'s `loginItemPlan`). */
+export function autostartWizardDefault(): Promise<boolean> {
+  return invoke<boolean>("autostart_wizard_default");
 }
 
 /* ── the wording, pure so `tests-web` can pin it ──────────────────────────────────────────────── */

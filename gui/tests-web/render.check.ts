@@ -411,6 +411,36 @@ describe("QuitDialog.svelte", () => {
     ).toEqual(["Keep running", "Quit"]);
   });
 
+  test("before setup is finished (no offer label from Rust) the notice is plain — no offer section, no Schedule button", () => {
+    // Phase E final harden: Rust's `QuitCopy::NotSetUp` sends `offerLabel: null` and no
+    // `scheduleLabel`; a reason may still ride along (the field's never-null rule) but must not show.
+    const notSetUp = {
+      ...dialog,
+      body: "Setup isn't finished yet. You can quit now — setup will be offered again the next time you open Daily Briefing.",
+      offerLabel: null,
+      offerAvailable: false,
+      offerUnavailableReason: "Setup is not finished, so there is no engine setting to change yet.",
+      scheduleLabel: null,
+    };
+    // Even with a config state that would make the offer a button, and a Schedule handler wired.
+    const body = html(QuitDialog, {
+      dialog: notSetUp,
+      offer: { kind: "offer", current: "off" },
+      oncancel: () => {},
+      onschedule: () => {},
+    });
+    expect(body).toContain(notSetUp.body);
+    expect(body).not.toContain('class="offer');
+    expect(body).not.toContain(notSetUp.offerUnavailableReason);
+    expect(body).not.toContain("Switch engine notifications");
+    expect(body).not.toContain("currently posts nothing");
+    expect(buttons(body).map((x) => x.text)).toEqual(["Keep running", "Quit"]);
+    // prove-it 3b: the same fixture WITH a label does render the section, so the absence above is
+    // the null label's doing.
+    const withOffer = html(QuitDialog, { dialog: { ...notSetUp, offerLabel: "Switch engine notifications to auto" }, oncancel: () => {} });
+    expect(withOffer).toContain('class="offer');
+  });
+
   test("the dialog adds no wording of its own about what quitting does", async () => {
     const source = await Bun.file(new URL("../src/lib/QuitDialog.svelte", import.meta.url)).text();
     const markup = source.replace(/<script[\s\S]*?<\/script>/, "").replace(/<!--[\s\S]*?-->/g, "");

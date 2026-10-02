@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-engine-update-check"
+description = "Enables the engine_update_check command without any pre-configured scope."
+commands.allow = ["engine_update_check"]
+
+[[permission]]
+identifier = "deny-engine-update-check"
+description = "Denies the engine_update_check command without any pre-configured scope."
+commands.deny = ["engine_update_check"]

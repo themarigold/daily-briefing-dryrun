@@ -18,7 +18,7 @@
 //
 // The SECOND scanner covers the other never-reach class: a test must not drive a privileged, machine-wide
 // binary (`launchctl` and friends), and must not run `scripts/uninstall.sh` without the
-// `DBA_TEST_DIR` / `DBA_TEST_PLIST` redirections that script reads (`scripts/uninstall.sh:3-5`). One
+// `DBA_TEST_DIR` / `DBA_TEST_PLIST` redirections that script reads (its `SUPPORT=` and `PLIST=` lines). One
 // dropped variable there is a `launchctl unload` of the author's LIVE agent. `scripts/install.sh` is
 // BANNED outright rather than conditioned, because it reads no redirection at all — see INSTALLER_BANNED.
 //
@@ -288,6 +288,13 @@ const STATE_TRIGGERS: Trigger[] = [
   // T4.4: the phase itself. Its caller hands it the record writer, but a test that drives it with the
   // production-shaped writer (core.ts's fallback appends to recapCampaignsPath()) writes the state dir.
   { token: "runRecapCampaignsPhase(", why: "src/recapCampaignsPhase.ts — tier B's phase; with core.ts's fallback writer it appends <state>/recap-campaigns.jsonl." },
+  // ── Phase E (E11)'s state-dir sink: the opt-in update check. Added WITH the code, same policy as the
+  // blocks above — every one defaults its `path` to `updateCheckPath()`, i.e. supportDir().
+  { token: "updateCheckPath(", why: "src/marker.ts — <state>/update-check.json, the update check's last answer; resolves via supportDir()." },
+  { token: "checkForUpdate(", why: "src/updateCheck.ts — the manual check; READS and REWRITES <state>/update-check.json when `path` is omitted." },
+  { token: "autoUpdateCheck(", why: "src/updateCheck.ts — the automatic path; reads the config and <state>/update-check.json, and rewrites the latter, when `path` is omitted." },
+  { token: "readUpdateCheckState(", why: "src/updateCheck.ts — READS <state>/update-check.json when `path` is omitted." },
+  { token: "writeUpdateCheckState(", why: "src/updateCheck.ts — WRITES <state>/update-check.json when `path` is omitted." },
 ];
 
 /** Does this source name the trigger? Call-shape tokens (`name(`) also match an ALIASED import
@@ -368,8 +375,19 @@ test("every state-touching test file isolates DAILY_BRIEFING_STATE_DIR", async (
   // Phase E (M3, 2026-10-01): re-measured the same way — files 163 (this milestone's release-check and
   // uninstall tests, plus three added on main since the M2 note), STATE_TRIGGERS 43 (floor stays 41),
   // touching 56 (unchanged: neither new file touches state); files floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(161);
-  expect(STATE_TRIGGERS.length).toBeGreaterThanOrEqual(41);
+  // Phase E (M4, E11, 2026-10-01): + five STATE_TRIGGERS for the update check's state file
+  // (`updateCheckPath(`, `checkForUpdate(`, `autoUpdateCheck(`, `readUpdateCheckState(`,
+  // `writeUpdateCheckState(`) and test/update-check.test.ts (state-touching; it isolates). Re-measured
+  // the same way — files 164, STATE_TRIGGERS 48, touching 57 — and ALL THREE floored two below.
+  // Phase E (M5, 2026-10-01): + four docs tests (docs-config, docs-links, reporting-channel, site), none
+  // state-touching. Re-measured with this file's own Glob: files 168; STATE_TRIGGERS 48 and touching 57
+  // unchanged (floors stay 46 and 55); files floored two below.
+  // Phase E final harden (2026-10-02): re-measured with this file's own Glob at 174 (170 on main at
+  // 98d4514db, + dispatch.help-anywhere, git.show-signature, credentials.gaps and
+  // credentials.anthropic-keys — the round-1 note here said 172 and the round-3 one 173, each written
+  // before a later file landed); files floored two below (round-4 harden B4-L4: it sat three below).
+  expect(files.length).toBeGreaterThanOrEqual(172);
+  expect(STATE_TRIGGERS.length).toBeGreaterThanOrEqual(46);
 
   const touching: string[] = [];
   const offenders: string[] = [];
@@ -403,7 +421,11 @@ test("every state-touching test file isolates DAILY_BRIEFING_STATE_DIR", async (
   // Tier B (T5.1): re-measured at 54 (see the T5.1 note above); floored two below.
   // Tier B (T5.2): re-measured at 55 (see the T5.2 note above); floored two below.
   // Phase E (M2 fix, 2026-10-01): re-measured at 56 (see the M2 note above); floored two below.
-  expect(touching.length).toBeGreaterThanOrEqual(54);
+  // Phase E (M4, 2026-10-01): re-measured at 57 (see the M4 note above); floored two below.
+  // Phase E final harden (2026-10-02, round-4 harden B4-L4): re-measured at 59 — 57 on main at 98d4514db
+  // (replayed there), + dispatch.help-anywhere (new) and clip-redacts-first (round 1 gave it a `runCore(`
+  // test; it isolates) — measured by diffing the two sets; floored two below.
+  expect(touching.length).toBeGreaterThanOrEqual(57);
   expect(offenders).toEqual([]);
 });
 
@@ -710,7 +732,11 @@ test("no test spawns a privileged machine-wide binary", async () => {
   // Phase E (M1b fix, 2026-10-01): re-measured at 155 `testFiles()`; floored two below.
   // Phase E (M2 fix, 2026-10-01): re-measured at 158 `testFiles()`; floored two below.
   // Phase E (M3, 2026-10-01): re-measured at 163 `testFiles()`; floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(161);
+  // Phase E (M4, 2026-10-01): re-measured at 164 `testFiles()` (+ update-check.test.ts); floored two below.
+  // Phase E (M5, 2026-10-01): re-measured at 168 `testFiles()` (+ the four docs tests); floored two below.
+  // Phase E final harden (2026-10-02): re-measured at 174 `testFiles()` (round 1 said 172, round 3 173);
+  // floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(172);
   const offenders: string[] = [];
   const conditional: string[] = [];
   for (const f of files) {
@@ -800,7 +826,7 @@ test("the never-reach matcher is not vacuous", () => {
   expect(commandUse("insecurity is not security-relevant", "security")).toBe(false);
 });
 
-/** `scripts/uninstall.sh` reads `DBA_TEST_DIR` and `DBA_TEST_PLIST` (scripts/uninstall.sh:3-5) and falls
+/** `scripts/uninstall.sh` reads `DBA_TEST_DIR` and `DBA_TEST_PLIST` (its `SUPPORT=`/`PLIST=` lines) and falls
  *  back to the REAL support dir and the REAL LaunchAgents plist when either is missing. So a file is
  *  allowed to spawn it — `maintenance.test.ts` is the sanctioned exerciser — but only while it passes
  *  BOTH. It is asserted, not exempted.
@@ -846,6 +872,27 @@ test("any test spawning scripts/uninstall.sh passes BOTH DBA_TEST_DIR and DBA_TE
   // Phase E (E10): the flag's exerciser is a spawner too, and is held to the same two variables.
   expect(spawners).toContain("uninstall.test.ts");
   expect(offenders).toEqual([]);
+});
+
+/** Phase E M5b fix round 2: the source install's codesign lines carry `--timestamp=none`, as
+ *  `src/schedule/install.ts`'s do (pinned in schedule.install.test.ts) — codesign's default for asking a
+ *  timestamp server is per-identity and unspecified, and the README's Privacy section lists no timestamp
+ *  server. Pinned HERE, by READING the script as data, because this is the one test file the ban above
+ *  exempts (SELF): any other file that so much as names the script fails that scan, by design. Never
+ *  spawned. Comment lines are dropped and backslash continuations joined first. */
+test("scripts/install.sh: every codesign it runs carries --timestamp=none (read as data, never run)", () => {
+  const lines = readFileSync(resolve(SCRIPTS_DIR, "install.sh"), "utf8")
+    .replace(/\\\n/g, " ")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"));
+  // `codesign` in COMMAND position (line start, after `if`/`then`/`else`/`do`, or after `;`, `&`, `|`)
+  // — not `-p codesigning` (security's policy name), and not the word inside an `echo`'d warning.
+  const signs = lines.filter((line) => /(^|[;&|]|\b(?:if|then|else|do))\s*codesign\s/.test(line));
+  // prove-it 3b: both shapes were found, so the filter below is not vacuous.
+  expect(signs.some((c) => c.includes('--sign "$SIGN_ID"'))).toBe(true);
+  expect(signs.some((c) => c.includes("codesign -s -"))).toBe(true);
+  expect(signs.length).toBeGreaterThanOrEqual(3);
+  expect(signs.filter((c) => !c.split(/\s+/).includes("--timestamp=none"))).toEqual([]);
 });
 
 /** Phase E (E10): `scripts/uninstall.sh --remove-signing-identity` DELETES a keychain identity, from the
@@ -899,6 +946,9 @@ const CONFIG_TRIGGERS: Trigger[] = [
   // 2026-09-19: the entry point every reader above goes through, named directly. A test calling only this
   // was invisible to the table, and from any cwd but the package root nothing would have isolated it.
   { token: "loadConfig(", why: "src/config.ts — reads the real user config via configPath()." },
+  // Phase E (E11): the automatic update check calls loadConfig() itself unless one is injected, and a test
+  // driving it unisolated would be enabled or disabled by the developer's own `updateCheck` setting.
+  { token: "autoUpdateCheck(", why: "src/updateCheck.ts — reads the real user config via loadConfig() unless `loadConfig` is injected." },
 ];
 
 const CONFIG_ALLOW: Record<string, string> = {
@@ -929,7 +979,11 @@ test("every config-writing test file redirects XDG_CONFIG_HOME", async () => {
   // were being shaped by the developer's own morningTime).
   // A3: re-measured at 5 — test/api-surfaces.test.ts calls initConfig()/configPath()/doctorReport() and
   // redirects XDG_CONFIG_HOME for the whole file. Floored AT the measurement, per the same reasoning.
-  expect(touching.length).toBeGreaterThanOrEqual(5);
+  // Phase E (M4, E11): CONFIG_TRIGGERS gained `autoUpdateCheck(` (it calls loadConfig() itself unless
+  // one is injected). Re-measured at 8 — the set had grown to 7 since A3 without a re-floor, and
+  // test/update-check.test.ts (which redirects XDG_CONFIG_HOME) is the eighth. Floored AT the
+  // measurement, per the same reasoning.
+  expect(touching.length).toBeGreaterThanOrEqual(8);
   expect(offenders).toEqual([]);
 });
 
@@ -1165,7 +1219,10 @@ test("every mkdtemp under tmpdir() in test/ is registered for run-end removal", 
   // Tier B (T5.2): re-measured at 167 (+ recap-campaigns.replay); floored two below.
   // Phase E (M2 fix, 2026-10-01): re-measured at 175 `testSources()`; floored two below.
   // Phase E (M3, 2026-10-01): re-measured at 180 `testSources()`; floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(178);
+  // Phase E (M4, 2026-10-01): re-measured at 181 `testSources()` (+ update-check.test.ts); floored two below.
+  // Phase E final harden (2026-10-02): re-measured at 191 `testSources()` (187 on main at 98d4514db, +
+  // the four test files named at scanner 1; round 1 said 189, round 3 190); floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(189);
 
   const offenders: string[] = [];
   const unwrapped: Record<string, number> = {};
@@ -1893,7 +1950,11 @@ test("every child bun that runs an entry point is handed the isolated env", asyn
   // Tier B (T5.2): re-measured at 150; floored two below.
   // Phase E (M2 fix, 2026-10-01): re-measured at 158 (scanner 1's count); floored two below.
   // Phase E (M3, 2026-10-01): re-measured at 163 (scanner 1's count); floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(161);
+  // Phase E (M4, 2026-10-01): re-measured at 164 (scanner 1's count); floored two below.
+  // Phase E (M5, 2026-10-01): re-measured at 168 (scanner 1's count); floored two below.
+  // Phase E final harden (2026-10-02): re-measured at 174 (scanner 1's count; round 1 said 172, round 3
+  // 173); floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(172);
   // The names that stand for an entry without its path. If these stop being read, every
   // `join(SCRIPTS, "x.ts")` and `bun run audit` spawn silently drops out of the scan.
   expect(ENTRY_NAMES).toEqual(expect.arrayContaining(["audit", "eval", "inspect-whys", "main", "start"]));

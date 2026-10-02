@@ -1,8 +1,9 @@
 # The capability — what the webview may ask the shell to do
 
-`default.json` is the whole of what this webview may invoke. It grants **thirty-four** entries: the
+`default.json` is the whole of what this webview may invoke. It grants **thirty-five** entries: the
 two core event permissions `listen()` needs (`core:event:allow-listen`, `core:event:allow-unlisten`),
-**nine** `allow-engine-*` permissions, T11's three `allow-state-snapshot` / `allow-open-today` /
+**ten** `allow-engine-*` permissions (Phase E's E12 adding `allow-engine-update-check` — see *Phase E's
+update check*), T11's three `allow-state-snapshot` / `allow-open-today` /
 `allow-app-quit`, B5's five `allow-read-latest-briefing` / `allow-read-archived-briefing` /
 `allow-config-read` / `allow-config-save` / `allow-config-offer-notify-auto`, B6's four
 `allow-access-snapshot` / `allow-access-probe` / `allow-access-reveal-engine` /
@@ -10,10 +11,11 @@ two core event permissions `listen()` needs (`core:event:allow-listen`, `core:ev
 B8's four `allow-config-create` (T16's first-config path) and `allow-cli-shim-status` /
 `allow-cli-shim-install` / `allow-cli-shim-remove` (dev 63's Settings action — see *B8's four*),
 B25's two `allow-uninstall-preview` / `allow-uninstall-execute` (T25's Settings action — see
-*B25's two*),
-and — the first plugin grants this file has ever carried — T19's `autostart:allow-enable` /
-`autostart:allow-disable` / `autostart:allow-is-enabled`, the WHOLE of that plugin's shipped
-allow-set (see *B7's two app commands, and the first plugin grants*). **Nothing else: no
+*B25's two*), Phase E M5b's two `allow-autostart-set-enabled` / `allow-autostart-wizard-default`
+(the login item's ON/OFF, branded on macOS, and the wizard's pre-tick — see *Phase E M5b: the
+login item*), and ONE plugin grant, T19's `autostart:allow-is-enabled` (B7 granted the plugin's
+whole allow-set; M5b took back `allow-enable` / `allow-disable` — see *B7's two app commands, and
+the first plugin grants*). **Nothing else: no
 `core:default`, no `shell:*` permission of any kind, nothing for `tauri-plugin-notification`
 (registered, live, refused — the tray's live-but-withheld command posture, though unlike the tray
 it also injects an init script; see its ⚠ below), and nothing for the opener or window-state
@@ -46,7 +48,7 @@ table) and is pinned by `../tests/capability.rs`, `../tests/engine_client.rs` an
 
 | Layer | What it decides | Where |
 | --- | --- | --- |
-| The capability | which of the twenty-seven app commands (nine engine operations, three shell commands, two briefing reads, four config commands, four access commands, two notify commands, three cli-shim commands), which two core event commands, and which three autostart plugin commands this webview may invoke | `default.json` |
+| The capability | which of the thirty-two app commands (ten engine operations, three shell commands, two briefing reads, four config commands, four access commands, two notify commands, three cli-shim commands, two uninstall commands, two autostart commands), which two core event commands, and which one autostart plugin command this webview may invoke | `default.json` |
 | The app ACL manifest | that app commands are checked against a capability **at all** | `../build.rs` |
 | `Operation` | the argv for each operation — fixed literals plus two validated operands | `../src/engine.rs` |
 | The validators | whether a caller-supplied operand may reach an argv position | `../src/engine.rs` |
@@ -54,12 +56,12 @@ table) and is pinned by `../tests/capability.rs`, `../tests/engine_client.rs` an
 
 **One `#[tauri::command]` per operation, not one command taking the operation as an argument.** The
 grant is per command name, so the capability can distinguish "may read status" from "may generate a
-briefing and stamp the day". A single enum-taking command would collapse all nine into one grant
+briefing and stamp the day". A single enum-taking command would collapse all ten into one grant
 and move the distinction back into application code.
 
 **The engine client is Tauri managed state** (`engine::Engine`, managed once in `lib.rs::run()`),
 not something each command resolves for itself. That is what lets `../tests/capability.rs` inject
-a fake sidecar and drive **all nine engine commands through real IPC**, asserting the argv each one
+a fake sidecar and drive **all ten engine commands through real IPC**, asserting the argv each one
 produces — so every command body is executed by a test, not merely reachable. It is also why the
 app starts when the sidecar is missing: the startup `Result` is stored, and every command returns
 `sidecarUnresolved` naming the path it looked at.
@@ -136,15 +138,34 @@ Settings screen edits an existing config through `config_save` rather than runni
 `--api-key` anywhere, because the engine has none: a literal secret on a command
 line lands in shell history and in the process table.
 
-`calendar` and `update --check` are also absent, and that is a **change from B1**, which allowlisted
-both ahead of the engine per plan R1's forward list. Neither exists in the engine (`src/main.ts`
-dispatches `run | init | status | doctor | config | help | schedule` and exits 2 on anything else),
-and a typed command for a subcommand that does not exist is a function that reports failure for a
-reason the user cannot act on. The operation enum is exhaustive over the **operations the app may
+`calendar` is also absent, and that is a **change from B1**, which allowlisted it ahead of the engine
+per plan R1's forward list. It does not exist in the engine (`src/main.ts` dispatches `run | init |
+status | doctor | config | help | schedule | update` and exits 2 on anything else), and a typed
+command for a subcommand that does not exist is a function that reports failure for a reason the
+user cannot act on. (`update --check` sat beside it on that list, for the same reason, until Phase E's
+E11 gave the engine the subcommand; E12 then granted it — see *Phase E's update check* below.) The operation enum is exhaustive over the **operations the app may
 perform** — the engine surface minus `init` and `help`, each excluded deliberately (`schedule
 verify` was on that excluded list until B6 added it; the paragraph above says why and on what
 terms) — not over R1's forward list; widening it is one enum variant, one command, one grant and
 one line of justification.
+
+### Phase E's update check (E12): `engine_update_check`
+
+`update --check --json` — the Settings screen's "Check now" — is the tenth engine operation
+(`Operation::UpdateCheck`). What the grant is, and what it is not:
+
+- **No operand.** The argv is three fixed literals; the webview cannot shape the request, which the
+  ENGINE builds (`src/updateCheck.ts`: one anonymous `GET` of the project's latest GitHub release, the
+  version in the User-Agent, no query string). The webview itself still cannot reach any remote host —
+  `tauri.conf.json`'s CSP is `default-src 'self'`, so there is no `connect-src` beyond the app.
+- **Not mutating** (plan §5 decision 16). It changes no schedule and no briefing state; its one write
+  is the engine's own atomic `<state>/update-check.json`. So `Operation::is_mutating` is false, it
+  takes no in-flight guard, and "Check now" works while a run is in flight — both pinned in
+  `../tests/engine_client.rs`.
+- **Manual, not automatic.** It always fetches (the config's `intervalHours` gates only the engine's
+  own scheduled-run check), and nothing in the webview calls it except the button. The result is read
+  back later through the EXISTING `engine_status` grant (`status --json`'s `updateCheck` field), so no
+  new read command exists.
 
 ### The three shell commands (T11), and the two plugins that got nothing
 
@@ -234,38 +255,58 @@ these commands read and write:
 | `notify_status` | takes nothing; reads the app-owned opt-in record, the ENGINE's `notify` value (one `status --json` to locate the config, then a local read) with the resolved-capability predicate's answer computed in Rust (`docs/gui-seam.md` §12 — a TypeScript copy of that predicate is the drift §4 warns about), and the suppression log |
 | `notify_set_enabled` | takes one boolean; writes `<app_data_dir>/notify-state.json`. It is the EXPLAINED ask's answer — a user gesture on the Settings/Schedule UI (and B8's wizard step). It posts nothing; the first real post afterwards is what triggers the OS's own registration |
 
-**T19's three are the first PLUGIN grants this capability has ever carried**, and they are the
-whole of `tauri-plugin-autostart 2.5.1`'s shipped allow-set — its `permissions/default.toml` is
-exactly `allow-enable`, `allow-disable`, `allow-is-enabled` (read from the crate, not assumed), so
-"exactly enumerated" and "the plugin's default set" happen to coincide here, member for member:
+**T19's grants were the first PLUGIN grants this capability ever carried.** B7 granted the whole
+of `tauri-plugin-autostart 2.5.1`'s shipped allow-set — its `permissions/default.toml` is exactly
+`allow-enable`, `allow-disable`, `allow-is-enabled` (read from the crate, not assumed). **Phase E
+M5b keeps ONE of them:**
 
 | Grant | Why the webview holds it |
 | --- | --- |
 | `autostart:allow-is-enabled` | the Settings toggle must reflect REAL state — a `stat` of `~/Library/LaunchAgents/<app name>.plist` — on every render, never a cached boolean (plan T19) |
-| `autostart:allow-enable` | the toggle's ON: writes that plist. Takes no operand at all — the plist's label, path and argv are derived Rust-side by the plugin from `package_info()` and `current_exe()` |
-| `autostart:allow-disable` | the toggle's OFF: removes that plist. Also operand-free. The webview then offers engine `notify: "auto"` through the EXISTING `config_offer_notify_auto` grant (T11 rework) |
+| ~~`autostart:allow-enable`~~ | **withdrawn in M5b.** The plugin's `enable()` writes an UNBRANDED plist; with this grant the webview held a second ON that skipped the branding. Every ON is now `autostart_set_enabled` (below) |
+| ~~`autostart:allow-disable`~~ | **withdrawn in M5b** with its twin, so ON and OFF are one app command, not an app command and a plugin command. The real `disable()` is still what removes the plist — reached Rust-side through `autostart::disable_now` (the toggle's OFF and T25's uninstall) |
 
-⚠ **`enable`/`disable` are the one granted webview surface whose real effect the suite never
-executes**: both touch `~/Library/LaunchAgents` (VM-gated, `docs/gui-seam.md` §12c). The ACL
-admission is asserted against a mock app WITHOUT the plugin registered
-(`the_autostart_grants_admit_exactly_the_three_plugin_commands`) — the ACL answers before plugin
-dispatch, so the grant is proven while nothing real can run. The label the plugin derives is pinned
-against the CLI scheduler's `local.daily-briefing` by `tests/autostart.rs`'s label test.
+⚠ **The plugin's `enable`/`disable` are now REFUSED to the webview**, and `is_enabled` admitted:
+`the_webview_reaches_autostart_only_through_is_enabled_and_the_two_app_commands` asserts all three
+against a mock app WITHOUT the plugin registered — the ACL answers before plugin dispatch, so the
+grant (and the refusals, which are the ACL's own "Permissions associated with this command": the
+crate is in `[dependencies]`) are proven while nothing real can run. The label the plugin derives
+is pinned against the CLI scheduler's `local.daily-briefing` by `tests/autostart.rs`'s label test.
 
-⚠ **Why three RAW plugin grants are safe here, stated in full** (round 1 asked for this to be the
-register, not an implication). The plist a granted `enable` writes has exactly THREE inputs, and
+### Phase E M5b: the login item (T19 reworked, user-directed)
+
+Two app commands replace the two withdrawn plugin grants. Neither takes a path, and NOTHING at
+launch calls either — the app registers no login item until the setup wizard's last step (or the
+Settings toggle) asks (`src/autostart.rs`; `tests/autostart.rs`'s
+`nothing_registers_a_login_item_at_launch`).
+
+| Command | What bounds it |
+| --- | --- |
+| `autostart_set_enabled` | takes ONE boolean. ON is the plugin's `enable()` — the same fixed plist as before (below) — followed, on macOS, by `brand_launch_agent`: parse that plist with the `plist` crate, refuse it unless its `Label` is this app's, add `AssociatedBundleIdentifiers` = `[tauri.conf.json's identifier]`, and replace the file atomically (a temp file CREATED with `create_new`, never opened through a planted link, mode 0644), keeping every other key. OFF is the plugin's `disable()`. Either way it records `<app_data_dir>/autostart-state.json` (a choice was made). The whole ON or OFF holds one change lock (`autostart::lock_changes`, shared with the uninstall's disable), so an OFF cannot land inside an ON's branding. The Settings toggle's ON/OFF and the wizard's Finish both come through here, so there is no unbranded ON. The webview then offers engine `notify: "auto"` after an OFF through the EXISTING `config_offer_notify_auto` grant (T11 rework) |
+| `autostart_wizard_default` | takes nothing; READS that record and `is_enabled()` and answers the wizard's pre-tick: ON with no record (a fresh install, plan R1's default), else the real state — an ERROR when a choice is recorded but the state cannot be read, which the wizard treats as unknown and leaves alone. It enables nothing |
+
+Both are driven against the recording sink and a scratch store (`tests/autostart.rs`,
+`tests/capability.rs`); the branding against scratch plists only. The real `enable()`/`disable()`
+and the rewrite of the real `~/Library/LaunchAgents` plist are VM-gated (`docs/gui-seam.md` §12c,
+§12d), and whether macOS 13+ then shows "Daily Briefing" with the app's icon is **UNVERIFIED**
+until the Phase F VM.
+
+⚠ **Why the plist an ON writes is still safe, stated in full** (B7 round 1 asked for this to be
+the register, not an implication). The plist the plugin's `enable` writes has exactly THREE inputs, and
 every one is bound Rust-side at setup, none by the webview: the **Label/file name** is
 `package_info().name` (the productName, "Daily Briefing" — pinned by the label test and by
 `the_product_name_the_register_hardcodes_is_pinned`); the **program path** is `current_exe()`
 (the running bundle — the webview supplies nothing); and the **args** are the `None` passed to
 `init(MacosLauncher::LaunchAgent, None)` at registration, which is TEST-PINNED
-(`lib_rs_registers_the_plugin_with_the_default_name_and_the_one_shot`'s whitespace-stripped
+(`lib_rs_registers_the_plugin_with_the_default_name`'s whitespace-stripped
 compare — `auto-launch 0.5.0` writes `ProgramArguments = [app_path] + args`, so an unpinned args
-vector would be launch-time argv this sentence silently depended on). The commands themselves are
-**operand-free** — there is no string a webview could send that changes any of the three — and
-`disable` can only remove the one fixed path the same derivation names. A grant that could write
-an arbitrary plist, point one at another binary, or smuggle argv would be none of these things;
-these three can do exactly one thing each, to one file, with fixed content.
+vector would be launch-time argv this sentence silently depended on). M5b's branding adds a
+FOURTH key with a fixed value (the bundle identifier, from `tauri.conf.json`), never a webview
+input. The commands themselves take at most one boolean — there is no string a webview could send
+that changes any of the inputs — and `disable` can only remove the one fixed path the same
+derivation names. A command that could write an arbitrary plist, point one at another binary, or
+smuggle argv would be none of these things; these can do exactly one thing each, to one file,
+with fixed content.
 
 ⚠ **`tauri-plugin-notification` is REGISTERED and granted NOTHING.** Registration is what makes
 the Rust-side post possible (`NotificationExt` resolves managed plugin state), and it makes the
@@ -324,7 +365,7 @@ not "command not found"), and `listen_and_unlisten_are_admitted` executes the tw
 
 `/usr/bin/caffeinate`, the PATH, the sidecar's absolute path: none of them needs a scope entry,
 because none of them is reachable from the webview. They are arguments to a `std`/`tokio` `Command`
-constructed inside `engine.rs`, behind the nine engine commands above (the other twelve app
+constructed inside `engine.rs`, behind the ten engine commands above (the other twenty app
 commands reach the engine only through the same client). B1 needed a pinned scope entry for
 caffeinate precisely because the webview was the thing doing the spawning.
 

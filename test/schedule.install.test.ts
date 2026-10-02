@@ -194,7 +194,7 @@ describe("install (darwin)", () => {
     const dest = managed();
     expect(f.calls.map((c) => c.join(" "))).toContain(`xattr -d com.apple.quarantine ${dest}`);
     expect(f.calls.map((c) => c.join(" ")))
-      .toContain(`codesign --force --sign ${DEFAULT_SIGN_IDENTITY} --identifier ${SCHEDULE_LABEL} ${dest}`);
+      .toContain(`codesign --force --sign ${DEFAULT_SIGN_IDENTITY} --timestamp=none --identifier ${SCHEDULE_LABEL} ${dest}`);
     // ⚠ THE SOURCE is never signed — you cannot cleanly re-sign the binary that is executing.
     expect(f.calls.some((c) => c[0] === "codesign" && c.includes(SRC_BIN))).toBe(false);
   });
@@ -227,6 +227,13 @@ describe("install (darwin)", () => {
     expect(await installSchedule({ noVerify: true }, deps("darwin", f.exec))).toBe(EXIT_OK);
     expect(warned.join("\n")).toContain("falling back to an ad-hoc signature");
     expect(f.calls.map((c) => c.join(" ")).some((c) => c.startsWith("codesign -s - -f"))).toBe(true);
+    // Phase E M5b checkpoint: NEITHER signature may ask a timestamp server — codesign's default for
+    // that is per-identity and unspecified, and the README promises nothing else is contacted. (The
+    // source install's own codesign lines are pinned in test/isolation.meta.test.ts, the one test file
+    // allowed to name that script.)
+    const signs = f.ran("codesign").map((c) => c.join(" "));
+    expect(signs.length).toBeGreaterThan(0);
+    expect(signs.filter((c) => !c.split(" ").includes("--timestamp=none"))).toEqual([]);
     expect(f.ran("launchctl").map((c) => c.join(" "))).toContain(`launchctl load ${join(UNITS, `${SCHEDULE_LABEL}.plist`)}`);
   });
 

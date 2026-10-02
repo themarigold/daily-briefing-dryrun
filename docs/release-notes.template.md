@@ -22,7 +22,7 @@ Every file in this release is listed in `SHA256SUMS`. In the folder you download
 
 ## Command-line binaries
 
-The engine as a single binary. The source install in the README is still supported.
+The engine as a single binary. Installing from source is still supported: see [docs/INSTALL.md](https://github.com/themarigold/daily-briefing/blob/main/docs/INSTALL.md#from-a-source-checkout).
 
 {{CLI_ASSETS}}
 

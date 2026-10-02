@@ -10,8 +10,8 @@
   "artifacts": {
     "app-aarch64-apple-darwin": {
       "budgetBytes": null,
-      "measuredBytes": 75230547,
-      "measuredAt": "2026-09-17",
+      "measuredBytes": 75236741,
+      "measuredAt": "2026-10-02",
       "path": "src-tauri/target/release/bundle/macos/Daily Briefing.app",
       "note": "informational — no appendix ceiling for the uncompressed .app; the DMG is the shipped artifact"
     },
@@ -24,9 +24,9 @@
     },
     "dmg-aarch64-apple-darwin": {
       "budgetBytes": 45000000,
-      "measuredBytes": 26264487,
-      "measuredAt": "2026-09-17",
-      "path": "src-tauri/target/release/bundle/dmg/Daily Briefing_0.1.1_aarch64.dmg"
+      "measuredBytes": 25978764,
+      "measuredAt": "2026-10-02",
+      "path": "src-tauri/target/release/bundle/dmg/Daily Briefing_0.2.0_aarch64.dmg"
     },
     "dmg-x86_64-apple-darwin": {
       "budgetBytes": 45000000,

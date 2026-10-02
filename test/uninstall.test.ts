@@ -19,7 +19,7 @@
 // names them in command position, and this file adds no exemption.
 import "./fixtures/isolate-state";
 import { test, expect, describe } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
@@ -37,6 +37,7 @@ const FLAG = "--remove-signing-identity";
 const ARTIFACTS = [
   "daily-briefing", "wake-schedule.json", "briefing.log", "briefing-latest.md",
   "briefing.log.1", "transcript-health.json", "audit-2026-07-30.md", "audit-2026-07-31.md",
+  "update-check.json",   // Phase E (E11): the opt-in update check's record
 ];
 
 interface Fx {
@@ -69,6 +70,8 @@ function stubs(): { bin: string; engine: string } {
     "#!/bin/sh",
     'printf \'%s\\n\' "$*" "$HOME" "$DAILY_BRIEFING_STATE_DIR" > "$STUB_MANAGED_LOG"',
     'echo "stub engine: schedule uninstall -> exit ${STUB_MANAGED_RC:-0}" >&2',
+    // STUB_MANAGED_ERR: what a real engine prints on that exit (an owner refusal, an unknown command).
+    '[ -z "${STUB_MANAGED_ERR:-}" ] || printf \'%s\\n\' "$STUB_MANAGED_ERR" >&2',
     'case "${STUB_MANAGED_RECORD:-}" in',
     '  keep) ;;',
     '  drop) rm -f "$DAILY_BRIEFING_STATE_DIR/schedule.json" ;;',
@@ -118,7 +121,7 @@ interface Run { code: number; out: string; calls: string[][]; managed: { argv: s
 /** `keychain`: the scratch keychain inside DBA_TEST_DIR (default), omitted (false), or an explicit value
  *  for the variable's own validation cases. `testDir: false` omits DBA_TEST_DIR (HOME stays scratch).
  *  `record`: the stub engine's STUB_MANAGED_RECORD. */
-function run(fx: Fx, args: string[] = [], opts: { keychain?: boolean | string; testDir?: boolean; record?: "keep" | "drop" } = {}): Run {
+function run(fx: Fx, args: string[] = [], opts: { keychain?: boolean | string; testDir?: boolean; record?: "keep" | "drop"; engineErr?: string } = {}): Run {
   const { bin } = stubs();
   const keychain = opts.keychain === undefined || opts.keychain === true ? fx.keychain : opts.keychain;
   const env: Record<string, string> = {
@@ -132,6 +135,7 @@ function run(fx: Fx, args: string[] = [], opts: { keychain?: boolean | string; t
     STUB_MANAGED_RC: String(fx.managedRc ?? 0),
     STUB_KEYCHAIN_RC: String(fx.keychainRc),
     ...(opts.record ? { STUB_MANAGED_RECORD: opts.record } : {}),
+    ...(opts.engineErr ? { STUB_MANAGED_ERR: opts.engineErr } : {}),
   };
   // The interlocks, asserted before anything runs: PATH is the stub directory alone, the stubs are what it
   // resolves, and every redirected path is scratch (HOME too, which is where the default support dir and
@@ -211,11 +215,47 @@ describe("uninstall.sh: the schedule record goes to the engine first", () => {
     expect(existsSync(join(fx.support, "daily-briefing"))).toBe(true);
     expect(r.calls).toEqual([]);
     expect(r.out).toContain("owned by another principal (typically the desktop app)");
-    expect(r.out).toContain("Schedule screen (or uninstall the app) and re-run");
-    // The other source of exit 2: an old engine with no `schedule` command, whose record is stale.
-    expect(r.out).toContain("old engine without a `schedule` command");
-    expect(r.out).toContain(STALE_HINT);
+    // The real way out, by the button's own label (gui/src/lib/ScheduleUninstall.svelte) — never "uninstall
+    // the app": the app's Uninstall removes no schedule, so that advice led nowhere.
+    expect(r.out).toContain('Schedule screen ("Remove background scheduler…"), then re-run');
+    expect(r.out).not.toContain("uninstall the app");
+    // …and it points at `schedule status`, NEVER at deleting the record: with no record the raw path
+    // unloads the app's own trigger (one shared label) and deletes the binary it runs.
+    expect(r.out).toContain("schedule status shows who owns it");
+    expect(r.out).toContain("Do not delete the record to get past this");
+    expect(r.out).not.toContain(STALE_HINT);
     expect(r.out).not.toMatch(/^Uninstalled/m);
+  });
+
+  // The engine's real owner refusal (src/schedule/install.ts uninstallSchedule) ends with advice this
+  // script must not pass on: it takes no --take-over, and taking over the app's schedule is what it refuses.
+  test("exit 2 with the engine's owner refusal -> its reason is shown, its --take-over advice is not", () => {
+    const fx = fixture({ record: true, managed: 2 });
+    const r = run(fx, [], { engineErr: 'schedule uninstall: the trigger is owned by "app", not "cli" — removing only what we own. Re-run with --take-over to remove it anyway.' });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain('schedule uninstall: the trigger is owned by "app", not "cli" — removing only what we own.');
+    expect(r.out).not.toContain("--take-over");
+    expect(r.out).toContain("owned by another principal");
+    expect(r.out).not.toContain(STALE_HINT);
+    expect(left(fx)).toEqual({ ...nothingRemoved(fx), record: true });
+    expect(r.calls).toEqual([]);
+  });
+
+  // The other source of exit 2: an engine that predates `schedule uninstall` exits 2 as an unknown command.
+  // It cannot have run the owner check, so the record may be stale: only here is the stale hint shown.
+  test("exit 2 as an unknown command (an engine older than the record) -> refused, and only now the stale-record hint", () => {
+    for (const engineErr of ["unknown command: schedule", "schedule: unknown verb uninstall — expected install | uninstall | status | verify"]) {
+      const fx = fixture({ record: true, managed: 2 });
+      const r = run(fx, [], { engineErr });
+      expect(`${engineErr}: ${r.code}`).toBe(`${engineErr}: 1`);
+      expect(r.out).toContain("is an engine without `schedule uninstall`");
+      expect(r.out).toContain('Schedule screen\n       ("Remove background scheduler…") and re-run');
+      expect(r.out).not.toContain("uninstall the app");
+      expect(r.out).toContain(STALE_HINT);
+      expect(r.out).not.toContain("owned by another principal");
+      expect(left(fx)).toEqual({ ...nothingRemoved(fx), record: true });
+      expect(r.calls).toEqual([]);
+    }
   });
 
   test("record + managed binary exiting 3 (error) -> non-zero, nothing removed, the engine's stderr shown", () => {
@@ -272,6 +312,9 @@ describe("uninstall.sh: the schedule record goes to the engine first", () => {
       expect(r.calls).toEqual([]);                      // no unload, no keychain call
       expect(left(fx)).toEqual({ ...nothingRemoved(fx), record: true });
       expect(r.out).toContain("the managed binary that owns it is missing or");
+      // Both ways out: the app's button for an app-owned schedule, the engine's verb for a terminal one.
+      expect(r.out).toContain('Schedule screen ("Remove background scheduler…") if the app owns it, else with `daily-briefing schedule uninstall`.');
+      expect(r.out).not.toContain("uninstall the app");
       expect(r.out).toContain(STALE_HINT);
     }
   });
@@ -307,6 +350,9 @@ describe("uninstall.sh --remove-signing-identity", () => {
     expect(left(fx)).toEqual({ ...nothingRemoved(fx), record: true });
     expect(r.out).toContain("refusing --remove-signing-identity: a schedule record still exists");
     expect(r.out).toContain(STALE_HINT);
+    // The engine exited 0, so it HAS removed the trigger: the refusal must not claim nothing was removed.
+    expect(r.out).toContain("The engine has already removed the schedule's trigger (above); nothing else was removed.");
+    expect(r.out).not.toContain("Nothing was removed");
     // Without the flag the same shape proceeds: the engine removed the trigger, so nothing still runs the
     // binary; only the identity is held back by the leftover record.
     const fx2 = fixture({ record: true, managed: 0 });
@@ -365,6 +411,24 @@ describe("uninstall.sh --remove-signing-identity", () => {
         expect(r.out).toContain("DBA_TEST_KEYCHAIN must be an absolute path inside DBA_TEST_DIR");
       }
     }
+    // Never a real keychain, even inside DBA_TEST_DIR (which may be an ancestor such as $HOME): a
+    // login.keychain*, anything under a Library/Keychains directory, or a symlink (here to a login-named
+    // file elsewhere, so only the symlink rule and the physical check can see it).
+    for (const make of [
+      (fx: Fx) => `${fx.support}/login.keychain-db`,
+      (fx: Fx) => `${fx.support}/login.keychain`,
+      (fx: Fx) => `${fx.support}/Library/Keychains/scratch.keychain-db`,
+      (fx: Fx) => { mkdirSync(join(fx.base, "elsewhere"), { recursive: true }); symlinkSync(join(fx.base, "elsewhere", "login.keychain-db"), join(fx.support, "kc-link")); return join(fx.support, "kc-link"); },
+      (fx: Fx) => { mkdirSync(join(fx.base, "Library", "Keychains"), { recursive: true }); symlinkSync(join(fx.base, "Library", "Keychains"), join(fx.support, "kcdir")); return join(fx.support, "kcdir", "scratch.keychain-db"); },
+    ]) {
+      const fx = fixture({ record: false, managed: "not-executable" });
+      const value = make(fx);
+      const r = run(fx, [FLAG], { keychain: value });
+      expect(`${value}: ${r.code}`).toBe(`${value}: 1`);
+      expect(r.calls).toEqual([]);
+      expect(left(fx)).toEqual({ ...nothingRemoved(fx), record: false });
+      expect(r.out).toContain("never a real keychain (login.keychain*, anything under Library/Keychains) or a symlink");
+    }
     // Outside DBA_TEST_DIR by a sibling path, and by a ".." escape (spelled out: join() would normalise it).
     for (const make of [(fx: Fx) => join(fx.base, "outside.keychain-db"), (fx: Fx) => `${fx.support}/../outside.keychain-db`, (fx: Fx) => `${fx.support}-sibling/x.keychain-db`, (fx: Fx) => fx.support, (fx: Fx) => `${fx.support}/`]) {
       const fx = fixture({ record: false, managed: "not-executable" });
@@ -374,6 +438,79 @@ describe("uninstall.sh --remove-signing-identity", () => {
       expect(r.calls).toEqual([]);
       expect(left(fx)).toEqual({ ...nothingRemoved(fx), record: false });
     }
+  });
+
+  // Round 4 (G4-2): "inside DBA_TEST_DIR" is judged PHYSICALLY as well as as written. A symlinked ancestor
+  // inside it — the keychain's own directory, or one further up — can carry the operand to a directory
+  // outside it (here a scratch one outside the test root) where no name rule sees anything wrong; and a
+  // directory that cannot be resolved refuses instead of passing on its spelling alone.
+  test("a DBA_TEST_KEYCHAIN that leaves DBA_TEST_DIR through a symlinked ancestor, or whose directory cannot be resolved -> refused before anything runs", () => {
+    for (const make of [
+      (fx: Fx) => { const out = join(fx.base, "outside"); mkdirSync(out); symlinkSync(out, join(fx.support, "kcdir")); return join(fx.support, "kcdir", "scratch.keychain-db"); },
+      (fx: Fx) => { const out = join(fx.base, "outside"); mkdirSync(join(out, "deeper"), { recursive: true }); symlinkSync(out, join(fx.support, "up")); return join(fx.support, "up", "deeper", "scratch.keychain-db"); },
+      (fx: Fx) => join(fx.support, "no-such-dir", "scratch.keychain-db"),
+    ]) {
+      for (const args of [[FLAG], []]) {
+        const fx = fixture({ record: false, managed: "not-executable" });
+        const value = make(fx);
+        const r = run(fx, args, { keychain: value });
+        expect(`${value} ${args.join(" ")}: ${r.code}`).toBe(`${value} ${args.join(" ")}: 1`);
+        expect(r.calls).toEqual([]);
+        expect(left(fx)).toEqual({ ...nothingRemoved(fx), record: false });
+        expect(r.out).toContain("its directory inside DBA_TEST_DIR once both are resolved physically");
+      }
+    }
+    // A case variant of a Library/Keychains directory inside DBA_TEST_DIR: on a case-insensitive volume it
+    // IS that directory, which only the canonical spelling (/bin/pwd -P) shows the case-sensitive rule;
+    // where case matters the directory does not exist, so it refuses there too.
+    const fx = fixture({ record: false, managed: "not-executable" });
+    mkdirSync(join(fx.support, "Library", "Keychains"), { recursive: true });
+    const r = run(fx, [FLAG], { keychain: `${fx.support}/library/keychains/scratch.keychain-db` });
+    expect(r.code).toBe(1);
+    expect(r.calls).toEqual([]);
+    expect(left(fx)).toEqual({ ...nothingRemoved(fx), record: false });
+  });
+
+  test("a DBA_TEST_DIR that does not exist -> a DBA_TEST_KEYCHAIN inside it is refused (neither side resolves), before anything runs", () => {
+    const fx = fixture({ record: false, managed: "not-executable" });
+    rmSync(fx.support, { recursive: true, force: true });
+    const r = run(fx, [FLAG], { keychain: fx.keychain });
+    expect(fx.keychain.startsWith(fx.support + "/")).toBe(true);   // inside it, as written
+    expect(r.code).toBe(1);
+    expect(r.calls).toEqual([]);
+    expect(existsSync(fx.plist)).toBe(true);
+    expect(r.out).toContain("its directory inside DBA_TEST_DIR once both are resolved physically");
+  });
+
+  test("…while a symlink that stays inside DBA_TEST_DIR is accepted: the operand goes to the keychain tool as written", () => {
+    const fx = fixture({ record: false, managed: "not-executable" });
+    mkdirSync(join(fx.support, "inner"));
+    symlinkSync(join(fx.support, "inner"), join(fx.support, "alias"));
+    const value = join(fx.support, "alias", "scratch.keychain-db");
+    const r = run(fx, [FLAG], { keychain: value });
+    expect(r.code).toBe(0);
+    expect(callsTo(r, KEYCHAIN_TOOL)).toEqual([["delete-identity", "-c", SIGN_ID, value]]);
+  });
+
+  // Set but EMPTY: without DBA_TEST_DIR it is still "set" (refused); with it, the flag still needs a real
+  // scratch keychain (refused), and without the flag nothing ever reaches the keychain tool.
+  test("a set-but-empty DBA_TEST_KEYCHAIN -> refused wherever the identity could be reached, never a keychain call", () => {
+    const noDir = fixture({ record: false, managed: "not-executable" });
+    const r1 = run(noDir, [FLAG], { keychain: "", testDir: false });
+    expect(r1.code).toBe(1);
+    expect(r1.out).toContain("DBA_TEST_KEYCHAIN is set but DBA_TEST_DIR is not");
+    expect(r1.calls).toEqual([]);
+    const flag = fixture({ record: false, managed: "not-executable" });
+    const r2 = run(flag, [FLAG], { keychain: "" });
+    expect(r2.code).toBe(1);
+    expect(r2.out).toContain("DBA_TEST_DIR is set without DBA_TEST_KEYCHAIN");
+    expect(r2.calls).toEqual([]);
+    expect(left(flag)).toEqual({ ...nothingRemoved(flag), record: false });
+    const noFlag = fixture({ record: false, managed: "not-executable" });
+    const r3 = run(noFlag, [], { keychain: "" });
+    expect(r3.code).toBe(0);
+    expect(callsTo(r3, KEYCHAIN_TOOL)).toEqual([]);
+    expect(left(noFlag)).toEqual({ ...ALL_REMOVED, record: false });
   });
 
   test("DBA_TEST_KEYCHAIN without DBA_TEST_DIR -> refused before anything runs, with or without the flag", () => {

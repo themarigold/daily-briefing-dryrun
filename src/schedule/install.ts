@@ -360,7 +360,10 @@ async function signManagedCopy(d: Resolved, copyPath: string, identity: string):
   if (q.code === 0) d.say(`Removed the macOS quarantine attribute from the managed copy at ${copyPath}.`);
   else d.say(`No macOS quarantine attribute to remove from ${copyPath} (xattr exited ${q.code}) — the ordinary case for a locally built binary.`);
   if (await ensureIdentity(d.exec, identity, d.home)) {
-    const signed = await d.exec(["codesign", "--force", "--sign", identity, "--identifier", SCHEDULE_LABEL, copyPath]);
+    // `--timestamp=none` on BOTH signatures (Phase E M5b checkpoint): codesign's default for whether
+    // it asks Apple's timestamp server is per-identity and unspecified, and the README's privacy
+    // section promises nothing else is contacted — so no signature this tool makes may depend on it.
+    const signed = await d.exec(["codesign", "--force", "--sign", identity, "--timestamp=none", "--identifier", SCHEDULE_LABEL, copyPath]);
     if (signed.code === 0) {
       d.say(`Signed the managed copy with '${identity}' — the macOS folder-access grant will persist across re-installs.`);
       return "stable";
@@ -370,7 +373,7 @@ async function signManagedCopy(d: Resolved, copyPath: string, identity: string):
     d.warn(`WARN: could not create/find a stable signing identity '${identity}' — falling back to an ad-hoc signature.`);
     d.warn(`      macOS may re-prompt for folder access after each re-install. Install a real 'openssl' (e.g. \`brew install openssl\`) and re-run.`);
   }
-  const adhoc = await d.exec(["codesign", "-s", "-", "-f", copyPath]);
+  const adhoc = await d.exec(["codesign", "-s", "-", "-f", "--timestamp=none", copyPath]);
   return adhoc.code === 0 ? "adhoc" : "unsigned";
 }
 

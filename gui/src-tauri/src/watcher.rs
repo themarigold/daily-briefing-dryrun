@@ -169,6 +169,66 @@ pub fn is_change(kind: &EventKind) -> bool {
     }
 }
 
+/// Whether ONE backend event means the app's view may be stale — the loop's whole per-event rule.
+/// Either of:
+///
+///   * a RESCAN notice ([`notify::Event::need_rescan`]) that can COVER the state dir: one with no
+///     path at all, or whose path is the state dir, one of its ancestors
+///     ([`WatchTargets::encloses_state_dir`]), or an interesting path inside it
+///     ([`WatchTargets::is_interesting`]). A rescan means "events were DROPPED under this path", so
+///     any of those could have been a change to a watched file, and it is served like one: a real
+///     re-read of both envelopes. A re-read cannot feed itself: the engine's reads are `Access`
+///     events, which are not changes.
+///   * a CHANGE ([`is_change`]) to an interesting path.
+///
+/// WHICH RESCAN PATHS CAN ARRIVE AT ALL, measured against `notify` 8.2.0's two shipped backends
+/// (the Windows backend emits no `Flag::Rescan`):
+///
+///   * **inotify**: `IN_Q_OVERFLOW` becomes `Other` + `Flag::Rescan` with NO path
+///     (`notify-8.2.0/src/inotify.rs:212-214`) — the kernel queue overflowed and nothing says
+///     where, so it always counts. Before Phase E final harden (M2 verifier item 2) this notice
+///     failed `is_interesting` and was dropped: a burst that overflowed the queue could leave the
+///     app stale until the next boundary or periodic read.
+///   * **FSEvents**: `MustScanSubDirs` becomes `Other` + `Flag::Rescan` (`fsevent.rs:116-125`)
+///     carrying the event's own path (`:572`) — the directory under which events were coalesced or
+///     dropped; Apple's `FSEvents.h` gives `/Users/jsmith` for coalesced events in two of its
+///     children. ⚠ `notify` DROPS every event whose path is not under a watched root, before the
+///     loop ever sees it (`fsevent.rs:549-566`): it keeps a path only if it IS a watched root, lies
+///     under a RECURSIVELY watched one, or is a direct child of a NON-recursively watched one.
+///     This loop watches two roots (`spawn_inner`): the state dir recursively and its PARENT
+///     non-recursively — keyed by their canonical paths (`fsevent.rs:392,407`). So a rescan
+///     reaches here only for the state dir or a path inside it, the parent itself (coalesced over
+///     the state dir and a sibling — it counts, as an ancestor), or a direct child of the parent
+///     other than the state dir: a SIBLING, such as another app's folder in
+///     `~/Library/Application Support`. A sibling's rescan says nothing about the state dir, and
+///     counting it (as this rule did in round 1, for any path) served a spurious re-read for every
+///     rescan anywhere beside the state dir (round 2: B-M4, D-L1, A-L2). A path INSIDE the state dir
+///     that is not interesting (an excluded file or an unknown subdirectory) cannot cover a watched
+///     file either, so it does not count.
+///
+/// ⚠ An ancestor is matched against the roots this watcher knows (the engine's spelling and, once
+/// the directory has existed, its resolved one). Before the state dir first exists only the
+/// engine's spelling is known, so a rescan carrying a resolved parent (`/private/var/…` for
+/// `/var/…`) is not matched — harmless: what it could stand for is the directory's creation, which
+/// the [`RECOVERY_POLL`] identity check serves anyway.
+pub fn counts_as_change(event: &notify::Event, targets: &WatchTargets) -> bool {
+    if event.need_rescan() {
+        event.paths.is_empty()
+            || event
+                .paths
+                .iter()
+                .any(|p| targets.encloses_state_dir(p) || targets.is_interesting(p))
+    } else {
+        is_change(&event.kind) && event.paths.iter().any(|p| targets.is_interesting(p))
+    }
+}
+
+/// The `info` tag [`StateWatcher::inject`] puts on every event it hands the loop, so the loop can
+/// count the injected ones apart from whatever the real backend delivers meanwhile. **Test harness
+/// only**: it changes nothing about how an event is judged.
+#[doc(hidden)]
+pub const INJECTED: &str = "daily-briefing:injected";
+
 /// The directory this watcher is pointed at, and the prefixes an event path may legitimately carry
 /// for it.
 ///
@@ -218,6 +278,13 @@ impl WatchTargets {
         if resolved != self.state_dir {
             self.roots.push(resolved);
         }
+    }
+
+    /// Whether `path` is the state directory or one of its ancestors, in either spelling — the
+    /// rescan paths that can cover it ([`counts_as_change`]). Component-wise, so `/tmp/sta` is not
+    /// an ancestor of `/tmp/state`.
+    pub fn encloses_state_dir(&self, path: &Path) -> bool {
+        self.roots.iter().any(|root| root.starts_with(path))
     }
 
     /// Whether a change at `path` means the app's view is stale.
@@ -690,6 +757,23 @@ struct Progress {
     emitted: AtomicU64,
     /// How many PURE time-driven re-derivations it has run.
     rederives: AtomicU64,
+    /// How many events tagged [`INJECTED`] the loop has judged, and how many of those it counted
+    /// as a change ([`counts_as_change`]) — the test harness's view of the per-event rule as WIRED.
+    ///
+    /// ⚠ `injected_seen` IS BUMPED LAST, after `injected_counted` and [`Progress::injected_stamps`]
+    /// (Phase E final harden round 4, G4-3): a test waits for `seen` to reach `n` and then reads
+    /// the others as EXACT, so `seen` must mean "judged, and every bit of bookkeeping for it done".
+    /// Bumped first (as it was in rounds 2 and 3), a preemption between the two increments failed a
+    /// correct loop.
+    injected_seen: AtomicU64,
+    injected_counted: AtomicU64,
+    /// The instant the loop judged each COUNTED injected event, in order — the very `Instant` it
+    /// handed [`Debounce::record`]. What `tests/watcher.rs` measures a burst's consumer-side span
+    /// with (round 4, G4-4). Only [`StateWatcher::inject`] can grow it, so the app's watcher, which
+    /// holds no injector, never does.
+    injected_stamps: std::sync::Mutex<Vec<Instant>>,
+    /// How many REAL (not injected) rescan notices the loop counted as a change.
+    rescans_counted: AtomicU64,
 }
 
 /// A running watcher. Dropping it stops the thread.
@@ -697,6 +781,10 @@ pub struct StateWatcher {
     stop: Arc<AtomicBool>,
     progress: Arc<Progress>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// A second sender into the loop's event channel — present ONLY on a watcher started by
+    /// [`spawn_injectable`]. The app's watcher holds none, so its channel still disconnects exactly
+    /// when the backend's sender goes, as the loop's `Disconnected` arm expects.
+    injector: Option<mpsc::Sender<notify::Result<notify::Event>>>,
 }
 
 impl StateWatcher {
@@ -728,6 +816,74 @@ impl StateWatcher {
     /// How many PURE time-driven re-derivations have run.
     pub fn rederives(&self) -> u64 {
         self.progress.rederives.load(Ordering::SeqCst)
+    }
+
+    /// How many REAL rescan notices — from the backend, not [`StateWatcher::inject`]ed — the loop
+    /// has counted as a change ([`counts_as_change`]). Each one can add at most ONE served batch
+    /// (one read, one announcement) that no file write caused, and nothing a test does can stop
+    /// FSEvents coalescing events onto a watched directory; so an exact read/emit count over a real
+    /// backend is exact up to this number (`tests/watcher.rs`, `assert_discounting_rescans`).
+    pub fn rescans_counted(&self) -> u64 {
+        self.progress.rescans_counted.load(Ordering::SeqCst)
+    }
+
+    /// **Test harness only** — hand `event` to the loop through the SAME channel the backend uses,
+    /// tagged [`INJECTED`], so the per-event rule's WIRING is observable on every platform (Phase E
+    /// final harden, M2 verifier item 4). FSEvents never emits an `Access` kind and never a
+    /// `Rescan` on demand, so on macOS no file write can show that the loop consults
+    /// [`counts_as_change`]; an injected event can. Panics on a watcher not started by
+    /// [`spawn_injectable`].
+    #[doc(hidden)]
+    pub fn inject(&self, event: notify::Event) {
+        let injector = self
+            .injector
+            .as_ref()
+            .expect("inject() needs a watcher started by spawn_injectable");
+        let _ = injector.send(Ok(event.set_info(INJECTED)));
+    }
+
+    /// **Test harness only** — hand `event` to the loop through the same channel as
+    /// [`StateWatcher::inject`] but UNTAGGED, exactly as the backend would, so the loop counts it
+    /// with the real events ([`StateWatcher::rescans_counted`]) rather than the injected ones. It is
+    /// how `tests/watcher.rs` pins that real-event counter with no backend in the room (Phase E final
+    /// harden round 3, B3-L2): nothing a test does makes FSEvents or inotify emit a rescan on demand.
+    /// Panics on a watcher not started by [`spawn_injectable`].
+    #[doc(hidden)]
+    pub fn inject_as_backend(&self, event: notify::Event) {
+        let injector = self
+            .injector
+            .as_ref()
+            .expect("inject_as_backend() needs a watcher started by spawn_injectable");
+        let _ = injector.send(Ok(event));
+    }
+
+    /// **Test harness only** — how many [`StateWatcher::inject`]ed events the loop has judged AND
+    /// finished the bookkeeping for: it is incremented after [`StateWatcher::injected_counted`] and
+    /// [`StateWatcher::injected_stamps`] (round 4, G4-3), so once this reads `n`, those two are
+    /// final for the first `n` events — wait on this, then read them exactly.
+    #[doc(hidden)]
+    pub fn injected_seen(&self) -> u64 {
+        self.progress.injected_seen.load(Ordering::SeqCst)
+    }
+
+    /// **Test harness only** — how many of those it counted as a change. Exact for the first `n`
+    /// events once [`StateWatcher::injected_seen`] reads `n`.
+    #[doc(hidden)]
+    pub fn injected_counted(&self) -> u64 {
+        self.progress.injected_counted.load(Ordering::SeqCst)
+    }
+
+    /// **Test harness only** — the instant the loop judged each COUNTED injected event, in order:
+    /// the same `Instant` it recorded in the debounce, so `stamps[last] - stamps[first]` over a
+    /// burst is the CONSUMER-side span the debounce actually saw (round 4, G4-4). Complete for the
+    /// first `n` events once [`StateWatcher::injected_seen`] reads `n`.
+    #[doc(hidden)]
+    pub fn injected_stamps(&self) -> Vec<Instant> {
+        self.progress
+            .injected_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Whether the first pass is complete: from here on, a write into an existing state directory
@@ -796,14 +952,37 @@ pub fn spawn(
 
 /// [`spawn`] with every setting exposed.
 pub fn spawn_with(
-    mut targets: WatchTargets,
+    targets: WatchTargets,
     source: Arc<dyn SnapshotSource>,
     sink: Arc<dyn StateSink>,
     opts: WatchOptions,
 ) -> Result<StateWatcher, notify::Error> {
+    spawn_inner(targets, source, sink, opts, false)
+}
+
+/// **Test harness only** — [`spawn_with`], plus an [`StateWatcher::inject`] handle into the loop's
+/// event channel. Everything else — the backend, the watch, the loop — is the shipped path.
+#[doc(hidden)]
+pub fn spawn_injectable(
+    targets: WatchTargets,
+    source: Arc<dyn SnapshotSource>,
+    sink: Arc<dyn StateSink>,
+    opts: WatchOptions,
+) -> Result<StateWatcher, notify::Error> {
+    spawn_inner(targets, source, sink, opts, true)
+}
+
+fn spawn_inner(
+    mut targets: WatchTargets,
+    source: Arc<dyn SnapshotSource>,
+    sink: Arc<dyn StateSink>,
+    opts: WatchOptions,
+    injectable: bool,
+) -> Result<StateWatcher, notify::Error> {
     let stop = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(Progress::default());
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let injector = injectable.then(|| tx.clone());
 
     // Constructed on THIS thread so a backend that cannot start (inotify limits, a sandbox with no
     // FSEvents) fails the caller loudly instead of dying silently inside a detached thread.
@@ -924,12 +1103,27 @@ pub fn spawn_with(
                         .min(RECOVERY_POLL);
                     match rx.recv_timeout(timeout) {
                         Ok(Ok(event)) => {
-                            // A CHANGE to an interesting path. A read is neither — see
-                            // [`is_change`], and the Linux re-read loop it closes.
-                            if is_change(&event.kind)
-                                && event.paths.iter().any(|p| targets.is_interesting(p))
-                            {
-                                debounce.record(Instant::now());
+                            // A CHANGE to an interesting path, or a rescan notice (events were
+                            // dropped). A read is neither — see [`counts_as_change`], [`is_change`],
+                            // and the Linux re-read loop it closes.
+                            let counted = counts_as_change(&event, &targets);
+                            let at = Instant::now();
+                            if counted {
+                                debounce.record(at);
+                            }
+                            if event.info() == Some(INJECTED) {
+                                // ⚠ `injected_seen` LAST — see [`Progress::injected_seen`].
+                                if counted {
+                                    progress.injected_counted.fetch_add(1, Ordering::SeqCst);
+                                    progress
+                                        .injected_stamps
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push(at);
+                                }
+                                progress.injected_seen.fetch_add(1, Ordering::SeqCst);
+                            } else if counted && event.need_rescan() {
+                                progress.rescans_counted.fetch_add(1, Ordering::SeqCst);
                             }
                         }
                         // A backend error (a dropped queue, a vanished watch) is not fatal: the
@@ -1024,5 +1218,6 @@ pub fn spawn_with(
         stop,
         progress,
         handle: Some(handle),
+        injector,
     })
 }

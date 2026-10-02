@@ -133,8 +133,13 @@ echo "notarization: $NOTARIZE"
 # output, so a failed AppImage reports only "failed to run linuxdeploy" (measured, M2b release run,
 # 2026-10-01; tauri-bundler 2.9.4 linux/appimage/linuxdeploy.rs:206-216). One -v sets the bundler's
 # level to Info (tauri-cli 2.11.4 bundle.rs:213-217), which streams every subprocess line to the log.
-# The only behaviour it changes is the verbosity passed to linuxdeploy and makensis; notarytool's
-# credentials are never logged (tauri-macos-sign runs it with `.output()`, not the logging helper).
-echo "ci-tauri-build: $TAURI_CMD build --verbose --target $TRIPLE"
+# It also raises tauri-cli's own logger from Info to Debug (lib.rs:229-236 `verbosity_level`, which
+# exports TAURI_CLI_VERBOSITY=1 to child processes), so the log is longer; nothing it changes alters
+# what gets built. notarytool's credentials are never logged (tauri-macos-sign runs it with
+# `.output()`, not the logging helper).
+# `-- --locked` goes to the runner, cargo (tauri-cli 2.11.4 interface/rust/desktop.rs `cargo_command`
+# appends these args to `cargo build`): a dependency-resolution change fails the build instead of
+# rewriting Cargo.lock, as every workflow `cargo test` is --locked too.
+echo "ci-tauri-build: $TAURI_CMD build --verbose --target $TRIPLE -- --locked"
 # Not `exec`: the EXIT trap must still remove the API key file after the build.
-"$TAURI_CMD" build --verbose --target "$TRIPLE"
+"$TAURI_CMD" build --verbose --target "$TRIPLE" -- --locked

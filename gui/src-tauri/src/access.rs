@@ -608,31 +608,19 @@ pub fn read_record(dir: &Path) -> AccessRecord {
 /// (see `read_record`'s note on why that does not apply here). The temp name carries the pid and a
 /// sequence number so two concurrent commands of this app never stage into the same file; a temp
 /// orphaned by a crash is inert — nothing reads any name but [`STORE_FILE`].
+///
+/// ⚠ THE TEMP IS CREATED, NEVER OPENED (Phase E final harden, known item 8). It was staged with
+/// `File::create`, which writes THROUGH a symlink planted at the predictable temp name (and
+/// truncates a hard link's target) — and on a failed write then removed whatever sat at that name.
+/// It now goes through `autostart::replace_atomically`, the autostart record's own path:
+/// `config_save::write_new_file` (`O_CREAT|O_EXCL`, so ANY existing name is refused and left as it
+/// was, and the next name is tried), an explicit mode (`autostart::REPLACED_MODE`) rather than the
+/// umask's, `fsync`, then the rename.
 pub fn write_record(dir: &Path, record: &AccessRecord) -> Result<(), String> {
-    use std::io::Write;
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let path = dir.join(STORE_FILE);
     let text = serde_json::to_string_pretty(record)
         .map_err(|e| format!("the access record could not be serialised: {e}"))?;
-    let tmp = dir.join(format!(
-        "{STORE_FILE}.tmp-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let staged = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()
-    })();
-    if let Err(e) = staged {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("{}: {e}", tmp.display()));
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })
+    crate::autostart::replace_atomically(&dir.join(STORE_FILE), text.as_bytes())
 }
 
 /* ── the System Settings deep links ───────────────────────────────────────────────────────────── */

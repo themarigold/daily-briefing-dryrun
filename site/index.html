@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>daily-briefing</title>
+  <meta name="description" content="A local-first morning briefing for developers who work with AI coding assistants: where you left off, what you did, what to do next.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="wrap">
+      <span class="name">daily-briefing</span>
+      <nav aria-label="Sections">
+        <a href="#sample">Sample</a>
+        <a href="#download">Download</a>
+        <a href="#privacy">Privacy</a>
+        <a href="#links">Links</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero wrap" id="what">
+      <h1>Pick up where you left off.</h1>
+      <p class="lede">
+        daily-briefing is a morning briefing for developers who work with AI coding assistants. It reads
+        your local git history and tells you where you left off, what you did, and what to do next,
+        written by the AI you already use and ready when you first sit down.
+      </p>
+      <p>
+        A desktop app for macOS and Linux, and a command-line tool for macOS, Linux and (experimentally)
+        Windows. No account, no server: it runs on your machine.
+      </p>
+      <p class="actions">
+        <a class="button primary" href="https://github.com/themarigold/daily-briefing/releases/latest">Download the latest release</a>
+        <a class="button" href="#sample">See a sample</a>
+      </p>
+    </section>
+
+    <section class="wrap" id="sample">
+      <h2>A sample briefing</h2>
+      <p class="note">This is an invented example: the repositories, commits and branch are made up.</p>
+<pre class="briefing">☀️  Daily briefing — 2026-10-01  (this machine: laptop)
+
+▶ Where you left off  (first wake past 07:20 · state as of 08:12)
+   • [invoice-api] On branch feat/retry-queue (ahead 3, behind 0)
+   • [invoice-api] finish the retry queue: the backoff test still fails on the third attempt
+   • [web-dashboard] the chart legend refactor is half done; legend.ts is uncommitted
+
+▶ What you did — 4 commits
+   • [invoice-api] src/retry.ts — 2 commits (Sep 30)
+      ◦ [invoice-api] added exponential backoff to the payment webhook retries  (4f2a91c)
+      ◦ [invoice-api] capped retries at five attempts and logged the final failure  (b7d03e8)
+   • [invoice-api] fixed the currency rounding in PDF totals  (19c5e40)
+   • [web-dashboard] moved the date picker to the shared components folder  (e81b2d7)
+   • [web-dashboard] 🔀 1 PR merged (#42) (Sep 30)  (a3f9c10)
+
+▶ Suggested next
+   • [invoice-api] make the backoff test deterministic by injecting the clock, then push feat/retry-queue
+   • [web-dashboard] commit legend.ts or stash it before starting the next chart
+   • [invoice-api] add a test for rounding a total that ends in .005
+
+— generated via claude</pre>
+    </section>
+
+    <section class="wrap" id="download">
+      <h2>Download</h2>
+      <p>Every file is on the latest release page, with a <code>SHA256SUMS</code> file to check it against.</p>
+      <div class="cards">
+        <div class="card">
+          <h3>macOS app</h3>
+          <p>A <code>.dmg</code> for Apple silicon or Intel. The app is not notarized, so the first open needs
+            <strong>Open Anyway</strong> in System Settings.</p>
+          <a class="button primary" href="https://github.com/themarigold/daily-briefing/releases/latest">macOS download</a>
+        </div>
+        <div class="card">
+          <h3>Linux app</h3>
+          <p>An AppImage, or a <code>.deb</code> for Debian and Ubuntu (x86_64).</p>
+          <a class="button primary" href="https://github.com/themarigold/daily-briefing/releases/latest">Linux download</a>
+        </div>
+        <div class="card">
+          <h3>Command line</h3>
+          <p>With <a href="https://brew.sh">Homebrew</a>:</p>
+          <pre class="cmd">brew install themarigold/tap/daily-briefing</pre>
+          <p>or a single binary for macOS, Linux or Windows (experimental).</p>
+          <a class="button" href="https://github.com/themarigold/daily-briefing/releases/latest">Binaries</a>
+        </div>
+      </div>
+      <p>
+        Step-by-step instructions, including the macOS first-open steps, are in the
+        <a href="https://github.com/themarigold/daily-briefing/blob/main/docs/INSTALL.md">install guide</a>.
+        You also need git and an AI to write the briefing: an installed AI coding tool such as
+        <code>claude</code>, an API key, or a local model.
+      </p>
+    </section>
+
+    <section class="wrap" id="privacy">
+      <h2>Privacy</h2>
+      <p>
+        daily-briefing is local-first and has no telemetry of its own: no analytics, no usage or crash
+        reporting, no account, and no server of its own. It reaches the network in five places, and no
+        others. The AI provider you choose: the prompt, built from your commit subjects, short hashes and dates, the
+        names of changed and uncommitted files, repository and branch names, and stash messages, goes to
+        that provider under its terms, through the AI tool you configure
+        (<code>provider.cli</code>) or as one HTTP(S) request per attempt to the API endpoint you set
+        (<code>provider.api</code>), which is encrypted only if that endpoint is <code>https://</code> (a
+        plain <code>http://</code> endpoint that is not on your own machine sends the prompt and your API
+        key unencrypted). Point it at a local model and the prompt never leaves your machine.
+        A connectivity check before it generates, and, on macOS, each time the desktop app opens: a TCP connection
+        to the hosts in <code>networkProbeHosts</code> (by default 1.1.1.1 and 8.8.8.8, or your API
+        endpoint), opened and closed with no data sent, which you can turn off.
+        GitHub, only if you turn on the update check or ask for one: a single anonymous request to
+        <code>api.github.com</code> for the latest release, carrying the version number, and after the
+        first answer GitHub's own cache tag, and nothing about you or your code. Your repository's own
+        remote, only in a partial clone (one made with <code>--filter</code>, or by
+        <code>scalar clone</code>): the tool never runs
+        <code>git fetch</code>, <code>pull</code> or
+        <code>push</code>, but when it reads such a repository's history, git itself downloads the file
+        contents it is missing from that remote, with your usual git credentials. A normal clone never
+        does this. Otherwise <code>git</code> only reads your local repositories. It can also start
+        helper programs your own git configuration names (a diff driver, an fsmonitor hook, or a
+        filter), and what those contact is up to
+        them. And the Bun runtime the engine is built with, only if Bun itself crashes: on macOS and
+        Windows it can send Bun's team a crash trace (Bun's version, your platform, an internal stack
+        trace, the crash reason and which Bun features were used; no source code or personal information, per Bun) to
+        <code>bun.report</code>. The desktop app and the macOS schedule turn this off; for a run you start
+        from a terminal, or the experimental Windows schedule, set <code>DO_NOT_TRACK=1</code> to turn it
+        off.
+        <a href="https://github.com/themarigold/daily-briefing#privacy">The full privacy notes</a>
+      </p>
+    </section>
+
+    <section class="wrap" id="links">
+      <h2>Links</h2>
+      <ul class="links">
+        <li><a href="https://github.com/themarigold/daily-briefing">Source code on GitHub</a></li>
+        <li><a href="https://github.com/themarigold/daily-briefing/releases/latest">Latest release</a></li>
+        <li><a href="https://github.com/themarigold/daily-briefing/blob/main/docs/INSTALL.md">Install guide</a></li>
+        <li><a href="https://github.com/themarigold/daily-briefing/blob/main/docs/CONFIG.md">Configuration reference</a></li>
+        <li><a href="https://github.com/themarigold/daily-briefing/blob/main/docs/TROUBLESHOOTING.md">Troubleshooting</a></li>
+        <li><a href="https://github.com/themarigold/daily-briefing/blob/main/SECURITY.md">Reporting a security problem</a></li>
+        <li><a href="https://github.com/themarigold/daily-briefing/issues">Issues</a></li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="wrap foot">
+    <p>MIT licensed. <a href="#what">Back to top</a></p>
+  </footer>
+</body>
+</html>

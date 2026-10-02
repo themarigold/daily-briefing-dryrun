@@ -48,6 +48,9 @@
     type Field,
   } from "../lib/settings-model";
   import AppSettings from "../lib/AppSettings.svelte";
+  import UpdateCheck from "../lib/UpdateCheck.svelte";
+  import { status, updateCheck, type UpdateCheckResult } from "../lib/engine";
+  import { parseUpdateResult, updateFromStatus } from "../lib/update-check";
   import {
     autostartIsEnabled,
     notifyStatus,
@@ -77,6 +80,47 @@
     } catch (e) {
       appAutostart = null;
       appAutostartError = describeFailure(e);
+    }
+  }
+
+  /** Phase E (E12): the update panel's state. `status --json` supplies the LAST recorded answer on
+   *  mount (a pure read, no network); "Check now" replaces it with a fresh one. */
+  let update = $state<UpdateCheckResult | null>(null);
+  let updateLoading = $state(true);
+  let updateChecking = $state(false);
+  let updateError = $state("");
+
+  async function loadUpdate(): Promise<void> {
+    try {
+      update = updateFromStatus(await status());
+      updateError = "";
+    } catch (e) {
+      updateError = describeFailure(e);
+    } finally {
+      updateLoading = false;
+    }
+  }
+
+  /** THE ONE CALL SITE of `updateCheck()` in this webview — the "Check now" button. Nothing calls it
+   *  on mount, on a timer or from the wizard. Not gated on a run being in flight: Rust admits it
+   *  regardless (`Operation::UpdateCheck` takes no in-flight guard). */
+  async function checkNow(): Promise<void> {
+    if (updateChecking) return;
+    updateChecking = true;
+    updateError = "";
+    try {
+      const outcome = await updateCheck();
+      const result = parseUpdateResult(outcome.payload);
+      if (result === null) {
+        const exit = outcome.exitCode === null ? "killed by a signal" : `exit ${outcome.exitCode}`;
+        updateError = `The engine did not return an update-check result (${exit}).${outcome.stderr.trim() !== "" ? `\n${outcome.stderr.trim()}` : ""}`;
+      } else {
+        update = result;
+      }
+    } catch (e) {
+      updateError = describeFailure(e);
+    } finally {
+      updateChecking = false;
     }
   }
 
@@ -112,6 +156,7 @@
 
   onMount(() => {
     void loadApp();
+    void loadUpdate();
     const k = takeKeptSettings();
     if (k === null) {
       void load(false);
@@ -225,6 +270,16 @@
     autostart={appAutostart}
     autostartError={appAutostartError}
     onrefresh={loadApp}
+  />
+
+  <!-- Phase E (E12): the update panel — the last answer and "Check now". The AUTOMATIC check is the
+       engine's `updateCheck` config, edited in the form below with the engine's own help text. -->
+  <UpdateCheck
+    result={update}
+    loading={updateLoading}
+    checking={updateChecking}
+    error={updateError}
+    oncheck={() => void checkNow()}
   />
 
   {#if loadFailure !== ""}

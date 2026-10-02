@@ -1,5 +1,6 @@
 // src/account.ts — account failover: which login the provider spawns under, and the sticky state that
-// decides it. Design notes are maintained privately by the author (see README "Docs").
+// decides it. User-facing behaviour: docs/PROVIDERS.md "Multiple accounts (failover)". Design notes are
+// kept outside this repository (see README "Links").
 //
 // Two halves, deliberately separated:
 //   - `resolveAccount` is PURE — (accounts, state, now) in, a choice out. No I/O, no clock of its own.

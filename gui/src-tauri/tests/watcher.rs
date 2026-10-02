@@ -25,6 +25,12 @@
 //! load, with the writes landing before the watch existed. The only remaining fixed windows assert
 //! ABSENCE (nothing was emitted in [`ABSENCE_WINDOW`]), which can make a mutant slower to catch.
 //!
+//! ⚠ AND WHERE A COUNT MUST BE EXACT, NO BACKEND IS IN THE ROOM (round 3, G3-4). The per-event rule
+//! as wired, the coalescing of a burst, and the real-rescan counter are driven over a state dir
+//! whose parent does not exist (`isolated_state`): the loop holds no watch, so every event it
+//! judges was handed to it through the injectable seam, and every count is an equality — where a
+//! backend-driven test must discount real rescans, and a discount can hide a missing coalesce.
+//!
 //! ⚠ AND AN ABSENCE WINDOW IS ONLY HONEST OVER A DIRECTORY THE BACKEND IS QUIET ABOUT — which is a
 //! CORRECTION, MEASURED. This header used to claim such a window "can never fail a correct
 //! watcher". It can, and it did: macOS FSEvents delivers events for changes made BEFORE the stream
@@ -282,11 +288,12 @@ fn only_the_engine_state_files_count_as_a_change() {
 /// in a loop (Phase E M2's first Linux `cargo test`: 11 failures here, 6 emits in a 1.5 s window in
 /// which only excluded files were touched). See `watcher::is_change`.
 ///
-/// ⚠ THIS PINS THE DECISION ON EVERY PLATFORM; THE LOOP'S USE OF IT IS PINNED ONLY ON LINUX.
-/// FSEvents emits no `Access` kind, so on macOS the loop tests cannot tell a loop that consults
-/// `is_change` from one that does not — MEASURED: with the guard removed from the loop, this file
-/// stays 38/38 green on macOS. Where inotify runs (the Linux `cargo test` job), the absence and
-/// exact-count tests in sections 3 and 4 are what catch it.
+/// ⚠ THIS PINS THE DECISION ON EVERY PLATFORM — AND SINCE THE PHASE E FINAL HARDEN, SO IS THE
+/// LOOP'S USE OF IT. FSEvents emits no `Access` kind, so on macOS no file write can tell a loop
+/// that consults `is_change` from one that does not — MEASURED at M2: with the guard removed from
+/// the loop, this file stayed 38/38 green on macOS, and only the Linux job's absence and
+/// exact-count tests caught it. `the_loop_judges_each_event_by_counts_as_change` now INJECTS the
+/// events into the running loop's own channel, so the wiring is pinned on every platform.
 #[test]
 fn a_read_is_not_a_change() {
     use notify::event::{
@@ -300,6 +307,7 @@ fn a_read_is_not_a_change() {
         // Opening FOR writing changes nothing yet; the write itself is a `Modify`.
         EventKind::Access(AccessKind::Open(AccessMode::Write)),
         EventKind::Access(AccessKind::Open(AccessMode::Execute)),
+        EventKind::Access(AccessKind::Open(AccessMode::Other)),
         EventKind::Access(AccessKind::Read),
         // `IN_CLOSE_NOWRITE` — a read handle closed.
         EventKind::Access(AccessKind::Close(AccessMode::Read)),
@@ -328,10 +336,12 @@ fn a_read_is_not_a_change() {
         EventKind::Modify(ModifyKind::Data(DataChange::Any)),
         EventKind::Modify(ModifyKind::Data(DataChange::Content)),
         EventKind::Modify(ModifyKind::Data(DataChange::Size)),
+        EventKind::Modify(ModifyKind::Data(DataChange::Other)),
         EventKind::Modify(ModifyKind::Name(RenameMode::From)),
         EventKind::Modify(ModifyKind::Name(RenameMode::To)),
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
         EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Other)),
         // `IN_ATTRIB` arrives as `Metadata(Any)`: a chmod or a utimensat is a change, and it cannot
         // be told apart from one.
         EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
@@ -354,6 +364,552 @@ fn a_read_is_not_a_change() {
     for kind in changes {
         assert!(watcher::is_change(&kind), "{kind:?} is a change");
     }
+}
+
+/// ⚠ A RESCAN NOTICE IS A CHANGE WHEN IT CAN COVER THE STATE DIR (Phase E final harden: M2
+/// verifier item 2, tightened in round 2 — B-M4, D-L1, A-L2). inotify reports a queue overflow as a
+/// PATHLESS `Other` + `Flag::Rescan`, which `is_interesting` rejects, so the loop dropped it — and
+/// with it whatever changes the overflow swallowed. Round 1 then counted EVERY rescan, whatever its
+/// path; but FSEvents also hands the loop rescans for the state dir's SIBLINGS (direct children of
+/// the non-recursively watched parent — another app's folder in `~/Library/Application Support`),
+/// which say nothing about the state dir. Now a rescan counts when it has no path, or its path is
+/// the state dir, an ancestor of it, or interesting; everything else is judged exactly as before.
+#[test]
+fn a_rescan_notice_counts_only_when_it_can_cover_the_state_dir() {
+    use notify::event::{AccessKind, AccessMode, DataChange, Flag, ModifyKind};
+    use notify::{Event, EventKind};
+    let targets = WatchTargets::new("/tmp/state");
+    let rescan = || Event::new(EventKind::Other).set_flag(Flag::Rescan);
+    let at = |path: &str| rescan().add_path(PathBuf::from(path));
+    assert!(
+        rescan().paths.is_empty(),
+        "premise: the overflow notice carries no path"
+    );
+    // Counted: no path (inotify's overflow), the state dir, its ancestors, interesting paths.
+    assert!(watcher::counts_as_change(&rescan(), &targets));
+    for counted in [
+        "/tmp/state",
+        "/tmp/state/",
+        "/tmp",
+        "/",
+        "/tmp/state/last-run",
+        "/tmp/state/briefings",
+        "/tmp/state/briefings/2026-09-16.md",
+    ] {
+        assert!(
+            watcher::counts_as_change(&at(counted), &targets),
+            "a rescan of {counted} can cover the state dir and must count"
+        );
+    }
+    // NOT counted: a SIBLING of the state dir (B-M4 — FSEvents delivers these for the parent's
+    // direct children), component-wise near-misses, and paths inside the state dir that cannot
+    // cover a watched file.
+    for ignored in [
+        "/tmp/other-app",
+        "/tmp/sta",
+        "/tmp/state-old",
+        "/tmp/state/briefing.log",
+        "/tmp/state/some-dir",
+        "/elsewhere",
+    ] {
+        assert!(
+            !watcher::counts_as_change(&at(ignored), &targets),
+            "a rescan of {ignored} says nothing about the state dir and must not count"
+        );
+    }
+    // Several paths: one that covers the state dir is enough.
+    assert!(watcher::counts_as_change(
+        &at("/tmp/other-app").add_path(PathBuf::from("/tmp")),
+        &targets
+    ));
+    // The RESOLVED spelling of an ancestor counts too: FSEvents reports canonical paths, and on
+    // macOS a scratch dir under `/var/folders` resolves to `/private/var/folders`.
+    let scratch = ScratchDir::new("rescan-resolved");
+    let state = scratch.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let resolved_parent = std::fs::canonicalize(&scratch.path).expect("canonical");
+    let real = WatchTargets::new(&state);
+    assert!(watcher::counts_as_change(
+        &rescan().add_path(resolved_parent.clone()),
+        &real
+    ));
+    assert!(!watcher::counts_as_change(
+        &rescan().add_path(resolved_parent.join("engine.sh")),
+        &real
+    ));
+    // …and only a rescan notice gets that pass: the same kind without the flag, and every
+    // ordinary event, are judged by kind AND path as before.
+    assert!(!watcher::counts_as_change(
+        &Event::new(EventKind::Other),
+        &targets
+    ));
+    assert!(!watcher::counts_as_change(
+        &Event::new(EventKind::Other).add_path(PathBuf::from("/tmp")),
+        &targets
+    ));
+    let modify = || Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)));
+    assert!(watcher::counts_as_change(
+        &modify().add_path(PathBuf::from("/tmp/state/last-run")),
+        &targets
+    ));
+    assert!(!watcher::counts_as_change(
+        &modify().add_path(PathBuf::from("/tmp/state/briefing.log")),
+        &targets
+    ));
+    assert!(!watcher::counts_as_change(
+        &Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+            .add_path(PathBuf::from("/tmp/state/last-run")),
+        &targets
+    ));
+}
+
+/// `observed` is `expected` plus at most what REAL rescan notices added: each one the loop counted
+/// (`StateWatcher::rescans_counted`) can cost one served batch — one read, one announcement — that
+/// nothing in the test caused, and nothing a test does can stop FSEvents coalescing events onto a
+/// watched directory (round 2, B-M4). With no rescan this IS the exact assertion, and it never
+/// lowers the floor: what a real file change must produce is still required in full.
+///
+/// ⚠ READ `rescans` AFTER `observed`: a rescan is counted before it is served, so every batch
+/// already observed has its rescan in a count read later — the other order could under-discount.
+///
+/// ⚠ AND IT CAN HIDE A MISSING COALESCE, SO NO COALESCING CLAIM RESTS ON IT (round 3, G3-4). A burst
+/// that itself made the backend raise R rescans, served one batch per event by a loop that does not
+/// coalesce at all, reads `R` events against a bound of `expected + R`. So the exact coalescing
+/// pins run over an ISOLATED watcher ([`isolated_state`]), where no backend event can arrive and
+/// nothing is discounted: `an_isolated_burst_is_served_as_exactly_one_batch` and
+/// `the_loop_judges_each_event_by_counts_as_change`.
+fn assert_discounting_rescans(observed: u64, expected: u64, rescans: u64, what: &str) {
+    assert!(
+        (expected..=expected + rescans).contains(&observed),
+        "{what}: observed {observed}, expected exactly {expected} (+ at most {rescans} for real \
+         rescan notices the loop counted)"
+    );
+}
+
+/// A state directory NO BACKEND CAN REPORT ON: neither it nor its parent exists, so the loop's
+/// watch on the parent fails (ignored by design — `spawn_inner`), its identity poll never sees the
+/// directory appear, and the backend holds no watch at all (`StateWatcher::arms` stays 0, which the
+/// callers assert). Every event the loop judges is then one the test handed it through the
+/// injectable seam (`StateWatcher::inject` / `inject_as_backend`), so a count is EXACT — no
+/// `settle_backend`, no rescan discount (round 3, G3-4). `WatchTargets::is_interesting` and
+/// `counts_as_change` judge paths lexically, so a path under a directory that does not exist is
+/// judged exactly like one under a real state dir.
+fn isolated_state(scratch: &ScratchDir) -> PathBuf {
+    let state = scratch.join("never-created").join("state");
+    assert!(
+        !state.exists() && !state.parent().is_some_and(Path::exists),
+        "premise: the isolated state dir and its parent must not exist"
+    );
+    state
+}
+
+/// Start an injectable watcher over [`isolated_state`] and check the isolation premise: the first
+/// pass is done, exactly one read was taken, and no watch exists for a backend to report through.
+///
+/// ⚠ THE LOOP TAKES TWO WATCHES, AND `arms()` COUNTS ONLY ONE (round 4, B4-I1): it counts the
+/// recursive watch on the state dir; the non-recursive watch on its PARENT is attempted once, in
+/// `spawn_inner`, before the loop starts, and is not counted anywhere. That one is ruled out by the
+/// parent's absence — a watch on a path that does not exist fails — so the absence is re-asserted
+/// here, after the spawn, rather than trusted from [`isolated_state`]'s check before it.
+fn isolated_watcher(
+    state: &Path,
+    source: Arc<Fixed>,
+    sink: Arc<Counter>,
+    quiet: Duration,
+    ceiling: Duration,
+) -> StateWatcher {
+    let w = watcher::spawn_injectable(
+        WatchTargets::new(state),
+        source.clone(),
+        sink,
+        file_only(quiet, ceiling),
+    )
+    .expect("the watcher starts");
+    assert!(w.wait_until(PATIENCE, StateWatcher::is_ready));
+    assert!(
+        !state.parent().is_some_and(Path::exists),
+        "premise: the state dir's parent still does not exist after the spawn, so the loop's \
+         parent watch (taken in spawn_inner, not counted by arms()) could not have been taken"
+    );
+    assert_eq!(
+        w.arms(),
+        0,
+        "premise: no watch on the state dir was taken (arms() counts that one only) — with the \
+         parent watch ruled out above, no backend event can arrive"
+    );
+    assert_eq!(
+        source.calls(),
+        1,
+        "premise: the first pass read the engine once"
+    );
+    w
+}
+
+/// THE LOOP'S PER-EVENT RULE, AS WIRED — ON EVERY PLATFORM (Phase E final harden, M2 verifier item
+/// 4). Events are INJECTED into the running loop's own channel (`StateWatcher::inject`), tagged so
+/// the loop counts them apart from anything else, and each is judged in turn: a READ of a watched
+/// file and a change to an EXCLUDED file are not counted and announce nothing — over a FULL debounce
+/// window, so a loop that queued a refresh for them could not hide it by coalescing it into the next
+/// counted event (round 2, C2-M1); a change to a watched file and a PATHLESS rescan notice are each
+/// counted and each served as a real engine read and one announcement. On macOS this is the only
+/// test that can tell a loop which consults `is_change` from one that does not (FSEvents emits no
+/// `Access` kind).
+///
+/// ⚠ ISOLATED, SO EVERY COUNT IS EXACT (round 3, G3-4). It used to run over a real state dir and
+/// discount real rescans (`assert_discounting_rescans`), which let a backend event stand in for the
+/// very refresh the absence check exists to catch. Over [`isolated_state`] no backend event can
+/// arrive, so "nothing was announced" means NOTHING, and the totals are equalities.
+#[test]
+fn the_loop_judges_each_event_by_counts_as_change() {
+    use notify::event::{AccessKind, AccessMode, DataChange, Flag, ModifyKind};
+    use notify::{Event, EventKind};
+    let scratch = ScratchDir::new("inject");
+    let state = isolated_state(&scratch);
+    let sink = Arc::new(Counter::default());
+    let source = Arc::new(Fixed::new(Snapshot::unavailable("counted, not used")));
+    const QUIET: Duration = Duration::from_millis(50);
+    const CEILING: Duration = Duration::from_millis(400);
+    let mut w = isolated_watcher(&state, source.clone(), sink.clone(), QUIET, CEILING);
+    let judged = |w: &StateWatcher, n: u64| {
+        assert!(
+            w.wait_until(PATIENCE, |w| w.injected_seen() >= n),
+            "the loop never judged injected event {n}"
+        );
+    };
+
+    // 1. A READ of a watched file — inotify's `IN_OPEN`, which FSEvents never produces.
+    w.inject(
+        Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+            .add_path(state.join("last-run")),
+    );
+    judged(&w, 1);
+    assert_eq!(w.injected_counted(), 0, "a READ was counted as a change");
+
+    // 2. A change to an EXCLUDED file.
+    w.inject(
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(state.join("briefing.log")),
+    );
+    judged(&w, 2);
+    assert_eq!(
+        w.injected_counted(),
+        0,
+        "a change to an excluded file was counted"
+    );
+    // Neither was served — judged over a FULL debounce window, not merely "judged" (round 2,
+    // C2-M1). A loop that queued a refresh for a rejected event serves it one quiet period later,
+    // the ceiling at the latest; asserted straight after the judging, that refresh is still
+    // pending, and injection 3 below would coalesce with it and hide it.
+    assert!(
+        ABSENCE_WINDOW > CEILING + QUIET,
+        "the window must outlast a whole batch"
+    );
+    std::thread::sleep(ABSENCE_WINDOW);
+    assert_eq!(sink.n(), 0, "an uncounted event was announced");
+    assert_eq!(source.calls(), 1, "an uncounted event was read");
+
+    // 3. A change to a WATCHED file: counted, served as one real read and one announcement.
+    w.inject(
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(state.join("last-run")),
+    );
+    judged(&w, 3);
+    assert_eq!(w.injected_counted(), 1);
+    assert_eq!(
+        sink.wait_for(1, PATIENCE),
+        1,
+        "the counted change was never served"
+    );
+
+    // 4. A PATHLESS rescan notice — inotify's queue overflow: counted and served too.
+    w.inject(Event::new(EventKind::Other).set_flag(Flag::Rescan));
+    judged(&w, 4);
+    assert_eq!(
+        w.injected_counted(),
+        2,
+        "a queue-overflow rescan notice was dropped; the changes it stands for would be missed"
+    );
+    assert_eq!(sink.wait_for(2, PATIENCE), 2, "the rescan was never served");
+    std::thread::sleep(ABSENCE_WINDOW);
+    // Stopped BEFORE anything is counted: the loop thread is joined, so the counts are final.
+    w.stop();
+    assert_eq!(
+        sink.n(),
+        2,
+        "two counted events → exactly two announcements"
+    );
+    assert_eq!(
+        source.calls(),
+        3,
+        "each announcement is one real read, plus the first pass's"
+    );
+    assert_eq!(
+        w.rescans_counted(),
+        0,
+        "isolation: no backend event arrived"
+    );
+}
+
+/// THE COALESCING PIN THAT NOTHING CAN BLUR (round 3, G3-4). A burst of counted events all inside
+/// one quiet window is ONE served batch — one engine read, one announcement — EXACTLY: a burst of
+/// ordinary changes to watched files, then a burst of rescan notices (pathless, and on the state dir
+/// itself). Over [`isolated_state`], so no backend event joins either burst and no allowance is
+/// subtracted; the backend-driven `twenty_rapid_writes_coalesce_to_a_bounded_number_of_events` keeps
+/// its documented bound, but its rescan allowance could not tell a loop that serves every event
+/// from one that coalesces, and this can.
+///
+/// ⚠ THE PREMISE IS JUDGED WHERE THE DEBOUNCE IS — ON THE CONSUMER SIDE (round 4, G4-4). The burst
+/// is one window only if the LOOP judged all of it inside one quiet period: it stamps the debounce
+/// when it processes an event, not when the test sends it. Round 3 timed the SENDING, so a loop
+/// thread descheduled for a quiet period between recording one event and checking `due` served a
+/// prefix of a burst the test had sent in a millisecond, and a correct loop failed. The span is now
+/// read from the stamps the loop recorded (`StateWatcher::injected_stamps`, the very `Instant`s it
+/// handed the debounce): a split needs a `due` check at least `QUIET` after some event's stamp and
+/// before the next one's, so a span under `QUIET` rules a split out, whoever was slow. (It also
+/// covers a slow sender: a gap in the sending is a gap between stamps.)
+///
+/// A span of `QUIET` or more does not say the loop is wrong — it says this attempt could not judge
+/// it — so the attempt is INCONCLUSIVE and re-run on a fresh watcher ([`retry_inconclusive`]). A count
+/// that fails with the premise held fails at once: it is an assertion inside the attempt, and the
+/// harness never catches a panic.
+#[test]
+fn an_isolated_burst_is_served_as_exactly_one_batch() {
+    retry_inconclusive(3, isolated_burst_attempt);
+}
+
+/// One attempt of [`an_isolated_burst_is_served_as_exactly_one_batch`], on its own watcher. `Err` is
+/// a premise miss (inconclusive); every count is an assertion.
+fn isolated_burst_attempt(attempt: u32) -> Result<(), String> {
+    use notify::event::{DataChange, Flag, ModifyKind};
+    use notify::{Event, EventKind};
+    let scratch = ScratchDir::new(&format!("burst-isolated-{attempt}"));
+    let state = isolated_state(&scratch);
+    let sink = Arc::new(Counter::default());
+    let source = Arc::new(Fixed::new(Snapshot::unavailable("counted, not used")));
+    // A long quiet period and a ceiling no burst reaches: the burst is one window by construction.
+    const QUIET: Duration = Duration::from_millis(500);
+    const CEILING: Duration = Duration::from_secs(60);
+    const BURST: u64 = 20;
+    let mut w = isolated_watcher(&state, source.clone(), sink.clone(), QUIET, CEILING);
+    assert!(
+        ABSENCE_WINDOW > QUIET,
+        "the window must outlast the quiet period"
+    );
+
+    let (changed, rescanned) = (state.clone(), state.clone());
+    let bursts: [(&str, Box<dyn Fn(u64) -> Event>); 2] = [
+        (
+            "ordinary changes",
+            Box::new(move |i| {
+                let name = WATCHED_NAMES[usize::try_from(i).expect("small") % WATCHED_NAMES.len()];
+                Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(changed.join(name))
+            }),
+        ),
+        (
+            "rescan notices",
+            Box::new(move |i| {
+                let notice = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+                if i % 2 == 0 {
+                    notice
+                } else {
+                    notice.add_path(rescanned.clone())
+                }
+            }),
+        ),
+    ];
+    for (round, (what, make)) in (1u64..).zip(bursts.iter()) {
+        for i in 0..BURST {
+            w.inject(make(i));
+        }
+        assert!(
+            w.wait_until(PATIENCE, |w| w.injected_seen() >= round * BURST),
+            "the loop never judged the {what} burst"
+        );
+        assert_eq!(
+            w.injected_counted(),
+            round * BURST,
+            "every event of the {what} burst counts as a change"
+        );
+        // The premise, from the loop's own stamps — final once `injected_seen` says so.
+        let stamps = w.injected_stamps();
+        assert_eq!(
+            u64::try_from(stamps.len()).expect("small"),
+            round * BURST,
+            "one stamp per counted event of the {what} burst"
+        );
+        let first = usize::try_from((round - 1) * BURST).expect("small");
+        let last = usize::try_from(round * BURST - 1).expect("small");
+        let span = stamps[last].duration_since(stamps[first]);
+        if span >= QUIET {
+            return Err(format!(
+                "the loop judged the {what} burst over {span:?}, not inside one {QUIET:?} quiet \
+                 period, so a split would prove nothing"
+            ));
+        }
+        assert!(
+            sink.wait_for(round, PATIENCE) >= round,
+            "the {what} burst was never served"
+        );
+        // A loop that served each event, or split the burst, would announce more within a window.
+        std::thread::sleep(ABSENCE_WINDOW);
+        assert_eq!(
+            sink.n(),
+            round,
+            "{BURST} {what} inside one quiet period must be served as EXACTLY one batch"
+        );
+        assert_eq!(
+            source.calls(),
+            round + 1,
+            "{BURST} {what} inside one quiet period must cost EXACTLY one engine read"
+        );
+    }
+    w.stop();
+    assert_eq!(
+        w.rescans_counted(),
+        0,
+        "isolation: no backend event arrived"
+    );
+    Ok(())
+}
+
+/// Run `attempt` (numbered from 1) until it returns `Ok`, at most `attempts` times (round 4, G4-4).
+/// `Err` is an INCONCLUSIVE attempt — its premise did not hold, so its counts could not judge the
+/// loop — and only that is re-run. An assertion that fails inside an attempt panics straight
+/// through: there is no `catch_unwind` here, so a failure with the premise held is never retried.
+/// Inconclusive every time is a loud failure, never a pass.
+fn retry_inconclusive(attempts: u32, mut attempt: impl FnMut(u32) -> Result<(), String>) {
+    let mut why = Vec::new();
+    for n in 1..=attempts {
+        match attempt(n) {
+            Ok(()) => return,
+            Err(reason) => {
+                eprintln!(
+                    "attempt {n}/{attempts} inconclusive: {reason} — re-running on a fresh watcher"
+                );
+                why.push(reason);
+            }
+        }
+    }
+    panic!("no attempt's premise held in {attempts} attempts, so nothing was judged: {why:?}");
+}
+
+/// The burst's retry harness is the one place that could hide a failure, so it is pinned on
+/// scripted attempts, like `exact_unless_rescanned`: a failing attempt is re-raised at once and
+/// never re-run; an inconclusive one is re-run and a later pass ends it; inconclusive every time
+/// fails loudly.
+#[test]
+fn the_burst_retry_re_runs_only_an_inconclusive_attempt() {
+    use std::sync::atomic::AtomicU32;
+
+    static FAILING: AtomicU32 = AtomicU32::new(0);
+    let r = std::panic::catch_unwind(|| {
+        retry_inconclusive(3, |_| {
+            FAILING.fetch_add(1, Ordering::SeqCst);
+            panic!("a premise-held count failed");
+        })
+    });
+    assert!(r.is_err(), "a failure was swallowed");
+    assert_eq!(FAILING.load(Ordering::SeqCst), 1, "a failure was retried");
+
+    let mut runs = 0;
+    retry_inconclusive(3, |n| {
+        runs += 1;
+        if n == 1 {
+            Err("slow".to_string())
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(
+        runs, 2,
+        "an inconclusive attempt is re-run, and a pass ends it"
+    );
+
+    static ALWAYS: AtomicU32 = AtomicU32::new(0);
+    let r = std::panic::catch_unwind(|| {
+        retry_inconclusive(3, |_| {
+            ALWAYS.fetch_add(1, Ordering::SeqCst);
+            Err("slow".to_string())
+        })
+    });
+    assert!(r.is_err(), "no attempt could judge, and it passed anyway");
+    assert_eq!(ALWAYS.load(Ordering::SeqCst), 3);
+}
+
+/// `rescans_counted` COUNTS WHAT IT SAYS (round 3, B3-L2): REAL rescan notices the loop counted as a
+/// change — and nothing else. Driven backend-free over [`isolated_state`], with events handed to the
+/// loop UNTAGGED (`StateWatcher::inject_as_backend`) so it treats them as the backend's: an ordinary
+/// counted change leaves the counter at 0; a counted rescan adds exactly 1; a rescan that cannot
+/// cover the state dir (a sibling's) and a TAGGED rescan (`inject`) add nothing. It is the number
+/// every discounted assertion in this file subtracts, so an over-count would loosen them and an
+/// under-count would flake them.
+#[test]
+fn rescans_counted_counts_only_real_counted_rescans() {
+    use notify::event::{DataChange, Flag, ModifyKind};
+    use notify::{Event, EventKind};
+    let scratch = ScratchDir::new("rescans-counted");
+    let state = isolated_state(&scratch);
+    let sink = Arc::new(Counter::default());
+    let source = Arc::new(Fixed::new(Snapshot::unavailable("counted, not used")));
+    let mut w = isolated_watcher(
+        &state,
+        source.clone(),
+        sink.clone(),
+        Duration::from_millis(50),
+        Duration::from_millis(400),
+    );
+
+    // 1. An ordinary counted change, as the backend would send it: served, and NOT a rescan.
+    w.inject_as_backend(
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(state.join("last-run")),
+    );
+    assert_eq!(sink.wait_for(1, PATIENCE), 1, "the change was never served");
+    assert_eq!(
+        w.rescans_counted(),
+        0,
+        "an ordinary change was counted as a rescan"
+    );
+
+    // 2. A counted rescan notice (pathless — inotify's overflow), as the backend would send it.
+    w.inject_as_backend(Event::new(EventKind::Other).set_flag(Flag::Rescan));
+    assert_eq!(sink.wait_for(2, PATIENCE), 2, "the rescan was never served");
+    assert_eq!(
+        w.rescans_counted(),
+        1,
+        "a counted real rescan must add exactly one"
+    );
+
+    // 3. A rescan on a SIBLING (cannot cover the state dir: not counted) from the backend, then a
+    //    TAGGED counted rescan. The channel is FIFO, so once the tagged one is judged the sibling's
+    //    was too; the tagged one is served, and neither is a real counted rescan.
+    w.inject_as_backend(
+        Event::new(EventKind::Other)
+            .set_flag(Flag::Rescan)
+            .add_path(scratch.join("never-created").join("another-app")),
+    );
+    w.inject(Event::new(EventKind::Other).set_flag(Flag::Rescan));
+    assert!(w.wait_until(PATIENCE, |w| w.injected_seen() >= 1));
+    assert_eq!(w.injected_counted(), 1);
+    assert_eq!(
+        sink.wait_for(3, PATIENCE),
+        3,
+        "the tagged rescan was never served"
+    );
+    std::thread::sleep(ABSENCE_WINDOW);
+    w.stop();
+    assert_eq!(
+        w.rescans_counted(),
+        1,
+        "an uncounted (sibling) rescan or a tagged one was counted as a real rescan"
+    );
+    assert_eq!(sink.n(), 3, "the sibling's rescan was served");
+    assert_eq!(
+        source.calls(),
+        4,
+        "one read per served batch, plus the first pass's"
+    );
 }
 
 /// ⚠ THE macOS SYMLINK TRAP, PINNED. `$TMPDIR` is under `/var/folders`, `/var` is a symlink to
@@ -716,38 +1272,52 @@ fn one_debounced_event_carries_the_state_the_files_describe() {
     // spawns) later. The window below is an ABSENCE check, so its length cannot fail a correct
     // watcher OVER A DIRECTORY THE BACKEND IS QUIET ABOUT — which is what the `settle_backend`
     // above is for, and without which this exact assertion is the one that flaked. It only bounds
-    // how slow a mutant may be and still be caught.
+    // how slow a mutant may be and still be caught. The one thing no settling can stop — FSEvents
+    // coalescing events onto the scratch dir into a RESCAN notice the loop rightly serves — is
+    // discounted, and only that (round 2, B-M4; `assert_discounting_rescans`).
     std::thread::sleep(ABSENCE_WINDOW);
-    assert_eq!(
-        sink.n(),
+    let (announced, reads) = (sink.n(), w.reads());
+    let rescans = w.rescans_counted();
+    assert_discounting_rescans(
+        announced,
         0,
-        "the watcher announced a change that never happened"
+        rescans,
+        "the watcher announced a change that never happened",
     );
-    assert_eq!(
-        w.reads(),
+    assert_discounting_rescans(
+        reads,
         1,
-        "the first pass must read the engine exactly once"
+        rescans,
+        "the first pass must read the engine exactly once",
     );
 
     let today = now_local().local_date;
+    let before = sink.n();
     std::fs::write(state.join("last-run"), format!("{today}\n")).expect("marker");
     std::fs::write(state.join("briefing-latest.md"), "# Today\n").expect("briefing");
 
-    let seen = sink.wait_for(1, PATIENCE);
+    let seen = sink.wait_for(before + 1, PATIENCE);
     // Let the coalescer settle so a second, spurious event would be visible.
     let total = sink.wait_quiet(Duration::from_millis(800), PATIENCE);
     w.stop();
 
-    assert!(seen >= 1, "no `state:changed` arrived within {PATIENCE:?}");
+    assert!(
+        seen > before,
+        "no `state:changed` arrived within {PATIENCE:?}"
+    );
     // ⚠ A REGISTERED TOLERANCE OF ONE, NOT AN EXACT 1, and not a vacuous bound either. The two
     // writes are 0 ms apart, but the backend may hand them over in two deliveries, and a delivery
     // that lands after the first batch was already served is a correct second read — an exact `1`
     // would fail a correct watcher on a loaded machine. MEASURED (review round 2): with the debounce
     // switched off (quiet 0) this same test produced 6 events and went red 3 runs in 3, so `<= 2`
     // still catches a watcher that does not coalesce. Deviation register, `docs/gui-seam.md` §9.
+    // Counted over the WHOLE run (the absence window's batches included), so the discount is the
+    // whole run's rescans, read after the stop.
+    let rescans = w.rescans_counted();
     assert!(
-        total <= 2,
-        "two file writes 0ms apart produced {total} events; the debounce is not coalescing"
+        total <= 2 + rescans,
+        "two file writes 0ms apart produced {total} events (+ at most {rescans} for real rescan \
+         notices); the debounce is not coalescing"
     );
 
     let value = sink.last().expect("a payload was recorded");
@@ -795,21 +1365,29 @@ fn twenty_rapid_writes_coalesce_to_a_bounded_number_of_events() {
     let burst = started.elapsed();
 
     sink.wait_for(1, PATIENCE);
-    let events = sink.wait_quiet(Duration::from_millis(800), PATIENCE);
-    let reads = source.calls();
+    sink.wait_quiet(Duration::from_millis(800), PATIENCE);
+    // Stopped BEFORE anything is counted (round 2, R4): the loop thread is joined, so a batch a
+    // real rescan started cannot land between the two reads below and break their pairing.
     w.stop();
+    let (events, reads) = (sink.n(), source.calls());
+    let rescans = w.rescans_counted();
 
     // ceil(burst / ceiling) + 1, with one extra slot of slack for a backend that delivers the tail
     // of the burst after the first fire.
     let bound = (burst.as_millis() as u64).div_ceil(DEBOUNCE_CEILING.as_millis() as u64) + 2;
     println!(
         "MEASURED: 20 writes in {burst:?} → {events} state:changed event(s), {reads} engine \
-         read(s) (one of them the first pass's); bound {bound}"
+         read(s) (one of them the first pass's), {rescans} real rescan(s); bound {bound}"
     );
     assert!(events >= 1, "the burst produced no events at all");
+    // The bound is on what the BURST costs; a real rescan notice can add at most one batch of its
+    // own (round 2, R4 — `assert_discounting_rescans`'s arithmetic, here on an upper bound only).
+    // ⚠ That allowance means this bound alone cannot prove coalescing (round 3, G3-4): the EXACT
+    // pin is `an_isolated_burst_is_served_as_exactly_one_batch`, with no backend to discount.
     assert!(
-        events <= bound,
-        "20 writes in {burst:?} produced {events} events, over the bound of {bound}"
+        events <= bound + rescans,
+        "20 writes in {burst:?} produced {events} events, over the bound of {bound} (+ at most \
+         {rescans} for real rescan notices)"
     );
     assert_eq!(
         events + 1,
@@ -1195,6 +1773,116 @@ impl Timed {
     }
 }
 
+thread_local! {
+    /// `rescans_counted()` of the last hand-clock watcher dropped on this thread — what
+    /// [`exact_unless_rescanned`] reads after an attempt, one that panicked included (the `Timed`
+    /// is dropped while the panic unwinds, before `catch_unwind` returns).
+    static LAST_TIMED_RESCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        LAST_TIMED_RESCANS.with(|c| c.set(self.w.rescans_counted()));
+    }
+}
+
+/// ⚠ A HAND-CLOCK TEST'S COUNTS ARE EXACT ONLY OVER A RUN NO REAL RESCAN TOUCHED — so such a run
+/// is RE-RUN, not discounted (Phase E final harden round 2, R4).
+///
+/// These tests watch a real scratch dir, and nothing a test does can stop FSEvents coalescing
+/// events onto it into a rescan notice the loop rightly serves as a file batch. In the event-driven
+/// tests that can only ADD a batch, which `assert_discounting_rescans` subtracts exactly. Here it
+/// can also ABSORB one: a batch served after the hand clock moved re-reads the engine at the new
+/// instant and re-bases the loop's clock, so the boundary or periodic read the test is about never
+/// happens (`boundary_reads` 0, not 1), its gap check sees a read the period did not cause, and a
+/// payload can come from the batch rather than the boundary — which could also PASS a broken
+/// boundary read. A discount there would have to lower what the boundary itself must produce. So an
+/// attempt with any real rescan counted is inconclusive whatever its outcome, and is run again;
+/// one with none is final — its assertions exact, its failure re-raised unchanged.
+fn exact_unless_rescanned(scenario: fn()) {
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        LAST_TIMED_RESCANS.with(|c| c.set(0));
+        let outcome = std::panic::catch_unwind(scenario);
+        let rescans = LAST_TIMED_RESCANS.with(|c| c.get());
+        if rescans == 0 {
+            if let Err(panic) = outcome {
+                std::panic::resume_unwind(panic);
+            }
+            return;
+        }
+        eprintln!(
+            "attempt {attempt}/{ATTEMPTS}: the loop counted {rescans} real rescan notice(s), so this \
+             attempt's counts are not exact ({}) — re-running",
+            if outcome.is_ok() { "it passed" } else { "it failed" }
+        );
+    }
+    panic!(
+        "a real rescan notice landed in all {ATTEMPTS} attempts — something keeps coalescing \
+         events onto the scratch dir; no attempt was exact enough to judge"
+    );
+}
+
+/// The retry harness is the one place that could hide a failure, so it is pinned on scripted
+/// attempts (each sets what a dropped `Timed` would have recorded): a CLEAN failure is re-raised at
+/// once and never retried; an attempt with a real rescan is re-run whether it passed or failed; a
+/// clean pass ends it; and rescans in every attempt fail loudly rather than pass.
+#[test]
+fn the_rescan_retry_re_raises_a_clean_failure_and_re_runs_only_a_rescanned_attempt() {
+    use std::sync::atomic::AtomicU32;
+
+    // A clean failure: re-raised on the FIRST attempt.
+    static CLEAN_FAIL: AtomicU32 = AtomicU32::new(0);
+    let r = std::panic::catch_unwind(|| {
+        exact_unless_rescanned(|| {
+            CLEAN_FAIL.fetch_add(1, Ordering::SeqCst);
+            panic!("a real failure");
+        })
+    });
+    assert!(r.is_err(), "a clean failure was swallowed");
+    assert_eq!(
+        CLEAN_FAIL.load(Ordering::SeqCst),
+        1,
+        "a clean failure was retried"
+    );
+
+    // Rescanned and failed, then clean and passing: re-run once, and passes.
+    static FAIL_THEN_PASS: AtomicU32 = AtomicU32::new(0);
+    exact_unless_rescanned(|| {
+        if FAIL_THEN_PASS.fetch_add(1, Ordering::SeqCst) == 0 {
+            LAST_TIMED_RESCANS.with(|c| c.set(1));
+            panic!("disturbed by a rescan");
+        }
+    });
+    assert_eq!(FAIL_THEN_PASS.load(Ordering::SeqCst), 2);
+
+    // Rescanned and PASSED, then clean and failing: the pass was inconclusive — the clean failure
+    // is what stands.
+    static PASS_THEN_FAIL: AtomicU32 = AtomicU32::new(0);
+    let r = std::panic::catch_unwind(|| {
+        exact_unless_rescanned(|| {
+            if PASS_THEN_FAIL.fetch_add(1, Ordering::SeqCst) == 0 {
+                LAST_TIMED_RESCANS.with(|c| c.set(1));
+            } else {
+                panic!("the real verdict");
+            }
+        })
+    });
+    assert!(r.is_err(), "a pass under a rescan was taken as final");
+    assert_eq!(PASS_THEN_FAIL.load(Ordering::SeqCst), 2);
+
+    // A rescan in every attempt: loud, never a pass.
+    static ALWAYS: AtomicU32 = AtomicU32::new(0);
+    let r = std::panic::catch_unwind(|| {
+        exact_unless_rescanned(|| {
+            ALWAYS.fetch_add(1, Ordering::SeqCst);
+            LAST_TIMED_RESCANS.with(|c| c.set(1));
+        })
+    });
+    assert!(r.is_err(), "no attempt was exact, and it passed anyway");
+    assert_eq!(ALWAYS.load(Ordering::SeqCst), 3);
+}
+
 /// Run a watcher over a scripted source, with the hand clock. `unhealthy_read_every` is an hour
 /// unless the test is about it.
 fn timed_watcher(
@@ -1258,48 +1946,50 @@ impl TempState {
 /// the engine's own answer may have turned. Inside the deadline, nothing is read.
 #[test]
 fn a_waiting_state_goes_stale_when_the_clock_passes_the_deadline() {
-    let (status, schedule) = envelopes(None, "2026-09-16T15:55:00.000Z", "2026-09-16");
-    let mut t = timed_watcher(local("2026-09-16", 9, 0, 0), status, schedule, HOUR, HOUR);
-    assert_eq!(t.sink.n(), 0);
+    exact_unless_rescanned(|| {
+        let (status, schedule) = envelopes(None, "2026-09-16T15:55:00.000Z", "2026-09-16");
+        let mut t = timed_watcher(local("2026-09-16", 9, 0, 0), status, schedule, HOUR, HOUR);
+        assert_eq!(t.sink.n(), 0);
 
-    // Still inside the deadline: nothing to say, and nothing read.
-    t.set_clock(local("2026-09-16", 9, 15, 0));
-    std::thread::sleep(ABSENCE_WINDOW);
-    assert_eq!(t.sink.n(), 0, "an unchanged state was announced");
-    assert_eq!(
-        t.source.calls(),
-        1,
-        "a clock move inside the deadline read the engine"
-    );
+        // Still inside the deadline: nothing to say, and nothing read.
+        t.set_clock(local("2026-09-16", 9, 15, 0));
+        std::thread::sleep(ABSENCE_WINDOW);
+        assert_eq!(t.sink.n(), 0, "an unchanged state was announced");
+        assert_eq!(
+            t.source.calls(),
+            1,
+            "a clock move inside the deadline read the engine"
+        );
 
-    // Past it.
-    t.set_clock(local("2026-09-16", 9, 16, 0));
-    let seen = t.sink.wait_for(1, PATIENCE);
-    let reads = t.source.calls();
-    let boundary_reads = t.w.boundary_reads();
-    t.w.stop();
-    assert!(
-        seen >= 1,
-        "the heartbeat went stale and nothing was emitted"
-    );
-    assert_eq!(
-        t.sink.phases().first().map(String::as_str),
-        Some("agent-stale")
-    );
-    assert_eq!(
-        (reads, boundary_reads),
-        (2, 1),
-        "crossing the stale deadline must be exactly one real read"
-    );
-    let payload = t.sink.last().expect("a payload");
-    assert_eq!(
-        payload["scheduleState"]["statusLine"],
-        "Scheduler has not checked in"
-    );
-    assert!(
-        payload["status"].is_object(),
-        "the envelopes ride along: {payload}"
-    );
+        // Past it.
+        t.set_clock(local("2026-09-16", 9, 16, 0));
+        let seen = t.sink.wait_for(1, PATIENCE);
+        let reads = t.source.calls();
+        let boundary_reads = t.w.boundary_reads();
+        t.w.stop();
+        assert!(
+            seen >= 1,
+            "the heartbeat went stale and nothing was emitted"
+        );
+        assert_eq!(
+            t.sink.phases().first().map(String::as_str),
+            Some("agent-stale")
+        );
+        assert_eq!(
+            (reads, boundary_reads),
+            (2, 1),
+            "crossing the stale deadline must be exactly one real read"
+        );
+        let payload = t.sink.last().expect("a payload");
+        assert_eq!(
+            payload["scheduleState"]["statusLine"],
+            "Scheduler has not checked in"
+        );
+        assert!(
+            payload["status"].is_object(),
+            "the envelopes ride along: {payload}"
+        );
+    });
 }
 
 /// ⚠ R2-1: AN UNLOADED UNIT WRITES NOTHING EITHER. The engine now answers `registered: false`, with
@@ -1307,29 +1997,31 @@ fn a_waiting_state_goes_stale_when_the_clock_passes_the_deadline() {
 /// and the actionable answer, not the AGENT-STALE a pure re-derive of the old envelope would give.
 #[test]
 fn the_stale_deadline_read_finds_an_unloaded_unit() {
-    let (status, schedule) = envelopes(None, "2026-09-16T15:55:00.000Z", "2026-09-16");
-    let mut t = timed_watcher(
-        local("2026-09-16", 9, 0, 0),
-        status.clone(),
-        schedule.clone(),
-        HOUR,
-        HOUR,
-    );
-    t.engine_answers(
-        &status,
-        with(schedule, serde_json::json!({ "registered": false })),
-    );
-    t.set_clock(local("2026-09-16", 9, 16, 0));
-    let payload = t.sink.wait_for_payload(PATIENCE, |v| {
-        v["scheduleState"]["phase"]["phase"] != serde_json::Value::Null
+    exact_unless_rescanned(|| {
+        let (status, schedule) = envelopes(None, "2026-09-16T15:55:00.000Z", "2026-09-16");
+        let mut t = timed_watcher(
+            local("2026-09-16", 9, 0, 0),
+            status.clone(),
+            schedule.clone(),
+            HOUR,
+            HOUR,
+        );
+        t.engine_answers(
+            &status,
+            with(schedule, serde_json::json!({ "registered": false })),
+        );
+        t.set_clock(local("2026-09-16", 9, 16, 0));
+        let payload = t.sink.wait_for_payload(PATIENCE, |v| {
+            v["scheduleState"]["phase"]["phase"] != serde_json::Value::Null
+        });
+        t.w.stop();
+        let payload = payload.expect("the deadline passed and nothing was emitted");
+        assert_eq!(
+            payload["scheduleState"]["phase"]["phase"], "scheduler-broken",
+            "the unloaded unit was not seen at the deadline: {payload}"
+        );
+        assert_eq!(payload["scheduleState"]["registered"], false);
     });
-    t.w.stop();
-    let payload = payload.expect("the deadline passed and nothing was emitted");
-    assert_eq!(
-        payload["scheduleState"]["phase"]["phase"], "scheduler-broken",
-        "the unloaded unit was not seen at the deadline: {payload}"
-    );
-    assert_eq!(payload["scheduleState"]["registered"], false);
 }
 
 /// ⚠ H1 + R2-1: A DELIVERED DAY ENDS AT LOCAL MIDNIGHT, AND MIDNIGHT IS A REAL READ. Delivered at
@@ -1338,43 +2030,45 @@ fn the_stale_deadline_read_finds_an_unloaded_unit() {
 /// today), not yesterday's 12 paired with today's countdown.
 #[test]
 fn a_delivered_day_rolls_over_at_local_midnight_with_the_engines_new_day_count() {
-    let (status, schedule) =
-        envelopes(Some("2026-09-16"), "2026-09-17T06:55:00.000Z", "2026-09-16");
-    let mut t = timed_watcher(
-        local("2026-09-16", 23, 59, 30),
-        status.clone(),
-        schedule.clone(),
-        HOUR,
-        HOUR,
-    );
-    std::thread::sleep(ABSENCE_WINDOW);
-    assert_eq!(t.sink.n(), 0, "nothing changed before midnight");
+    exact_unless_rescanned(|| {
+        let (status, schedule) =
+            envelopes(Some("2026-09-16"), "2026-09-17T06:55:00.000Z", "2026-09-16");
+        let mut t = timed_watcher(
+            local("2026-09-16", 23, 59, 30),
+            status.clone(),
+            schedule.clone(),
+            HOUR,
+            HOUR,
+        );
+        std::thread::sleep(ABSENCE_WINDOW);
+        assert_eq!(t.sink.n(), 0, "nothing changed before midnight");
 
-    t.engine_answers(
-        &status,
-        with(
-            schedule,
-            serde_json::json!({ "ticksToday": 0, "ticksExpectedSinceFloor": null }),
-        ),
-    );
-    t.set_clock(local("2026-09-17", 0, 0, 5));
-    let seen = t.sink.wait_for(1, PATIENCE);
-    let boundary_reads = t.w.boundary_reads();
-    t.w.stop();
-    assert!(
-        seen >= 1,
-        "midnight passed and the delivered day did not end"
-    );
-    assert_eq!(
-        t.sink.phases().first().map(String::as_str),
-        Some("waiting-for-floor")
-    );
-    let payload = t.sink.last().expect("a payload");
-    assert_eq!(
-        payload["scheduleState"]["ticksToday"], 0,
-        "after midnight the screen paired today's countdown with yesterday's count: {payload}"
-    );
-    assert_eq!(boundary_reads, 1, "midnight must be exactly one real read");
+        t.engine_answers(
+            &status,
+            with(
+                schedule,
+                serde_json::json!({ "ticksToday": 0, "ticksExpectedSinceFloor": null }),
+            ),
+        );
+        t.set_clock(local("2026-09-17", 0, 0, 5));
+        let seen = t.sink.wait_for(1, PATIENCE);
+        let boundary_reads = t.w.boundary_reads();
+        t.w.stop();
+        assert!(
+            seen >= 1,
+            "midnight passed and the delivered day did not end"
+        );
+        assert_eq!(
+            t.sink.phases().first().map(String::as_str),
+            Some("waiting-for-floor")
+        );
+        let payload = t.sink.last().expect("a payload");
+        assert_eq!(
+            payload["scheduleState"]["ticksToday"], 0,
+            "after midnight the screen paired today's countdown with yesterday's count: {payload}"
+        );
+        assert_eq!(boundary_reads, 1, "midnight must be exactly one real read");
+    });
 }
 
 /// ⚠ H1: NO EMIT WHEN NOTHING CHANGED — measured over MANY re-derivations, not assumed from zero of
@@ -1382,84 +2076,90 @@ fn a_delivered_day_rolls_over_at_local_midnight_with_the_engines_new_day_count()
 /// boundary is crossed, so nothing is read.
 #[test]
 fn rederiving_an_unchanged_state_emits_nothing() {
-    let (status, schedule) = envelopes(None, "2026-09-16T15:55:00.000Z", "2026-09-16");
-    let mut t = timed_watcher(
-        local("2026-09-16", 9, 0, 0),
-        status,
-        schedule,
-        Duration::from_millis(20),
-        HOUR,
-    );
-    // Move the clock within the same state, repeatedly.
-    for second in 1..30 {
-        t.set_clock(local("2026-09-16", 9, 1, second));
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    let rederived = t.w.wait_until(PATIENCE, |w| w.rederives() >= 5);
-    let seen = t.sink.n();
-    let reads = t.source.calls();
-    let rederives = t.w.rederives();
-    t.w.stop();
-    assert!(
-        rederived,
-        "the loop re-derived only {rederives} time(s), so an absence of events proves nothing"
-    );
-    assert_eq!(seen, 0, "an unchanged state was announced");
-    assert_eq!(reads, 1);
+    exact_unless_rescanned(|| {
+        let (status, schedule) = envelopes(None, "2026-09-16T15:55:00.000Z", "2026-09-16");
+        let mut t = timed_watcher(
+            local("2026-09-16", 9, 0, 0),
+            status,
+            schedule,
+            Duration::from_millis(20),
+            HOUR,
+        );
+        // Move the clock within the same state, repeatedly.
+        for second in 1..30 {
+            t.set_clock(local("2026-09-16", 9, 1, second));
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let rederived = t.w.wait_until(PATIENCE, |w| w.rederives() >= 5);
+        let seen = t.sink.n();
+        let reads = t.source.calls();
+        let rederives = t.w.rederives();
+        t.w.stop();
+        assert!(
+            rederived,
+            "the loop re-derived only {rederives} time(s), so an absence of events proves nothing"
+        );
+        assert_eq!(seen, 0, "an unchanged state was announced");
+        assert_eq!(reads, 1);
+    });
 }
 
 /// Before the floor the countdown is part of the state, so it is re-announced each minute — by a
 /// PURE re-derive (the engine's answer does not turn between minutes).
 #[test]
 fn the_countdown_to_the_floor_is_kept_current_without_reading() {
-    let (status, schedule) = envelopes(None, "2026-09-16T12:55:00.000Z", "2026-09-16");
-    let mut t = timed_watcher(local("2026-09-16", 6, 0, 30), status, schedule, HOUR, HOUR);
-    t.set_clock(local("2026-09-16", 6, 1, 0));
-    let seen = t.sink.wait_for(1, PATIENCE);
-    let reads = t.source.calls();
-    t.w.stop();
-    assert!(seen >= 1);
-    let payload = t.sink.last().expect("a payload");
-    assert_eq!(payload["scheduleState"]["phase"]["minutesUntilFloor"], 79);
-    assert_eq!(reads, 1, "a minute of countdown read the engine");
+    exact_unless_rescanned(|| {
+        let (status, schedule) = envelopes(None, "2026-09-16T12:55:00.000Z", "2026-09-16");
+        let mut t = timed_watcher(local("2026-09-16", 6, 0, 30), status, schedule, HOUR, HOUR);
+        t.set_clock(local("2026-09-16", 6, 1, 0));
+        let seen = t.sink.wait_for(1, PATIENCE);
+        let reads = t.source.calls();
+        t.w.stop();
+        assert!(seen >= 1);
+        let payload = t.sink.last().expect("a payload");
+        assert_eq!(payload["scheduleState"]["phase"]["minutesUntilFloor"], 79);
+        assert_eq!(reads, 1, "a minute of countdown read the engine");
+    });
 }
 
 /// ⚠ R2-1: THE FLOOR IS A REAL READ. The engine's `ticksExpectedSinceFloor` is `null` before it and a
 /// number after it, so a pure re-derive at 07:20 would show the new phase with the old figure.
 #[test]
 fn crossing_the_floor_reads_the_engine() {
-    // A heartbeat at 07:15 local, so the stale deadline (07:35:01) is not what is crossed here.
-    let (status, schedule) = envelopes(None, "2026-09-16T14:15:00.000Z", "2026-09-16");
-    let schedule = with(
-        schedule,
-        serde_json::json!({ "ticksExpectedSinceFloor": null }),
-    );
-    let mut t = timed_watcher(
-        local("2026-09-16", 7, 19, 0),
-        status.clone(),
-        schedule.clone(),
-        HOUR,
-        HOUR,
-    );
-    t.engine_answers(
-        &status,
-        with(
+    exact_unless_rescanned(|| {
+        // A heartbeat at 07:15 local, so the stale deadline (07:35:01) is not what is crossed here.
+        let (status, schedule) = envelopes(None, "2026-09-16T14:15:00.000Z", "2026-09-16");
+        let schedule = with(
             schedule,
-            serde_json::json!({ "ticksExpectedSinceFloor": 1 }),
-        ),
-    );
-    t.set_clock(local("2026-09-16", 7, 20, 5));
-    let payload = t.sink.wait_for_payload(PATIENCE, |v| {
-        v["scheduleState"]["phase"]["phase"] == "waiting-for-wake"
+            serde_json::json!({ "ticksExpectedSinceFloor": null }),
+        );
+        let mut t = timed_watcher(
+            local("2026-09-16", 7, 19, 0),
+            status.clone(),
+            schedule.clone(),
+            HOUR,
+            HOUR,
+        );
+        t.engine_answers(
+            &status,
+            with(
+                schedule,
+                serde_json::json!({ "ticksExpectedSinceFloor": 1 }),
+            ),
+        );
+        t.set_clock(local("2026-09-16", 7, 20, 5));
+        let payload = t.sink.wait_for_payload(PATIENCE, |v| {
+            v["scheduleState"]["phase"]["phase"] == "waiting-for-wake"
+        });
+        let boundary_reads = t.w.boundary_reads();
+        t.w.stop();
+        let payload = payload.expect("the floor passed and the phase did not move");
+        assert_eq!(
+            payload["scheduleState"]["ticksExpectedSinceFloor"], 1,
+            "the floor was crossed on the old envelope: {payload}"
+        );
+        assert_eq!(boundary_reads, 1);
     });
-    let boundary_reads = t.w.boundary_reads();
-    t.w.stop();
-    let payload = payload.expect("the floor passed and the phase did not move");
-    assert_eq!(
-        payload["scheduleState"]["ticksExpectedSinceFloor"], 1,
-        "the floor was crossed on the old envelope: {payload}"
-    );
-    assert_eq!(boundary_reads, 1);
 }
 
 /// ⚠ R2-1: WHILE A UNIT CAN BE LOADED OR UNLOADED BEHIND THE APP'S BACK, THE LOOP RE-READS. A dead
@@ -1476,92 +2176,96 @@ fn crossing_the_floor_reads_the_engine() {
 /// the periodic count is within `elapsed / period + 1`.
 #[test]
 fn an_unhealthy_state_is_re_read_every_period() {
-    const PERIOD: Duration = Duration::from_millis(1_200);
-    const WINDOW: Duration = Duration::from_secs(6);
-    /// Between the loop stamping its read clock and the source being asked: two statements.
-    const SLACK: Duration = Duration::from_millis(100);
-    assert!(
-        PERIOD > RECOVERY_POLL + SLACK,
-        "a period at or below the loop's poll cannot tell a per-period read from a per-pass one"
-    );
-    // The last tick two hours before a 09:00 that never moves.
-    let (status, schedule) = envelopes(None, "2026-09-16T14:00:00.000Z", "2026-09-16");
-    let started = Instant::now();
-    let mut t = timed_watcher(
-        local("2026-09-16", 9, 0, 0),
-        status.clone(),
-        schedule.clone(),
-        HOUR,
-        PERIOD,
-    );
-    t.engine_answers(
-        &status,
-        with(schedule.clone(), serde_json::json!({ "registered": false })),
-    );
-    let broken = t.sink.wait_for_payload(PATIENCE, |v| {
-        v["scheduleState"]["phase"]["phase"] == "scheduler-broken"
+    exact_unless_rescanned(|| {
+        const PERIOD: Duration = Duration::from_millis(1_200);
+        const WINDOW: Duration = Duration::from_secs(6);
+        /// Between the loop stamping its read clock and the source being asked: two statements.
+        const SLACK: Duration = Duration::from_millis(100);
+        assert!(
+            PERIOD > RECOVERY_POLL + SLACK,
+            "a period at or below the loop's poll cannot tell a per-period read from a per-pass one"
+        );
+        // The last tick two hours before a 09:00 that never moves.
+        let (status, schedule) = envelopes(None, "2026-09-16T14:00:00.000Z", "2026-09-16");
+        let started = Instant::now();
+        let mut t = timed_watcher(
+            local("2026-09-16", 9, 0, 0),
+            status.clone(),
+            schedule.clone(),
+            HOUR,
+            PERIOD,
+        );
+        t.engine_answers(
+            &status,
+            with(schedule.clone(), serde_json::json!({ "registered": false })),
+        );
+        let broken = t.sink.wait_for_payload(PATIENCE, |v| {
+            v["scheduleState"]["phase"]["phase"] == "scheduler-broken"
+        });
+        t.engine_answers(&status, schedule);
+        let back = t.sink.wait_for_payload(PATIENCE, |v| {
+            v["scheduleState"]["phase"]["phase"] == "agent-stale"
+        });
+        // The rest of the window with the answer unchanged: the reads go on, at the period.
+        if let Some(rest) = WINDOW.checked_sub(started.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        // Stopped BEFORE anything is counted, so the counters and the call log are final and every
+        // read they record happened inside `elapsed`.
+        t.w.stop();
+        let elapsed = started.elapsed();
+        let (periodic, boundary) = (t.w.periodic_reads(), t.w.boundary_reads());
+        let asked_at = t.source.asked_at();
+        assert!(
+            broken.is_some(),
+            "an unloaded unit was never seen while the scheduler was stale: {:?}",
+            t.sink.phases()
+        );
+        assert!(back.is_some(), "the reload was never seen");
+        assert_eq!(
+            boundary, 0,
+            "no boundary was crossed; these were periodic reads"
+        );
+        assert_eq!(
+            asked_at.len() as u64,
+            periodic + 1,
+            "every read after the first should be a periodic one"
+        );
+        let gaps: Vec<Duration> = asked_at.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.iter().all(|gap| *gap + SLACK >= PERIOD),
+            "engine reads closer together than the {PERIOD:?} period: {gaps:?}"
+        );
+        let bound = (elapsed.as_millis() / PERIOD.as_millis()) as u64 + 1;
+        assert!(
+            (2..=bound).contains(&periodic),
+            "{periodic} periodic reads in {elapsed:?} at a {PERIOD:?} period (bound {bound}; gaps \
+             {gaps:?})"
+        );
     });
-    t.engine_answers(&status, schedule);
-    let back = t.sink.wait_for_payload(PATIENCE, |v| {
-        v["scheduleState"]["phase"]["phase"] == "agent-stale"
-    });
-    // The rest of the window with the answer unchanged: the reads go on, at the period.
-    if let Some(rest) = WINDOW.checked_sub(started.elapsed()) {
-        std::thread::sleep(rest);
-    }
-    // Stopped BEFORE anything is counted, so the counters and the call log are final and every
-    // read they record happened inside `elapsed`.
-    t.w.stop();
-    let elapsed = started.elapsed();
-    let (periodic, boundary) = (t.w.periodic_reads(), t.w.boundary_reads());
-    let asked_at = t.source.asked_at();
-    assert!(
-        broken.is_some(),
-        "an unloaded unit was never seen while the scheduler was stale: {:?}",
-        t.sink.phases()
-    );
-    assert!(back.is_some(), "the reload was never seen");
-    assert_eq!(
-        boundary, 0,
-        "no boundary was crossed; these were periodic reads"
-    );
-    assert_eq!(
-        asked_at.len() as u64,
-        periodic + 1,
-        "every read after the first should be a periodic one"
-    );
-    let gaps: Vec<Duration> = asked_at.windows(2).map(|w| w[1] - w[0]).collect();
-    assert!(
-        gaps.iter().all(|gap| *gap + SLACK >= PERIOD),
-        "engine reads closer together than the {PERIOD:?} period: {gaps:?}"
-    );
-    let bound = (elapsed.as_millis() / PERIOD.as_millis()) as u64 + 1;
-    assert!(
-        (2..=bound).contains(&periodic),
-        "{periodic} periodic reads in {elapsed:?} at a {PERIOD:?} period (bound {bound}; gaps \
-         {gaps:?})"
-    );
 }
 
 /// …and a healthy state is NOT re-read on a timer: its own ticks are its file events.
 #[test]
 fn a_healthy_state_is_not_re_read_periodically() {
-    let (status, schedule) = envelopes(None, "2026-09-16T15:55:00.000Z", "2026-09-16");
-    let mut t = timed_watcher(
-        local("2026-09-16", 9, 0, 0),
-        status,
-        schedule,
-        HOUR,
-        Duration::from_millis(50),
-    );
-    std::thread::sleep(ABSENCE_WINDOW);
-    let (reads, periodic) = (t.source.calls(), t.w.periodic_reads());
-    t.w.stop();
-    assert_eq!(
-        (reads, periodic),
-        (1, 0),
-        "a waiting (healthy) state was re-read on a timer"
-    );
+    exact_unless_rescanned(|| {
+        let (status, schedule) = envelopes(None, "2026-09-16T15:55:00.000Z", "2026-09-16");
+        let mut t = timed_watcher(
+            local("2026-09-16", 9, 0, 0),
+            status,
+            schedule,
+            HOUR,
+            Duration::from_millis(50),
+        );
+        std::thread::sleep(ABSENCE_WINDOW);
+        let (reads, periodic) = (t.source.calls(), t.w.periodic_reads());
+        t.w.stop();
+        assert_eq!(
+            (reads, periodic),
+            (1, 0),
+            "a waiting (healthy) state was re-read on a timer"
+        );
+    });
 }
 
 /// The app's cadences, as values: a re-derive at least once a minute, an unhealthy re-read no more

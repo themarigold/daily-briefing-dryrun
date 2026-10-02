@@ -1,6 +1,6 @@
 [package]
 name = "daily-briefing-gui"
-version = "0.1.1"
+version = "0.2.0"
 description = "Desktop shell for the daily-briefing engine"
 authors = ["themarigold"]
 license = "MIT"
@@ -191,6 +191,17 @@ notify = "=8.2.0"
 # libc is already in `Cargo.lock` as a transitive dependency of tokio and tauri, so this adds no
 # crate to the graph — only a direct edge.
 libc = "=0.2.189"
+
+# ⚠ PHASE E M5b: THE LOGIN ITEM'S BRANDING, macOS ONLY, AND NO NEW CRATE. `src/autostart.rs`'s
+# `brand_launch_agent` parses the LaunchAgent plist `tauri-plugin-autostart` writes and adds
+# `AssociatedBundleIdentifiers` = the bundle id, so macOS 13+ can list the login item as "Daily
+# Briefing" rather than "daily-briefing-gui" — a real plist parser/writer, not string surgery on
+# auto-launch's unescaped `format!`. `plist` 1.10.1 was ALREADY in `Cargo.lock` as tauri's own
+# macOS dependency (`tauri-2.11.5/Cargo.toml`: `[target.'cfg(target_os = "macos")'.dependencies.plist]`,
+# default features — the same ones requested here), so this adds an edge, not a crate. Linux has no
+# equivalent key and does not compile it.
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "=1.10.1"
 
 [dev-dependencies]
 # `tauri/test` provides MockRuntime + the IPC harness the capability tests drive. It is a

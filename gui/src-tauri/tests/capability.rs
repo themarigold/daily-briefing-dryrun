@@ -1,6 +1,6 @@
 //! What the webview may ask the Rust shell to do — asserted THROUGH Tauri's permission layer, not
 //! against a second copy of the rules — and what each granted command then DOES, asserted by
-//! driving all nine ENGINE commands through real IPC against a fake sidecar (the shell, B5 and B6
+//! driving all ten ENGINE commands through real IPC against a fake sidecar (the shell, B5 and B6
 //! commands are driven here too, and in `shell.rs`, `briefing_files.rs` and `config_save.rs`).
 //!
 //! ## What replaced what (B1 → T8), because this file used to say the opposite
@@ -32,7 +32,7 @@
 //!   * **Behavioural, through real `get_ipc_response` calls against an app built from
 //!     `tauri::generate_context!()` and `daily_briefing_gui_lib::handler()` — the same context and
 //!     the same handler `run()` ships.** Refusals: the shell plugin's commands (absent, so refused);
-//!     an engine command name that is not granted. Admissions: **all nine commands, each driven
+//!     an engine command name that is not granted. Admissions: **all ten commands, each driven
 //!     with VALID arguments into a fake sidecar managed as the app's `Engine` state**, asserting
 //!     the response is `Ok` AND the argv the fake received is the literal the engine's grammar
 //!     expects. Every command body is therefore EXECUTED, not merely reached — a mutation that
@@ -75,6 +75,7 @@ use common::{
 };
 use daily_briefing_gui_lib::access::AccessState;
 use daily_briefing_gui_lib::all_commands;
+use daily_briefing_gui_lib::autostart::{read_record, AutostartRecord, AutostartState};
 use daily_briefing_gui_lib::cli_shim::CliShimState;
 use daily_briefing_gui_lib::config_save::ConfigSaver;
 use daily_briefing_gui_lib::engine::{Engine, EngineClient, EngineError};
@@ -97,6 +98,11 @@ struct Fixture {
     notify: Arc<RecordingNotifySink>,
     /// Where the B7 commands' `notify-state.json` lands (inside the scratch).
     notify_store: PathBuf,
+    /// T19's recording autostart sink — nothing real is ever enabled or disabled
+    /// (`docs/gui-seam.md` §12c) — and where the M5b commands' `autostart-state.json` lands
+    /// (inside the scratch: the default is MockRuntime's REAL `app_data_dir()`).
+    autostart: Arc<RecordingAutostartSink>,
+    autostart_store: PathBuf,
     // Dropped last, which removes the scratch directory.
     _scratch: ScratchDir,
 }
@@ -108,6 +114,8 @@ fn fixture() -> Fixture {
     let opener = Arc::new(RecordingOpener::default());
     let notify = Arc::new(RecordingNotifySink::default());
     let notify_store = scratch.join("app-data");
+    let autostart = Arc::new(RecordingAutostartSink::default());
+    let autostart_store = scratch.join("app-data");
     Fixture {
         app: app_managing(
             Engine(Ok(EngineClient::with_program(program))),
@@ -115,11 +123,16 @@ fn fixture() -> Fixture {
             NotifyState::default()
                 .with_sink(notify.clone())
                 .with_store_dir(&notify_store),
+            AutostartState::default()
+                .with_sink(autostart.clone())
+                .with_store_dir(&autostart_store),
         ),
         argv_file,
         opener,
         notify,
         notify_store,
+        autostart,
+        autostart_store,
         _scratch: scratch,
     }
 }
@@ -150,6 +163,8 @@ fn appending_fixture() -> Fixture {
     let opener = Arc::new(RecordingOpener::default());
     let notify = Arc::new(RecordingNotifySink::default());
     let notify_store = scratch.join("app-data");
+    let autostart = Arc::new(RecordingAutostartSink::default());
+    let autostart_store = scratch.join("app-data");
     Fixture {
         app: app_managing(
             Engine(Ok(EngineClient::with_program(program))),
@@ -157,11 +172,16 @@ fn appending_fixture() -> Fixture {
             NotifyState::default()
                 .with_sink(notify.clone())
                 .with_store_dir(&notify_store),
+            AutostartState::default()
+                .with_sink(autostart.clone())
+                .with_store_dir(&autostart_store),
         ),
         argv_file,
         opener,
         notify,
         notify_store,
+        autostart,
+        autostart_store,
         _scratch: scratch,
     }
 }
@@ -169,7 +189,12 @@ fn appending_fixture() -> Fixture {
 /// The mock app. NO shell plugin is registered — none is a dependency of this crate in any table
 /// — so `plugin:shell|*` is refused because the plugin is absent, and that is the property T8
 /// ships: there is nothing to grant.
-fn app_managing(engine: Engine, access: AccessState, notify: NotifyState) -> App<MockRuntime> {
+fn app_managing(
+    engine: Engine,
+    access: AccessState,
+    notify: NotifyState,
+    autostart: AutostartState,
+) -> App<MockRuntime> {
     // ⚠ `EngineSnapshots` IS MANAGED HERE TOO, AND IT HAS TO BE. `state_snapshot` resolves it
     // through `State<'_, Arc<EngineSnapshots>>`, and Tauri's `State` extractor PANICS when nothing
     // of that type is managed — so a mock app without it would fail the command with a panic
@@ -210,16 +235,16 @@ fn app_managing(engine: Engine, access: AccessState, notify: NotifyState) -> App
                 .with_sink(Arc::new(RecordingShimSink))
                 .with_dir(std::env::temp_dir().join("daily-briefing-t8-capability-shim-unused")),
         )
-        // T19's autostart state, with a recording sink: B25's `uninstall_execute` resolves it
-        // (`autostart::enabled_now` / `disable_now`), and managing it WITHOUT a sink would send
-        // that resolution to the real plugin manager — which is not registered here, and whose
-        // real `disable()` REMOVES a `~/Library/LaunchAgents` plist.
-        .manage(
-            daily_briefing_gui_lib::autostart::AutostartState::default()
-                .with_sink(Arc::new(RecordingAutostartSink::default())),
-        )
+        // T19's autostart state, ALWAYS with a recording sink and a scratch store (every caller
+        // passes one): B25's `uninstall_execute` and M5b's two autostart commands resolve it
+        // (`autostart::enabled_now` / `enable_now` / `disable_now`), and managing it WITHOUT a
+        // sink would send that resolution to the real plugin manager — which is not registered
+        // here, and whose real `enable()`/`disable()` WRITE/REMOVE a `~/Library/LaunchAgents`
+        // plist; without a store, `autostart_set_enabled` would write its record into
+        // MockRuntime's REAL `app_data_dir()` (the ConfigSaver/AccessState trap again).
+        .manage(autostart)
         // B25's uninstall state, for the same `State` reason — with a sink that answers "nothing
-        // there" and REMOVES NOTHING, and scratch app directories: the default is the real
+        // there" and REMOVES NOTHING, and scratch app directories and home: the default is the real
         // filesystem over the real `app_data_dir()`/`app_config_dir()` (the ConfigSaver/
         // AccessState trap, a fourth time), and `uninstall_execute` DELETES files.
         .manage(
@@ -229,6 +254,9 @@ fn app_managing(engine: Engine, access: AccessState, notify: NotifyState) -> App
                     std::env::temp_dir().join("daily-briefing-t8-capability-uninstall-unused"),
                 )
                 .with_app_config_dir(
+                    std::env::temp_dir().join("daily-briefing-t8-capability-uninstall-unused"),
+                )
+                .with_home_dir(
                     std::env::temp_dir().join("daily-briefing-t8-capability-uninstall-unused"),
                 ),
         )
@@ -461,22 +489,29 @@ fn the_webview_cannot_reach_the_shell_plugin() {
 }
 
 /// Every operation the enum deliberately does NOT carry, spelled as the command name someone would
-/// reach for, plus the two the engine does not have. None of them is granted, and none of them
+/// reach for, plus the one the engine does not have. None of them is granted, and none of them
 /// exists — either failure mode is a refusal, which is the property being pinned: the surface is
-/// the nine names and nothing adjacent to them.
+/// the ten names and nothing adjacent to them.
 #[test]
 fn engine_commands_outside_the_granted_set_are_refused() {
     let f = fixture();
     let w = main_webview(&f.app);
 
     for cmd in [
-        "engine_init",          // the first-run wizard, T16; T15 edits via `config_save`
-        "engine_calendar",      // in R1's forward list; NOT in the engine
-        "engine_update_check",  // same
-        "engine_invoke",        // a hypothetical enum-taking command — the design this rejects
+        "engine_init",     // the first-run wizard, T16; T15 edits via `config_save`
+        "engine_calendar", // in R1's forward list; NOT in the engine
+        // ⚠ Phase E (E12): `engine_update_check` was in THIS list until the engine gained
+        // `update --check` (E11) and is now granted. What replaces it is the shape of command E12
+        // deliberately did not build — the check is notify-only, so nothing here downloads,
+        // installs or opens what it found, and the webview never spells the request.
+        "engine_update_download",
+        "engine_update_install",
+        "engine_update_apply",
+        "engine_update_check_url",
+        "engine_invoke", // a hypothetical enum-taking command — the design this rejects
         "engine_run_scheduled", // the deferred app-owned tick (plan R1)
-        "engine_config_write",  // the config write is `config_save`, not an engine operation
-        "app_exit",             // `app_quit` is the one exit, and it refuses without the notice
+        "engine_config_write", // the config write is `config_save`, not an engine operation
+        "app_exit",      // `app_quit` is the one exit, and it refuses without the notice
         // B5's neighbours that do NOT exist: the archive is never pruned, the webview never names
         // a path, and there is no generic file read.
         "delete_archived_briefing",
@@ -785,6 +820,12 @@ fn every_command_body_runs_through_real_ipc_against_a_fake_sidecar() {
             serde_json::json!({}),
             "schedule\nverify\n--json\n",
         ),
+        // Phase E (E12): the Settings screen's "Check now". No operand — the argv is three literals.
+        (
+            "engine_update_check",
+            serde_json::json!({}),
+            "update\n--check\n--json\n",
+        ),
     ];
 
     for (cmd, body, expected_argv) in cases {
@@ -834,7 +875,7 @@ fn every_command_body_runs_through_real_ipc_against_a_fake_sidecar() {
         );
     }
 
-    // And that WAS all nine — the point of this test is coverage of every body.
+    // And that WAS all ten — the point of this test is coverage of every body.
     let driven: BTreeSet<&str> = cases.iter().map(|(cmd, _, _)| *cmd).collect();
     let all: BTreeSet<&str> = daily_briefing_gui_lib::engine::COMMANDS
         .iter()
@@ -1633,49 +1674,113 @@ fn the_webview_cannot_reach_the_notification_plugin() {
     }
 }
 
-/// B7 (T19): the three autostart grants admit EXACTLY the plugin's three commands — and nothing
-/// else from that plugin's namespace.
+/// T19 as reworked in Phase E M5b: the webview holds ONE autostart PLUGIN grant —
+/// `is_enabled`, the toggle's real-state read — and reaches ON/OFF only through the APP command
+/// `autostart_set_enabled`, which brands the plist the plugin writes. The plugin's own `enable` and
+/// `disable` are REFUSED: a webview that could call `enable` directly would hold an unbranded way
+/// to turn the login item on (`src/autostart.rs`'s header).
 ///
-/// ⚠ ASSERTED AGAINST AN APP WITHOUT THE PLUGIN REGISTERED, DELIBERATELY. `enable`'s real body
-/// writes `~/Library/LaunchAgents/<app name>.plist` and `disable` removes it — the VM-gated legs
+/// ⚠ THE PLUGIN COMMANDS ARE ASSERTED AGAINST AN APP WITHOUT THE PLUGIN REGISTERED, DELIBERATELY.
+/// `enable`'s real body writes `~/Library/LaunchAgents/<app name>.plist` — the VM-gated leg
 /// (`docs/gui-seam.md` §12c). The ACL check runs BEFORE plugin dispatch, so an admission here
-/// proves the grant while the missing registration guarantees nothing real can execute. The
-/// dispatch error that comes back is asserted NOT to be a refusal marker (otherwise this test
-/// could pass with the grants deleted).
+/// proves the grant while the missing registration guarantees nothing real can execute, and a
+/// refusal is the ACL's own (the crate is in `[dependencies]`, so its manifest was collected).
+///
+/// The two APP commands are admitted and RUN THEIR OWN CODE against the fixture's recording sink
+/// and scratch store: ON enables once through the sink and records the choice; the wizard's
+/// default then reads the record and the (recorded) real state.
 #[test]
-fn the_autostart_grants_admit_exactly_the_three_plugin_commands() {
+fn the_webview_reaches_autostart_only_through_is_enabled_and_the_two_app_commands() {
     let f = fixture();
     let w = main_webview(&f.app);
+    let o = attempt(&w, "plugin:autostart|is_enabled", serde_json::json!({}));
+    assert_eq!(
+        o.verdict,
+        Verdict::Admitted,
+        "plugin:autostart|is_enabled was refused — the Settings toggle reads REAL state through \
+         it (autostart:allow-is-enabled): {}",
+        o.message
+    );
+    // The plugin is not registered on this mock app, so the admitted call must have died at
+    // dispatch, not executed.
+    assert!(
+        o.body.is_none(),
+        "plugin:autostart|is_enabled RETURNED A BODY on a mock app with no autostart plugin \
+         registered — something executed where nothing should exist"
+    );
     for cmd in [
         "plugin:autostart|enable",
         "plugin:autostart|disable",
-        "plugin:autostart|is_enabled",
+        "plugin:autostart|configure",
     ] {
         let o = attempt(&w, cmd, serde_json::json!({}));
         assert_eq!(
             o.verdict,
-            Verdict::Admitted,
-            "{cmd} was refused — the capability must grant the plugin's whole allow-set \
-             (autostart:allow-enable/-disable/-is-enabled): {}",
+            Verdict::Refused,
+            "{cmd} was admitted — every ON must go through `autostart_set_enabled`, which brands \
+             the plist; the plugin's own enable/disable are not granted (Phase E M5b): {}",
             o.message
         );
-        // The plugin is not registered on this mock app, so the admitted call must have died at
-        // dispatch, not executed: the shipped `enable` would have written a real LaunchAgent.
+    }
+
+    // The app commands: admitted, and they run THIS crate's code against the recording sink.
+    assert_eq!(read_record(&f.autostart_store), AutostartRecord::default());
+    let o = attempt(&w, "autostart_wizard_default", serde_json::json!({}));
+    assert_eq!(o.verdict, Verdict::Admitted, "{}", o.message);
+    assert_eq!(
+        f.autostart.enables(),
+        0,
+        "the wizard's default READ enabled something"
+    );
+    // A MALFORMED call enables nothing (Phase E M5b checkpoint): no `enabled` at all, or one that
+    // is not a boolean, fails argument deserialisation before the body runs — never a truthy
+    // coercion into an ON, never a record.
+    for malformed in [
+        serde_json::json!({}),
+        serde_json::json!({ "enabled": "yes" }),
+    ] {
+        let o = attempt(&w, "autostart_set_enabled", malformed.clone());
         assert!(
             o.body.is_none(),
-            "{cmd} RETURNED A BODY on a mock app with no autostart plugin registered — something \
-             executed where nothing should exist"
+            "autostart_set_enabled({malformed}) returned a body — it ran: {}",
+            o.message
         );
+        assert!(
+            o.message.contains("enabled"),
+            "autostart_set_enabled({malformed}) failed for some other reason than its argument: {}",
+            o.message
+        );
+        assert_eq!(
+            (f.autostart.enables(), f.autostart.disables()),
+            (0, 0),
+            "autostart_set_enabled({malformed}) changed the login item"
+        );
+        assert_eq!(read_record(&f.autostart_store), AutostartRecord::default());
     }
-    // A name the plugin does not export stays refused: the grants name three commands, not a
-    // namespace.
-    let o = attempt(&w, "plugin:autostart|configure", serde_json::json!({}));
-    assert_eq!(
-        o.verdict,
-        Verdict::Refused,
-        "plugin:autostart|configure was admitted: {}",
+    let o = attempt(
+        &w,
+        "autostart_set_enabled",
+        serde_json::json!({ "enabled": true }),
+    );
+    assert_eq!(o.verdict, Verdict::Admitted, "{}", o.message);
+    assert!(
+        o.body.is_some(),
+        "autostart_set_enabled failed: {}",
         o.message
     );
+    assert_eq!(f.autostart.enables(), 1);
+    assert_eq!(
+        read_record(&f.autostart_store),
+        AutostartRecord { defaulted: true },
+        "the applied choice was not recorded in the fixture's scratch store"
+    );
+    let o = attempt(
+        &w,
+        "autostart_set_enabled",
+        serde_json::json!({ "enabled": false }),
+    );
+    assert_eq!(o.verdict, Verdict::Admitted, "{}", o.message);
+    assert_eq!(f.autostart.disables(), 1);
 }
 
 /// B7 (T18): the two notify commands are admitted and RUN THEIR OWN CODE — `notify_set_enabled`
@@ -1732,6 +1837,9 @@ fn a_missing_sidecar_is_reported_at_call_time_not_at_startup() {
         access_state(&scratch, Arc::new(RecordingOpener::default())),
         NotifyState::default()
             .with_sink(Arc::new(RecordingNotifySink::default()))
+            .with_store_dir(scratch.join("app-data")),
+        AutostartState::default()
+            .with_sink(Arc::new(RecordingAutostartSink::default()))
             .with_store_dir(scratch.join("app-data")),
     );
     let w = main_webview(&app);
@@ -1848,12 +1956,13 @@ fn the_capability_grants_exactly_the_app_commands() {
     // refuses them behaviourally). `window-state`'s commands are unused (its persistence is
     // Rust-side) and `single-instance` has none.
     //
-    // B7 adds T19's three: `tauri-plugin-autostart`'s WHOLE shipped allow-set (its
+    // B7 added T19's three: `tauri-plugin-autostart`'s WHOLE shipped allow-set (its
     // `permissions/default.toml` is exactly `allow-enable`, `allow-disable`, `allow-is-enabled` —
-    // read, not assumed), granted because the Settings toggle lives in the webview and reflects
-    // REAL state via `is_enabled()`. `notification:*` is deliberately NOT here: that plugin is
-    // registered for the RUST side and its commands stay refused
-    // (`the_webview_cannot_reach_the_notification_plugin`).
+    // read, not assumed). Phase E M5b KEEPS ONE: `allow-is-enabled`, because the Settings toggle
+    // reflects REAL state via `is_enabled()`; `allow-enable`/`allow-disable` are gone, replaced by
+    // the app command `autostart_set_enabled`, which brands the plist (`src/autostart.rs`).
+    // `notification:*` is deliberately NOT here: that plugin is registered for the RUST side and
+    // its commands stay refused (`the_webview_cannot_reach_the_notification_plugin`).
     // Each grant carries ITS OWN reason (round 1: one shared message claimed `listen()` breaks
     // for all five, which was true of two and nonsense for the autostart three).
     const NON_COMMAND_GRANTS_WITH_WHY: &[(&str, &str)] = &[
@@ -1866,14 +1975,6 @@ fn the_capability_grants_exactly_the_app_commands() {
             "without it the function `listen()` returns cannot unsubscribe",
         ),
         (
-            "autostart:allow-enable",
-            "the Settings toggle's ON writes the login-item plist through this plugin command",
-        ),
-        (
-            "autostart:allow-disable",
-            "the Settings toggle's OFF removes the login-item plist through this plugin command",
-        ),
-        (
             "autostart:allow-is-enabled",
             "the Settings toggle reflects REAL plist state per render through this plugin command",
         ),
@@ -1881,8 +1982,6 @@ fn the_capability_grants_exactly_the_app_commands() {
     const NON_COMMAND_GRANTS: &[&str] = &[
         "core:event:allow-listen",
         "core:event:allow-unlisten",
-        "autostart:allow-enable",
-        "autostart:allow-disable",
         "autostart:allow-is-enabled",
     ];
     for (grant, why) in NON_COMMAND_GRANTS_WITH_WHY {
@@ -1944,7 +2043,13 @@ fn the_capability_grants_exactly_the_app_commands() {
     // `/usr/local/bin` leg VM-gated behind the sink), 28 → 32 — and B25 adds the two
     // `allow-uninstall-*` grants (T25: preview reads, execute removes the app's OWN pieces and,
     // only behind its one explicit consent boolean, the engine-state list pinned against
-    // scripts/uninstall.sh; the real autostart-disable leg VM-gated behind T19's sink), 32 → 34.
+    // scripts/uninstall.sh; the real autostart-disable leg VM-gated behind T19's sink), 32 → 34 — and
+    // Phase E (E12) adds `allow-engine-update-check` (`update --check --json`, "Check now": NOT
+    // mutating, no operand, the request is the engine's), 34 → 35 — and Phase E M5b swaps T19's
+    // plugin `autostart:allow-enable` / `allow-disable` for the app's `allow-autostart-set-enabled`
+    // (one boolean: ON = the plugin's enable PLUS the macOS branding, OFF = its disable) and
+    // `allow-autostart-wizard-default` (reads the record and the real state for the wizard's
+    // pre-tick), 35 → 35.
     const EXPECTED_GRANTS: &[&str] = &[
         "core:event:allow-listen",
         "core:event:allow-unlisten",
@@ -1957,6 +2062,7 @@ fn the_capability_grants_exactly_the_app_commands() {
         "allow-engine-schedule-uninstall",
         "allow-engine-schedule-status",
         "allow-engine-schedule-verify",
+        "allow-engine-update-check",
         "allow-state-snapshot",
         "allow-open-today",
         "allow-app-quit",
@@ -1977,13 +2083,13 @@ fn the_capability_grants_exactly_the_app_commands() {
         "allow-cli-shim-remove",
         "allow-uninstall-preview",
         "allow-uninstall-execute",
-        "autostart:allow-enable",
-        "autostart:allow-disable",
+        "allow-autostart-set-enabled",
+        "allow-autostart-wizard-default",
         "autostart:allow-is-enabled",
     ];
     assert_eq!(
         permissions, EXPECTED_GRANTS,
-        "capabilities/default.json is not exactly the enumerated thirty-four grants, in order"
+        "capabilities/default.json is not exactly the enumerated thirty-five grants, in order"
     );
 
     // The third spelling. `build.rs` cannot import this crate, so its list is a copy — which is
@@ -2052,6 +2158,7 @@ fn the_capability_grants_exactly_the_app_commands() {
         "notifications::",
         "cli_shim::",
         "uninstall::",
+        "autostart::",
     ];
     let mut registered_names: Vec<&str> = Vec::new();
     for entry in &registered {

@@ -17,7 +17,7 @@ import {
   type CampaignItem, type RecapRecordV2,
 } from "../src/recapCampaigns";
 import { norm } from "../src/subprojects";
-import { CREDENTIAL_PATTERNS, REDACTION, matchesCredential } from "../src/transcripts/credentials";
+import { CREDENTIAL_PATTERNS, REDACTION, matchesCredential, matchesCredentialAnyCase } from "../src/transcripts/credentials";
 
 const TOKENS: Record<string, { token: string; secret: string }> = {
   "provider-key": { token: "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", secret: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789" },
@@ -87,10 +87,30 @@ describe("PR branch words carry no credential the separator strip broke apart", 
     expect(branchWords(branch)).toBe(REDACTION);
   });
 
-  test("after the strip: `x_AKIA…` has no \\b in the raw branch, but its words do", () => {
+  // ⚠ INVERTED PREMISE, by the USER'S DECISION (2026-10-02, Phase E final harden E16 "Close both"):
+  // `_` no longer hides a key id from the shared matcher (credentials.ts), so the RAW branch half now
+  // catches `x_AKIA…` too. The assertion that matters — the branch renders `[redacted]` — is unchanged.
+  // This fixture therefore no longer pins the WORDS half; the next test does.
+  test("`x_AKIA…`: the raw branch half catches it (E16), and the branch renders [redacted]", () => {
     const branch = `x_${TOKENS["aws-access-key-id"]!.token}`;
-    expect(matchesCredential(branch)).toBe(false);   // premise: `_` is a word character
+    expect(matchesCredential(branch)).toBe(true);    // premise inverted: the `_` glue is closed
     expect(branchWords(branch)).toBe(REDACTION);
+  });
+
+  // The WORDS half's own fixture (round-2 harden B-M2 — the round-1 comment here said none existed, and a
+  // mutation deleting `|| matchesCredentialAnyCase(words)` survived every test file). Once the `_` glue is
+  // closed on both sides of the prefixed shapes, what the strip can still CREATE is whitespace where the
+  // raw text had a `/ . _ -` — and env-assignment allows whitespace between a credential-word name and
+  // its `=` (`\s*:?=`) where it allows no separator. So `API_TOKEN-=<value>` (a legal git branch name)
+  // is an assignment only after the strip: raw, the `-` stands between the name and the `=`.
+  test("`me/API_TOKEN-=…`: only the WORDS half catches it, and the branch renders [redacted]", () => {
+    const branch = `me/${TOKENS["env-assignment"]!.token.replace("=", "-=")}`;
+    const words = branch.replace(/[/._-]+/g, " ");                       // branchWords' own strip
+    expect(matchesCredentialAnyCase(branch)).toBe(false);                // premise: the raw half misses it
+    expect(matchesCredentialAnyCase(words)).toBe(true);                  // premise: the words half matches
+    expect(branchWords(branch)).toBe(REDACTION);
+    const [it] = attachPrFacts([item({})], new Map([["a".repeat(40), { number: 12, branch }]]));
+    expect(containsCI(it!.fact, TOKENS["env-assignment"]!.secret)).toBe(false);
   });
 
   test("a credential-free branch renders its words exactly as before", () => {

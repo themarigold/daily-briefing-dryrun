@@ -263,6 +263,6 @@ export function renderStruct(b: BriefingStruct): Block[] {
     push("placeholder", "(none)");
   }
   if (b.warnings?.length) push("warnings", `⚠ ${b.warnings.join("; ")}`);
-  push("footer", `— generated locally via ${b.provider}`);
+  push("footer", `— generated via ${b.provider}`);
   return out;
 }

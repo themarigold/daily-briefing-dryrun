@@ -210,7 +210,9 @@ describe("release-check.sh: the all-PASS run", () => {
     expect(git(fx.repo, "worktree", "list", "--porcelain").match(/^worktree /gm)?.length).toBe(1);
     expect(readdirSync(fx.tmp).sort()).toEqual(before);
     expect(git(fx.repo, "status", "--porcelain")).toBe("");
-  });
+    // A whole run (worktree add, every check's stub, worktree remove) in one test: under a loaded machine
+    // the 5 s default expired mid-run, bun TERMed the script, and its trap made it exit 130.
+  }, 60_000);
 
   test("the eval-integrity header is there: wiring only, the accepted posture set is the literal {\"full\"}", () => {
     const src = readFileSync(SCRIPT, "utf8");
@@ -460,7 +462,7 @@ describe("release-check.sh: check 1 and the worktree", () => {
     expect(out).toContain("not run: there is no worktree");
   });
 
-  test("the exported layout (no export-public.sh) -> checks 7-8 SKIP with a note; PASS prints the tag commands", () => {
+  test("the exported layout (no export-public.sh) -> checks 7-8 SKIP with a note; PASS says not to tag this tree", () => {
     const fx = fixture("export");
     const head = git(fx.repo, "rev-parse", "HEAD").trim();
     const r = run(fx, [V]);
@@ -468,8 +470,14 @@ describe("release-check.sh: check 1 and the worktree", () => {
     expect(r.status).toEqual({ ...ALL_PASS, "7": "SKIP", "8": "SKIP" });
     expect(r.out).toContain("scripts/export-public.sh is absent: this is the exported tree");
     expect(r.calls).toEqual(EVERY_CALL.slice(0, 10));
-    expect(r.out).toContain(`git tag v${V} ${head}`);
-  });
+    // The exported tree is never tagged from here: only the sha docs/RELEASE.md step 5 recorded, from a
+    // monorepo export, is (never a commit made directly in the public repo).
+    expect(r.out).toContain("this checkout is the exported tree: do not tag it");
+    expect(r.out).toContain(`tag only the sha docs/RELEASE.md step 5 recorded for the monorepo export of v${V}`);
+    expect(r.out).toContain("steps 5-7");
+    expect(r.out).not.toContain(`git tag v${V} ${head}`);
+    expect(r.out).not.toMatch(/^\s*git tag /m);
+  }, 60_000);
 });
 
 describe("release-check.sh: arguments", () => {

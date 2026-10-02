@@ -198,6 +198,18 @@ export function recapCampaignsPath(): string {
   return join(supportDir(), "recap-campaigns.jsonl");
 }
 
+/**
+ * `<state>/update-check.json` — Phase E's opt-in update check (E11): the LAST answer, overwritten
+ * atomically by each check. Read back by `status --json` (no network) and by the automatic path's
+ * "is a check due?" gate. Written by `src/updateCheck.ts` and by nothing else.
+ *
+ * ⚠ HERE, beside the other state paths, for `schedulePath`'s reason: `json.ts` lists it in
+ * `StatePaths` and `engineOwns`, so `--json-out` can never truncate it.
+ */
+export function updateCheckPath(): string {
+  return join(supportDir(), "update-check.json");
+}
+
 /** The marker FILE exists at all (any date) — i.e. a briefing has succeeded at least once.
  *  Distinguishes a fresh install (never delivered) from a config that vanished after working. */
 export async function markerExists(): Promise<boolean> {

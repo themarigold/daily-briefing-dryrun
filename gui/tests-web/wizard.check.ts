@@ -30,15 +30,22 @@ import {
   buildConfig,
   cancelWritesNothing,
   DEFAULT_FLOOR,
+  doctorRepoNotes,
   DEFAULT_NETWORK_PROBE_HOSTS as WIZARD_PROBE_HOSTS,
   DEFAULT_TOKEN_BUDGET,
   DEFAULT_LOOKBACK_CAP_DAYS as WIZARD_LOOKBACK,
   draftFromConfig,
   draftPaths,
   emptyDraft,
+  finishLoginItem,
   firstWakeSentence,
   floorValid,
+  loginItemChecked,
+  loginItemNote,
+  loginItemPlan,
   mergeConfig,
+  settleLoginItemDefault,
+  type LoginItemDefault,
   nextStep,
   previousStep,
   PREFILL_API_MODEL,
@@ -112,15 +119,23 @@ test("the first-wake sentence is schedule_state.rs's, word for word", () => {
 /* ── steps, skips, cancel ─────────────────────────────────────────────────────────────────────── */
 
 describe("the step machine", () => {
-  test("six steps in R1's order; access is conditional, delivery unconditional", () => {
-    expect(STEP_ORDER).toEqual(["welcome", "provider", "repos", "access", "floor", "delivery"]);
+  test("R1's six steps in order plus E12's consent; access is conditional, delivery unconditional", () => {
+    // Phase E (E12): `updates` (the update-check consent) sits BEFORE `floor`, which stays the save
+    // gate — so the consent answer is part of the one write.
+    expect(STEP_ORDER).toEqual(["welcome", "provider", "repos", "access", "updates", "floor", "delivery"]);
     expect(nextStep("repos", true)).toBe("access");
-    expect(nextStep("repos", false)).toBe("floor");
-    expect(nextStep("access", true)).toBe("floor");
+    expect(nextStep("repos", false)).toBe("updates");
+    expect(nextStep("access", true)).toBe("updates");
+    expect(nextStep("updates", false)).toBe("floor");
     expect(nextStep("floor", false)).toBe("delivery");
     expect(nextStep("delivery", true)).toBeNull();
-    expect(previousStep("floor", false)).toBe("repos");
-    expect(previousStep("floor", true)).toBe("access");
+    expect(previousStep("floor", false)).toBe("updates");
+    // …and with access IN scope too: `access` sits before `updates`, so the skip rule must not
+    // reach past `updates` from either side (Phase E final harden, GM2-2).
+    expect(previousStep("floor", true)).toBe("updates");
+    expect(nextStep("updates", true)).toBe("floor");
+    expect(previousStep("updates", false)).toBe("repos");
+    expect(previousStep("updates", true)).toBe("access");
     expect(previousStep("welcome", true)).toBeNull();
   });
 
@@ -489,12 +504,193 @@ describe("the wizard renders", () => {
   test("step 1 says local-first, no telemetry, BYO AI — and that cancelling writes nothing", () => {
     const body = html();
     expect(body).toContain("Set up Daily Briefing");
-    expect(body).toContain("Step 1 of 6");
+    expect(body).toContain("Step 1 of 7");
     expect(body).toContain("Local-first");
     expect(body).toContain("No telemetry");
     expect(body).toContain("Bring your own AI");
     expect(body).toContain("Cancelling now changes nothing");
     expect(body).toContain("Set up later");
+  });
+});
+
+/* ── the login item: the last step's choice, applied on Finish (Phase E M5b) ──────────────────── */
+
+describe("the login item is the wizard's LAST step — default ON, applied only on Finish", () => {
+  const src = (rel: string) => readFileSync(new URL(`../src/${rel}`, import.meta.url), "utf8");
+  const wizard = src("routes/Wizard.svelte");
+
+  // Phase E M5b checkpoint fix: the first shape started the box ticked (`$state(true)`), let Finish
+  // apply that before the default read answered, and turned a FAILED read into an OFF that Finish
+  // then applied as an active removal. The rule now lives in lib/wizard.ts and is driven below
+  // with a deferred and a failing read; these pins hold the component to it.
+  test("the component wires the rule: the read sets only the default, the box only the choice, Finish waits on `wait`", () => {
+    expect(wizard).toContain('let loginDefault = $state<LoginItemDefault>({ kind: "pending" });');
+    expect(wizard).toContain("let loginChoice = $state<boolean | null>(null);");
+    expect(wizard).toContain("const loginPlan = $derived(loginItemPlan(loginDefault, loginChoice));");
+    expect(wizard.match(/autostartWizardDefault\(/g)).toHaveLength(1);
+    expect(wizard).toContain("void settleLoginItemDefault(() => autostartWizardDefault(), describeFailure).then((settled) => {\n      loginDefault = settled;\n    });");
+    expect(wizard).toContain("checked={loginItemChecked(loginDefault, loginChoice)}");
+    expect(wizard).toContain("onchange={(e) => (loginChoice = e.currentTarget.checked)}");
+    expect(wizard).toContain('<button disabled={finishing || loginPlan.kind === "wait"} onclick={() => void finish()}>');
+    // No provisional value anywhere: nothing ticks the box but the answered default or the user.
+    expect(wizard).not.toContain("$state(true)");
+  });
+
+  test("Finish is the ONE place it is applied: the plan through autostartSetEnabled, then onfinished()", () => {
+    expect(wizard.match(/autostartSetEnabled\(/g)).toHaveLength(1);
+    const finish = wizard.slice(wizard.indexOf("async function finish()"));
+    const body = finish.slice(0, finish.indexOf("\n  }\n"));
+    expect(body).toContain("const plan = loginItemPlan(loginDefault, loginChoice);");
+    expect(body).toContain("if (await finishLoginItem(plan, (enabled) => autostartSetEnabled(enabled))) onfinished();");
+    expect(body.match(/onfinished\(\)/g)).toHaveLength(1);
+    expect(wizard).toContain("onclick={() => void finish()}");
+    // The old Finish that left without applying anything is gone.
+    expect(wizard).not.toContain("onclick={() => onfinished()}");
+    // The choice is rendered on the LAST step only: after the delivery branch opens.
+    const delivery = wizard.indexOf("Install background delivery");
+    expect(delivery).toBeGreaterThan(0);
+    expect(wizard.indexOf("Start Daily Briefing at login.")).toBeGreaterThan(delivery);
+  });
+
+  test("nothing else in the webview turns the login item on — only the wizard's Finish and the Settings toggle", () => {
+    // EVERY .svelte/.ts file under gui/src (checkpoint fix: the census was a hand-written list of
+    // six files, so a call from a seventh stayed green), minus the definition in lib/notify.ts.
+    const root = new URL("../src/", import.meta.url).pathname;
+    const files = [...new Bun.Glob("**/*.{svelte,ts}").scanSync({ cwd: root })].sort();
+    // prove-it 3b: the glob found the tree (both callers and the definition), not an empty dir.
+    expect(files.length).toBeGreaterThan(20);
+    expect(files).toContain("routes/Wizard.svelte");
+    expect(files).toContain("lib/AppSettings.svelte");
+    expect(files).toContain("lib/notify.ts");
+    const calls: string[] = [];
+    const mentions: string[] = [];
+    for (const rel of files) {
+      if (rel === "lib/notify.ts") continue;
+      const text = src(rel);
+      const n = (text.match(/autostartSetEnabled\(/g) ?? []).length;
+      if (n > 0) calls.push(`${rel}:${n}`);
+      // A by-value use (`apply(autostartSetEnabled)`) has no `(` — so any MENTION counts too.
+      if (/\bautostartSetEnabled\b/.test(text)) mentions.push(rel);
+    }
+    expect(calls).toEqual(["lib/AppSettings.svelte:2", "routes/Wizard.svelte:1"]);
+    expect(mentions).toEqual(["lib/AppSettings.svelte", "routes/Wizard.svelte"]);
+    // …and the plugin's own enable is not invoked from anywhere (it is no longer granted).
+    expect(src("lib/notify.ts")).not.toContain("plugin:autostart|enable");
+  });
+});
+
+/* ── the login item's default: pending, answered, failed — driven (Phase E M5b checkpoint) ─────── */
+
+describe("Finish never applies a provisional or unknown login-item state", () => {
+  /** A promise the test settles by hand — the IPC read, before and after it answers. */
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+  /** The injected `autostartSetEnabled`: records every call, applies nothing. */
+  function recorder() {
+    const calls: boolean[] = [];
+    return { calls, apply: async (enabled: boolean) => void calls.push(enabled) };
+  }
+  const describeError = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+  test("PENDING and untouched: the box is not ticked, Finish waits and applies nothing; the answer then applies", async () => {
+    const read = deferred<boolean>();
+    let state: LoginItemDefault = { kind: "pending" };
+    const settling = settleLoginItemDefault(() => read.promise, describeError).then((s) => {
+      state = s;
+    });
+    await Promise.resolve();
+    expect(state).toEqual({ kind: "pending" });
+    expect(loginItemPlan(state, null)).toEqual({ kind: "wait" });
+    expect(loginItemChecked(state, null)).toBe(false);
+    expect(loginItemNote(state, null)).toContain("Checking whether");
+    // The way out is named while Finish waits: a tick or an untick is applied whatever the read says.
+    expect(loginItemNote(state, null)).toContain("Finish waits for the answer, or tick or untick the box to choose now.");
+    const r = recorder();
+    expect(await finishLoginItem(loginItemPlan(state, null), r.apply)).toBe(false);
+    expect(r.calls).toEqual([]);
+
+    read.resolve(true);
+    await settling;
+    expect(state).toEqual({ kind: "answered", on: true });
+    expect(loginItemChecked(state, null)).toBe(true);
+    expect(loginItemNote(state, null)).toBeNull();
+    expect(await finishLoginItem(loginItemPlan(state, null), r.apply)).toBe(true);
+    expect(r.calls).toEqual([true]);
+  });
+
+  test("an answered OFF (a removed login item, recorded) is applied as OFF — never re-ticked", async () => {
+    const state = await settleLoginItemDefault(async () => false, describeError);
+    expect(state).toEqual({ kind: "answered", on: false });
+    expect(loginItemChecked(state, null)).toBe(false);
+    const r = recorder();
+    expect(await finishLoginItem(loginItemPlan(state, null), r.apply)).toBe(true);
+    expect(r.calls).toEqual([false]);
+  });
+
+  test("FAILED and untouched: Finish leaves the login item exactly as it is, and the copy says why", async () => {
+    const read = deferred<boolean>();
+    const settling = settleLoginItemDefault(() => read.promise, describeError);
+    read.reject(new Error("the autostart state is not managed by this app"));
+    const state = await settling;
+    expect(state).toEqual({ kind: "failed", detail: "the autostart state is not managed by this app" });
+    expect(loginItemPlan(state, null)).toEqual({ kind: "leave" });
+    expect(loginItemChecked(state, null)).toBe(false);
+    const note = loginItemNote(state, null);
+    expect(note).toContain("could not be read (the autostart state is not managed by this app)");
+    expect(note).toContain("Finish leaves that setting as it is");
+    // Worded ONCE (fix round 2): the command sends the bare cause (src-tauri `wizard_default`, pinned
+    // there by `assert_eq!(err, "stat failed")`), and this note is its only wrapper.
+    expect(note!.split("could not be read").length).toBe(2);
+    expect(loginItemNote({ kind: "failed", detail: "stat failed" }, null)).toBe(
+      "Whether Daily Briefing already starts at login could not be read (stat failed), so Finish " +
+        "leaves that setting as it is. Tick or untick the box to choose.",
+    );
+    const r = recorder();
+    // The wizard may leave — and NO call was made: an unknown state is never an active removal.
+    expect(await finishLoginItem(loginItemPlan(state, null), r.apply)).toBe(true);
+    expect(r.calls).toEqual([]);
+  });
+
+  test("a read that throws synchronously is a failure too, never an exception out of onMount", async () => {
+    const state = await settleLoginItemDefault(() => {
+      throw new Error("no IPC");
+    }, describeError);
+    expect(state).toEqual({ kind: "failed", detail: "no IPC" });
+  });
+
+  test("a TOUCHED box is applied as the user set it — before the read answers, after it fails, over its answer", async () => {
+    const pending: LoginItemDefault = { kind: "pending" };
+    const failed: LoginItemDefault = { kind: "failed", detail: "x" };
+    const on: LoginItemDefault = { kind: "answered", on: true };
+    for (const [state, choice] of [[pending, false], [pending, true], [failed, true], [failed, false], [on, false]] as const) {
+      const r = recorder();
+      expect(loginItemPlan(state, choice)).toEqual({ kind: "apply", enabled: choice });
+      expect(loginItemChecked(state, choice)).toBe(choice);
+      expect(loginItemNote(state, choice)).toBeNull();
+      expect(await finishLoginItem(loginItemPlan(state, choice), r.apply)).toBe(true);
+      expect(r.calls).toEqual([choice]);
+    }
+    // A late answer never overrides the choice: the choice is a separate fact the read never sets.
+    const read = deferred<boolean>();
+    const settling = settleLoginItemDefault(() => read.promise, describeError);
+    read.resolve(true);
+    expect(loginItemPlan(await settling, false)).toEqual({ kind: "apply", enabled: false });
+  });
+
+  test("a failed apply rejects, so the wizard stays on its last step with the reason", async () => {
+    const plan = loginItemPlan({ kind: "answered", on: true }, null);
+    await expect(
+      finishLoginItem(plan, async () => {
+        throw new Error("no launch agent dir");
+      }),
+    ).rejects.toThrow("no launch agent dir");
   });
 });
 
@@ -533,5 +729,88 @@ describe("the CLI-shim wording", () => {
     expect(
       describeShimFailure({ kind: "foreign", path: "/usr/local/bin/daily-briefing", detail: "a regular file" }),
     ).toContain("will not replace or remove");
+  });
+});
+
+/* ── the last step's per-repo notes: doctor's partial-clone note (Phase E final harden) ────────── */
+
+describe("the save gate's notes are keyed by position, not by text", () => {
+  test("round 3 (D3-L3): saveWarnings and saveErrors key on the index — two notes can render alike", () => {
+    // The engine redacts every note (`src/json.ts`, `redactNote`), so two DIFFERENT notes on one field
+    // can arrive as the same text, and a duplicate each-key is a Svelte runtime error. Source-pinned:
+    // both lists render only after a real save, which a server render cannot reach.
+    const component = readFileSync(new URL("../src/routes/Wizard.svelte", import.meta.url), "utf8");
+    expect(component).toContain("{#each saveWarnings as warning, i (i)}");
+    expect(component).toContain("{#each saveErrors as error, i (i)}");
+    expect(component.match(/\{#each save(?:Warnings|Errors) as/g)).toHaveLength(2);
+    expect(component).not.toMatch(/\(\s*(?:warning|error)\.field\s*\+\s*(?:warning|error)\.message\s*\)/);
+  });
+});
+
+describe("the last step shows doctor's per-repo notes verbatim", () => {
+  // A COPY of the engine's sentence, `PARTIAL_CLONE_NOTE` in `src/json.ts` — checked equal, byte for
+  // byte, against the engine branch (`fix/dba-e-harden-engine`) on 2026-10-02. It is copied rather
+  // than imported because this test was written on the GUI branch, whose `src/json.ts` did not
+  // declare the constant yet. Nothing here depends on the copy staying equal: the helper never looks
+  // at the wording — any string passes through untouched — so this is a fixture, not a pin.
+  const NOTE =
+    "partial clone: while the tool reads this repository's history, git itself may download missing " +
+    "file contents from the repository's own remote, with your usual git credentials (the tool never fetches)";
+  /** A `doctor --json` envelope from the NEW engine: one partial clone, one normal repo, one denied. */
+  const WITH_PARTIAL = {
+    schemaVersion: 1,
+    repos: [
+      { path: "/Users/x/code/big-monorepo", ok: true, issueKind: null, advice: null, partialClone: true, notes: [NOTE] },
+      { path: "/Users/x/code/app", ok: true, issueKind: null, advice: null },
+      { path: "/Users/x/Documents/proj", ok: false, issueKind: "tcc-denied", advice: "TCC-blocked: …" },
+    ],
+    discoveredCount: 2,
+    verdict: "blocked",
+  };
+  /** The same envelope from an OLDER engine: no repo carries `partialClone` or `notes`. */
+  const WITHOUT = {
+    ...WITH_PARTIAL,
+    repos: WITH_PARTIAL.repos.map(({ path, ok, issueKind, advice }) => ({ path, ok, issueKind, advice })),
+  };
+
+  test("a partial clone gets one row: its path and the engine's sentence, unmodified", () => {
+    expect(doctorRepoNotes(WITH_PARTIAL.repos)).toEqual([{ path: "/Users/x/code/big-monorepo", note: NOTE }]);
+  });
+
+  test("an older engine's envelope (no partialClone, no notes) yields no row", () => {
+    expect(WITHOUT.repos.some((r) => "notes" in r || "partialClone" in r)).toBe(false);
+    expect(doctorRepoNotes(WITHOUT.repos)).toEqual([]);
+    // …and an envelope with no `repos` at all, or a payload that is not an envelope.
+    expect(doctorRepoNotes(undefined)).toEqual([]);
+    expect(doctorRepoNotes(null)).toEqual([]);
+    expect(doctorRepoNotes("repos")).toEqual([]);
+  });
+
+  test("rows not shaped as documented are skipped, never guessed at; several notes keep their order", () => {
+    expect(
+      doctorRepoNotes([
+        null,
+        "a string",
+        { path: 7, notes: ["x"] },
+        { path: "/p", notes: "not an array" },
+        { path: "/q", notes: [3, "", "first", "second"] },
+      ]),
+    ).toEqual([
+      { path: "/q", note: "first" },
+      { path: "/q", note: "second" },
+    ]);
+  });
+
+  test("the component renders each row as `{path}: {note}` text, from the doctor payload's repos", () => {
+    // Source-pinned, like this file's other wiring checks: the row only exists after a real save and
+    // doctor call, which a server render cannot reach.
+    const component = readFileSync(new URL("../src/routes/Wizard.svelte", import.meta.url), "utf8");
+    expect(component.match(/doctorRepoNotes\(/g)).toHaveLength(1);
+    expect(component).toContain("{#each doctorRepoNotes(payload?.repos) as row}");
+    expect(component).toContain("{row.path}: {row.note}");
+    expect(component).not.toMatch(/\{@html[^}]*row\./);
+    // …inside the provider-check block that renders `doctor()`'s payload, not on another step.
+    const block = component.slice(component.indexOf("<h3>Provider check</h3>"), component.indexOf("<h3>Background delivery</h3>"));
+    expect(block).toContain("{#each doctorRepoNotes(payload?.repos) as row}");
   });
 });

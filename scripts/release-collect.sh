@@ -12,35 +12,53 @@
 #
 # It implements the bundle-status contract frozen in docs/RELEASE.md §Assets (plan §3a) and FAILS
 # CLOSED: every check runs, every failure is printed, and the exit is 1 if any failed. Only on a
-# full pass does it write <dist>/SHA256SUMS and <notes-out>, so a failed collect leaves nothing a
-# later step could mistake for a finished release.
+# full pass does it write <dist>/SHA256SUMS and <notes-out>, and a failed collect also removes a
+# SHA256SUMS an earlier run left in <dist>, so it leaves nothing a later step could mistake for a
+# finished release.
 #
 # Collect rules (§3a):
-#   - required legs macos-arm64, macos-x64, linux-x86_64: marker absent, or body not exactly one of
-#     `built` / `build-failed` / `size-rejected` plus a newline -> FAIL; `size-rejected` -> FAIL;
+#   - required legs macos-arm64, macos-x64, linux-x86_64: marker absent, or body not byte-for-byte
+#     one of `built` / `build-failed` / `size-rejected` plus a newline -> FAIL; `size-rejected` -> FAIL;
 #   - `built` => that leg's frozen names are in <dist>, else FAIL;
 #   - `build-failed` => that leg's names are absent (present -> FAIL), and the notes name the leg;
+#   - no required leg `built` -> FAIL: a release with zero desktop bundles (CLI only) is refused
+#     (user-directed 2026-10-02). One or two `build-failed` legs still ship, named in the notes;
 #   - <dl-bundles-outcome> other than `success` while any marker says `built` -> FAIL (a truncated or
 #     partial download never ships). Any value outside the four GitHub step outcomes -> FAIL;
-#   - the windows-x64 marker is read for the notes only; its absence or body is never a FAIL;
-#   - any other file in <markers> -> FAIL (the contract is a closed set).
+#   - the windows-x64 marker is read for the notes only; its absence or body is never a FAIL, and it
+#     never counts as a desktop bundle;
+#   - any other file in <markers>, or a known leg's marker that is not a regular file -> FAIL (the
+#     contract is a closed set).
 # Plus:
-#   - <dist> is flat (a subdirectory or any non-regular entry -> FAIL) and holds only frozen names
-#     for <version> (anything else -> FAIL, named); a Windows installer (*setup*.exe, *.msi) -> FAIL
-#     with its own message (C3: the NSIS artifact is never attached);
+#   - <dist> is a directory, flat (a subdirectory or any non-regular entry -> FAIL) and holds only
+#     frozen names for <version> (anything else -> FAIL, named); a Windows installer (*setup*.exe,
+#     *.msi) -> FAIL with its own message (C3: the NSIS artifact is never attached);
 #   - the CLI floor: all 5 CLI binaries present;
-#   - a signing argument other than exactly `signed` or `unsigned` -> FAIL.
+#   - a version that is not plain semver X.Y.Z -> FAIL;
+#   - a signing argument other than exactly `signed` or `unsigned` -> FAIL;
+#   - <notes-out> a directory, in a directory that does not exist, or inside <dist> (judged by
+#     canonical physical path, /bin/pwd -P), or either side of that judgement unresolvable -> FAIL;
+#     the notes template missing -> FAIL.
+# After every check passed, these still refuse (exit 1, nothing written): the template does not
+# render (an unknown, nested or unbalanced block, or a placeholder left unsubstituted); hashing any
+# asset fails; SHA256SUMS would not list exactly the CLI floor plus every built leg's names; moving
+# SHA256SUMS or the notes into place fails.
 #
 # SHA256SUMS is computed from INSIDE <dist>, so its lines carry bare basenames and
 # `shasum -a 256 -c SHA256SUMS` works in a download folder; LC_ALL=C sorted; it never lists itself.
-# A SHA256SUMS already in <dist> is replaced, never listed.
+# A SHA256SUMS already in <dist> is replaced on a pass, never listed, and removed on a FAIL.
 #
 # Portable: macOS (bash 3.2, BSD tools) and ubuntu. No GNU-only flags. sha256sum when present,
 # else `shasum -a 256`; both print `<hex>  <name>`.
 set -uo pipefail
 export LC_ALL=C
+# Every `cd` below resolves PHYSICALLY (a symlinked component followed by `..` means the symlink
+# target's parent, as the kernel resolves it for the later `mv`), and no CDPATH entry can redirect a
+# relative `cd` or make it print the directory it chose into a captured path.
+unset CDPATH
+set -o physical
 
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF_DIR="$(cd -P "$(dirname "$0")" && pwd -P)"
 TEMPLATE="$SELF_DIR/../docs/release-notes.template.md"
 
 REQUIRED_LEGS="macos-arm64 macos-x64 linux-x86_64"
@@ -60,6 +78,15 @@ NOTES_OUT="$6"
 FAILS=0
 fail() { echo "FAIL: $*" >&2; FAILS=$((FAILS + 1)); }
 ok() { echo "ok:   $*"; }
+DIST_OK=0
+# A refused collect leaves no SHA256SUMS in dist: one an earlier run wrote describes an attach set
+# this run did not certify, and would read as a finished release. Only a regular file is removed (a
+# SHA256SUMS that is a link or a directory already FAILs the flat-dist check, and is left alone).
+drop_stale_sums() {
+  if [ "$DIST_OK" = 1 ] && [ -f "$DIST/SHA256SUMS" ] && [ ! -L "$DIST/SHA256SUMS" ]; then
+    rm -f "$DIST/SHA256SUMS" && echo "release-collect: removed dist/SHA256SUMS left by an earlier run (it does not describe this refused attach set)" >&2
+  fi
+}
 
 # ── arguments ────────────────────────────────────────────────────────────────────────────────────
 if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -101,7 +128,6 @@ file_title() {
 ALL_BUNDLE_NAMES="$(leg_names macos-arm64) $(leg_names macos-x64) $(leg_names linux-x86_64)"
 
 # ── dist: exists, flat, only frozen names ────────────────────────────────────────────────────────
-DIST_OK=0
 if [ ! -d "$DIST" ]; then
   fail "dist '$DIST' is not a directory"
 else
@@ -132,14 +158,14 @@ done
 
 # ── markers ──────────────────────────────────────────────────────────────────────────────────────
 # Reads <markers>/<leg>.status; prints the token, or `absent`, or `invalid`. The body must be EXACTLY
-# one token and a newline: the file's bytes are compared whole, so a missing newline, a trailing
-# space or a second line all read as invalid.
+# one token and a newline, compared byte-for-byte with `cmp` (a `$(...)` read drops NUL bytes, so
+# `built<NUL><newline>` once read as built): a missing newline, a trailing space, a second line or
+# a NUL all read as invalid.
 marker_body() {
   local f="$MARKERS/$1.status" tok
   [ -f "$f" ] || { echo absent; return; }
   for tok in built build-failed size-rejected; do
-    if [ "$(cat "$f"; printf x)" = "$tok
-x" ]; then echo "$tok"; return; fi
+    if printf '%s\n' "$tok" | cmp -s - "$f"; then echo "$tok"; return; fi
   done
   echo invalid
 }
@@ -182,6 +208,12 @@ for leg in $REQUIRED_LEGS; do
   esac
 done
 
+# Zero desktop bundles is refused (user-directed 2026-10-02): the CLI floor alone is not a release.
+# Whatever else the markers said (absent, invalid, size-rejected) is reported above as well.
+if [ "$ANY_BUILT" = 0 ]; then
+  fail "no desktop bundle built: none of macos-arm64, macos-x64, linux-x86_64 has marker 'built' — a CLI-only release is refused"
+fi
+
 if [ "$ANY_BUILT" = 1 ] && [ "$DL_OUTCOME" != "success" ]; then
   fail "the bundle download step's outcome is '$DL_OUTCOME' while a marker says built — a partial download never ships"
 fi
@@ -199,6 +231,10 @@ esac
 # name — into dist itself when <notes-out> is <dist> or <dist>/. The temp files are created in the
 # RESOLVED parent of <notes-out> (NOTES_DIR_ABS), which this block proves is not dist, so no temp
 # file can ever land inside dist.
+# Both sides are CANONICAL: printed by /bin/pwd -P (getcwd), never by the builtin `pwd -P`, which
+# keeps a typed case variant and macOS's /System/Volumes/Data firmlink spelling (measured, bash 3.2 on
+# macOS, 2026-10-02) — so an alias of dist compared unequal, and a dot-named notes file landed in dist,
+# where the `for f in *` checksum pass below never sees it. A side that cannot be resolved FAILS.
 NOTES_PARENT="$(dirname "$NOTES_OUT")"
 NOTES_DIR_ABS=""
 if [ -d "$NOTES_OUT" ]; then
@@ -206,12 +242,19 @@ if [ -d "$NOTES_OUT" ]; then
 elif [ ! -d "$NOTES_PARENT" ]; then
   fail "notes-out's directory '$NOTES_PARENT' does not exist"
 else
-  NOTES_DIR_ABS="$(cd "$NOTES_PARENT" && pwd -P)"
-  if [ "$DIST_OK" = 1 ]; then
+  NOTES_DIR_ABS="$(cd -P "$NOTES_PARENT" 2>/dev/null && /bin/pwd -P)" || NOTES_DIR_ABS=""
+  case "$NOTES_DIR_ABS" in /*) ;; *) NOTES_DIR_ABS="" ;; esac
+  if [ -z "$NOTES_DIR_ABS" ]; then
+    fail "notes-out's directory '$NOTES_PARENT' could not be resolved to a canonical path, so the notes cannot be proven outside dist"
+  elif [ "$DIST_OK" = 1 ]; then
     notes_abs="$NOTES_DIR_ABS/$(basename "$NOTES_OUT")"
-    dist_abs="$(cd "$DIST" && pwd -P)"
-    case "$notes_abs" in
-      "$dist_abs"|"$dist_abs"/*) fail "notes-out '$NOTES_OUT' lies inside dist — the notes would be attached as an asset" ;;
+    dist_abs="$(cd -P "$DIST" 2>/dev/null && /bin/pwd -P)" || dist_abs=""
+    case "$dist_abs" in
+      /*)
+        case "$notes_abs" in
+          "$dist_abs"|"$dist_abs"/*) fail "notes-out '$NOTES_OUT' lies inside dist — the notes would be attached as an asset" ;;
+        esac ;;
+      *) fail "dist '$DIST' could not be resolved to a canonical path, so notes-out cannot be proven outside it" ;;
     esac
   fi
 fi
@@ -219,6 +262,7 @@ fi
 
 if [ "$FAILS" -ne 0 ]; then
   echo "release-collect: $FAILS check(s) FAILED — nothing written" >&2
+  drop_stale_sums
   exit 1
 fi
 
@@ -235,7 +279,7 @@ for leg in $BUILT_LEGS; do
 "
   done
 done
-[ -n "$DESKTOP_ASSETS" ] || DESKTOP_ASSETS="No desktop bundle built for this release."
+# Never empty here: a run with no `built` leg was refused above.
 DESKTOP_ASSETS="${DESKTOP_ASSETS%
 }"
 FAILED_LIST=""
@@ -254,7 +298,7 @@ HAS_FAILED=0
 [ -n "$FAILED_LEGS" ] && HAS_FAILED=1
 
 NOTES_BASE="$NOTES_DIR_ABS/$(basename "$NOTES_OUT")"
-NOTES_TMP="$(mktemp "${NOTES_BASE}.XXXXXX")" || { echo "FAIL: cannot create a temp file beside $NOTES_OUT" >&2; exit 1; }
+NOTES_TMP="$(mktemp "${NOTES_BASE}.XXXXXX")" || { echo "FAIL: cannot create a temp file beside $NOTES_OUT" >&2; drop_stale_sums; exit 1; }
 if ! R_VERSION="$VERSION" R_SIGNING_STATUS="$SIGNING_STATUS" R_CLI_ASSETS="$CLI_ASSETS" \
   R_DESKTOP_ASSETS="$DESKTOP_ASSETS" R_FAILED_LEGS="$FAILED_LIST" R_WINDOWS_STATUS="$WINDOWS_STATUS" \
   R_MODE="$SIGNING" R_HAS_FAILED="$HAS_FAILED" \
@@ -294,6 +338,7 @@ if ! R_VERSION="$VERSION" R_SIGNING_STATUS="$SIGNING_STATUS" R_CLI_ASSETS="$CLI_
   ' "$TEMPLATE" > "$NOTES_TMP"; then
   rm -f "$NOTES_TMP"
   echo "FAIL: the release notes template did not render — nothing written" >&2
+  drop_stale_sums
   exit 1
 fi
 
@@ -303,39 +348,44 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   SHA_CMD="shasum -a 256"
 fi
-SUMS_TMP="$(mktemp "${NOTES_BASE}.sums.XXXXXX")" || { rm -f "$NOTES_TMP"; echo "FAIL: cannot create a temp file" >&2; exit 1; }
-# Names were validated above: frozen names only, no spaces, no leading dash. Sorted with LC_ALL=C.
+SUMS_TMP="$(mktemp "${NOTES_BASE}.sums.XXXXXX")" || { rm -f "$NOTES_TMP"; echo "FAIL: cannot create a temp file" >&2; drop_stale_sums; exit 1; }
+# Names were validated above: frozen names only, no spaces, no leading dash, no dotfiles. The glob
+# expands in C order (LC_ALL=C above), the order `sort` would give.
 # Every file is hashed in its own command whose status is checked: a pipeline into a `while` loop
 # reports only the LAST hash's status, so an unreadable earlier asset would vanish from SHA256SUMS
 # while collect printed PASS.
 # shellcheck disable=SC2086
-if ! ( cd "$DIST" || exit 1
-       names="$(ls -1 | grep -vx 'SHA256SUMS' | sort)" || exit 1
+if ! ( cd -P "$DIST" || exit 1
        rc=0
-       for f in $names; do
+       for f in *; do
+         [ "$f" = SHA256SUMS ] && continue
+         [ -e "$f" ] || continue
          $SHA_CMD "$f" || { echo "FAIL: checksumming dist/$f failed" >&2; rc=1; }
        done
        exit "$rc" ) > "$SUMS_TMP"; then
   rm -f "$NOTES_TMP" "$SUMS_TMP"
   echo "FAIL: checksumming dist failed — nothing written" >&2
+  drop_stale_sums
   exit 1
 fi
-# Independent cross-check: the CLI floor plus every built leg's frozen names is exactly the attach
-# set (dist was proven to hold nothing else), so SHA256SUMS must carry exactly that many lines.
-EXPECTED_ASSETS=0
-for n in $CLI_NAMES; do EXPECTED_ASSETS=$((EXPECTED_ASSETS + 1)); done
-for leg in $BUILT_LEGS; do
-  for n in $(leg_names "$leg"); do EXPECTED_ASSETS=$((EXPECTED_ASSETS + 1)); done
-done
+# Independent cross-check, by NAME: the CLI floor plus every built leg's frozen names is exactly the
+# attach set (dist was proven to hold nothing else), so SHA256SUMS must carry exactly those names,
+# each once, in C order, each on a well-formed `<64 hex>  <name>` line — and no other line.
+EXPECTED_NAMES="$( { for n in $CLI_NAMES; do echo "$n"; done
+                     for leg in $BUILT_LEGS; do for n in $(leg_names "$leg"); do echo "$n"; done; done; } | sort)"
+EXPECTED_ASSETS="$(printf '%s\n' "$EXPECTED_NAMES" | wc -l | tr -d ' ')"
+SUMS_NAMES="$(sed -n 's/^[0-9a-f]\{64\}  \(.*\)$/\1/p' "$SUMS_TMP")"
 SUMS_LINES="$(wc -l < "$SUMS_TMP" | tr -d ' ')"
-if [ "$SUMS_LINES" != "$EXPECTED_ASSETS" ]; then
+if [ "$SUMS_LINES" != "$EXPECTED_ASSETS" ] || [ "$SUMS_NAMES" != "$EXPECTED_NAMES" ]; then
   rm -f "$NOTES_TMP" "$SUMS_TMP"
-  echo "FAIL: SHA256SUMS would list $SUMS_LINES asset(s), the attach set holds $EXPECTED_ASSETS — nothing written" >&2
+  echo "FAIL: SHA256SUMS would list $SUMS_LINES line(s), not exactly the $EXPECTED_ASSETS asset name(s) of the attach set — nothing written" >&2
+  drop_stale_sums
   exit 1
 fi
 if ! mv "$SUMS_TMP" "$DIST/SHA256SUMS"; then
   rm -f "$NOTES_TMP" "$SUMS_TMP"
   echo "FAIL: could not move SHA256SUMS into dist — nothing written" >&2
+  drop_stale_sums
   exit 1
 fi
 if ! mv "$NOTES_TMP" "$NOTES_OUT"; then

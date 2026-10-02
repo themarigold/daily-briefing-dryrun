@@ -121,6 +121,22 @@ describe("redactStruct", () => {
     expect(Object.keys(out)).toEqual(keys);
   });
 
+  // D2 (Phase E final harden): a key spelled `__proto__` — reachable, `whys` is keyed by a git-derived
+  // folder name — went through `out[key] = …`, hit the inherited setter and was DROPPED (a string) or
+  // became the object's prototype (an object). It must survive like any other key.
+  test("a `__proto__` key is kept as an ordinary key, in the value AND in its serialisation", () => {
+    const parsed = JSON.parse(`{"whys":{"__proto__":"why","normal":"ok"},"nested":{"__proto__":{"polluted":"${GH}"}}}`);
+    expect(Object.keys(parsed.whys)).toEqual(["__proto__", "normal"]);      // PREMISE: JSON.parse makes it an own key
+    const out = redactStruct(parsed) as { whys: Record<string, unknown>; nested: Record<string, unknown> };
+    expect(Object.keys(out.whys)).toEqual(["__proto__", "normal"]);
+    expect(Object.getOwnPropertyDescriptor(out.whys, "__proto__")?.value).toBe("why");
+    expect(Object.getPrototypeOf(out.nested)).toBe(Object.prototype);       // not re-parented onto the value
+    expect(JSON.stringify(out)).toBe(`{"whys":{"__proto__":"why","normal":"ok"},"nested":{"__proto__":{"polluted":"${REDACTION}"}}}`);
+    // …and the envelope boundary is the same function.
+    const env = redactEnvelope(envelopeFrom(coreResult({ struct: { ...STRUCT, whys: parsed.whys } as BriefingStruct }), "", 0));
+    expect(JSON.stringify(env.struct)).toContain(`"whys":{"__proto__":"why","normal":"ok"}`);
+  });
+
   // Fix 2: the map used to pass anything non-plain through UNREDACTED, and a plain object's own `toJSON`
   // survived the rebuild and ran AFTER redaction. What is redacted must be what is serialised.
   test("fails closed on non-plain values: class instance, boxed String, own toJSON", () => {

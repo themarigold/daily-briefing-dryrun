@@ -305,7 +305,7 @@ export type Config = {
   // exists (config.ts), so every existing install would otherwise have no root and the feature
   // would be inert with no diagnostic. Shape errors WARN and disable — never throw (B1 style).
   transcripts?: { enabled?: boolean; root?: string };
-  networkProbeHosts?: { host: string; port: number }[]; // additive: TCP connectivity-probe targets; [] disables the gate (local/offline providers). Default anycast 1.1.1.1:443 / 8.8.8.8:443.
+  networkProbeHosts?: { host: string; port: number }[]; // additive: TCP connectivity-probe targets; [] disables the gate (local/offline providers). Default when absent: anycast 1.1.1.1:443 / 8.8.8.8:443 with a CLI provider; with provider.api, the endpoint's own host and port ([] for a loopback endpoint).
   /** Slice 4 T7 — the optional desktop notification. ADDITIVE-OPTIONAL, default `"off"`.
    *
    *  `"off"` (and an absent field) — the CLI story is the briefing file plus the terminal. This is the
@@ -353,6 +353,31 @@ export type Config = {
    *  each spend one extra model call on a busy morning and widen the run lock's staleness bound
    *  (§4.9). New installs default to `off`; nothing is seeded by `init`. */
   recapCampaigns?: unknown;
+  /** Phase E (E11) — the opt-in update check. ADDITIVE-OPTIONAL, default OFF.
+   *
+   *  `enabled: true` lets a scheduled run that has just delivered a briefing ask GitHub whether a newer
+   *  release exists. It is notify-only:
+   *  it downloads nothing and installs nothing, and the answer is only recorded for `status --json` and
+   *  the desktop app. Absent, or anything other than `true`, means no automatic check at all.
+   *
+   *  `intervalHours`: the minimum number of hours between automatic checks — a whole number from 1 to
+   *  720, default 24. Only scheduled runs check automatically, and only right after one of them has
+   *  delivered that day's briefing, once that run's own work is done: a tick that delivers nothing (the
+   *  day already done, the morning floor not yet reached, no network, a failed run) never checks. No
+   *  briefing ever waits for it, and a run in a terminal or with `--json` never checks.
+   *  `daily-briefing update --check` always checks, whatever this says.
+   *
+   *  What is sent: one HTTPS GET to api.github.com for this project's latest release, with this
+   *  version in the User-Agent and no query string — and, after the first answer, GitHub's own cache
+   *  tag for that release (`If-None-Match`, the same value for every client). No account, machine or
+   *  install identifier.
+   *
+   *  ⚠ The result reaches NOTHING the briefing run reports: never stdout or stderr, never the struct's
+   *  or the envelope's `warnings` — so it cannot move the eval's posture line. A malformed value WARNS
+   *  (`config validate --json`) and disables the check; it never throws, because a typo in a
+   *  notify-only feature must not cost the morning its briefing (B1 style — `src/updateCheck.ts`,
+   *  `resolveUpdateCheck`). */
+  updateCheck?: { enabled?: boolean; intervalHours?: number };
 };
 
 /**

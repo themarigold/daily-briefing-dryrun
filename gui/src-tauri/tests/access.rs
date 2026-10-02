@@ -263,6 +263,53 @@ fn a_tcc_denied_row_carries_the_engines_advice_unmodified() {
     );
 }
 
+/// Phase E final harden: `doctor --json` now adds `partialClone: true` and `notes: [<sentence>]` to a
+/// repo row that is a partial clone (ADDITIVE-OPTIONAL — a normal row keeps the old shape, and only
+/// rows that read fine are probed). `DoctorRepo` declares no `deny_unknown_fields`, and must not:
+/// `scope_of` maps a failed parse of the envelope to an EMPTY view, so a strict row type would drop
+/// every denied row's advice the moment one repo is a partial clone. The app shows the note on the
+/// wizard's last step (`lib/wizard.ts`, `doctorRepoNotes`); this path only has to keep reading.
+#[test]
+fn a_doctor_row_carrying_the_partial_clone_keys_still_reads() {
+    let advice =
+        "TCC-blocked: can't read /Users/x/Desktop/proj (macOS-protected folder /Users/x/Desktop).";
+    let doctor = doctor_with(serde_json::json!([
+        {
+            "path": "/Users/x/Desktop/proj",
+            "ok": false,
+            "issueKind": "tcc-denied",
+            "advice": advice,
+        },
+        {
+            "path": "/Users/x/Documents/big",
+            "ok": true,
+            "issueKind": null,
+            "advice": null,
+            "partialClone": true,
+            "notes": ["partial clone: while the tool reads this repository's history, git itself may download missing file contents from the repository's own remote, with your usual git credentials (the tool never fetches)"],
+        },
+    ]));
+    let scope = scope_of(&doctor, None, &[], &PathBuf::from("/Users/x"), true);
+    let desktop = scope
+        .iter()
+        .find(|r| r.key == "desktop")
+        .expect("the denied row's root is in scope");
+    assert_eq!(desktop.denied.len(), 1, "{scope:?}");
+    assert_eq!(desktop.denied[0].advice, advice);
+    let documents = scope
+        .iter()
+        .find(|r| r.key == "documents")
+        .expect("the partial clone's root is in scope");
+    assert!(
+        documents.denied.is_empty(),
+        "a partial clone is a fact, not a denial: {scope:?}"
+    );
+    assert_eq!(
+        documents.because,
+        vec!["/Users/x/Documents/big".to_string()]
+    );
+}
+
 /// Round 1 (lens 2, t12): the engine expands a leading `~` in `repos`/`discoverRoots` at config
 /// LOAD (`src/config.ts`, `expandTilde`), but `scope_of` reads the RAW file — so a `~`-spelled
 /// entry was invisible to the config-side source, which §11d justifies precisely by the protected
@@ -583,6 +630,25 @@ fn an_unreadable_record_reads_as_nothing_observed() {
         Vec::<String>::new(),
         "a successful write must leave no staging file beside {STORE_FILE}"
     );
+}
+
+/// Known item 8 (Phase E final harden): the record's temp file is CREATED, never opened. With a
+/// dangling symlink planted at every temp name the write can draw, the write refuses — it neither
+/// creates a link's target through it (`File::create` did) nor replaces a plant — and the record
+/// already on disk is left exactly as it was.
+#[cfg(unix)]
+#[test]
+fn a_planted_temp_name_is_never_written_through() {
+    let scratch = ScratchDir::new("access-temp-plant");
+    let seeded = AccessRecord {
+        app_principal_grant_observed: true,
+        last_launch_version: Some("0.1.0".into()),
+    };
+    daily_briefing_gui_lib::access::write_record(&scratch.path, &seeded).expect("seed the record");
+    common::assert_planted_temp_names_refused(&scratch.path, STORE_FILE, || {
+        daily_briefing_gui_lib::access::write_record(&scratch.path, &AccessRecord::default())
+    });
+    assert_eq!(read_record(&scratch.path), seeded);
 }
 
 /* ── the commands, through real IPC ───────────────────────────────────────────────────────────── */

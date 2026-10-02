@@ -777,14 +777,16 @@ export function campaignKey(subject: string): { tier: 2 | 3; key: string; label:
   // wrong claim. Pinned in `test/campaign-label-credential.test.ts`.
   // ⚠ The subject check is NOT a superset of a label check (cold review round 1, measured): tier 3
   // can MANUFACTURE a match the subject lacks. Its leading strip drops a `_` before the first token, so
-  // `_AKIA<…>` (no `\b` in the subject: `_` is a word character) became `akia<…>` with one; and
-  // `toLowerCase` folds a Kelvin sign U+212A to ASCII `k`, which a non-unicode `/i` never does. So
-  // the finished label is checked as well (`labelled`, below): the subject sees the `=` the tokenizer
-  // drops, the label sees what tier 3 produced. NOT covered, measured in review round 2: both
-  // transformations at once — a Kelvin sign inside `API_TOKEN=…`, or `_xoxb-…` whose `\b` the strip
-  // makes and whose `-` the tokenizer drops. The shared matcher misses each RAW subject as well, so
-  // these are its stated "literals, not classes" scope (credentials.ts), not a loss lower-casing adds.
-  // 0 of 2593 real subjects match either check.
+  // `_eyJ<…>` and `_AKIA<…>` (no `\b` in the subject: `_` is a word character) became `eyj<…>` /
+  // `akia<…>` with one — until the shared matcher stopped letting `_` hide those tokens (Phase E final
+  // harden, user-directed 2026-10-02: key ids and Slack in E16, then JWTs, GitHub and provider keys) —
+  // and `toLowerCase` folds a Kelvin sign U+212A to ASCII `k`, which a non-unicode `/i` never does.
+  // So the finished label is checked as well (`labelled`, below): the subject sees the `=` the tokenizer
+  // drops, the label sees what tier 3 produced. NOT covered, measured in review round 2: a Kelvin sign
+  // inside `API_TOKEN=…` (both transformations at once). The shared matcher misses that RAW subject as
+  // well, so it is its stated "literals, not classes" scope (credentials.ts), not a loss lower-casing
+  // adds. (`_xoxb-…`, the other round-2 case, is now caught in the raw subject by E16.) 0 of 2593 real
+  // subjects match either check.
   if (matchesCredentialAnyCase(s)) return undefined;
   const labelled = <T extends { label: string }>(c: T): T | undefined => (matchesCredentialAnyCase(c.label) ? undefined : c);
   for (const [name, re] of CAMPAIGN_TOKENS) {

@@ -27,9 +27,12 @@ export async function busyRepo(n: number): Promise<BusyRepo> {
     const iso = new Date(base + i * 60_000).toISOString();
     script.push(`printf 'q${i}\\n' > f${i}.txt && git add f${i}.txt && GIT_AUTHOR_DATE=${iso} GIT_COMMITTER_DATE=${iso} git commit -q -m 'adjust q${i} widget'`);
   }
-  const p = Bun.spawnSync(["sh", "-c", script.join("\n")], { cwd: dir, env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
+  // A NEUTRAL git config, as `buildRepo` itself uses (round-4 harden D4-L1): a developer's global
+  // `commit.gpgsign=true` must not call their real signer here (measured: it failed every busyRepo).
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+  const p = Bun.spawnSync(["sh", "-c", script.join("\n")], { cwd: dir, env, stdout: "pipe", stderr: "pipe" });
   if (p.exitCode !== 0) throw new Error(`busyRepo: ${p.stderr.toString()}`);
-  const log = Bun.spawnSync(["git", "log", "--reverse", "--format=%H"], { cwd: dir, stdout: "pipe", stderr: "pipe" });
+  const log = Bun.spawnSync(["git", "log", "--reverse", "--format=%H"], { cwd: dir, env, stdout: "pipe", stderr: "pipe" });
   const shas = log.stdout.toString().trim().split("\n").filter(Boolean);
   if (shas.length !== n) throw new Error(`busyRepo: ${shas.length} commits, wanted ${n}`);
   return { dir, label: basename(dir), shas };

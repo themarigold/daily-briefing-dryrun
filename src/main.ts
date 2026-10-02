@@ -24,6 +24,7 @@ import { section } from "./generator";
 import { TIMEOUT_MS } from "./provider";
 import { acquireRunLock } from "./runlock";
 import { notify, notifyPayload } from "./notify";
+import { autoUpdateCheck, checkForUpdate, type UpdateCheckDeps, type UpdateCheckResult } from "./updateCheck";
 import {
   envelopeFrom, gateEnvelope, redactEnvelope, resolveJsonOutPath, statusReport, doctorReport, validateCandidate,
   type RunEnvelope, type SkipReason,
@@ -48,6 +49,9 @@ export type RunDeps = {
   netPollMs?: number;
   now?: () => Date;                      // injectable clock for the floor gate (tests pin it; production uses real time)
   interactive?: boolean;                 // TTY at the entry point → floor-exempt (dispatch passes isTTY; tests default false for determinism)
+  /** Phase E (E11): the automatic update check's seams (`fetch`, `now`, the state-file path). Read ONLY
+   *  by `run()`'s post-run call below — never by the pipeline, whose `deps` spread carries it inert. */
+  updateCheck?: UpdateCheckDeps;
 };
 
 // The pipeline (discover → … → generate → drift) and its helpers — blockedDelivery,
@@ -137,7 +141,49 @@ export type RunOutput = {
   jsonOut?: string;
 };
 
+/** One `daily-briefing run`: the briefing (`runBriefing`, below), THEN — Phase E (E11) — the
+ *  opt-in automatic update check.
+ *
+ *  ⚠ THE CHECK RUNS AFTER `runBriefing` HAS RETURNED, and that ordering is the whole design (plan §5
+ *  decision 5). By then every write the run makes has happened — the briefing file, the dated archive,
+ *  the day marker, the envelope on stdout and in the `--json-out` sidecar — and the run lock is
+ *  RELEASED (`runBriefing`'s `finally`), so delivery never waits on the network and a GUI "Run now" is
+ *  never refused as `concurrent` while a check is in flight. The exit code is decided before the check
+ *  starts and returned unchanged.
+ *
+ *  ⚠ ONLY RIGHT AFTER A DELIVERED BRIEFING (user-directed, 2026-10-01, Phase E M5b — it reverses M4's
+ *  "after ANY scheduled tick", gate skips included). The signal is the envelope's own `delivered`
+ *  field (`RunEnvelope.delivered`, computed by `envelopeFrom` in src/json.ts: exit 0 AND neither
+ *  blocked nor offline-skipped), carried out of `runBriefing` by `emit` — the one function every
+ *  non-throwing return passes through — so the gate reads the SAME fact the run reports rather than a
+ *  second derivation of it. It is true on exactly one return: the last one, after `stampToday`
+ *  succeeded. Every gate skip (already ran, below the floor, no config, a concurrent run), an
+ *  offline/darkwake/limited skip, a blocked or parse-empty run, a failed marker write, a provider
+ *  failure and a crash leave it false. Exit code 0 is NOT the signal: most of those skips exit 0 too.
+ *
+ *  ⚠ AND ONLY ON A NON-TTY, NON-`--json` RUN — the launchd/systemd tick. A human at a terminal and the
+ *  desktop app's `run --json` never run it, so neither ever waits on it. `--json-out` alone does not
+ *  exempt a run: the scheduled path writes no envelope to stdout, and the check writes nothing to it.
+ *
+ *  ⚠ IT REACHES NO CHANNEL THE RUN REPORTS: no stdout/stderr byte, nothing in `struct.warnings`,
+ *  `runtimeWarnings` or the envelope's `warnings` — its one output is `<state>/update-check.json`
+ *  (src/updateCheck.ts). `test/update-check.test.ts` pins that byte-for-byte against a disabled run.
+ *  A run that THROWS (a crash) rethrows before reaching it, unchanged. */
 export async function run(force: boolean, deps: RunDeps = {}, out: RunOutput = {}): Promise<number> {
+  const { code, delivered } = await runBriefing(force, deps, out);
+  if (delivered && !(deps.interactive ?? false) && !out.json) {
+    // `.catch` on top of autoUpdateCheck's own total try/catch — the notify()-call rule above: a
+    // feature whose failure mode would be "the run reported something it should not" gets both.
+    await autoUpdateCheck(deps.updateCheck).catch(() => {});
+  }
+  return code;
+}
+
+/** What `runBriefing` hands back to `run()`: the exit code, and the `delivered` field of the envelope
+ *  it emitted — the post-run update check's gate (see `run`). */
+type BriefingOutcome = { code: number; delivered: boolean };
+
+async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promise<BriefingOutcome> {
   // ⚠ FIRST LINE OF THE FUNCTION, ahead of the log rotation and the tick heartbeat, because the
   // contract for the shape guard is "throws BEFORE any write" — and `stampTick` is a write. It is
   // pure, so hoisting it costs nothing. `dispatch` guards too (turning the throw into exit 2); this
@@ -169,7 +215,10 @@ export async function run(force: boolean, deps: RunDeps = {}, out: RunOutput = {
   }
   /** Set at the one `console.log(rendered)` below. Read by `emit` — see its comment. */
   let renderedToStdout = false;
-  const emit = async (env: RunEnvelope): Promise<number> => {
+  // ⚠ RETURNS `env.delivered` BESIDE THE EXIT CODE (Phase E M5b): every non-throwing return of this
+  // function is `return emit(…)` or `return skip(…)` (which ends in `emit`), so this is the one place
+  // `run()`'s update-check gate can read what the run actually reported — see `run`.
+  const emit = async (env: RunEnvelope): Promise<BriefingOutcome> => {
     // ── E1: THE ENVELOPE'S CREDENTIAL REDACTION — once, here, BEFORE the split between stdout and the
     // `--json-out` file, so both channels serialise the SAME redacted line and cannot disagree. Every
     // envelope — `envelopeFrom` AND `gateEnvelope` — reaches the process boundary only through `emit`.
@@ -201,7 +250,7 @@ export async function run(force: boolean, deps: RunDeps = {}, out: RunOutput = {
         if (!renderedToStdout) console.error(stripControl(`could not write --json-out ${jsonOutPath}: ${e}`));
       });
     }
-    return env.exitCode;
+    return { code: env.exitCode, delivered: env.delivered };
   };
   /** Record WHY this tick delivered nothing, then emit + return. Fail-open at every step: a
    *  diagnostic must never be the reason a morning is lost (same rule as `stampTick` above).
@@ -212,7 +261,7 @@ export async function run(force: boolean, deps: RunDeps = {}, out: RunOutput = {
   const skip = async (
     reason: SkipReason, exitCode: number, detail?: string,
     net?: { online: boolean; waitedMs: number } | null,
-  ): Promise<number> => {
+  ): Promise<BriefingOutcome> => {
     await writeLastSkip({ iso: now.toISOString(), localDate, reason, ...(detail ? { detail } : {}) })
       .catch(() => {});
     return emit(gateEnvelope({ exitCode, runDate: localDate, skipReason: reason, net: net ?? null }));
@@ -251,7 +300,10 @@ export async function run(force: boolean, deps: RunDeps = {}, out: RunOutput = {
     // A forced run, OR any non-"no-config" load error (malformed JSON, perms) is a real error →
     // surface it and exit 2 (today's behavior), regardless of force. NOT silenced.
     if (noConfig) console.error(`No config. Run \`daily-briefing init\` (writes ${configPath()}).`);
-    else console.error(`Config error: ${e}`);
+    // `diagError`, not a bare console.error: the message can quote the config's own text (a Bun JSON
+    // parse error echoes the offending token; a validator error quotes the value it rejected), and
+    // fd 2 is briefing.log under launchd. `skip`'s detail below is redacted by `writeLastSkip`.
+    else diagError(`Config error: ${e}`);
     return skip(noConfig ? "no-config" : "config-error", 2, String(e));
   }
 
@@ -429,8 +481,10 @@ export async function run(force: boolean, deps: RunDeps = {}, out: RunOutput = {
   // the coupling. A security control must not ride on an unrelated feature flag.
   //
   // The false-positive worry the gate existed for is already handled INSIDE the matcher, not here:
-  // `provider-key` requires a >=20-char UNHYPHENATED run precisely because branch names like
-  // `pk-refactor-the-whole-thing` were measured matching a looser tail at C2.
+  // `provider-key`'s generic `sk-`/`pk-`/`rk-`/`ak-` branch requires a >=20-char UNHYPHENATED run
+  // precisely because branch names like `pk-refactor-the-whole-thing` were measured matching a looser
+  // tail at C2. Its `sk-ant-` branch (user-directed 2026-10-02) takes hyphens, since a real key's
+  // base64url body has them, and keeps slugs out by a 40-character floor instead (credentials.ts).
   //
   // ⚠ It can never fire INSIDE a why, and that is the shared-matcher guarantee, not luck: a turn that
   // passed the ingest scan cannot match output-side because both scans use the SAME pattern module.
@@ -706,14 +760,17 @@ Usage:
                                    Validate a CANDIDATE config with the validator the engine uses
   daily-briefing schedule install|uninstall|status|verify
                                    Install/remove the OS trigger that delivers your briefing
+  daily-briefing update --check [--json]
+                                   Ask GitHub whether a newer release exists — notify-only: it
+                                   downloads and installs nothing, and exits 0 whatever it finds
 
 Flags:
   --force, -f      Ignore the morning-time floor and the once-per-day guard
   --json           run: print the machine-readable envelope INSTEAD of the markdown briefing
-                   schedule status|verify: print the report as JSON instead of text
+                   schedule status|verify, update --check: print the report as JSON instead of text
   --json-out <p>   run: write that envelope to <p> and leave stdout exactly as it is
-  --help,  -h      Show this help
-  --version, -v    Show the version
+  --help,  -h      Show this help (anywhere on the line — \`run --help\` runs nothing)
+  --version, -v    Show the version (anywhere on the line; runs nothing)
 
 init flags (API provider — omit them all for the default CLI provider):
   --provider anthropic-api|openai-compatible
@@ -758,6 +815,12 @@ Exit codes — \`schedule install\`/\`uninstall\`: 0 ours (installed/refreshed/r
 skip the engine wrote), 1 the kick was accepted but produced NO NEW evidence — including the case
 where today's briefing had already been delivered BEFORE the kick, which proves nothing about the
 trigger — 3 the scheduler refused the kick. \`schedule status\` exits 0; it only reports.
+
+\`update --check\` sends ONE anonymous HTTPS GET to api.github.com for this project's latest release:
+this version in the User-Agent, no query string, no account or machine identifier. It always checks
+when you run it. Set "updateCheck": { "enabled": true } in the config to let a scheduled run also check
+on its own, right after it has delivered that day's briefing (about every "intervalHours", default
+24, with an hour's slack) — off unless you turn it on.
 
 The three read-only subcommands exist for the desktop app and for scripting; they require --json
 because there is no human-readable form of them yet. None of them generates a briefing or writes
@@ -825,11 +888,31 @@ const RUN_LEADING_FLAGS = new Set(["--force", "-f", "--json", "--json-out"]);
  *  `test/dispatch.json.test.ts`, so a new subcommand cannot be added without becoming un-swallowable.
  *  ⚠ Slice 4 added `schedule`, and adding it HERE — not merely to the switch — is what keeps
  *  `daily-briefing --json schedule install` from routing to `run` and consuming the morning. */
-const KNOWN_COMMANDS = new Set(["run", "init", "status", "doctor", "config", "help", "schedule"]);
+const KNOWN_COMMANDS = new Set(["run", "init", "status", "doctor", "config", "help", "schedule", "update"]);
 
 /** The verbs of `schedule`. Refused rather than defaulted: `daily-briefing schedule` with no verb must
  *  print usage and exit non-zero, never fall through to anything stateful (the H2 lesson). */
 const SCHEDULE_VERBS = new Set(["install", "uninstall", "status", "verify"]);
+
+/** Phase E (E11). `update`'s whole argv vocabulary: the one verb (`--check`) and its one flag. A bare
+ *  `update`, any other token, or a repeated one is refused with usage and exit 2 — the SCHEDULE_VERBS
+ *  rule. There is deliberately no verb that downloads or installs anything. */
+const UPDATE_VERBS = new Set(["--check"]);
+const UPDATE_FLAGS = new Set(["--json"]);
+
+/** The one line a human `update --check` prints. Exported and pure so the WORDING is testable.
+ *  `latest`/`url` are already constrained by src/updateCheck.ts (a bounded version string; this
+ *  project's release page), and stripped of control bytes here anyway — they arrived over a network. */
+export function renderUpdateResult(r: UpdateCheckResult): string {
+  switch (r.status) {
+    case "newer":
+      return stripControl(`a newer version is available: ${r.latest ?? "?"} (you have ${r.current}) — ${r.url ?? ""}`.trimEnd());
+    case "up-to-date":
+      return stripControl(`up to date — you have ${r.current}${r.latest !== undefined && r.latest !== r.current ? ` (latest release: ${r.latest})` : ""}`);
+    default:
+      return stripControl(`could not check for updates (you have ${r.current}) — GitHub did not answer, or its answer could not be read. Nothing was downloaded.`);
+  }
+}
 
 /** Pull `--flag <value>` out of argv. A MISSING value is an ERROR, never a silent default — the same
  *  rule `jsonOutArg` follows, for the same reason: `--invoker` with nothing after it must not quietly
@@ -856,7 +939,8 @@ function flagValue(argv: string[], flag: string): { value?: string; error?: stri
  * ⚠ THE `--json-out` OPERAND IS SCANNED TOO, deliberately. `--json-out status --json` is ambiguous
  * between "write the sidecar to a file called status" and a mangled `status --json`, and the H2 rule
  * is that ambiguity resolves AWAY from a stateful run. The cost is that a sidecar may not be named
- * exactly `run`/`init`/`status`/`doctor`/`config`/`help`; `./status` or an absolute path still works.
+ * exactly a KNOWN_COMMANDS token (`run`/`init`/`status`/`doctor`/`config`/`help`/`schedule`/`update`);
+ * `./status` or an absolute path still works.
  */
 function swallowedCommand(argv: string[]): string | undefined {
   for (let i = 3; i < argv.length; i++) if (KNOWN_COMMANDS.has(argv[i]!)) return argv[i]!;
@@ -885,6 +969,8 @@ export async function dispatch(
     //   the only edges into the scheduler.
     schedule?: typeof import("./schedule/install");
     scheduleStatus?: typeof import("./schedule/status");
+    /** Phase E (E11): the manual check, injectable so a routing test never reaches the network. */
+    updateCheck?: typeof checkForUpdate;
   } = {},
 ): Promise<number> {
   const runFn = deps.run ?? run;
@@ -892,8 +978,14 @@ export async function dispatch(
   const first = argv[2];
   // Help/version are informational — they must NEVER trigger a stateful briefing run (the old
   // catch-all routed any leading flag, incl. --help, straight into a full generate + day-stamp).
-  if (first === "--help" || first === "-h" || first === "help") { printUsage(); return 0; }
-  if (first === "--version" || first === "-v") { console.log(VERSION); return 0; }
+  // ⚠ ANYWHERE IN ARGV, not only as argv[2], and BEFORE every other branch. This checked `first` only,
+  // so `run --help`, `init --help` and `schedule install --help` EXECUTED the subcommand — a reviewer's
+  // `run --help` stamped a real tick. There is no per-subcommand help, so every spelling prints the one
+  // usage text. A `-h`/`-v` that was meant as a flag VALUE (`--model -h`) is read as help too: that
+  // ambiguity resolves AWAY from a state change (the H2 rule), and help wins over version.
+  const flags = argv.slice(2);
+  if (first === "help" || flags.some((a) => a === "--help" || a === "-h")) { printUsage(); return 0; }
+  if (flags.some((a) => a === "--version" || a === "-v")) { console.log(VERSION); return 0; }
   // A leading run-flag (bare `daily-briefing --force`, `daily-briefing --json`) still means the
   // default `run`, but reject an UNKNOWN leading flag instead of silently running.
   if (first && first.startsWith("-") && !RUN_LEADING_FLAGS.has(first)) {
@@ -1036,6 +1128,28 @@ export async function dispatch(
           return sched.verifyExitCode(v);
         }
       }
+    }
+    // ── Phase E (E11): the manual, notify-only update check. ──────────────────────────────────────
+    case "update": {
+      const rest = argv.slice(3);
+      const verbs = rest.filter((a) => UPDATE_VERBS.has(a));
+      // ⚠ NO DEFAULT VERB and no unknown token (the SCHEDULE_VERBS rule): `daily-briefing update` alone
+      // must print usage and exit 2, never guess. `--json-out` is `run`'s and is refused here with
+      // every other stray token.
+      if (verbs.length !== 1 || rest.some((a) => !UPDATE_VERBS.has(a) && !UPDATE_FLAGS.has(a)) ||
+          rest.filter((a) => a === "--json").length > 1) {
+        console.error(verbs.length === 0
+          ? "update: --check is required — `daily-briefing update --check [--json]` (nothing is ever downloaded or installed)"
+          : `update: unexpected argument(s) ${stripControl(rest.filter((a) => !UPDATE_VERBS.has(a) && !UPDATE_FLAGS.has(a)).join(" ") || rest.join(" "))} — expected \`update --check [--json]\``);
+        printUsage();
+        return 2;
+      }
+      // ALWAYS fetches — `intervalHours` gates only the automatic path — and rewrites the state file.
+      // Exit 0 whatever the answer: `unknown` is a REPORT that the check could not be completed, the
+      // `doctor` rule ("it reports a problem, it does not become one").
+      const result = await (deps.updateCheck ?? checkForUpdate)();
+      console.log(wantsJson ? JSON.stringify(result) : renderUpdateResult(result));
+      return 0;
     }
     default: console.error(`unknown command: ${cmd}`); printUsage(); return 2;
   }

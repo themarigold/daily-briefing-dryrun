@@ -171,7 +171,10 @@ describe("IN-3 widen-only: tiers 2–3 never split a file cluster (property)", (
     // larger run: a no-op still scores 0, and a spurious trip needs merges to fall by more than half.
     expect(atomsSeen).toBeGreaterThan(100);
     expect(mergesSeen).toBeGreaterThan(60);
-  });
+    // ⚠ ITS OWN TIMEOUT, not bun's 5 s default: 2000 windows measured ~1.9 s alone (bun 1.3.14) and timed
+    // out under a loaded full-suite run (known item 5, Phase E final harden). The seed count and both
+    // floors above are the property; only the wall-clock allowance changed.
+  }, 30_000);
 
   test("the day-51 shape: a 12-member STATE.md cluster with mixed campaign keys is not pulled apart", () => {
     // Part 1 §4.3b, the measured regression: 7 of the 12 lead with "suite count", 3 carry GATE-S,

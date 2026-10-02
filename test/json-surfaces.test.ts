@@ -5,17 +5,19 @@ import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off 
 // negative ones: status creates and modifies ZERO files (its one trap is `checkRanToday`, which
 // REPAIRS, i.e. writes); doctor never generates and never stamps; config validate is the SAME
 // validator `loadConfig` uses, pinned by a shared fixture so the two cannot drift.
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, spyOn } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, statSync, existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  statusReport, doctorReport, validateCandidate, parseTickLine, statePaths, SKIP_REASONS,
+  statusReport, doctorReport, validateCandidate, parseTickLine, statePaths, SKIP_REASONS, PARTIAL_CLONE_NOTE,
   type DoctorDeps,
 } from "../src/json";
 import { loadConfig } from "../src/config";
-import { DEFAULT_MORNING_TIME } from "../src/schedule";
+import { REPO_SCAN_CONCURRENCY } from "../src/extractor";
+import { DEFAULT_MORNING_TIME, parseFloor } from "../src/schedule";
+import { REDACTION } from "../src/transcripts/credentials";
 import type { Config } from "../src/types";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
@@ -196,6 +198,29 @@ describe("status --json", () => {
     } finally { env.cleanup(); }
   });
 
+  // Round-2 harden (D-M1, a round-1 REGRESSION): `loadConfig` deliberately does not validate
+  // `morningTime` (config.ts — `parseFloor` degrades a bad one), so a hand-edited NON-STRING reaches
+  // `statusReport`, whose redaction of `value` called `.replace` on it and threw — `status --json`
+  // crashed where it used to report the value and a warning. `value` stays a STRING (its declared type):
+  // the JSON spelling of what the file holds.
+  test("a NON-STRING morningTime is reported as its JSON spelling, with the warning — never a throw", async () => {
+    for (const [mt, shown] of [[720, "720"], [true, "true"], [{}, "{}"], [[], "[]"]] as const) {
+      const env = withEnv({ repos: [], provider: PROV, morningTime: mt });
+      try {
+        const s = await statusReport();
+        expect(s.configError).toBeNull();                         // PREMISE: loadConfig accepted it
+        expect(s.morningTime).toEqual({
+          value: shown,
+          minutes: parseFloor(DEFAULT_MORNING_TIME).minutes,
+          warning: `invalid morningTime ${shown} — using the default ${DEFAULT_MORNING_TIME}`,
+        });
+        const d = await doctorReport(OFFLINE_DEPS);               // the other config-echo surface, same file
+        expect(d.config.valid).toBe(true);
+        expect(d.config.warnings.map((w) => w.field)).toContain("morningTime");
+      } finally { env.cleanup(); }
+    }
+  });
+
   test("status creates and modifies ZERO files — snapshot before and after", async () => {
     const env = withEnv({ repos: [], provider: PROV, morningTime: "07:20" });
     try {
@@ -240,6 +265,194 @@ describe("doctor --json", () => {
       expect(d.discoveredCount).toBe(2);
       expect(d.repos.every((r) => r.ok)).toBe(true);
       expect(await snapshot(env.stateDir)).toEqual(before);   // never stamps, never writes
+    } finally { env.cleanup(); }
+  });
+
+  // Known item 1 ("A+", user-approved): doctor NAMES a partial clone, with one note, from a read-only
+  // `git config` — real fixture repos, so the detection itself is exercised, not a stand-in.
+  test("a PARTIAL clone is named with a note — by remote.<name>.promisor or by extensions.partialClone — and the verdict is untouched", async () => {
+    const { buildRepo } = await import("./fixtures/build-repo");
+    const day = new Date(Date.now() - 864e5).toISOString();
+    const [plain, promisor, ext, bare, falsy, two, zero] = await Promise.all([0, 1, 2, 3, 4, 5, 6].map(() => buildRepo([{ file: "a.txt", content: "a", isoDate: day }])));
+    const git = async (repo: string, ...args: string[]) => {
+      const p = Bun.spawn(["git", "-C", repo, ...args], { stdout: "ignore", stderr: "pipe" });
+      if ((await p.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(p.stderr).text()}`);
+    };
+    await git(promisor!, "config", "remote.origin.url", "https://example.invalid/r.git");
+    await git(promisor!, "config", "remote.origin.promisor", "true");
+    await git(ext!, "config", "extensions.partialClone", "origin");
+    // A bare boolean key — `[remote "origin"]\n\tpromisor` with no `=` — is TRUE to git, and must be here.
+    await Bun.write(join(bare!, ".git", "config"), (await Bun.file(join(bare!, ".git", "config")).text()) + `[remote "upstream"]\n\tpromisor\n`);
+    await git(falsy!, "config", "remote.origin.promisor", "false");
+    // Round-2 harden (gpt R7): git reads ANY nonzero integer as true and 0 as false — its own boolean
+    // parser decides, not a list of spellings (`true/yes/on/1` missed `promisor=2`).
+    await git(two!, "config", "remote.origin.promisor", "2");
+    await git(zero!, "config", "remote.origin.promisor", "0");
+    const env = withEnv({ repos: [plain, promisor, ext, bare, falsy, two, zero], provider: PROV });
+    try {
+      const d = await doctorReport({ ...OFFLINE_DEPS, discover: async () => ({ repos: [plain!, promisor!, ext!, bare!, falsy!, two!, zero!], issues: [] }) });
+      const row = (p: string) => d.repos.find((r) => r.path === p)!;
+      for (const p of [promisor!, ext!, bare!, two!]) {
+        expect({ p, partialClone: row(p).partialClone, notes: row(p).notes }).toEqual({ p, partialClone: true, notes: [PARTIAL_CLONE_NOTE] });
+        expect(row(p).ok).toBe(true);                            // a fact, not a fault
+      }
+      for (const p of [plain!, falsy!, zero!]) {
+        expect({ p, keys: Object.keys(row(p)).sort() }).toEqual({ p, keys: ["advice", "issueKind", "ok", "path"] });   // the pre-existing shape, unchanged
+      }
+      expect(d.verdict).toBe("ready");
+      expect(PARTIAL_CLONE_NOTE).toContain("own remote");
+      expect(JSON.stringify(d)).not.toContain("example.invalid");   // the note never carries a remote URL
+    } finally { env.cleanup(); }
+  });
+
+  // Round-3 harden G3-3, corrected in round 4 (A4-L1 / B4-L1). `--get-regexp` lists OVERRIDDEN values
+  // too, and the three keys resolve differently in git — each expectation below was measured on git
+  // 2.50.1 by whether git lazily fetches a missing object from a local `file://` remote (src/git.ts
+  // `isPartialClone`). An `include.path` file is read where it sits, BEFORE (`earlier`) or AFTER
+  // (`later`) the repo's own section — for the two `remote.*` keys. NOT for `extensions.partialClone`:
+  // git honours that key from the repository's own config file only and never follows an include for
+  // it (round 3 wrongly took an include to stand in for an earlier level there), so an included value
+  // of it is IGNORED, whichever side it sits on.
+  test("partial-clone keys resolve as git resolves them: extensions.partialClone repo-own LAST value; remote.*.promisor ANY true; remote.*.partialclonefilter ANY", async () => {
+    const { buildRepo } = await import("./fixtures/build-repo");
+    const day = new Date(Date.now() - 864e5).toISOString();
+    const [extIncludedOriginOwnEmpty, extIncludedEmptyOwnOrigin, extOwnOriginLaterIncludedEmpty, extIncludedOnly,
+      extOwnLastEmpty, extOwnLastOrigin, promisorOverridden, promisorSameFile, promisorLaterTrue,
+      filterOnly, filterBesidePromisorFalse, filterIncludedOnly] =
+      await Promise.all(Array.from({ length: 12 }, () => buildRepo([{ file: "a.txt", content: "a", isoDate: day }])));
+    const append = async (repo: string, text: string) =>
+      Bun.write(join(repo, ".git", "config"), (await Bun.file(join(repo, ".git", "config")).text()) + text);
+    const included = (repo: string, name: string, text: string) => { const f = join(repo, name); writeFileSync(f, text); return `[include]\n\tpath = ${f}\n`; };
+    const earlier = (repo: string, text: string) => included(repo, "earlier.cfg", text);
+    const later = (repo: string, text: string) => included(repo, "later.cfg", text);
+    // extensions.partialClone — the included value is ignored; the repo's own LAST value decides.
+    await append(extIncludedOriginOwnEmpty!, earlier(extIncludedOriginOwnEmpty!, "[extensions]\n\tpartialClone = origin\n") + "[extensions]\n\tpartialClone =\n");
+    await append(extIncludedEmptyOwnOrigin!, earlier(extIncludedEmptyOwnOrigin!, "[extensions]\n\tpartialClone =\n") + "[extensions]\n\tpartialClone = origin\n");
+    // The round-4 case: own `origin`, then an included EMPTY value AFTER it — git still fetches.
+    await append(extOwnOriginLaterIncludedEmpty!, "[extensions]\n\tpartialClone = origin\n" + later(extOwnOriginLaterIncludedEmpty!, "[extensions]\n\tpartialClone =\n"));
+    await append(extIncludedOnly!, earlier(extIncludedOnly!, "[extensions]\n\tpartialClone = origin\n"));
+    // In the repo's own file the key is single-valued: `origin` then EMPTY → git cannot fetch; the reverse can.
+    await append(extOwnLastEmpty!, "[extensions]\n\tpartialClone = origin\n\tpartialClone =\n");
+    await append(extOwnLastOrigin!, "[extensions]\n\tpartialClone =\n\tpartialClone = origin\n");
+    // remote.<name>.promisor: an earlier-level `true` under a later `false` — git STILL treats the remote
+    // as a promisor (a later false never unmarks it), so this is partial, NOT "overridden".
+    await append(promisorOverridden!, earlier(promisorOverridden!, `[remote "origin"]\n\tpromisor = true\n`) + `[remote "origin"]\n\tpromisor = false\n`);
+    await append(promisorSameFile!, `[remote "origin"]\n\tpromisor = true\n\tpromisor = false\n`);
+    await append(promisorLaterTrue!, earlier(promisorLaterTrue!, `[remote "origin"]\n\tpromisor = false\n`) + `[remote "origin"]\n\tpromisor = true\n`);
+    // remote.<name>.partialclonefilter alone makes the remote a promisor — beside `promisor = false` too,
+    // and from an included file (it is ordinary config, read at every level).
+    await append(filterOnly!, `[remote "origin"]\n\tpartialclonefilter = blob:none\n`);
+    await append(filterBesidePromisorFalse!, `[remote "origin"]\n\tpromisor = false\n\tpartialclonefilter = blob:none\n`);
+    await append(filterIncludedOnly!, earlier(filterIncludedOnly!, `[remote "origin"]\n\tpartialclonefilter = blob:none\n`));
+    const repos = [extIncludedOriginOwnEmpty!, extIncludedEmptyOwnOrigin!, extOwnOriginLaterIncludedEmpty!, extIncludedOnly!,
+      extOwnLastEmpty!, extOwnLastOrigin!, promisorOverridden!, promisorSameFile!, promisorLaterTrue!,
+      filterOnly!, filterBesidePromisorFalse!, filterIncludedOnly!];
+    const env = withEnv({ repos, provider: PROV });
+    try {
+      const d = await doctorReport({ ...OFFLINE_DEPS, discover: async () => ({ repos, issues: [] }) });
+      const verdict = (p: string) => d.repos.find((r) => r.path === p)!.partialClone === true;
+      expect({
+        extIncludedOriginOwnEmpty: verdict(extIncludedOriginOwnEmpty!), extIncludedEmptyOwnOrigin: verdict(extIncludedEmptyOwnOrigin!),
+        extOwnOriginLaterIncludedEmpty: verdict(extOwnOriginLaterIncludedEmpty!), extIncludedOnly: verdict(extIncludedOnly!),
+        extOwnLastEmpty: verdict(extOwnLastEmpty!), extOwnLastOrigin: verdict(extOwnLastOrigin!),
+        promisorOverridden: verdict(promisorOverridden!), promisorSameFile: verdict(promisorSameFile!),
+        promisorLaterTrue: verdict(promisorLaterTrue!),
+        filterOnly: verdict(filterOnly!), filterBesidePromisorFalse: verdict(filterBesidePromisorFalse!),
+        filterIncludedOnly: verdict(filterIncludedOnly!),
+      }).toEqual({
+        extIncludedOriginOwnEmpty: false, extIncludedEmptyOwnOrigin: true,
+        extOwnOriginLaterIncludedEmpty: true, extIncludedOnly: false,
+        extOwnLastEmpty: false, extOwnLastOrigin: true,
+        promisorOverridden: true, promisorSameFile: true,
+        promisorLaterTrue: true,
+        filterOnly: true, filterBesidePromisorFalse: true,
+        filterIncludedOnly: true,
+      });
+    } finally { env.cleanup(); }
+  });
+
+  // Round-4 harden A4-L1: the GLOBAL level. `runGit` inherits the environment the test process started
+  // with (Bun.spawn does not see a later `process.env` write — measured on Bun 1.3.14), so a pass-through
+  // spy hands git ONE controlled global file (and no system file) instead. Measured on git 2.50.1: a
+  // global `extensions.partialClone = origin` never fetches; a global `partialclonefilter` alone does.
+  // The second is also this test's PREMISE — it proves the injected global file is the one git read.
+  test("partial-clone keys at the GLOBAL level: extensions.partialClone is ignored there; partialclonefilter counts", async () => {
+    const { buildRepo } = await import("./fixtures/build-repo");
+    const repo = await buildRepo([{ file: "a.txt", content: "a", isoDate: new Date(Date.now() - 864e5).toISOString() }]);
+    const env = withEnv({ repos: [repo], provider: PROV });
+    const realSpawn = Bun.spawn;
+    const underGlobal = async (name: string, text: string) => {
+      const file = join(env.cfgHome, name);
+      writeFileSync(file, text);
+      let gitSpawns = 0;
+      const spy = spyOn(Bun, "spawn").mockImplementation(((cmd: Parameters<typeof Bun.spawn>[0], opts?: Parameters<typeof Bun.spawn>[1]) => {
+        if (Array.isArray(cmd) && cmd[0] === "git") gitSpawns++;
+        return realSpawn(cmd as string[], { ...(opts as object), env: { ...process.env, GIT_CONFIG_GLOBAL: file, GIT_CONFIG_SYSTEM: "/dev/null" } } as Parameters<typeof Bun.spawn>[1]);
+      }) as unknown as typeof Bun.spawn);
+      try {
+        const d = await doctorReport({ ...OFFLINE_DEPS, discover: async () => ({ repos: [repo], issues: [] }) });
+        return { partial: d.repos[0]!.partialClone === true, gitSpawns };
+      } finally { spy.mockRestore(); }
+    };
+    try {
+      expect(await underGlobal("global-filter.gitconfig", `[remote "origin"]\n\tpartialclonefilter = blob:none\n`))
+        .toEqual({ partial: true, gitSpawns: 3 });   // PREMISE: the injected global file is read
+      expect(await underGlobal("global-ext.gitconfig", "[extensions]\n\tpartialClone = origin\n"))
+        .toEqual({ partial: false, gitSpawns: 3 });
+    } finally { env.cleanup(); }
+  });
+
+  // Round-3 harden A3-L1 (= D3-L2): a probe failure is a "no", whenever it lands. Before the fix an early
+  // rejection made doctorReport throw (mapLimit → Promise.race). A LATE one never escaped, measured: the
+  // race had already attached a handler to the pass, so it was handled, not lost — but it is pinned here
+  // anyway, because `bun test` fails the running test on any unhandled rejection (measured with a
+  // control), and the sleep below keeps this test running until both late probes have rejected.
+  test("a partial-clone probe that throws or rejects — early, or after the deadline — costs a note, never the report", async () => {
+    const env = withEnv({ repos: ["/r1", "/r2"], provider: PROV });
+    try {
+      const early = await doctorReport({ ...OFFLINE_DEPS, partialClone: async () => { throw new Error("early"); } });
+      expect([early.verdict, early.repos.map((r) => r.partialClone)]).toEqual(["ready", [undefined, undefined]]);
+      const sync = await doctorReport({ ...OFFLINE_DEPS, partialClone: () => { throw new Error("sync"); } });
+      expect([sync.verdict, sync.repos.map((r) => r.partialClone)]).toEqual(["ready", [undefined, undefined]]);
+      // Late: both probes reject 40 ms AFTER a 20 ms deadline — doctor has already answered by then.
+      const late = await doctorReport({
+        ...OFFLINE_DEPS, partialClone: () => new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("late")), 60)), partialCloneMs: 20,
+      });
+      expect([late.verdict, late.repos.map((r) => r.partialClone)]).toEqual(["ready", [undefined, undefined]]);
+      await Bun.sleep(150);   // past the late rejections, so an unhandled one would fail THIS test
+    } finally { env.cleanup(); }
+  });
+
+  test("the partial-clone pass is bounded: a probe that never answers costs at most its budget and adds no note", async () => {
+    const env = withEnv({ repos: ["/r1", "/r2"], provider: PROV });
+    try {
+      const t0 = Date.now();
+      const d = await doctorReport({ ...OFFLINE_DEPS, partialClone: () => new Promise<boolean>(() => {}), partialCloneMs: 50 });
+      expect(Date.now() - t0).toBeLessThan(5_000);
+      expect(d.repos.map((r) => r.partialClone)).toEqual([undefined, undefined]);
+      expect(d.verdict).toBe("ready");
+    } finally { env.cleanup(); }
+  });
+
+  // Round-2 harden (gpt R6): the race above only stopped AWAITING the scan. Every worker kept taking
+  // queued repos after doctor returned, each a `git config` spawn, so the bound covered the answer and
+  // not the pass. Controllable probes make it deterministic: the first wave is held past the deadline,
+  // then answered — under a race-only bound each freed worker starts the next repo at once.
+  test("the partial-clone pass has ONE deadline: no queued probe starts after it, and doctor does not wait on those in flight", async () => {
+    const many = Array.from({ length: 3 * REPO_SCAN_CONCURRENCY }, (_, i) => `/r${String(i).padStart(2, "0")}`);
+    const env = withEnv({ repos: many, provider: PROV });
+    try {
+      const held: ((v: boolean) => void)[] = [];
+      const probe = () => new Promise<boolean>((r) => { held.push(r); });
+      const d = await doctorReport({ ...OFFLINE_DEPS, discover: async () => ({ repos: many, issues: [] }), partialClone: probe, partialCloneMs: 50 });
+      // PREMISE: doctor returned at the deadline with a full first wave in flight, none of it answered.
+      expect(held.length).toBe(REPO_SCAN_CONCURRENCY);
+      expect(d.repos.length).toBe(many.length);
+      expect(d.repos.every((r) => r.partialClone === undefined)).toBe(true);
+      // The in-flight probes answer AFTER the deadline, freeing every worker.
+      for (const answer of held.splice(0)) answer(true);
+      await Bun.sleep(20);
+      expect(`probes started after the deadline: ${held.length}`).toBe("probes started after the deadline: 0");
     } finally { env.cleanup(); }
   });
 
@@ -391,6 +604,10 @@ const CASES: { name: string; raw: unknown; valid: boolean; warns?: string; errFi
   // schedule.ts:19-21 degrades a bad floor to 07:20 + a warning ON PURPOSE — never an error, or a
   // typo'd time would cost every morning until someone noticed.
   { name: "invalid morningTime degrades with a warning", raw: { provider: PROV, morningTime: "25:99" }, valid: true, warns: "morningTime" },
+  // A hand-edited NON-STRING degrades the same way (round-2 harden D-M1: status --json used to throw on it).
+  { name: "a non-string morningTime (720) degrades with a warning", raw: { provider: PROV, morningTime: 720 }, valid: true, warns: "morningTime" },
+  { name: "a non-string morningTime (true) degrades with a warning", raw: { provider: PROV, morningTime: true }, valid: true, warns: "morningTime" },
+  { name: "a non-string morningTime ({}) degrades with a warning", raw: { provider: PROV, morningTime: {} }, valid: true, warns: "morningTime" },
   { name: "a malformed transcripts block warns and disables", raw: { provider: PROV, transcripts: "yes" }, valid: true, warns: "transcripts" },
   { name: "malformed networkProbeHosts falls back to the defaults", raw: { provider: PROV, networkProbeHosts: "1.1.1.1" }, valid: true, warns: "networkProbeHosts" },
   { name: "an uncompilable exclude pattern warns, it is not fatal", raw: { provider: PROV, excludeCommitPatterns: ["("] }, valid: true, warns: "excludeCommitPatterns" },
@@ -521,4 +738,75 @@ test("SKIP_REASONS covers every non-delivering return in run(), and nothing else
     expect(`${fromPipeline} in SKIP_REASONS`).toBe(
       (SKIP_REASONS as readonly string[]).includes(fromPipeline) ? `${fromPipeline} in SKIP_REASONS` : "MISSING");
   }
+});
+
+// ── E11 (Phase E final harden; deferred M1a A3/A4): config-ECHO strings leave the read-only surfaces
+// redacted, exactly as the run envelope already redacts them. Each plant is first shown raw at its source.
+describe("config-echo warnings and errors are redacted on status / doctor / config validate, and on `Config error:`", () => {
+  const GH = "ghp_AbCdEfGhIjKlMnOpQrStUv123456";
+  const base = { repos: [], provider: PROV, networkProbeHosts: [] };
+
+  test("config validate: an echoed morningTime, an echoed bad regex, and a validator error that quotes the value", () => {
+    // PREMISES: the sources really echo the value.
+    expect(parseFloor(GH).warning).toContain(GH);
+    const warned = validateCandidate({ ...base, morningTime: GH, excludeCommitPatterns: [`${GH}[`] });
+    expect(warned.valid).toBe(true);
+    expect(warned.warnings.map((w) => w.field).sort()).toEqual(["excludeCommitPatterns", "morningTime"]);
+    expect(JSON.stringify(warned.warnings)).not.toContain(GH);
+    expect(warned.warnings.every((w) => w.message.includes(REDACTION))).toBe(true);
+    expect(warned.normalized?.morningTime).toBe(GH);           // the caller's own config is handed back untouched
+
+    const failed = validateCandidate({ ...base, lookbackCapDays: GH });
+    expect(failed.valid).toBe(false);
+    expect(failed.errors[0]!.field).toBe("lookbackCapDays");
+    expect(failed.errors[0]!.message).toContain(REDACTION);
+    expect(JSON.stringify(failed)).not.toContain(GH);
+  });
+
+  test("status --json: configError and morningTime.warning", async () => {
+    for (const [cfg, pick] of [
+      [{ ...base, lookbackCapDays: GH }, (s: Awaited<ReturnType<typeof statusReport>>) => s.configError],
+      [{ ...base, morningTime: GH }, (s: Awaited<ReturnType<typeof statusReport>>) => s.morningTime.warning],
+      // A NON-STRING carrying one (round-2 D-M1): `value` is its JSON spelling, redacted like any string.
+      [{ ...base, morningTime: [GH] }, (s: Awaited<ReturnType<typeof statusReport>>) => s.morningTime.value],
+      [{ ...base, morningTime: { t: GH } }, (s: Awaited<ReturnType<typeof statusReport>>) => s.morningTime.warning],
+    ] as const) {
+      const env = withEnv(cfg);
+      try {
+        const s = await statusReport();
+        expect(pick(s)).toContain(REDACTION);                    // PREMISE: the field was populated
+        expect(JSON.stringify(s)).not.toContain(GH);
+      } finally { env.cleanup(); }
+    }
+  });
+
+  test("doctor --json: the config block's errors and warnings", async () => {
+    for (const cfg of [{ ...base, lookbackCapDays: GH }, { ...base, morningTime: GH }, { ...base, morningTime: [GH] }]) {
+      const env = withEnv(cfg);
+      try {
+        const d = await doctorReport(OFFLINE_DEPS);
+        const notes = [...d.config.errors, ...d.config.warnings];
+        expect(notes.length).toBeGreaterThan(0);
+        expect(notes.some((n) => n.message.includes(REDACTION))).toBe(true);
+        expect(JSON.stringify(d)).not.toContain(GH);
+      } finally { env.cleanup(); }
+    }
+  });
+
+  test("`Config error:` on stderr (fd 2 is briefing.log under launchd), forced and scheduled alike", async () => {
+    const { run } = await import("../src/main");
+    for (const force of [true, false]) {
+      const env = withEnv({ ...base, lookbackCapDays: GH });
+      const err: string[] = [];
+      const oErr = console.error;
+      console.error = (...a: unknown[]) => { err.push(a.map(String).join(" ")); };
+      let code: number;
+      try { code = await run(force, { interactive: false }); } finally { console.error = oErr; env.cleanup(); }
+      expect(code!).toBe(2);
+      const text = err.join("\n");
+      expect(text).toContain("Config error:");                    // PREMISE: the line was printed
+      expect(text).toContain(REDACTION);
+      expect(text).not.toContain(GH);
+    }
+  });
 });

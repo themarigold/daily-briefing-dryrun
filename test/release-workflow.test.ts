@@ -17,7 +17,7 @@
 // in command position, so every assertion about the signing commands below is a REGEX literal (the
 // scanner strips those before it looks).
 import { test, expect, describe } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
@@ -525,17 +525,25 @@ describe("release.yml: bundle legs", () => {
   });
 
   // The Linux smoke, RUN — not pattern-matched. A stub `dpkg-deb` first on PATH serves a real tarball
-  // (built here with `tar`) as the package's data member, and a stub AppImage extracts the layout the
-  // conf ships (gui/src-tauri/tauri.linux.conf.json, bundle.linux.appimage.files): the TRACKED wrapper
-  // at usr/bin/daily-briefing and the built engine at usr/libexec/daily-briefing/daily-briefing, both
-  // copied from a fake gui/ tree that is the step's working directory. The engine is a stub printing a
-  // version, and the step's `--version` runs it THROUGH the real wrapper. `layout` swaps in each broken
-  // variant the AppImage half must refuse.
+  // (built here with `tar`, binaries 0755 and the desktop entry 0644, as tauri-bundler writes them) as the
+  // package's data member, and a stub AppImage extracts the layout tauri-bundler and the conf ship: the
+  // TRACKED wrapper at usr/bin/daily-briefing and the built engine at
+  // usr/libexec/daily-briefing/daily-briefing (gui/src-tauri/tauri.linux.conf.json,
+  // bundle.linux.appimage.files), both copied from a fake gui/ tree that is the step's working
+  // directory; the app's main executable at usr/bin/daily-briefing-gui; its desktop entry at
+  // usr/share/applications/Daily Briefing.desktop, linked from the AppDir root. The engine is a stub
+  // printing a version, and the step's `--version` runs it THROUGH the real wrapper; the GUI stub exits
+  // 99 and is never run. `layout`, `app` and `debModes` swap in each broken variant the smoke must refuse.
   interface LinuxSmokeOpts {
     debMembers?: string[];
+    /** Mode overrides for the deb's data members (default: 0755 for usr/bin/*, 0644 otherwise). */
+    debModes?: Record<string, number>;
     prefixed?: boolean;
     /** What the AppImage puts at usr/bin/daily-briefing and at usr/libexec/daily-briefing/daily-briefing. */
     layout?: { bin: "wrapper" | "engine" | "edited-wrapper" | "wrapper-0644" | "missing"; libexec: "engine" | "engine-0644" | "patched-engine" | "missing" };
+    /** The app's own files in the AppImage: its main executable, and its desktop entry (in
+     *  usr/share/applications and linked from the AppDir root). */
+    app?: { gui: "exe" | "exe-0644" | "missing"; desktop: "both" | "renamed-root" | "no-root" | "no-share" | "none" };
     /** What the built engine prints for --version; null makes it exit 3 instead. */
     engineVersion?: string | null;
     /** The fake tree's copy of the tracked wrapper (default: the real one), which the AppImage stub copies. */
@@ -547,6 +555,7 @@ describe("release.yml: bundle legs", () => {
   const linuxSmoke = (dir: string, o: LinuxSmokeOpts = {}): { code: number; out: string } => {
     const members = o.debMembers ?? DEB_REQUIRED;
     const layout = o.layout ?? { bin: "wrapper", libexec: "engine" };
+    const app = o.app ?? { gui: "exe", desktop: "both" };
     const engineVersion = o.engineVersion === undefined ? SMOKE_VERSION : o.engineVersion;
     const triple = linux.env!.TRIPLE!;
     const sh = (cmd: string[], cwd?: string) => {
@@ -556,7 +565,8 @@ describe("release.yml: bundle legs", () => {
     const root = join(dir, "root");
     for (const m of members) {
       mkdirSync(join(root, m, ".."), { recursive: true });
-      writeFileSync(join(root, m), "");
+      writeFileSync(join(root, m), m.startsWith("usr/bin/") ? "#!/bin/sh\nexit 99\n" : "[Desktop Entry]\n");
+      chmodSync(join(root, m), o.debModes?.[m] ?? (m.startsWith("usr/bin/") ? 0o755 : 0o644));   // chmod: not subject to the umask
     }
     const tarball = join(dir, "data.tar");
     sh(o.prefixed ? ["tar", "-cf", tarball, "-C", root, "."] : ["tar", "-cf", tarball, "-C", root, "usr"]);
@@ -599,11 +609,28 @@ describe("release.yml: bundle legs", () => {
       "patched-engine": `cp "${engineSrc}" ${ul}; chmod 755 ${ul}; printf '# patched\\n' >> ${ul}`,
       missing: ":",
     }[layout.libexec];
+    const ug = "squashfs-root/usr/bin/daily-briefing-gui";
+    const guiStep = {
+      exe: `printf '#!/bin/sh\\nexit 99\\n' > ${ug}; chmod 755 ${ug}`,
+      "exe-0644": `printf '#!/bin/sh\\nexit 99\\n' > ${ug}; chmod 644 ${ug}`,
+      missing: ":",
+    }[app.gui];
+    const share = '"squashfs-root/usr/share/applications/Daily Briefing.desktop"';
+    const entry = `printf '[Desktop Entry]\\nExec=daily-briefing-gui\\n' > ${share}`;
+    const desktopStep = {
+      both: `${entry}; ln -s "usr/share/applications/Daily Briefing.desktop" "squashfs-root/Daily Briefing.desktop"`,
+      // Another name at the root is still an entry AppRun can launch through.
+      "renamed-root": `${entry}; ln -s "usr/share/applications/Daily Briefing.desktop" "squashfs-root/daily-briefing.desktop"`,
+      "no-root": entry,
+      // A root link left dangling: the entry it names is not there.
+      "no-share": `ln -s "usr/share/applications/Daily Briefing.desktop" "squashfs-root/Daily Briefing.desktop"`,
+      none: ":",
+    }[app.desktop];
     writeFileSync(join(stage, `daily-briefing-${SMOKE_VERSION}-linux-x86_64.AppImage`),
       "#!/bin/sh\nset -e\n" +
       "[ \"$1\" = --appimage-extract ] || exit 2\n" +
-      "mkdir -p squashfs-root/usr/bin squashfs-root/usr/libexec/daily-briefing\n" +
-      `${binStep}\n${libexecStep}\n`, { mode: 0o755 });
+      "mkdir -p squashfs-root/usr/bin squashfs-root/usr/libexec/daily-briefing squashfs-root/usr/share/applications\n" +
+      `${binStep}\n${libexecStep}\n${guiStep}\n${desktopStep}\n`, { mode: 0o755 });
     writeFileSync(join(stage, `daily-briefing_${SMOKE_VERSION}_amd64.deb`), "stub: dpkg-deb never reads it\n");
     const r = Bun.spawnSync(["bash", "-c", stepById(linux, "smoke").run!], {
       cwd: gui,
@@ -631,10 +658,20 @@ describe("release.yml: bundle legs", () => {
         expect(`${form} without ${drop}: ${r.code}`).toBe(`${form} without ${drop}: 1`);
         expect(r.out).toContain(`deb: ${drop} is missing from the package contents`);
       }
+      // Present but not executable by everyone: each of the two executables, at 0644 and at 0700 (root-
+      // owned once installed, so a user could not run it).
+      for (const exe of ["usr/bin/daily-briefing-gui", "usr/bin/daily-briefing"]) {
+        for (const mode of [0o644, 0o700]) {
+          const r = linuxSmoke(join(base, `mode-${form.replace(/\W/g, "")}-${exe.replace(/\W/g, "")}-${mode.toString(8)}`), { prefixed, debModes: { [exe]: mode } });
+          expect(`${form} ${exe} ${mode.toString(8)}: ${r.code}`).toBe(`${form} ${exe} ${mode.toString(8)}: 1`);
+          expect(r.out).toContain(`deb: ${exe} is not one regular file executable by everyone (mode '-rw`);
+          expect(r.out).not.toContain("smoke: ok");
+        }
+      }
     }
-    // Eight full smoke runs, each executing several freshly written scripts: macOS scans every new
+    // Sixteen full smoke runs, each executing several freshly written scripts: macOS scans every new
     // executable on first exec (~0.2 s each, measured 2026-10-01), so the 5 s default is too tight.
-  }, 30_000);
+  }, 90_000);
 
   // The AppImage half (user-directed 2026-10-01, "B: try AppImage, else .deb"): the layout the conf sets
   // up, checked on the extracted AppImage, each broken variant refused by name.
@@ -669,6 +706,17 @@ describe("release.yml: bundle legs", () => {
       // that goes THROUGH the wrapper can catch this (one run against the engine directly would pass).
       ["a wrapper whose target is wrong", { wrapperText: misdirected },
         /AppImage: --version through the wrapper exited non-zero/],
+      // The app's own files.
+      ["no GUI main executable", { app: { gui: "missing", desktop: "both" } },
+        /AppImage: usr\/bin\/daily-briefing-gui \(the app's main executable\) is missing/],
+      ["a non-executable GUI main executable", { app: { gui: "exe-0644", desktop: "both" } },
+        /AppImage: usr\/bin\/daily-briefing-gui is not executable/],
+      ["no desktop entry at all", { app: { gui: "exe", desktop: "none" } },
+        /AppImage: usr\/share\/applications\/Daily Briefing\.desktop is missing/],
+      ["a root link to a desktop entry that is not there", { app: { gui: "exe", desktop: "no-share" } },
+        /AppImage: usr\/share\/applications\/Daily Briefing\.desktop is missing/],
+      ["no desktop entry at the AppDir root", { app: { gui: "exe", desktop: "no-root" } },
+        /AppImage: no \.desktop entry at the AppDir root/],
     ];
     refused.forEach(([what, opts, why], i) => {
       const r = linuxSmoke(join(base, `refused-${i}`), opts);
@@ -676,8 +724,11 @@ describe("release.yml: bundle legs", () => {
       expect(r.out).toMatch(why);
       expect(r.out).not.toContain("smoke: ok");
     });
-    // Eleven full smoke runs (see the deb test's timing note).
-  }, 60_000);
+    // A root entry under another name is still one AppRun can launch through: accepted.
+    const renamed = linuxSmoke(join(base, "renamed-root"), { app: { gui: "exe", desktop: "renamed-root" } });
+    expect(`renamed root entry: ${renamed.code} ${renamed.out}`).toStartWith("renamed root entry: 0 ");
+    // Seventeen full smoke runs (see the deb test's timing note).
+  }, 90_000);
 
   test("the size step checks the staged DMG and the built .app against their matrix rows", () => {
     const run = stepById(mac, "size").run!;
@@ -702,15 +753,15 @@ describe("release.yml: bundle legs", () => {
       expect(r).toMatch(/^bun run test$/m);
       expect(r).toMatch(/^bun run check$/m);
     }
-    expect(macRun).toMatch(/^cargo test --manifest-path src-tauri\/Cargo\.toml --no-fail-fast$/m);
+    expect(macRun).toMatch(/^cargo test --locked --manifest-path src-tauri\/Cargo\.toml --no-fail-fast$/m);
     expect(macRun).not.toContain("--skip");
-    expect(linRun).toMatch(new RegExp(`^cargo test --manifest-path src-tauri/Cargo\\.toml --no-fail-fast -- --skip ${SKIP}$`, "m"));
+    expect(linRun).toMatch(new RegExp(`^cargo test --locked --manifest-path src-tauri/Cargo\\.toml --no-fail-fast -- --skip ${SKIP}$`, "m"));
     expect(linRun.match(/--skip/g)?.length).toBe(1);
     // No other step of either workflow file skips anything.
     expect(Object.values(J).flatMap((j) => j.steps).filter((s) => s.run?.includes("--skip")).length).toBe(1);
   });
 
-  test("bundle-windows turns off CRLF conversion BEFORE its checkout (no .gitattributes is tracked)", () => {
+  test("bundle-windows turns off CRLF conversion BEFORE its checkout (the tracked .gitattributes covers only site/**)", () => {
     const checkout = win.steps.findIndex((s) => s.uses?.startsWith("actions/checkout@"));
     const lf = win.steps.findIndex((s) => /^git config --global core\.autocrlf false$/m.test(s.run ?? ""));
     expect(lf).toBe(0);
@@ -727,6 +778,79 @@ describe("release.yml: bundle legs", () => {
     expect(linux["runs-on"]).toBe("ubuntu-22.04");
     expect(mac["runs-on"]).toBe("${{ matrix.runner }}");
     expect(win["runs-on"]).toBe("windows-latest");
+  });
+
+  // Disk headroom (release dry run 2, 2026-10-02: the runner ran out of disk inside the Linux smoke, after
+  // the debug and release Rust targets, and died without writing a marker). The step DELETES things as
+  // root, so what it may delete is pinned twice: an exact allowlist, and — independently of that list, so
+  // editing the list cannot quietly widen the blast radius — the classes of path the job itself uses.
+  const FREE_DISK = "Free disk space (unused preinstalled toolchains)";
+  const FREED = ["/usr/share/dotnet", "/usr/local/lib/android", "/usr/local/.ghcup", "/opt/hostedtoolcache/CodeQL"];
+  /** A run script's code lines: continuations joined, comments and blank lines dropped. */
+  const codeLines = (run: string): string[] =>
+    run.replace(/\\\n/g, " ").split("\n").map((l) => l.trim()).filter((l) => l !== "" && !l.startsWith("#"));
+  /** Why the free-disk step must never delete `p`, or null when it may. On a hosted runner the workspace,
+   *  $RUNNER_TEMP, ~/.cargo, ~/.rustup and ~/.bun all live under /home/runner. */
+  const forbiddenDeletion = (p: string): string | null => {
+    if (!/^(?:\/[\w.+-]+)+$/.test(p)) return "not a literal absolute path (a variable, ~, a glob or a relative path)";
+    const parts = p.split("/").slice(1);
+    if (parts.some((c) => c === "." || c === "..")) return "has a . or .. component";
+    if (parts.length < 3) return "a top-level system directory";
+    if (p.startsWith("/home/") || p.startsWith("/root/")) return "under a home directory (workspace, $RUNNER_TEMP, cargo, rustup, bun)";
+    if (p.startsWith("/opt/hostedtoolcache/") && p !== "/opt/hostedtoolcache/CodeQL") return "the hosted tool cache outside CodeQL";
+    if (/\/\.?(?:cargo|rustup|bun|node|nodejs|npm|python[\d.]*|apt|dpkg)(?:\/|$)/i.test(p)) return "a toolchain this job uses";
+    return null;
+  };
+
+  test("bundle-linux frees disk in ONE step of its own: after the checkout, before System packages, outside the derivation", () => {
+    // Only here: no other job of release.yml carries it.
+    const where = Object.entries(J).flatMap(([jn, job]) => job.steps.filter((s) => s.name === FREE_DISK).map(() => jn));
+    expect(where).toEqual(["bundle-linux"]);
+    const at = linux.steps.findIndex((s) => s.name === FREE_DISK);
+    const checkout = linux.steps.findIndex((s) => s.uses?.startsWith("actions/checkout@"));
+    const packages = linux.steps.findIndex((s) => s.name === "System packages");
+    expect([checkout, packages].every((n) => n >= 0)).toBe(true);
+    // After the checkout: gui/ (the job's default working directory) does not exist before it.
+    expect(at).toBeGreaterThan(checkout);
+    expect(at).toBeLessThan(packages);
+    for (const id of ENUMERATED) expect(`${id}: ${indexOfId(linux, id) > at}`).toBe(`${id}: true`);
+    // No id (the marker never reads it) and no condition: it runs on every release, and its failure skips
+    // every later step, which the derivation already reads as build-failed.
+    const step = linux.steps[at]!;
+    expect(step.id).toBeUndefined();
+    expect(step.if).toBeUndefined();
+  });
+
+  test("the free-disk step deletes exactly the named toolchains, between two df -h prints, and none is a path the job uses", () => {
+    const step = linux.steps.find((s) => s.name === FREE_DISK)!;
+    const lines = codeLines(step.run!);
+    const rm = lines.filter((l) => /\brm\b/.test(l));
+    expect(rm.length).toBe(1);
+    // One plain command: no chaining, no redirection, every argument a path.
+    const args = /^sudo rm -rf((?: [^\s;&|<>]+)+)$/.exec(rm[0]!)?.[1]?.trim().split(" ");
+    expect(`${rm[0]}: ${args !== undefined}`).toBe(`${rm[0]}: true`);
+    expect([...args!].sort()).toEqual([...FREED].sort());
+    expect(new Set(args).size).toBe(args!.length);
+    for (const p of args!) expect(`${p}: ${forbiddenDeletion(p)}`).toBe(`${p}: null`);
+    // The whole step: the root filesystem and $RUNNER_TEMP's printed before and after, and nothing else.
+    const df = 'df -h / "$RUNNER_TEMP"';
+    expect(lines).toEqual(["set -euo pipefail", df, rm[0]!, df]);
+    // Nowhere else: no other step of any job deletes as root or names a path freed here.
+    for (const [jn, job] of Object.entries(J)) {
+      job.steps.forEach((s, i) => {
+        if (s === step) return;
+        const run = s.run ?? "";
+        const hit = /\bsudo\s+rm\b/.test(run) || FREED.some((p) => run.includes(p));
+        expect(`${jn}/${s.id ?? s.name ?? i}: ${hit}`).toBe(`${jn}/${s.id ?? s.name ?? i}: false`);
+      });
+    }
+    // Non-vacuity: the class check refuses each kind of path the job relies on, whatever the list says.
+    for (const p of ["$GITHUB_WORKSPACE", "/home/runner/work/repo/repo", "$RUNNER_TEMP", "/home/runner/work/_temp",
+      "$HOME/.cargo", "/home/runner/.cargo", "~/.rustup", "/home/runner/.rustup", "~/.bun", "/home/runner/.bun",
+      "/opt/hostedtoolcache", "/opt/hostedtoolcache/node", "/opt/hostedtoolcache/Python/3.12.14", "gui/src-tauri/target",
+      "/usr/local", "/usr/share/*", "/usr/local/lib/../../../home/runner", "/usr/local/cargo", "/usr/lib/apt"]) {
+      expect(`${p}: ${forbiddenDeletion(p) !== null}`).toBe(`${p}: true`);
+    }
   });
 
   // The macOS toolchain step, RUN against stub rustup/rustc: native legs add no target, and a host that
@@ -853,7 +977,7 @@ describe("release.yml: release", () => {
     expect(JSON.stringify(rel)).not.toContain("secrets.");
     const create = rel.steps.find((s) => s.run?.includes("gh release create"))!;
     expect(create.env).toEqual({ GH_TOKEN: "${{ github.token }}" });
-    expect(create.run).toContain('gh release create "$TAG" dist/* --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"');
+    expect(create.run).toContain('gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"');
   });
 
   test("checks out the repo (collect and the notes template live in it)", () => {
@@ -898,8 +1022,9 @@ describe("ci.yml (public)", () => {
     expect(C.on).toEqual({ push: { branches: ["main"] }, pull_request: null });
     const check = C.jobs.check!;
     expect((check.strategy?.matrix as unknown as { os: string[] }).os).toEqual(["ubuntu-latest", "macos-latest"]);
-    expect(check.steps.map((s) => s.run ?? s.uses)).toEqual([
-      "actions/checkout@v4", "oven-sh/setup-bun@v2", "bun install --frozen-lockfile", "bunx tsc --noEmit", "bun test",
+    // The two actions by name (their refs are SHA pins, checked in "action pins" below).
+    expect(check.steps.map((s) => s.run ?? s.uses?.replace(/@.*$/, "@<pin>"))).toEqual([
+      "actions/checkout@<pin>", "oven-sh/setup-bun@<pin>", "bun install --frozen-lockfile", "bunx tsc --noEmit", "bun test",
     ]);
   });
 
@@ -923,7 +1048,7 @@ describe("ci.yml (public)", () => {
     expect(r).toContain("bun install --frozen-lockfile");
     expect(r).toContain("bun run test");
     expect(r).toContain("bun run check");
-    expect(r).toContain(`cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --skip ${SKIP}`);
+    expect(r).toContain(`cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --skip ${SKIP}`);
     expect(r.join("\n").match(/--skip/g)?.length).toBe(1);
     expect(gui.defaults?.run?.["working-directory"]).toBe("gui");
   });
@@ -931,7 +1056,7 @@ describe("ci.yml (public)", () => {
   test("a full, unskipped cargo test on macos-26", () => {
     const mac = C.jobs["cargo-macos"]!;
     expect(mac["runs-on"]).toBe("macos-26");
-    expect(runs(mac)).toContain("cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast");
+    expect(runs(mac)).toContain("cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast");
     expect(runs(mac).join("\n")).not.toContain("--skip");
     expect(runs(mac)).toContain("bash scripts/build-sidecar.sh");
   });
@@ -943,7 +1068,7 @@ describe("ci.yml (public)", () => {
     const r = runs(mac);
     const install = r.indexOf("bun install --frozen-lockfile");
     expect(install).toBeGreaterThanOrEqual(0);
-    expect(install).toBeLessThan(r.indexOf("cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast"));
+    expect(install).toBeLessThan(r.indexOf("cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast"));
     expect(workdir(mac, mac.steps[install]!)).toBe("gui");
   });
 
@@ -958,6 +1083,83 @@ describe("ci.yml (public)", () => {
   });
 });
 
+// ── action pins: a moved tag must not change what runs (C1) ────────────────────────────────────────
+// setup-bun is third-party and runs in the macOS legs before the signing keychain is unlocked; a tag is
+// a mutable pointer. So every `uses:` names a full 40-hex commit SHA with its release in a trailing
+// `# vX.Y.Z` comment, and a docker:// image carries an @sha256: digest. Read from the RAW text (the
+// parsed YAML drops comments), and cross-checked against the parsed `uses` values so no step escapes the
+// line scan. The monorepo's own CI runs the same actions and is held to the same form where it exists.
+const MONO_CI = `${ROOT}../.github/workflows/daily-briefing-ci.yml`;
+const ACTION_PIN = /^\s*(?:- )?uses: ([\w.-]+\/[\w.-]+)@([0-9a-f]{40}) # (v\d+\.\d+\.\d+)$/;
+const DOCKER_PIN = /^\s*(?:- )?uses: (docker:\/\/[\w./-]+):([\w.-]+)@sha256:[0-9a-f]{64}$/;
+/** A `uses:` line's problem, or null when it is a pin in one of the two accepted forms. */
+const pinProblem = (line: string): string | null =>
+  ACTION_PIN.test(line) || DOCKER_PIN.test(line) ? null : `not a SHA pin with a # vX.Y.Z comment, nor a docker digest: ${line.trim()}`;
+/** Every line whose key is `uses:` (a YAML comment line starts with `#`, so it never matches). */
+const usesLines = (text: string): string[] => text.split("\n").filter((l) => /^\s*(?:- )?uses:/.test(l));
+
+describe("action pins (release.yml, ci.yml, and the monorepo's daily-briefing-ci.yml)", () => {
+  const files = [workflowFile("release.yml"), workflowFile("ci.yml"), ...(IN_MONOREPO ? [MONO_CI] : [])];
+
+  test("the matcher accepts exactly the two pinned forms (negative controls)", () => {
+    const sha = "11d5960a326750d5838078e36cf38b85af677262";
+    const digest = "b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667";
+    for (const ok of [`      - uses: actions/checkout@${sha} # v4.4.0`, `        uses: actions/upload-artifact@${sha} # v4.6.2`,
+      `        uses: docker://rhysd/actionlint:1.7.12@sha256:${digest}`]) {
+      expect(`${ok}: ${pinProblem(ok)}`).toBe(`${ok}: null`);
+    }
+    for (const bad of ["      - uses: actions/checkout@v4", `      - uses: actions/checkout@${sha}`, `      - uses: actions/checkout@${sha.slice(1)} # v4.4.0`,
+      `      - uses: actions/checkout@${sha} # v4`, `      - uses: actions/checkout@${sha.toUpperCase()} # v4.4.0`, "      - uses: actions/checkout@main # v4.4.0",
+      "        uses: docker://rhysd/actionlint:1.7.12", `        uses: docker://rhysd/actionlint@sha256:${digest.slice(1)}`]) {
+      expect(`${bad}: ${pinProblem(bad) !== null}`).toBe(`${bad}: true`);
+    }
+  });
+
+  test("every uses: in every file is pinned, and the line scan saw every parsed step", () => {
+    if (IN_MONOREPO) expect(existsSync(MONO_CI), `${MONO_CI} is missing from a monorepo checkout`).toBe(true);
+    for (const f of files) {
+      const text = readFileSync(f, "utf8");
+      const lines = usesLines(text);
+      for (const l of lines) expect(`${f}: ${pinProblem(l)}`).toBe(`${f}: null`);
+      const parsed = Object.values((Bun.YAML.parse(text) as Workflow).jobs).flatMap((j) => j.steps).flatMap((s) => (s.uses === undefined ? [] : [s.uses]));
+      // Same refs in the same order: a `uses` written any other way (a flow mapping, a quoted key) would
+      // show up here as a parsed ref the line scan never checked.
+      expect(lines.map((l) => /uses: (\S+)/.exec(l)![1])).toEqual(parsed);
+      expect(parsed.length).toBeGreaterThan(3);
+    }
+  });
+
+  test("one action, one pin: every file names the same SHA and release for the same action", () => {
+    const seen = new Map<string, string>();
+    for (const f of files) {
+      for (const l of usesLines(readFileSync(f, "utf8"))) {
+        const m = ACTION_PIN.exec(l) ?? DOCKER_PIN.exec(l);
+        const name = m![1]!;
+        const ref = l.trim().replace(/^(?:- )?uses: /, "");
+        expect(`${name} in ${f}: ${seen.get(name) ?? ref}`).toBe(`${name} in ${f}: ${ref}`);
+        seen.set(name, ref);
+      }
+    }
+    // Non-vacuity: the actions this pipeline runs today are all reached.
+    expect([...seen.keys()].sort()).toEqual(["actions/checkout", "actions/download-artifact", "actions/upload-artifact", "docker://rhysd/actionlint", "oven-sh/setup-bun"]);
+  });
+
+  test("every cargo test/build in every file is --locked (a resolution change fails, never rewrites Cargo.lock)", () => {
+    let n = 0;
+    for (const f of files) {
+      const parsed = Bun.YAML.parse(readFileSync(f, "utf8")) as Workflow;
+      for (const s of Object.values(parsed.jobs).flatMap((j) => j.steps)) {
+        for (const line of (s.run ?? "").split("\n").filter((l) => /^\s*cargo (?:test|build)\b/.test(l))) {
+          n++;
+          expect(`${line.trim()}   (${f})`).toMatch(/^cargo (?:test|build) --locked /);
+        }
+      }
+    }
+    // release.yml's two legs, ci.yml's gui and cargo-macos, and the monorepo's cargo job.
+    expect(n).toBe(IN_MONOREPO ? 5 : 4);
+  });
+});
+
 // ── E6: the private monorepo's own CI (monorepo only: the export does not carry it) ─────────────────
 test.skipIf(!IN_MONOREPO)("daily-briefing-ci.yml (monorepo): an ubuntu cargo test job with exactly the one --skip", () => {
   const p = `${ROOT}../.github/workflows/daily-briefing-ci.yml`;
@@ -968,7 +1170,7 @@ test.skipIf(!IN_MONOREPO)("daily-briefing-ci.yml (monorepo): an ubuntu cargo tes
   expect(cargo.defaults?.run?.["working-directory"]).toBe("daily_briefing_application/gui");
   const r = runs(cargo);
   expect(r).toContain("bash scripts/build-sidecar.sh");
-  expect(r).toContain(`cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --skip ${SKIP}`);
+  expect(r).toContain(`cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --skip ${SKIP}`);
   expect(Object.values(M.jobs).flatMap((j) => runs(j)).join("\n").match(/--skip [\w-]+/g)).toEqual([`--skip ${SKIP}`]);
   // No macOS job in the private monorepo (billed at a multiple).
   expect(Object.values(M.jobs).map((j) => j["runs-on"]).filter((o) => String(o).startsWith("macos"))).toEqual([]);
@@ -976,4 +1178,15 @@ test.skipIf(!IN_MONOREPO)("daily-briefing-ci.yml (monorepo): an ubuntu cargo tes
   const resolved = shellsUnderJobDefaults(M);
   expect(resolved.length).toBeGreaterThan(5);
   for (const r of resolved) expect(r).toEndWith(": bash");
+});
+
+// Round 4 (D4-L3): read-only, as the public ci.yml is — a workflow-level read-only token, no job widening
+// it, and no checkout leaving it on disk for the steps after it.
+test.skipIf(!IN_MONOREPO)("daily-briefing-ci.yml (monorepo): permissions are contents: read, no job widens them, and no checkout persists the token", () => {
+  const M = Bun.YAML.parse(readFileSync(MONO_CI, "utf8")) as Workflow;
+  expect(M.permissions).toEqual({ contents: "read" });
+  for (const [jn, job] of Object.entries(M.jobs)) expect(`${jn}: ${JSON.stringify(job.permissions)}`).toBe(`${jn}: undefined`);
+  const checkouts = Object.entries(M.jobs).flatMap(([jn, j]) => j.steps.filter((s) => s.uses?.startsWith("actions/checkout@")).map((s) => [jn, s] as const));
+  expect(checkouts.map(([jn]) => jn)).toEqual(["check", "gui", "cargo"]);
+  for (const [jn, s] of checkouts) expect(`${jn}: ${s.with?.["persist-credentials"]}`).toBe(`${jn}: false`);
 });

@@ -12,18 +12,21 @@
 //! duplicate-symbol warning nobody reads.
 
 use crate::{
-    access, briefing_files, cli_shim, config_save, engine, notifications, shell, uninstall,
+    access, autostart, briefing_files, cli_shim, config_save, engine, notifications, shell,
+    uninstall,
 };
 
 /// Every `#[tauri::command]` this app exposes, in the order [`crate::handler`] registers them.
 ///
-/// ⚠ THE APP-LEVEL LIST IS A CONCATENATION, NOT A SPELLING OF ITS OWN. Eight module lists as of
-/// B25: `engine::COMMANDS` (the engine seam's), `shell::COMMANDS` (T11), B5's
+/// ⚠ THE APP-LEVEL LIST IS A CONCATENATION, NOT A SPELLING OF ITS OWN. Nine module lists as of
+/// Phase E M5b: `engine::COMMANDS` (the engine seam's), `shell::COMMANDS` (T11), B5's
 /// `briefing_files::COMMANDS` (T12/T13's two reads) and `config_save::COMMANDS` (T15's read,
 /// save and the Quit offer — grown by B8's `config_create`), B6's `access::COMMANDS` (T17's
 /// folder-access flow), B7's `notifications::COMMANDS` (T18's two), B8's
-/// `cli_shim::COMMANDS` (dev 63's three), and B25's `uninstall::COMMANDS` (T25's preview +
-/// consent-gated execute); each module owns the names it defines, and this is
+/// `cli_shim::COMMANDS` (dev 63's three), B25's `uninstall::COMMANDS` (T25's preview +
+/// consent-gated execute), and M5b's `autostart::COMMANDS` (T19's ON/OFF and the wizard's
+/// default, replacing the plugin's own enable/disable grants); each module owns the names it
+/// defines, and this is
 /// the ORDER the four pinned spellings (the invoke handler, `build.rs`,
 /// `capabilities/default.json`, and each module's `COMMANDS`) are compared as. B3 compared
 /// `engine::COMMANDS` directly; adding a command outside `engine` is what made an app-level list
@@ -39,6 +42,7 @@ pub fn all_commands() -> Vec<&'static str> {
         .chain(notifications::COMMANDS.iter())
         .chain(cli_shim::COMMANDS.iter())
         .chain(uninstall::COMMANDS.iter())
+        .chain(autostart::COMMANDS.iter())
         .copied()
         .collect()
 }

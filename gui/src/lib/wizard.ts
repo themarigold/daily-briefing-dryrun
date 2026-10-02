@@ -27,10 +27,16 @@ import { REDACTED_API_KEY } from "./files";
 
 /* ── the steps ────────────────────────────────────────────────────────────────────────────────── */
 
-export type StepId = "welcome" | "provider" | "repos" | "access" | "floor" | "delivery";
+export type StepId = "welcome" | "provider" | "repos" | "access" | "updates" | "floor" | "delivery";
 
-/** Plan R1's six steps, in order. */
-export const STEP_ORDER: StepId[] = ["welcome", "provider", "repos", "access", "floor", "delivery"];
+/** Plan R1's six steps, in order — plus Phase E's update-check consent (E12), placed BEFORE the floor
+ *  step on purpose: the floor step is the save gate, so the consent answer is part of the one write
+ *  and answering it sends nothing (the draft holds it until then).
+ *
+ *  ⚠ STEP NUMBERS IN COMMENTS ARE PLAN R1'S (step 4 = access, step 5 = floor and the save gate,
+ *  step 6 = delivery), kept because they cite R1. The screen numbers seven ("Step 5 of 7 — new
+ *  versions", "Step 6 of 7 — your morning time", …); the consent step has no R1 number. */
+export const STEP_ORDER: StepId[] = ["welcome", "provider", "repos", "access", "updates", "floor", "delivery"];
 
 /**
  * The next step after `current`. `accessInScope` is whether the folder-access step applies —
@@ -101,6 +107,9 @@ export interface WizardDraft {
   excludeRepos: string;
   /** Step 5: the morning FLOOR, HH:MM. Earliest, not exact ([`firstWakeSentence`]). */
   floor: string;
+  /** Phase E (E12): the update-check consent answer — `config.updateCheck.enabled`. `false` ("No")
+   *  is the DEFAULT; only an explicit "Yes" turns the engine's automatic check on. */
+  updateCheck: boolean;
 }
 
 /** The engine's own defaults, mirrored — each pinned against `src/config.ts` /
@@ -138,6 +147,7 @@ export function emptyDraft(): WizardDraft {
     explicitRepos: "",
     excludeRepos: "",
     floor: DEFAULT_FLOOR,
+    updateCheck: false,
   };
 }
 
@@ -385,6 +395,19 @@ function applyDraft(target: Json, draft: WizardDraft): Json {
   // endpoint itself (`src/config.ts` initConfig's note: the derivation fires only when the key
   // is absent) — and an existing value is preserved. Path (a)'s default pair is a CREATE
   // template default only (`buildConfig`): on a merge, presence or absence is the user's.
+  //
+  // Phase E (E12): the update-check consent. Written ONLY when the answer differs from what the
+  // config already means (`enabled === true` is on; anything else — absent, false, malformed — is
+  // off, the engine's own rule), so an untouched re-run stays the save path's `unchanged` no-op;
+  // and when it is written, every other key in the block (`intervalHours`, …) rides through.
+  const existingCheck = target["updateCheck"];
+  const checkBlock =
+    typeof existingCheck === "object" && existingCheck !== null && !Array.isArray(existingCheck)
+      ? (existingCheck as Json)
+      : undefined;
+  if (draft.updateCheck !== (checkBlock?.["enabled"] === true)) {
+    target["updateCheck"] = { ...(checkBlock ?? {}), enabled: draft.updateCheck };
+  }
   return target;
 }
 
@@ -399,6 +422,10 @@ export function buildConfig(draft: WizardDraft): Json {
   }
   out["tokenBudget"] = DEFAULT_TOKEN_BUDGET;
   out["lookbackCapDays"] = DEFAULT_LOOKBACK_CAP_DAYS;
+  // Phase E (E12): the consent answer is written EXPLICITLY on a create — `{ enabled: false }` for
+  // the default "No" — so the new config records that the question was asked and answered, and the
+  // switch is discoverable in Settings and in the file.
+  out["updateCheck"] = { enabled: draft.updateCheck };
   return out;
 }
 
@@ -495,6 +522,9 @@ export function draftFromConfig(text: string): WizardDraft | null {
     draft.explicitRepos = asStrings(c["repos"]).join("\n");
     draft.excludeRepos = asStrings(c["excludeRepos"]).join("\n");
     draft.floor = typeof c["morningTime"] === "string" ? c["morningTime"] : DEFAULT_FLOOR;
+    // Phase E (E12): on only when the config says exactly `enabled: true` — the engine's rule.
+    const check = c["updateCheck"];
+    draft.updateCheck = isObj(check) && check["enabled"] === true;
     return draft;
   } catch {
     // A shape the reads above cannot walk. The caller must block, not merge an empty draft.
@@ -530,4 +560,111 @@ export function saveGateBlocker(state: SaveGateState): string | null {
     return "Confirm the loaded configuration below before saving again.";
   }
   return null;
+}
+
+/* ── the last step's login item (Phase E M5b; checkpoint fix) ─────────────────────────────────── */
+
+/** What `autostart_wizard_default` has said so far: nothing yet, its answer, or why it failed. */
+export type LoginItemDefault =
+  | { kind: "pending" }
+  | { kind: "answered"; on: boolean }
+  | { kind: "failed"; detail: string };
+
+/** What Finish does with the login item. `wait`: Finish stays disabled. `leave`: Finish changes
+ *  nothing about the login item. `apply`: Finish turns it on or off. */
+export type LoginItemPlan = { kind: "wait" } | { kind: "leave" } | { kind: "apply"; enabled: boolean };
+
+/** Run the default read (`read` is the one IPC call, injected) and settle it into a
+ *  [`LoginItemDefault`]. Never rejects — a failure is a state, with `describe`'s words for it. */
+export async function settleLoginItemDefault(
+  read: () => Promise<boolean>,
+  describe: (e: unknown) => string,
+): Promise<LoginItemDefault> {
+  try {
+    return { kind: "answered", on: await read() };
+  } catch (e) {
+    return { kind: "failed", detail: describe(e) };
+  }
+}
+
+/** THE RULE (Phase E M5b checkpoint fix). `choice` is the user's own tick or untick — `null` until
+ *  they touch the box — and it always wins. Untouched:
+ *    • the read has not answered ⇒ `wait`. No provisional value is ever applied: the first shape
+ *      started the box ticked and let Finish apply that before the read answered, which could
+ *      re-create a login item the user had removed.
+ *    • the read FAILED ⇒ `leave`: the current state is unknown, so Finish touches nothing. The
+ *      first shape turned the box off and Finish then applied that as an active REMOVAL.
+ *    • the read answered ⇒ `apply` its answer (no record yet ⇒ ON; a record ⇒ the real state). */
+export function loginItemPlan(state: LoginItemDefault, choice: boolean | null): LoginItemPlan {
+  if (choice !== null) return { kind: "apply", enabled: choice };
+  if (state.kind === "pending") return { kind: "wait" };
+  if (state.kind === "failed") return { kind: "leave" };
+  return { kind: "apply", enabled: state.on };
+}
+
+/** Whether the box is shown ticked: the user's choice, else the answered default — never ticked
+ *  while the read is pending or after it failed. */
+export function loginItemChecked(state: LoginItemDefault, choice: boolean | null): boolean {
+  if (choice !== null) return choice;
+  return state.kind === "answered" && state.on;
+}
+
+/** The line under the box while the default is not usable, or `null`. Both notes name the way out:
+ *  ticking or unticking the box is a choice, and a choice is applied whatever the read says (fix
+ *  round 2: the pending note said only "Checking…", while Finish sat disabled with no timeout).
+ *  `state.detail` is the read's bare cause — the Rust command does not word it (its
+ *  `wizard_default`), so this sentence is the only wrapper. */
+export function loginItemNote(state: LoginItemDefault, choice: boolean | null): string | null {
+  if (choice !== null) return null;
+  if (state.kind === "pending") {
+    return "Checking whether Daily Briefing already starts at login… Finish waits for the answer, or " +
+      "tick or untick the box to choose now.";
+  }
+  if (state.kind === "failed") {
+    return (
+      `Whether Daily Briefing already starts at login could not be read (${state.detail}), so ` +
+      "Finish leaves that setting as it is. Tick or untick the box to choose."
+    );
+  }
+  return null;
+}
+
+/** Finish's login-item half: carry out `plan` through `apply` (the one IPC call, injected).
+ *  Resolves `true` when the wizard may leave — after an applied change, or when there is nothing
+ *  to apply — and `false` while the plan is `wait`. A failed `apply` rejects, so the wizard stays
+ *  on its last step with the reason. */
+export async function finishLoginItem(
+  plan: LoginItemPlan,
+  apply: (enabled: boolean) => Promise<void>,
+): Promise<boolean> {
+  if (plan.kind === "wait") return false;
+  if (plan.kind === "apply") await apply(plan.enabled);
+  return true;
+}
+
+/* ── the last step's per-repo notes (Phase E final harden: the partial-clone note) ────────────── */
+
+/** One line the last step shows under the provider check: a repo's path and one of its notes. */
+export interface RepoNote {
+  path: string;
+  note: string;
+}
+
+/** `doctor --json`'s per-repo NOTES, as `{ path, note }` rows to show VERBATIM — every string in a
+ *  `repos[].notes` array, in the engine's order. The engine adds `partialClone: true` and
+ *  `notes: [<one sentence>]` to a repo that is a partial clone (`git clone --filter`: git itself may
+ *  download missing file contents from that repo's remote while the engine reads its history); a
+ *  normal repo keeps the old shape, and an OLDER engine never sends either key — so both are
+ *  optional here and their absence yields no row. The wording is the engine's: nothing here
+ *  composes a sentence, and a row whose `path` or note is not a string is skipped, not guessed at. */
+export function doctorRepoNotes(repos: unknown): RepoNote[] {
+  if (!Array.isArray(repos)) return [];
+  const out: RepoNote[] = [];
+  for (const r of repos) {
+    if (r === null || typeof r !== "object") continue;
+    const { path, notes } = r as { path?: unknown; notes?: unknown };
+    if (typeof path !== "string" || !Array.isArray(notes)) continue;
+    for (const note of notes) if (typeof note === "string" && note !== "") out.push({ path, note });
+  }
+  return out;
 }

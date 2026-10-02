@@ -53,6 +53,25 @@ export const SYSTEMD_TIMER_NAME = "daily-briefing.timer";
 /** The Windows task name. */
 export const WINDOWS_TASK_NAME = "DailyBriefing";
 
+/** ⚠ BUN'S OWN CRASH REPORTER, turned off for every scheduled run whose environment this file writes.
+ *  The engine is a `bun build --compile` binary, and Bun (v1.3.14, `src/crash_handler/crash_handler.zig`
+ *  `isReportingEnabled`) uploads a crash trace to `bun.report` when the RUNTIME itself panics or
+ *  segfaults — by default on macOS and Windows, not on Linux. It reads `BUN_ENABLE_CRASH_REPORTING`
+ *  through libc `getenv` when it decides, and `"0"` turns the upload off. launchd and systemd give the
+ *  agent the environment written below rather than the user's shell's, so this is where it has to be.
+ *  The desktop app sets the same variable on its own spawns (`gui/src-tauri/src/engine.rs`,
+ *  `BUN_CRASH_REPORTING_OFF`). NOT in the Windows task: a Task Scheduler `<Exec>` action has no
+ *  environment element, and the README's Privacy section says so.
+ *
+ *  ⚠ AND `BUN_CRASH_REPORT_URL` IS SET, TO THE EMPTY STRING, beside it. Bun checks that variable FIRST:
+ *  a non-empty value turns reporting ON (to that URL) whatever `BUN_ENABLE_CRASH_REPORTING` says, and an
+ *  empty one turns it off. "Nothing here sets one" was not enough: a LaunchAgent also inherits the
+ *  user-domain environment (`launchctl setenv`) and a systemd user unit the manager's
+ *  (`environment.d`, `systemctl --user set-environment`), so an inherited URL would have re-enabled
+ *  uploads — to an arbitrary host. An explicit empty value in the unit itself wins over both. */
+export const BUN_CRASH_REPORTING_OFF = { name: "BUN_ENABLE_CRASH_REPORTING", value: "0" } as const;
+export const BUN_CRASH_REPORT_URL_EMPTY = { name: "BUN_CRASH_REPORT_URL", value: "" } as const;
+
 /** ⚠ THE WINDOWS ENCODING CONTRACT, pinned as a constant so a test can assert it without a Windows
  *  runtime. `schtasks /Create /XML` REJECTS a UTF-8 file — this is the classic trap — so the writer
  *  emits UTF-16LE **with a BOM**. Asserted in `test/schedule.units.test.ts` against
@@ -158,7 +177,7 @@ export function launchdPlist(opts: ScheduleOpts): string {
   <key>StartCalendarInterval</key><dict><key>Hour</key><integer>${hour}</integer><key>Minute</key><integer>${minute}</integer></dict>
   <key>StandardOutPath</key><string>${log}</string>
   <key>StandardErrorPath</key><string>${log}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xmlEscape(opts.pathEnv)}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xmlEscape(opts.pathEnv)}</string><key>${BUN_CRASH_REPORTING_OFF.name}</key><string>${BUN_CRASH_REPORTING_OFF.value}</string><key>${BUN_CRASH_REPORT_URL_EMPTY.name}</key><string>${BUN_CRASH_REPORT_URL_EMPTY.value}</string></dict>
 </dict></plist>
 `;
 }
@@ -199,6 +218,8 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${systemdQuote(opts.binPath)} run
 Environment=${systemdQuote(`PATH=${opts.pathEnv}`)}
+Environment=${systemdQuote(`${BUN_CRASH_REPORTING_OFF.name}=${BUN_CRASH_REPORTING_OFF.value}`)}
+Environment=${systemdQuote(`${BUN_CRASH_REPORT_URL_EMPTY.name}=${BUN_CRASH_REPORT_URL_EMPTY.value}`)}
 `;
   const timer = `[Unit]
 Description=Daily Briefing — poll for the first wake past the morning floor

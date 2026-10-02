@@ -90,6 +90,9 @@ function softFixture(): { repo: string; target: string; stubs: string } {
   writeFileSync(join(repo, "a.txt"), "hello\n");
   writeFileSync(join(repo, "LICENSE"), `Copyright (c) 2026 ${AUTHOR}\n`);
   writeFileSync(join(repo, "README.md"), `MIT (c) ${AUTHOR}\n`);
+  // Names that merely START with the two exempt ones: listed like any other file (exact-match exemption).
+  writeFileSync(join(repo, "LICENSE-THIRD-PARTY"), `bundled by ${AUTHOR}\n`);
+  writeFileSync(join(repo, "README.md.orig"), `old copy, ${AUTHOR}\n`);
   writeFileSync(join(repo, "test", "fixture.ts"), `export const repoName = "${SOFT_NAME}";\n`);
   writeFileSync(join(repo, "publish", "overlay.txt"), "overlay\n");
   const env = { PATH: `${dirname(GIT)}:/usr/bin:/bin`, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
@@ -110,12 +113,12 @@ function exportWith(fx: { repo: string; target: string }, PATH: string) {
   return { code: r.exitCode, out: text(r.stdout), err: text(r.stderr) };
 }
 
-test.skipIf(!IN_MONOREPO)("the SOFT sweep lists its residuals, never LICENSE or README.md, and prints (none) only when there are none", () => {
+test.skipIf(!IN_MONOREPO)("the SOFT sweep lists its residuals, never LICENSE or README.md themselves, and prints (none) only when there are none", () => {
   const fx = softFixture();
   const r = exportWith(fx, `${dirname(GIT)}:/usr/bin:/bin`);
   expect(r.code, r.out + r.err).toBe(0);
   const soft = r.out.split("— soft residuals")[1]!.split("\n— ")[0]!.split("\n").slice(1).filter(Boolean);
-  expect(soft).toEqual([join(fx.target, "test", "fixture.ts")]);
+  expect(soft.sort()).toEqual([join(fx.target, "LICENSE-THIRD-PARTY"), join(fx.target, "README.md.orig"), join(fx.target, "test", "fixture.ts")].sort());
 });
 
 test.skipIf(!IN_MONOREPO)("a SOFT sweep that could not run fails the export (exit 1), never prints (none)", () => {

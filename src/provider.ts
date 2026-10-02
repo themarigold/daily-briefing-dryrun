@@ -2,6 +2,7 @@
 import type { Provider, Config } from "./types";
 import { ProviderError } from "./types";
 import { drain, raceFlush, sinkText } from "./stream";
+import { redactCredentials } from "./transcripts/credentials";
 
 export const TIMEOUT_MS = 120_000;
 /** SIGTERM → this long → SIGKILL (a TERM-ignoring child can't hang the run).
@@ -373,9 +374,12 @@ export class BYOCliProvider implements Provider {
       // is set — so a stderr-preferred diag rendered a blank "claude exited 1:" for the 2026-07-11
       // launchd failure, and an "only if stderr is empty" fallback never fires on the machines that
       // most need it. Include both, tagged, so neither cause is thrown away.
+      // REDACT, THEN CLIP. The 300-char cut used to come first, so a credential straddling it lost its
+      // tail — and a prefix too short for its pattern (`ghp_` + 12 chars) escaped every later redaction
+      // pass (the envelope, last-skip, briefing.log) while still being most of a secret.
       const parts: string[] = [];
-      if (err.trim()) parts.push(err.slice(0, 300));
-      if (out.trim()) parts.push(`(stdout) ${out.slice(0, 300)}`);
+      if (err.trim()) parts.push(redactCredentials(err).slice(0, 300));
+      if (out.trim()) parts.push(`(stdout) ${redactCredentials(out).slice(0, 300)}`);
       const diag = parts.length ? parts.join(" | ") : "(no output)";
       // A subscription usage wall (weekly or session) is not a transient failure: retrying cannot
       // succeed until the reset, so it is classified separately and treated as PERMANENT by both

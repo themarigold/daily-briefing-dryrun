@@ -101,10 +101,12 @@ export function setGitFlushMsForTests(ms: number | undefined): void {
 /** Swallow a git failure to `fallback` — EXCEPT an IncompleteReadError, which must propagate.
  *  These `.catch`es exist because an unborn HEAD / missing git config / detached HEAD are all
  *  normal; an incomplete read is not, and swallowing it silently degrades (at resolveAuthor, to NO
- *  AUTHOR FILTER, crediting coworkers' commits). Uniform within git.ts, no per-site exceptions: on
+ *  AUTHOR FILTER, crediting coworkers' commits). Uniform within git.ts's BRIEFING reads: on
  *  a machine with a held pipe every subsequent call is untrustworthy too, so failing early beats
  *  guessing. Two sites OUTSIDE this file stay deliberately swallowed (core.ts's render-time drift
- *  re-check and scripts/audit.ts's ground truth) — both advisory, both scoped out by C1 rev 3.4. */
+ *  re-check and scripts/audit.ts's ground truth) — both advisory, both scoped out by C1 rev 3.4.
+ *  ONE site inside it swallows everything, by contract: `isPartialClone`, which only `doctor` calls and
+ *  only for a NOTE (round-3 harden A3-L1 — its `orElse` let an incomplete read throw out of doctor). */
 function orElse<T>(fallback: T) {
   return (e: unknown): T => { if (e instanceof IncompleteReadError) throw e; return fallback; };
 }
@@ -150,10 +152,64 @@ export async function gitDirExists(repo: string): Promise<boolean> {
   return runGit(["rev-parse", "--git-dir"], repo).then(() => true).catch(orElse(false));
 }
 
+/** Is `repo` a PARTIAL clone — one git may lazily download missing objects into, from its own remote,
+ *  while the tool's `git log --numstat` / `log -p` reads run? Set by `git clone --filter` (and
+ *  `scalar clone`): `extensions.partialClone` names the promisor remote, `remote.<name>.promisor` is
+ *  true, and/or `remote.<name>.partialclonefilter` is set. READ-ONLY and offline — `git config`, never
+ *  a fetch — and fail-open to `false` (an unreadable repo, a timeout, no git): `doctor` uses it for a
+ *  NOTE, never for a verdict. `--get-regexp` prints canonical (lower-cased) section and key names.
+ *  ⚠ THREE READS, in parallel and each bounded by `timeoutMs`, because the keys differ in type and in
+ *  WHERE git reads them from:
+ *   - `extensions.partialClone` is a STRING (the promisor remote's name), and git honours it ONLY from
+ *     the repository's OWN config file — it is a repository-format extension. Measured on git 2.50.1
+ *     by whether git lazily fetches a missing object (round-4 harden A4-L1 / B4-L1): the key in the
+ *     global file, in an `include.path` file, or in `-c` / `GIT_CONFIG_COUNT` never fetches, and the
+ *     repo's own `origin` under a LATER included empty value still fetches. So this read is `--local`,
+ *     which reads that one file and does not follow includes.
+ *   - `remote.<name>.promisor` is a BOOLEAN, read through git's OWN parser (`--type=bool`, git >= 2.18)
+ *     so it is true exactly when git says so — `promisor=2` and a bare `promisor` (no `=`) included,
+ *     which a list of spellings (`true/yes/on/1`) missed for the former (round-2 harden). A value git
+ *     cannot read as a boolean (`promisor=maybe`) fails that read with exit 128 — as `git status` and
+ *     `git commit` fail on it too, measured on git 2.50.1 — and so fails open, for every remote in that
+ *     repo; the other two reads are separate so it never takes them down with it.
+ *   - `remote.<name>.partialclonefilter` is a STRING (`blob:none`, …) — so NOT `--type=bool`, which would
+ *     fail on every real value. Its presence alone makes the remote a promisor: measured on git 2.50.1,
+ *     a filter alone fetches, and so does a filter beside `promisor = false` (round-4 harden A4-L1).
+ *  The two `remote.*` keys are ordinary config, which git reads at every level (system, global, local,
+ *  includes) — measured: a global `promisor = true`, or a global filter alone, also fetches — so those
+ *  two reads are NOT `--local`.
+ *  ⚠ FAIL OPEN MEANS EVERY FAILURE — an IncompleteReadError included (round-3 harden A3-L1). The other
+ *  reads in this file let that one through (`orElse`); here it rejected out of doctor's whole report.
+ *  ⚠ `--get-regexp` LISTS EVERY VALUE, overridden ones too, in config order, and the keys do NOT resolve
+ *  alike — measured on git 2.50.1 by what git does on a missing object (a lazy fetch, or not), round-3
+ *  harden G3-3:
+ *   - `extensions.partialClone` is single-valued: the LAST value is the one git uses. `origin`, then an
+ *     empty value later in the same file → git cannot fetch (it refuses its own `--filter` before
+ *     connecting), so only the last value counts here.
+ *   - `remote.<name>.promisor` is NOT last-wins: git marks a remote a promisor on ANY true value and a
+ *     later `false` never unmarks it (a global `true` under a local `false`, or `true` then `false` in one
+ *     file → git still fetches). So ANY true counts, deliberately — "last value" would hide a real one.
+ *   - `remote.<name>.partialclonefilter`: ANY entry counts, an empty value included (measured: fetches). */
+export async function isPartialClone(repo: string, timeoutMs = 2_000): Promise<boolean> {
+  const [ext, promisor, filter] = await Promise.all([
+    runGit(["config", "--local", "--get-regexp", "^extensions\\.partialclone$"], repo, timeoutMs).catch(() => ""),
+    runGit(["config", "--type=bool", "--get-regexp", "^remote\\..+\\.promisor$"], repo, timeoutMs).catch(() => ""),
+    runGit(["config", "--get-regexp", "^remote\\..+\\.partialclonefilter$"], repo, timeoutMs).catch(() => ""),
+  ]);
+  const entries = (out: string) => out.split("\n").filter(Boolean).map((line) => {
+    const sp = line.indexOf(" ");
+    return sp === -1 ? { key: line, value: "" } : { key: line.slice(0, sp), value: line.slice(sp + 1).trim() };
+  });
+  const lastExt = entries(ext).filter((e) => e.key.toLowerCase() === "extensions.partialclone").at(-1);
+  return (lastExt !== undefined && lastExt.value !== "")
+    || entries(promisor).some((e) => /^remote\..+\.promisor$/i.test(e.key) && e.value === "true")
+    || entries(filter).some((e) => /^remote\..+\.partialclonefilter$/i.test(e.key));
+}
+
 /** SHA + committer-date ISO of a ref, in ONE `git show` (both come from the same commit object).
  *  Best-effort: returns empty strings if the ref can't be resolved (e.g. unborn HEAD). */
 async function shaAndDate(repo: string, ref: string): Promise<{ sha: string; date: string }> {
-  const out = (await runGit(["show", "-s", "--format=%H%n%cI", ref], repo).catch(orElse(""))).trim();
+  const out = (await runGit(["show", NO_SHOW_SIGNATURE, "-s", "--format=%H%n%cI", ref], repo).catch(orElse(""))).trim();
   const [sha, date] = out.split("\n");
   return { sha: (sha ?? "").trim(), date: (date ?? "").trim() };
 }
@@ -203,6 +259,20 @@ async function shaAndDate(repo: string, ref: string): Promise<{ sha: string; dat
 //    last-working-day window. A stash is resumption state and has its OWN signal — `git stash list`
 //    in `resumptionSignals` below — which is why dropping it here loses nothing.
 export const LOCAL_WORK_REFS = ["--branches", "--tags", "--ignore-missing", "HEAD"] as const;
+
+/** ⚠ ON EVERY `git log` / `git show` / `git stash list` WHOSE OUTPUT IS PARSED. A user's
+ *  `log.showSignature=true` makes git run gpg on every SIGNED commit and print gpg's verdict INTO STDOUT,
+ *  ahead of the formatted record ("gpg: Signature made …") — so `shaAndDate` read a gpg line as the SHA,
+ *  and the field-split parsers below saw lines they never wrote (measured on git 2.50.1 with a stand-in
+ *  `gpg.program`; `test/git.show-signature.test.ts` pins it). `--no-show-signature` overrides the config
+ *  for that one command; it exists since git 2.10, the release that introduced `log.showSignature`.
+ *  `stash list` forwards its options to `git log`, so it takes the flag too.
+ *  ⚠ THE FLAG IS HALF OF IT; AN EXPLICIT FORMAT IS THE OTHER HALF (round-3 harden G3-1). A user's
+ *  `format.pretty` holding `%G?`/`%GG` makes git verify the signature to fill the placeholder — gpg
+ *  runs, `--no-show-signature` notwithstanding (measured, git 2.50.1: once per signed commit). Every
+ *  such read therefore also names its own `--format`/`--pretty`, which replaces `format.pretty`;
+ *  `rev-list` never reads that config (measured too). `test/git.show-signature.test.ts` pins both. */
+export const NO_SHOW_SIGNATURE = "--no-show-signature";
 
 // Author-filter args, shared with the audit's ground-truth query (same drift rationale).
 export function authorArgs(author?: { names?: string[]; emails?: string[] }): string[] {
@@ -382,7 +452,7 @@ export async function committerDaysWithCommits(
   // Include the subject so bot/auto commits can be excluded HERE too — otherwise a repo that
   // auto-commits every day (the vault) marks every day active and collapses the shared window to
   // just yesterday, hiding real older work that listCommits would then filter out anyway (#3/#1).
-  const out = await runGit(["log", ...LOCAL_WORK_REFS, ...(await windowArgs(cutoff)), "--pretty=%cI%x1f%s", ...authorArgs(author)], repo);
+  const out = await runGit(["log", NO_SHOW_SIGNATURE, ...LOCAL_WORK_REFS, ...(await windowArgs(cutoff)), "--pretty=%cI%x1f%s", ...authorArgs(author)], repo);
   const days = new Set<number>();
   for (const line of out.split("\n").filter(Boolean)) {
     const [cISO, subject] = line.split("\x1f");
@@ -405,7 +475,7 @@ export async function listCommits(
   // %P (parent hashes) drives merge detection: a merge has 2+ parents.
   const fmt = "%x1e%cI%x1f%H%x1f%P%x1f%s";
   const out = await runGit(
-    ["-c", "core.quotePath=false", "log", ...LOCAL_WORK_REFS, ...(await windowArgs(start.getTime())), "--date-order", "--numstat", `--pretty=format:${fmt}`, ...authorArgs(author)],
+    ["-c", "core.quotePath=false", "log", NO_SHOW_SIGNATURE, ...LOCAL_WORK_REFS, ...(await windowArgs(start.getTime())), "--date-order", "--numstat", `--pretty=format:${fmt}`, ...authorArgs(author)],
     repo,
   );
   const acts: Activity[] = [];
@@ -478,7 +548,7 @@ export async function listPrMerges(
   // -c core.quotePath=false, same as listCommits (review MED-1, measured): without it non-ASCII
   // paths come octal-escaped, unquotePath passes the escapes through, rootOf then matches no root —
   // dropping exactly the votes mergeLabel exists to count.
-  const baseArgs = ["-c", "core.quotePath=false", "log", ...LOCAL_WORK_REFS, ...(await windowArgs(start.getTime())), "--merges", "--date-order", `--pretty=format:${fmt}`, ...authorArgs(author)];
+  const baseArgs = ["-c", "core.quotePath=false", "log", NO_SHOW_SIGNATURE, ...LOCAL_WORK_REFS, ...(await windowArgs(start.getTime())), "--merges", "--date-order", `--pretty=format:${fmt}`, ...authorArgs(author)];
   let out: string;
   let hasFiles = true;
   try {
@@ -587,7 +657,11 @@ export async function patchIds(repo: string, shas: string[]): Promise<Map<string
   try {
     dir = mkdtempSync(join(tmpdir(), "dba-patchids-"));
     const spool = join(dir, "patches.diff");
-    const log = Bun.spawn(["git", "-C", repo, "log", "--no-walk=unsorted", "--stdin", "-p", "--no-color", "--unified=3"],
+    // `--format=commit %H`: an explicit format, so a user's `format.pretty` (`%G?` runs gpg) is never
+    // read, and a FULL SHA on the `commit` line patch-id keys on — the default `medium` header is cut
+    // to 7 hex by `log.abbrevCommit=true`, which patch-id cannot read (measured: every id came back
+    // against the zero SHA, so nothing was ever deduped). patch-id skips everything up to `diff `.
+    const log = Bun.spawn(["git", "-C", repo, "log", NO_SHOW_SIGNATURE, "--format=commit %H", "--no-walk=unsorted", "--stdin", "-p", "--no-color", "--unified=3"],
       { stdin: "pipe", stdout: Bun.file(spool), stderr: "ignore", timeout: GIT_TIMEOUT_MS, killSignal: "SIGKILL" });
     log.stdin.write(shas.join("\n") + "\n");
     await log.stdin.end();
@@ -777,7 +851,7 @@ export async function resumptionSignals(repo: string): Promise<Activity[]> {
   // ONE `git stash list --format` yields sha + date + ref + subject per stash — no N+1 `git show`
   // per stash. `%gd: %gs` reconstructs the default `git stash list` line exactly (verified), and %H/%cI
   // are the same commit fields shaAndDate returned, so event_id (ref + sha) is unchanged.
-  const stashes = (await runGit(["stash", "list", "--format=%H%x1f%cI%x1f%gd%x1f%gs"], repo)).trim();
+  const stashes = (await runGit(["stash", "list", NO_SHOW_SIGNATURE, "--format=%H%x1f%cI%x1f%gd%x1f%gs"], repo)).trim();
   if (stashes) {
     for (const line of stashes.split("\n").filter(Boolean)) {
       const [sha, date, ref, subject] = line.split("\x1f");
@@ -878,7 +952,7 @@ export async function listDefaultRefMerges(
     const t3 = budget.callTimeoutMs();
     if (t3 === undefined) return unread;
     const out = await runGit(
-      ["log", "--first-parent", "--merges", ...(await windowArgs(windowStart.getTime())), "--format=%H%x1f%P%x1f%cI%x1f%s", ...existing],
+      ["log", NO_SHOW_SIGNATURE, "--first-parent", "--merges", ...(await windowArgs(windowStart.getTime())), "--format=%H%x1f%P%x1f%cI%x1f%s", ...existing],
       repo, t3,
     );
     const seen = new Set<string>();

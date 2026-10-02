@@ -1,5 +1,5 @@
 /**
- * The webview's whole view of the engine: nine typed `invoke()` wrappers.
+ * The webview's whole view of the engine: ten typed `invoke()` wrappers.
  *
  * ⚠ THIS MODULE NO LONGER SPELLS AN ARGV, AND THAT IS THE CHANGE. B1's version imported
  * `@tauri-apps/plugin-shell` and assembled argv here; `src-tauri/capabilities/README.md` records
@@ -98,8 +98,37 @@ export function onProgress(handler: (event: ProgressEvent) => void): Promise<Unl
 
 /* ── read-only ────────────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * The engine's update-check answer (Phase E, E11) — `update --check --json`'s payload, and
+ * `status --json`'s `updateCheck`. Mirrors `UpdateCheckResult` in `src/updateCheck.ts`.
+ * ⚠ `latest` and `url` arrived over a network: render them as text, never as markup or a link.
+ */
+export interface UpdateCheckResult {
+  status: "up-to-date" | "newer" | "unknown";
+  /** The running engine's version. */
+  current: string;
+  /** The latest release's version; absent when the check could not read one. */
+  latest?: string;
+  /** This project's release page for `latest`. */
+  url?: string;
+  /** When the check finished (UTC ISO-8601). */
+  checkedAt: string;
+}
+
+/**
+ * `status --json`, MINIMALLY typed (Phase E, E12): only the fields this webview reads. The engine's
+ * full report is `StatusReport` in `src/json.ts`; it is frozen additive-only, so a field missing
+ * here is simply unread, never wrong. `updateCheck` is optional and nullable: absent from an older
+ * engine, `null` before any check has run.
+ */
+export interface StatusReport {
+  schemaVersion: number;
+  engineVersion?: string;
+  updateCheck?: UpdateCheckResult | null;
+}
+
 /** `status --json` — a pure state-dir read. Safe to call every few seconds. */
-export function status<P = unknown>(): Promise<EngineOutcome<P>> {
+export function status<P = StatusReport>(): Promise<EngineOutcome<P>> {
   return invoke<EngineOutcome<P>>("engine_status");
 }
 
@@ -211,17 +240,32 @@ export function scheduleVerify<P = unknown>(): Promise<EngineOutcome<P>> {
 }
 
 /**
- * ⚠ THREE ENGINE SURFACES HAVE NO WRAPPER HERE, ON PURPOSE, and the capability grants none of them:
+ * `update --check --json` (Phase E, E12) — the Settings screen's "Check now": the ENGINE's manual,
+ * notify-only update check. It always asks (the config's `intervalHours` gates only the engine's own
+ * scheduled-run check), rewrites the engine's update-check record, and resolves with the result
+ * object as `payload` — `status: "unknown"` when GitHub did not answer, which is still exit 0.
+ *
+ * ⚠ NOT A WRITE THE GUARD CARES ABOUT: it takes no in-flight slot, so it works while a run is in
+ * flight (`src-tauri/src/engine.rs`, `Operation::UpdateCheck`). ⚠ THE ONE CALL SITE is the button
+ * (`lib/UpdateCheck.svelte`); nothing calls it on mount, on a timer, or from the wizard.
+ */
+export function updateCheck(): Promise<EngineOutcome<UpdateCheckResult>> {
+  return invoke<EngineOutcome<UpdateCheckResult>>("engine_update_check");
+}
+
+/**
+ * ⚠ TWO ENGINE SURFACES HAVE NO WRAPPER HERE, ON PURPOSE, and the capability grants neither:
  *
  *   - `init` and its provider flags — the first-run wizard (T16). The Settings screen (T15, B5)
  *     edits an EXISTING config through `config_save` (`lib/files.ts`) and never runs `init`.
- *   - `calendar` and `update --check` — plan R1's forward list carries both; the ENGINE does not
- *     (`src/main.ts` dispatches run | init | status | doctor | config | help | schedule and exits 2
- *     on anything else). B1 allowlisted them ahead of the engine; a typed command for a subcommand
- *     that does not exist is a function that reports failure for a reason the user cannot act on,
- *     so the operation enum is exhaustive over the operations the app may perform instead — the
- *     engine surface minus `init` and `help`.
+ *   - `calendar` — plan R1's forward list carries it; the ENGINE does not (`src/main.ts` dispatches
+ *     run | init | status | doctor | config | help | schedule | update and exits 2 on anything
+ *     else). B1 allowlisted it ahead of the engine; a typed command for a subcommand that does not
+ *     exist is a function that reports failure for a reason the user cannot act on, so the
+ *     operation enum is exhaustive over the operations the app may perform instead — the engine
+ *     surface minus `init` and `help`.
  *
- * `schedule verify` was the fourth until B6 (T20). The kickstart is still ENGINE-SIDE — the app
- * never reaches `launchctl` — and this wrapper re-issues that same engine-side kick.
+ * `schedule verify` was on this list until B6 (T20) — the kickstart is still ENGINE-SIDE, and that
+ * wrapper re-issues the same engine-side kick — and `update --check` was until Phase E, when E11 gave
+ * the engine the subcommand and E12 added `updateCheck()` above.
  */

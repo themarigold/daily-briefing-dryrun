@@ -54,7 +54,7 @@ export type BlockKind =
   | "why" // — you wrote: "…"
   | "placeholder" // (nothing in progress) / (none) / (no commits in the window)
   | "warnings" // ⚠ a; b
-  | "footer" // — generated locally via <provider>
+  | "footer" // — generated via <provider>  (archives before 0.2.0: — generated locally via <provider>)
   | "text"; // any other line
 
 export interface Block {
@@ -82,6 +82,10 @@ const INDENT = "   ";
 const PLACEHOLDERS = new Set(["(nothing in progress)", "(none)", "(no commits in the window)"]);
 /** Both header spellings: "Morning" was dropped on 2026-08-17 and older archives still carry it. */
 const TITLE = /^☀️?\s+(Daily|Morning) briefing\b/;
+/** Both footer spellings. `src/render.ts` writes `— generated via <provider>` since the Phase E final
+ *  harden ("locally" was false for an API provider and for the default CLI provider); briefings
+ *  archived before that carry `— generated locally via <provider>` and must still read as a footer. */
+const FOOTER_PREFIXES = ["— generated via ", "— generated locally via "];
 
 /** Lines longer than this are shown as plain text: the inline scan is per-position, and a
  *  1 MiB single-line file must not cost a quadratic parse. A briefing line is ~100-300 chars. */
@@ -193,7 +197,7 @@ export function classifyLine(line: string): { kind: BlockKind; text: string } | 
     return { kind: "placeholder", text: line.slice(INDENT.length) };
   }
   if (line.startsWith("⚠ ")) return { kind: "warnings", text: line };
-  if (line.startsWith("— generated locally via ")) return { kind: "footer", text: line };
+  if (FOOTER_PREFIXES.some((p) => line.startsWith(p))) return { kind: "footer", text: line };
   return { kind: "text", text: line };
 }
 

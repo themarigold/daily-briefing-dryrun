@@ -38,19 +38,33 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { render } from "svelte/server";
 
 // READ-ONLY imports of the engine's own code — the `notify.check.ts` / `briefing.check.ts`
 // discipline. `lastBriefing` IS the parser the audit grades through; calling it here is what the
 // brief means by "do not re-implement it".
 import { lastBriefing } from "../../src/audit";
 
+import ScheduleUninstall from "../src/lib/ScheduleUninstall.svelte";
 import {
   autostartLine,
   consentLabel,
+  doneNotes,
+  executeLabel,
+  finishLine,
   outcomeLine,
+  REMOVE_SCHEDULE_BUTTON,
+  SCHEDULE_RECORD_RULE,
+  SCHEDULE_UNIT_RULE,
+  SCHEDULE_WAY_OUT,
   SCHEDULER_NOTE,
+  STALE_RECORD_CLAUSE,
   UNINSTALL_EXPLANATION,
+  UNIT_DIR_CLAUSE,
+  UNIT_WAY_OUT,
+  unitUninstallCommand,
   type UninstallPreview,
+  type UninstallReport,
 } from "../src/lib/app-uninstall";
 
 const ROOT = new URL("../../", import.meta.url).pathname;
@@ -250,8 +264,9 @@ function appDirs(sb: Sandbox): { data: string; config: string } {
  *     (`staged_prefix` + `STAGED_SUFFIXES`, `.prev` among them). Measured inert — the engine
  *     never enumerates its config dir — but the simulation must be the FULL write-set, not the
  *     subset that happened to matter.
- *   the login item, which the app enables by default at first launch (autostart.rs), named after
- *     the productName (auto-launch 0.5.0 via tauri-plugin-autostart):
+ *   the login item, which the setup wizard's last step turns on by default (autostart.rs — since
+ *     Phase E M5b; B7 enabled it at first launch), named after the productName (auto-launch 0.5.0
+ *     via tauri-plugin-autostart; on macOS the app then adds `AssociatedBundleIdentifiers`):
  *     - Linux: `$HOME/.config/autostart/<productName>.desktop` — auto-launch hard-codes
  *       `~/.config` there, ignoring XDG_CONFIG_HOME (`src/linux.rs:81-83`).
  *     - macOS: `$HOME/Library/LaunchAgents/<productName>.plist` (`src/macos.rs:179-190`) — the
@@ -652,24 +667,396 @@ describe("the uninstall wording names what consent actually removes", () => {
     engineEntries: [],
     autostartEnabled: true,
     autostartError: null,
+    scheduleRecordPresent: false,
+    scheduleUnitFile: null,
+    os: "macos",
   };
+  const UNIT = "/Users/x/Library/LaunchAgents/local.daily-briefing.plist";
 
   test("the consent label names the archive, the irrecoverability, the engine copy and the bound", () => {
     const label = consentLabel(preview);
     expect(label).toContain("/x/state");
     expect(label).toContain("briefing archive");
     expect(label).toContain("cannot be recovered");
-    expect(label).toContain("engine copy");
+    expect(label).toContain("plus the background engine copy");
     expect(label).toContain("scripts/uninstall.sh");
     expect(label).toContain("nothing else in that folder is touched");
+    // The parity claim is about the LIST and is qualified (`docs/INSTALL.md`): none of the engine's
+    // data goes while a background schedule is installed — one may appear after this preview.
+    expect(label).toContain("none of them while a background schedule is installed");
+    expect(label).not.toContain("Exactly what");
     // Without a resolved dir the label still stands, minus the path.
     expect(consentLabel({ ...preview, engineStateDir: null })).not.toContain("/x/state");
   });
 
+  test("round 3 (B3-L6): off macOS the label does NOT claim the engine copy — on Linux it names where the copy is and that it stays", () => {
+    // `src/schedule/install.ts` `managedBinPath`: the copy is IN the state folder on macOS, and in the
+    // XDG data dir on Linux — outside the folder the box empties.
+    const linux = consentLabel({ ...preview, os: "linux" });
+    expect(linux).not.toContain("plus the background engine copy");
+    expect(linux).toContain("~/.local/share/daily-briefing/");
+    expect(linux).toContain("this does not remove it");
+    expect(linux).toContain("briefing archive");
+    expect(linux).toContain("cannot be recovered");
+    const blocked = consentLabel({ ...preview, os: "linux", scheduleRecordPresent: true });
+    expect(blocked).not.toContain("plus the background engine copy");
+    expect(blocked).toContain("this does not remove it");
+    const other = consentLabel({ ...preview, os: "windows" });
+    expect(other).not.toContain("plus the background engine copy");
+    expect(other).toContain("The background engine copy is not removed by this.");
+    expect(consentLabel(preview)).not.toContain("does not remove it");
+  });
+
+  test("round 4 (B4-L5): the script-parity claim is macOS-only — `scripts/uninstall.sh` is a macOS source-checkout script", () => {
+    // macOS keeps the claim (the list is pinned against the script by `tests/uninstall.rs`).
+    expect(consentLabel(preview)).toContain("The same files `bash scripts/uninstall.sh` removes from that folder");
+    // Elsewhere there is no script to be at parity with: the qualification stays, the claim goes.
+    for (const os of ["linux", "windows"]) {
+      const label = consentLabel({ ...preview, os });
+      expect(label).not.toContain("scripts/uninstall.sh");
+      expect(label).not.toContain("The same files");
+      expect(label).toContain(
+        "None of the engine's data is removed while a background schedule is installed; nothing else in that folder is touched.",
+      );
+    }
+  });
+
+  test("under a schedule record the label says the box removes NOTHING, and names the way out — never 'exactly what uninstall.sh would remove'", () => {
+    // Phase E final harden round 2 (A-M1): with `schedule.json` there the consented leg removes
+    // nothing of the engine's (`uninstall.rs`, `REFUSED_FOR_SCHEDULE`) — the schedule would keep
+    // running the engine copy and re-create the archive — so the label says so BEFORE consent,
+    // with the way out, and makes no parity claim.
+    const label = consentLabel({ ...preview, scheduleRecordPresent: true });
+    expect(label).toContain("/x/state");
+    expect(label).toContain("briefing archive");
+    expect(label).toContain("cannot be recovered");
+    expect(label).toContain("ticking this removes nothing");
+    expect(label).toContain(SCHEDULE_RECORD_RULE);
+    expect(label).toContain(`Schedule screen → ${REMOVE_SCHEDULE_BUTTON}`);
+    expect(label).toContain("`daily-briefing schedule uninstall` if you installed it from the terminal");
+    expect(label).toContain("then run Uninstall again");
+    expect(label).not.toContain("scripts/uninstall.sh");
+    expect(label).not.toContain("kept");
+    // Round 3 (B3-L1): it says what IS there — a record — not that a schedule is installed (a record
+    // can be stale), and the rule it carries ends with the stale record's way out.
+    expect(label).toContain("A background schedule record (schedule.json) is there right now");
+    expect(label).not.toContain("is installed right now");
+    expect(label).toContain(STALE_RECORD_CLAUSE);
+    // And the record-free label is the one that removes, and makes the parity claim.
+    expect(consentLabel(preview)).not.toContain("removes nothing");
+    expect(consentLabel(preview)).not.toContain(SCHEDULE_RECORD_RULE);
+  });
+
+  test("round 3 (D3-L4) + round 4 (B4-L6): a record-less scheduler unit file blocks the box too, and the label names it and its OWN way out — first, with no stale-record clause", () => {
+    const label = consentLabel({ ...preview, scheduleUnitFile: UNIT });
+    expect(label).toContain(`A background scheduler unit file (${UNIT}) is there right now, with no schedule record`);
+    expect(label).toContain("ticking this removes nothing");
+    // Its own rule, and that rule ends the label: the way out that applies is the instruction given.
+    expect(label.endsWith(` ${SCHEDULE_UNIT_RULE}`)).toBe(true);
+    expect(SCHEDULE_UNIT_RULE).toContain(UNIT_WAY_OUT);
+    expect(SCHEDULE_UNIT_RULE).toContain("`daily-briefing schedule uninstall` in a terminal, which removes that unit file");
+    // No record, so no record's rule: no stale-RECORD clause, no `schedule.json` to delete, and no
+    // Schedule-screen button — that screen draws its removal only where there is a record.
+    expect(label).not.toContain(SCHEDULE_RECORD_RULE);
+    expect(label).not.toContain(STALE_RECORD_CLAUSE);
+    expect(label).not.toContain("schedule.json");
+    expect(label).not.toContain(REMOVE_SCHEDULE_BUTTON);
+    expect(label).not.toContain("scripts/uninstall.sh");
+    // A record and a unit together: the record's wording (the unit is the record's own).
+    const both = consentLabel({ ...preview, scheduleRecordPresent: true, scheduleUnitFile: UNIT });
+    expect(both).toContain("A background schedule record (schedule.json) is there right now");
+    expect(both).toContain(SCHEDULE_RECORD_RULE);
+    expect(both).not.toContain("removes that unit file");
+  });
+
+  test("round 3 (A3-L2): the execute button says what clicking WILL do — ticked under a schedule, engine data stays", () => {
+    expect(executeLabel(false, preview)).toBe("Remove app pieces");
+    expect(executeLabel(true, preview)).toBe("Remove app pieces and engine data");
+    for (const blocked of [
+      { ...preview, scheduleRecordPresent: true },
+      { ...preview, scheduleUnitFile: UNIT },
+    ]) {
+      expect(executeLabel(false, blocked)).toBe("Remove app pieces");
+      const ticked = executeLabel(true, blocked);
+      expect(ticked).not.toContain("and engine data");
+      expect(ticked).toContain("engine data stays");
+    }
+  });
+
+  test("round 4 (B4-L7): with the state dir unresolved (engineError) the ticked button does not promise engine data either", () => {
+    // The view says under the box that it "will not remove anything until" the engine can say
+    // where its data lives; the button must not say the opposite.
+    const unresolved = { ...preview, engineStateDir: null, engineError: "status --json exited 2" };
+    expect(executeLabel(false, unresolved)).toBe("Remove app pieces");
+    const ticked = executeLabel(true, unresolved);
+    expect(ticked).not.toContain("and engine data");
+    expect(ticked).toBe("Remove app pieces (engine data stays while the engine cannot say where it is)");
+    // A schedule there as well: the schedule's words, the more certain block (it outlasts the engine
+    // answering by the click).
+    expect(executeLabel(true, { ...unresolved, scheduleUnitFile: UNIT })).toBe(
+      "Remove app pieces (engine data stays while a schedule is there)",
+    );
+  });
+
+  test("the way out names the Schedule screen's REAL button, and Rust's refusal says the same sentence", () => {
+    // The label the consent text and Rust's refusal both point at, read from the RENDERED
+    // component (SSR: the closed state draws exactly the one removal button) — a renamed button
+    // fails here instead of leaving the advice pointing at nothing.
+    const body = render(ScheduleUninstall as never, { props: { scheduleState: null } }).body.replace(/<!--[\s\S]*?-->/g, "");
+    const drawn = [...body.matchAll(/<button[^>]*>([\s\S]*?)<\/button>/g)].map((m) => (m[1] ?? "").trim());
+    expect(drawn).toEqual([REMOVE_SCHEDULE_BUTTON]);
+    // Rust's `REFUSED_FOR_SCHEDULE` is what the done view shows after a refused run; it must carry
+    // the same sentence — the stale-record clause included. Parsed from the source (the T9
+    // pattern): the string literal with Rust's `\<newline><indent>` continuations folded the way the
+    // compiler folds them.
+    const rust = readFileSync(join(ROOT, "gui", "src-tauri", "src", "uninstall.rs"), "utf8");
+    const literal = rust.match(/pub const REFUSED_FOR_SCHEDULE: &str = "((?:[^"\\]|\\[\s\S])*)";/);
+    expect(literal).not.toBeNull();
+    const refused = (literal?.[1] ?? "").replace(/\\\n\s*/g, "");
+    expect(refused).toContain(SCHEDULE_RECORD_RULE);
+    expect(SCHEDULE_RECORD_RULE).toContain(STALE_RECORD_CLAUSE);
+    // The SHARED sentence, word for word (`docs/INSTALL.md` carries it too).
+    expect(STALE_RECORD_CLAUSE).toBe(
+      "If the Schedule screen shows no schedule and `daily-briefing schedule uninstall` reports nothing " +
+        "installed, the record is stale: delete `schedule.json` from the engine's folder, then run Uninstall again.",
+    );
+    // Round 4 (B4-L6): the record-LESS unit's rule is its own, in step on both sides — Rust's
+    // `REFUSED_FOR_UNIT_RULE` (which `refused_for_unit` carries) is the webview's `SCHEDULE_UNIT_RULE`.
+    const unitLiteral = rust.match(/pub const REFUSED_FOR_UNIT_RULE: &str = "((?:[^"\\]|\\[\s\S])*)";/);
+    expect(unitLiteral).not.toBeNull();
+    expect((unitLiteral?.[1] ?? "").replace(/\\\n\s*/g, "")).toBe(SCHEDULE_UNIT_RULE);
+    // Cap round (G5-2): the reason a systemd unit gets its own command, in step on both sides too.
+    const dirLiteral = rust.match(/pub const UNIT_DIR_CLAUSE: &str = "((?:[^"\\]|\\[\s\S])*)";/);
+    expect(dirLiteral).not.toBeNull();
+    expect((dirLiteral?.[1] ?? "").replace(/\\\n\s*/g, "")).toBe(UNIT_DIR_CLAUSE);
+    // And the record's refusal no longer names a unit file: the unit has its own.
+    expect(refused).not.toContain("unit file");
+  });
+
   test("the default action's copy promises the engine is untouched, and the scheduler is out of scope", () => {
     expect(UNINSTALL_EXPLANATION).toContain("not touched unless");
-    expect(UNINSTALL_EXPLANATION).toContain("dragging it out of Applications");
-    expect(SCHEDULER_NOTE).toContain("Schedule screen");
+    // Shown before the preview tells the webview its platform, so it names both (round 3, B3-L6).
+    expect(UNINSTALL_EXPLANATION).toContain("on macOS by dragging it out of Applications");
+    expect(UNINSTALL_EXPLANATION).toContain("on Linux by removing the .deb or deleting the AppImage");
+    expect(SCHEDULER_NOTE).toContain(`Schedule screen (${REMOVE_SCHEDULE_BUTTON})`);
+    expect(SCHEDULER_NOTE).toContain("Uninstall removes none of the engine's data");
+  });
+
+  test("round 3 (B3-L6): the last step is per platform — the Trash on macOS, the .deb or the AppImage on Linux", () => {
+    expect(finishLine("macos")).toBe("To finish, quit the app and drag it from Applications to the Trash.");
+    const linux = finishLine("linux");
+    expect(linux).toContain("`sudo apt remove daily-briefing` for the .deb");
+    expect(linux).toContain("delete the `.AppImage` file");
+    expect(linux).not.toContain("Applications");
+    expect(linux).not.toContain("Trash");
+    expect(finishLine("windows")).not.toContain("Applications");
+  });
+
+  // The report's shape for each case, as `uninstall_execute` answers it (`tests/uninstall.rs` pins
+  // the Rust half): unticked → no engine leg; ticked, no record → the list removed; ticked under a
+  // record → the one refusal. The schedule facts are the EXECUTE-time ones, read ticked or not.
+  const unticked: UninstallReport = {
+    autostart: { result: "removed" },
+    app: [],
+    engineStateRemoved: false,
+    engine: [],
+    engineRefused: null,
+    engineStateDir: null,
+    engineError: null,
+    scheduleRecordPresent: false,
+    scheduleUnitFile: null,
+    os: "macos",
+  };
+  const tickedRemoved: UninstallReport = {
+    ...unticked,
+    engineStateRemoved: true,
+    engine: [{ name: "briefing.log", outcome: { result: "removed" } }],
+    engineStateDir: "/x/state",
+  };
+  const tickedRefused: UninstallReport = {
+    ...unticked,
+    engineRefused: "a background schedule's record …",
+    engineStateDir: "/x/state",
+    scheduleRecordPresent: true,
+  };
+
+  test("R4 + round 3: the done view warns that a schedule outlives the app whenever the EXECUTE-time check found one — ticked or not — before the finish line", () => {
+    // No record: no warning, ticked or not — the plain finish.
+    expect(doneNotes(unticked)).toEqual({ warning: null, finish: finishLine("macos") });
+    expect(doneNotes(tickedRemoved)).toEqual({ warning: null, finish: finishLine("macos") });
+
+    // A record, box UNTICKED: the gap R4 closes — the app's own pieces went, the schedule did not.
+    const untickedNotes = doneNotes({ ...unticked, scheduleRecordPresent: true });
+    expect(untickedNotes.warning).not.toBeNull();
+    const warning = untickedNotes.warning ?? "";
+    // What IS there — not "is still installed": a record can be stale (B3-L1) — with its way out.
+    expect(warning).toContain("A background schedule record is still there");
+    expect(warning).not.toContain("is still installed");
+    expect(warning).toContain("keeps running the engine after the app is deleted");
+    expect(warning).toContain(SCHEDULE_WAY_OUT);
+    expect(warning).toContain(`Schedule screen → ${REMOVE_SCHEDULE_BUTTON}`);
+    expect(warning).toContain("`daily-briefing schedule uninstall` if you installed it from the terminal");
+    expect(warning).toContain(STALE_RECORD_CLAUSE);
+    // The same way out as the rule sentence, not a second wording of it.
+    expect(SCHEDULE_RECORD_RULE).toContain(SCHEDULE_WAY_OUT);
+    expect(untickedNotes.finish).toBe(finishLine("macos"));
+
+    // A record, box TICKED: the leg was refused — the same warning, and the finish says to run
+    // Uninstall again before removing the app.
+    const tickedNotes = doneNotes(tickedRefused);
+    expect(tickedNotes.warning).toBe(warning);
+    expect(tickedNotes.finish).toContain("run Uninstall again");
+    expect(tickedNotes.finish).toContain(finishLine("macos"));
+    // A refusal the facts did not foresee (a schedule installed and removed again around the
+    // execute) still warns.
+    expect(doneNotes({ ...tickedRefused, scheduleRecordPresent: false }).warning).toBe(warning);
+  });
+
+  test("round 3 (A3-L2): the warning follows the EXECUTE-time facts, not the preview — a schedule removed in between, a record-less unit, and an unknown state dir", () => {
+    // The preview saw a record; by execute it was gone: no warning (the old preview-flag version
+    // warned here).
+    expect(doneNotes({ ...unticked, scheduleRecordPresent: false }).warning).toBeNull();
+    // A record-less unit file at execute: warned, with the unit named and ITS way out (round 4,
+    // B4-L6) — the engine's subcommand, not the Schedule screen's button (drawn only with a record) —
+    // and no stale-RECORD clause.
+    const unit = doneNotes({ ...unticked, scheduleUnitFile: UNIT }).warning ?? "";
+    expect(unit).toContain(`A background scheduler unit file is still there (${UNIT})`);
+    expect(unit).toContain(`${UNIT_WAY_OUT}.`);
+    expect(unit).not.toContain(SCHEDULE_WAY_OUT);
+    expect(unit).not.toContain(REMOVE_SCHEDULE_BUTTON);
+    expect(unit).not.toContain(STALE_RECORD_CLAUSE);
+    // …and a refused run on that unit (the report states the look the gate refused on — Rust's
+    // `ScheduleSeen`, round 4 G4-L1) says the same, then to run Uninstall again.
+    const unitRefused = doneNotes({
+      ...unticked,
+      engineRefused: "a background scheduler unit file (…) is there with no schedule record …",
+      engineStateDir: "/x/state",
+      scheduleUnitFile: UNIT,
+    });
+    expect(unitRefused.warning).toBe(unit);
+    expect(unitRefused.finish).toContain("run Uninstall again");
+    // The state dir could not be named at execute and no unit was found: UNKNOWN, said as unknown.
+    const unknown = doneNotes({ ...unticked, scheduleRecordPresent: null });
+    expect(unknown.warning).toContain("could not say whether a background schedule is installed");
+    expect(unknown.warning).toContain(SCHEDULE_WAY_OUT);
+    expect(unknown.finish).toBe(finishLine("macos"));
+    // …and the finish is the report's platform's.
+    expect(doneNotes({ ...unticked, os: "linux" }).finish).toBe(finishLine("linux"));
+    expect(doneNotes({ ...tickedRefused, os: "linux" }).finish).toContain(finishLine("linux"));
+  });
+
+  test("cap round (A5-L1): an UNKNOWN record is not 'no record' — a unit with the record unanswered gets the record's way out, hedged", () => {
+    // The preview: the engine could not name its state dir (`engineError`), so `scheduleRecordPresent`
+    // is `false` without meaning absent — an app-owned record is the Schedule screen's to remove
+    // (`schedule uninstall` refuses it as foreign). The label names the unit, claims no "no schedule
+    // record", and gives the record's rule, never the record-less unit's.
+    const unanswered = { ...preview, engineStateDir: null, engineError: "status --json exited 2", scheduleUnitFile: UNIT };
+    const label = consentLabel(unanswered);
+    expect(label).toContain(`A background scheduler unit file (${UNIT}) is there right now`);
+    expect(label).toContain("ticking this removes nothing");
+    expect(label).toContain("the engine could not say whether a schedule record is there too");
+    expect(label).not.toContain("with no schedule record");
+    expect(label.endsWith(` ${SCHEDULE_RECORD_RULE}`)).toBe(true);
+    expect(label).not.toContain(SCHEDULE_UNIT_RULE);
+    // The done view: the execute-time record unknown (`null`) and a unit there.
+    const notes = doneNotes({ ...unticked, scheduleRecordPresent: null, scheduleUnitFile: UNIT });
+    const warning = notes.warning ?? "";
+    expect(warning).toContain(`A background scheduler unit file is still there (${UNIT}`);
+    expect(warning).toContain("the engine could not say whether a schedule record is there too");
+    expect(warning).not.toContain("A background schedule record is still there");
+    expect(warning.endsWith(`${SCHEDULE_WAY_OUT}. ${STALE_RECORD_CLAUSE}`)).toBe(true);
+    expect(warning).not.toContain(UNIT_WAY_OUT);
+    expect(notes.finish).toBe(finishLine("macos"));
+    // Known absent stays the record-less unit's own way out.
+    expect(doneNotes({ ...unticked, scheduleRecordPresent: false, scheduleUnitFile: UNIT }).warning).toContain(
+      `${UNIT_WAY_OUT}.`,
+    );
+  });
+
+  test("cap round (G5-2): a Linux unit's way out is the command for the unit's OWN directory — both directories, a path with a space and a quote", () => {
+    // `daily-briefing schedule uninstall` looks only under its own environment's
+    // `$XDG_CONFIG_HOME/systemd/user` (else `~/.config/systemd/user`); this app looks under both.
+    const DEFAULT = "/h/.config/systemd/user/daily-briefing.timer";
+    const CUSTOM = "/x/my cfg/it's $HOME/systemd/user/daily-briefing.service";
+    expect(unitUninstallCommand(DEFAULT)).toBe("XDG_CONFIG_HOME='/h/.config' daily-briefing schedule uninstall");
+    expect(unitUninstallCommand(CUSTOM)).toBe(
+      "XDG_CONFIG_HOME='/x/my cfg/it'\\''s $HOME' daily-briefing schedule uninstall",
+    );
+    // The macOS plist keeps the rule's own command.
+    expect(unitUninstallCommand(UNIT)).toBeNull();
+    // The quoting, measured: the prefix alone (the engine's subcommand stripped off first, so it never
+    // runs), in front of `printenv`, through a real `/bin/sh`.
+    for (const [unit, config] of [
+      [DEFAULT, "/h/.config"],
+      [CUSTOM, "/x/my cfg/it's $HOME"],
+    ] as const) {
+      const command = unitUninstallCommand(unit) ?? "";
+      const suffix = " daily-briefing schedule uninstall";
+      expect(command.endsWith(suffix)).toBe(true);
+      const shell = Bun.spawnSync(["/bin/sh", "-c", `${command.slice(0, -suffix.length)} /usr/bin/printenv XDG_CONFIG_HOME`], {
+        env: { PATH: "/usr/bin:/bin" },
+      });
+      expect(shell.exitCode).toBe(0);
+      expect(shell.stdout.toString()).toBe(`${config}\n`);
+    }
+    // Byte for byte the sentence Rust's `unit_command_note` builds for the same unit
+    // (`tests/uninstall.rs`, `a_linux_units_refusal_names_the_command_for_its_own_directory`).
+    const note =
+      "To remove this unit file from a terminal, run `XDG_CONFIG_HOME='/h/.config' daily-briefing schedule " +
+      "uninstall`: `daily-briefing schedule uninstall` looks for it only under `$XDG_CONFIG_HOME/systemd/user`, " +
+      "or `~/.config/systemd/user` when XDG_CONFIG_HOME is unset.";
+    // The label and the done view: the unit's rule, then the command beside it — record known absent.
+    const linux = { ...preview, os: "linux", scheduleUnitFile: DEFAULT };
+    expect(consentLabel(linux).endsWith(` ${SCHEDULE_UNIT_RULE} ${note}`)).toBe(true);
+    expect(doneNotes({ ...unticked, os: "linux", scheduleUnitFile: DEFAULT }).warning?.endsWith(`${UNIT_WAY_OUT}. ${note}`)).toBe(
+      true,
+    );
+    const custom = `To remove this unit file from a terminal, run \`${unitUninstallCommand(CUSTOM)}\`: ${UNIT_DIR_CLAUSE}`;
+    expect(consentLabel({ ...linux, scheduleUnitFile: CUSTOM }).endsWith(` ${SCHEDULE_UNIT_RULE} ${custom}`)).toBe(true);
+    // …and the record unanswered (A5-L1): the record's way out, then the command.
+    const unanswered = { ...linux, engineStateDir: null, engineError: "status --json exited 2" };
+    expect(consentLabel(unanswered).endsWith(` ${SCHEDULE_RECORD_RULE} ${note}`)).toBe(true);
+    expect(
+      doneNotes({ ...unticked, os: "linux", scheduleRecordPresent: null, scheduleUnitFile: DEFAULT }).warning?.endsWith(
+        `${STALE_RECORD_CLAUSE} ${note}`,
+      ),
+    ).toBe(true);
+    // Where the unit is not named — a record there — no command is added.
+    expect(consentLabel({ ...linux, scheduleRecordPresent: true })).not.toContain("XDG_CONFIG_HOME=");
+    expect(doneNotes({ ...unticked, os: "linux", scheduleRecordPresent: true, scheduleUnitFile: DEFAULT }).warning).not.toContain(
+      "XDG_CONFIG_HOME=",
+    );
+  });
+
+  test("R4 + round 3: AppSettings draws doneNotes' words from the REPORT, the warning BEFORE the finish, and the refusal line verbatim", () => {
+    // The done view is reached only by clicking (SSR cannot get there), so its wiring is pinned by
+    // source — the way `wizard.check.ts` pins the last step.
+    const source = readFileSync(join(ROOT, "gui", "src", "lib", "AppSettings.svelte"), "utf8");
+    const markup = source.slice(source.indexOf("</script>"));
+    // The facts are the report's own (execute time) — no flag carried over from the preview.
+    expect(markup).toContain("doneNotes(uninstallReport)");
+    expect(source).not.toContain("uninstallScheduled");
+    expect(source).not.toContain(".scheduleRecordPresent");
+    // Warning first, then the finish — and no finish wording of the component's own.
+    const warningAt = markup.indexOf("{notes.warning}");
+    const finishAt = markup.indexOf("{notes.finish}");
+    expect(warningAt).toBeGreaterThan(-1);
+    expect(finishAt).toBeGreaterThan(warningAt);
+    expect(markup).not.toContain("drag it from Applications");
+    // Round 3 (B3-L5): the refused leg's ONE line — "nothing removed" and the refusal verbatim
+    // (`{}`-interpolated, never `{@html}`), drawn only when there is a refusal, inside the report.
+    const refusalLine = '<li class="bad">engine data: nothing removed — {uninstallReport.engineRefused}</li>';
+    const guard = "{#if uninstallReport.engineRefused !== null}";
+    const reportAt = markup.indexOf('<ul class="muted report">');
+    expect(reportAt).toBeGreaterThan(-1);
+    const report = markup.slice(reportAt, markup.indexOf("</ul>", reportAt));
+    expect(report).toContain(refusalLine);
+    expect(report.indexOf(guard)).toBeGreaterThan(-1);
+    expect(report.indexOf(refusalLine)).toBeGreaterThan(report.indexOf(guard));
+    expect(markup).not.toMatch(/\{@html[^}]*engineRefused/);
+    // The execute button's words are `executeLabel`'s (round 3, A3-L2) — none of its own.
+    expect(markup).toContain("{executeLabel(consent, uninstall)}");
+    expect(markup).not.toContain("Remove app pieces");
   });
 
   test("the report lines cover the three outcomes", () => {

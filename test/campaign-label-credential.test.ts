@@ -112,14 +112,25 @@ describe("campaign labels never carry a credential past redaction", () => {
   const KELVIN = "\u212A";
   const AWS = TOKENS["aws-access-key-id"]!.token, JWT = TOKENS["jwt"]!.token;
   const manufactured: Record<string, string> = {
+    "Kelvin-sign K": AWS.replace("K", KELVIN),
+  };
+  // ⚠ INVERTED PREMISE, by the USER'S DECISION (2026-10-02, Phase E final harden E16 "Close both"): the
+  // shared matcher now catches a key id glued to `_` in the RAW subject (credentials.ts, the
+  // aws-access-key-id lookbehind), so these two no longer need the label-side check — the subject
+  // check refuses them first. Every assertion after the premise is unchanged; the label-side check
+  // stays pinned by the Kelvin row above, which still escapes the raw subject.
+  // The JWT row joined them by a second decision (user-directed 2026-10-02, "yes, close the underscore
+  // ones": the same lookbehind on jwt, github-token and provider-key), so `_eyJ…` is refused at the
+  // subject too — its premise inverted, every assertion after it unchanged.
+  const closedAtTheSubject: Record<string, string> = {
     "leading underscore": `_${AWS}`,
     "parenthesised leading underscore": `(_${AWS})`,
     "leading underscore JWT": `_${JWT}`,
-    "Kelvin-sign K": AWS.replace("K", KELVIN),
   };
-  for (const [why, tok] of Object.entries(manufactured)) {
+  for (const [why, tok] of [...Object.entries(manufactured), ...Object.entries(closedAtTheSubject)]) {
     test(`label-side check: ${why} keys no campaign and reaches neither channel`, () => {
-      expect(matchesCredential(`chore: ${tok} rotated`)).toBe(false);   // premise: the raw subject escapes the shared matcher
+      // premise: the raw subject escapes the shared matcher — except the rows closed at the subject
+      expect(matchesCredential(`chore: ${tok} rotated`)).toBe(why in closedAtTheSubject);
       const { out } = windowFor(tok);
       expect(out.map((e) => e.group)).toEqual([undefined, undefined]);
       const md = redactCredentials(renderBriefing(structOf(out)));

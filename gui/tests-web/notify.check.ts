@@ -172,8 +172,10 @@ describe("AppSettings", () => {
       .replace(/\s+/g, " ");
     // consent starts unchecked, and both open and cancel reset it
     expect(source).toContain("let consent = $state(false)");
-    // the execute button's label switches with consent…
-    expect(source).toContain('{consent ? "Remove app pieces and engine data" : "Remove app pieces"}');
+    // the execute button's label switches with consent — through `executeLabel`, whose three
+    // answers (unticked; ticked; ticked under a schedule, where engine data stays) are pinned in
+    // `coexistence.check.ts` (round 3, A3-L2)…
+    expect(source).toContain("{executeLabel(consent, uninstall)}");
     // …and carries the danger affordance (B6's ScheduleUninstall pattern — round-1 fix M2), with
     // the style rule that makes the class an affordance rather than a dead attribute.
     expect(source).toMatch(/<button class="danger" disabled=\{uninstallBusy\} onclick=\{\(\) => void runUninstall\(\)\}/);

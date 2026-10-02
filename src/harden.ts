@@ -35,6 +35,7 @@ import { expandTilde } from "./config";
 import { supportDir } from "./marker";
 import { probeCapabilities, type Capabilities } from "./probe";
 import { FLAG_REJECTION_RE, failFastMs, TIMEOUT_MS } from "./provider";
+import { redactCredentials } from "./transcripts/credentials";
 
 export type HardenedProvider = Provider & {
   /** Accumulated during `generate()`; read by core AFTER the call and merged into the briefing.
@@ -561,5 +562,8 @@ function join2(a: string, b: string): string { return resolve(a, b); }
  *  a strictly better fallback than shared /tmp. */
 function tmpdirSafe(): string { return tmpdir(); }
 
-/** First line only: a CLI usage error can dump its whole help text after the message. */
-function firstLine(m: string): string { return m.split("\n")[0]!.slice(0, 160); }
+/** First line only: a CLI usage error can dump its whole help text after the message. Redacted BEFORE
+ *  the 160-char cut, never after: a credential straddling the cut would otherwise keep a prefix too
+ *  short for its pattern to match downstream (the warning reaches the briefing's ⚠ line, the envelope
+ *  and last-skip). Exported for test/clip-redacts-first.test.ts only. */
+export function firstLine(m: string): string { return redactCredentials(m.split("\n")[0]!).slice(0, 160); }

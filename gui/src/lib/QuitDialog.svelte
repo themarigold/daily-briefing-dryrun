@@ -84,6 +84,9 @@
     <h2>{dialog.title}</h2>
     <p>{dialog.body}</p>
 
+    <!-- No offer section at all when Rust sends no label: before setup is finished there is no
+         engine setting to offer (`shell::QuitCopy::NotSetUp`, Phase E final harden). -->
+    {#if dialog.offerLabel !== null}
     <div class="offer">
       <!-- The label and, when the offer cannot be taken here, the reason are Rust's
            (`shell::quit_dialog_for`). The button calls `config_offer_notify_auto`: the Settings
@@ -107,6 +110,7 @@
         {/if}
       {/if}
     </div>
+    {/if}
 
     {#if failure !== ""}
       <p class="bad">{failure}</p>

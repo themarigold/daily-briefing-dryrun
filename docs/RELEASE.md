@@ -72,7 +72,49 @@ Run from this project's directory (the one holding `package.json`). `X.Y.Z` is t
    the budget file's own definition, which is what `artifactBytes` computes.
 3. `bash scripts/check-versions.sh X.Y.Z` must print `check-versions: PASS`. It also fails a versioned
    size-row path that still carries the old version, so a forgotten re-measure is caught here.
-4. Commit on a branch, open a PR, and merge it (a merge commit).
+4. On an Apple-silicon Mac, prove what this machine can prove about the distribution:
+
+   ```sh
+   bash scripts/verify-dist-local.sh
+   ```
+
+   It takes no arguments (the version is `gui/package.json`'s) and prints PASS or FAIL for each of its
+   twelve steps; every step runs, and it exits 1 if any failed. The steps: the host is macOS arm64; the
+   four version carriers; the 5 CLI cross-compiles, as the release workflow builds them, into a
+   temporary dist (never the repo's `dist/`); the plain host `tauri build` under the rule above; the
+   stage under the frozen DMG name; the size gate on the DMG and `.app` rows; the DMG leg (mounted
+   `-nobrowse -noautoopen -readonly` at a scratch mount point, the `.app` copied out, the image
+   detached, both executables arm64, the copied sidecar's `--version`); the hardened runtime on the
+   ad-hoc path (the copied bundle verifies and is sealed, its two executables carry `runtime` and
+   entitlements equal to `gui/src-tauri/entitlements.plist`, and a bare sidecar ad-hoc signed
+   `--options runtime` in scratch still answers `--version` — a `--version` regression of E4 only:
+   E4's full `run --force` legs were measured once, in M1b on 2026-10-01, and are re-proven in Phase
+   F's VM walkthrough);
+   `scripts/release-collect.sh` over that dist with `unsigned` and `success`, with the `macos-x64` and
+   `linux-x86_64` markers written as `build-failed` because this Mac cannot build them (so the notes
+   name them; and when the arm64 leg did not build either, collect refuses the release, which has no
+   desktop bundle left); the `docs/CONFIG.md` drift guard and the site test; and that no step rewrote a tracked
+   file. It never opens, launches or registers the `.app`: only the sidecar executes, and only with
+   `--version`. What it leaves unproven is [below](#what-this-mac-cannot-prove).
+5. Commit on a branch, open a PR, and merge it (a merge commit).
+
+#### What this Mac cannot prove
+
+`verify-dist-local.sh` covers the arm64 leg and the release scripts. The rest is proven only on CI
+(the release workflow, or the private dry-run repo) or in a VM, never on the maintainer's Mac:
+
+- **the x64 DMG**: built, staged, size-gated and smoked natively on the `macos-26-intel` runner;
+- **the Linux AppImage and `.deb`**: built and smoked on `ubuntu-22.04` (a local Docker leg was
+  dropped: CI's native smoke already proves the AppImage extracts and reports the version, and the
+  dry run's `SHA256SUMS` check proves the downloaded bytes are the built bytes);
+- **Windows**: the NSIS installer is an informational CI artifact only and never ships;
+- **notarization**: parameterized and empty until Apple enrollment; nothing here or in CI notarizes;
+- **a genuine Gatekeeper first-open**: this Mac carries its own grants and never opens the app, so the
+  quarantined first-open of the downloaded DMG, and the app's launch under the hardened runtime, are
+  checked in a clean VM.
+
+The Finder layout of the DMG (background and icon positions) is deferred past v0.2.0: every build, local
+and CI, runs with `CI=true`, which ships a brandless DMG.
 
 ### 2. Run the release check on the merged commit
 
@@ -188,7 +230,8 @@ gh run watch <run-id> -R themarigold/daily-briefing --exit-status
 `gate` (typecheck, tests, `scripts/check-versions.sh` against the tag, the signing mode) → the CLI
 binaries and the bundle legs in parallel → `release`. A failed bundle leg does not stop the release: its
 marker says `build-failed`, its assets are absent, and the notes name it. A missing or `size-rejected`
-required marker fails `release` (the [Bundle-status contract](#bundle-status-contract) below).
+required marker fails `release`, and so does a run in which **no** desktop leg built: a CLI-only release
+is refused (user-directed 2026-10-02; the [Bundle-status contract](#bundle-status-contract) below).
 
 ### 9. Verify every asset and `SHA256SUMS`
 
@@ -308,9 +351,9 @@ Each bundle leg of the release workflow reports what it built through a marker. 
 
 | Item | Value |
 |---|---|
-| Legs | `macos-arm64`, `macos-x64`, `linux-x86_64` (**required**: the marker must be present); `windows-x64` (informational) |
+| Legs | `macos-arm64`, `macos-x64`, `linux-x86_64` (**required**: the marker must be present, and at least one of the three must say `built`); `windows-x64` (informational: it never counts as a desktop bundle) |
 | Marker artifact | `marker-<leg>`, uploaded from an `if: always()` step, holding one file `<leg>.status` |
-| Marker body | exactly one token and a newline: `built`, `build-failed` or `size-rejected` |
+| Marker body | exactly one token and a newline, compared byte-for-byte: `built`, `build-failed` or `size-rejected` |
 | Derivation | a step with id `marker` and `if: always()`, after `smoke` and before every upload, sets `steps.marker.outputs.status`. It reads `.outcome` (never `.conclusion`) of an enumerated list of step ids and nothing else: `gui-tests`, `build`, `stage`, `size`, `smoke` for the macOS and Linux legs; `build` alone for Windows. None of them carries `continue-on-error`. `steps.size.outcome == 'failure'` → `size-rejected`; all enumerated `success` → `built`; anything else → `build-failed` |
 | Bundle artifact | `bundle-<leg>`, uploaded with `if: always() && steps.marker.outputs.status == 'built'`; holds the frozen-name files flat |
 | Marker upload | `if: always()`, after the bundle upload |
@@ -324,22 +367,36 @@ Each bundle leg of the release workflow reports what it built through a marker. 
 **Collect rules** (`scripts/release-collect.sh <dist> <markers> <version> <signed|unsigned> <dl-bundles-outcome> <notes-out>`),
 every one checked, all failures printed, exit 1 if any:
 
-- a required leg's marker absent, or its body not exactly one of the three tokens plus a newline → FAIL;
+- a required leg's marker absent, or its body not byte-for-byte one of the three tokens plus a newline
+  (a NUL, a trailing space or a second line included) → FAIL;
 - `size-rejected` → FAIL;
 - `built` ⇒ that leg's frozen names are in `dist/`, else FAIL;
 - `build-failed` ⇒ that leg's names are absent (present → FAIL), and the notes name the leg;
+- **no** required leg `built` → FAIL: a release with zero desktop bundles (the CLI floor alone) is refused
+  (user-directed 2026-10-02). One or two `build-failed` legs still ship, named in the notes;
 - the `dl-bundles` outcome not `success` while any marker says `built` → FAIL (a partial download never
   ships); an outcome that is not `success`, `failure`, `cancelled` or `skipped` → FAIL;
-- the windows marker is read for the notes only: absent or any body is never a FAIL;
-- any other file in `markers/` → FAIL;
-- `dist/` not flat (a subdirectory or link), or holding anything but a frozen name for this version → FAIL,
-  named; a Windows installer (`*setup*.exe`, `*.msi`) → FAIL;
+- the windows marker is read for the notes only: absent or any body is never a FAIL, and it never counts
+  as a desktop bundle;
+- any other file in `markers/`, or a known leg's marker that is not a regular file → FAIL;
+- `dist/` not a directory, not flat (a subdirectory or link), or holding anything but a frozen name for
+  this version → FAIL, named; a Windows installer (`*setup*.exe`, `*.msi`) → FAIL;
 - any of the 5 CLI binaries missing → FAIL;
+- a version that is not plain semver `X.Y.Z` → FAIL;
 - a signing argument other than exactly `signed` or `unsigned` (an empty value means the gate job's
   output was lost) → FAIL;
-- the notes file inside `dist/` → FAIL.
+- the notes path a directory, in a directory that does not exist, or inside `dist/` (judged by canonical
+  physical path, `/bin/pwd -P`, so a symlink, `..`, a case variant or the `/System/Volumes/Data` firmlink
+  spelling cannot hide it), or either side of that judgement unresolvable → FAIL; the notes template
+  missing → FAIL.
 
-Only on a full pass does it write `dist/SHA256SUMS` and the notes.
+After every check above passed, these still refuse the release (exit 1, nothing written): the notes
+template does not render (an unknown, nested or unbalanced block, or a placeholder left
+unsubstituted); hashing any asset fails; `SHA256SUMS` would not list exactly the CLI floor plus every
+built leg's frozen names, each once; moving `SHA256SUMS` or the notes into place fails.
+
+Only on a full pass does it write `dist/SHA256SUMS` and the notes. A refused run also removes a
+`dist/SHA256SUMS` an earlier run left there, so nothing in `dist/` reads as a finished release.
 
 ### Runners
 
@@ -350,7 +407,7 @@ cross-built to ship, and nothing runs under Rosetta.
 |---|---|---|
 | `macos-arm64` | `macos-26` (Apple silicon) | |
 | `macos-x64` | `macos-26-intel` (Intel) | The smoke runs the x64 sidecar's `--version` natively. The leg also cross-builds the `aarch64-apple-darwin` sidecar before its GUI tests, because `gui/size-budget.json` records that file and the size-budget stale-row test re-stats it. So `cargo test` runs with no `--skip` on both macOS legs. |
-| `linux-x86_64` | `ubuntu-22.04` (pinned: it sets the oldest glibc and webkit2gtk the Linux bundles run on) | `cargo test` skips exactly the one stale-row test. The AppImage carries the engine at `usr/libexec/daily-briefing/daily-briefing` and a shell wrapper at `usr/bin/daily-briefing` (linuxdeploy's RPATH rewrite breaks the engine in `usr/bin`; `docs/gui-seam.md` §15a). The smoke checks that layout, the engine byte-identical to the built sidecar, and `--version` through the wrapper. The .deb ships the engine itself at `usr/bin/daily-briefing`. |
+| `linux-x86_64` | `ubuntu-22.04` (pinned: it sets the oldest glibc and webkit2gtk the Linux bundles run on) | Right after the checkout and the bun setup it frees disk: it deletes four preinstalled toolchains the job never uses (.NET, Android, GHC, CodeQL), because the leg needs about 14G and the image starts with 13G free (release dry run 2 died with "No space left on device", 2026-10-02). `cargo test` skips exactly the one stale-row test. The AppImage carries the engine at `usr/libexec/daily-briefing/daily-briefing` and a shell wrapper at `usr/bin/daily-briefing` (linuxdeploy's RPATH rewrite breaks the engine in `usr/bin`; `docs/gui-seam.md` §15a). The smoke checks that layout, the engine byte-identical to the built sidecar, `--version` through the wrapper, and the app itself: its main executable at `usr/bin/daily-briefing-gui` (present and executable; never run), its desktop entry at `usr/share/applications/Daily Briefing.desktop`, and a `.desktop` at the AppDir root. The .deb ships the engine itself at `usr/bin/daily-briefing`; the smoke checks its metadata, its members, and that both executables are executable by everyone. |
 | `windows-x64` | `windows-latest` | informational |
 
 The public `ci.yml` runs its full macOS `cargo test` on `macos-26`. `macos-14` is not used anywhere: it
@@ -373,7 +430,10 @@ with SIGILL under that runner's Rosetta (M2b dry run, 2026-10-01). Runner choice
   identity the workflow's keychain import put in `APPLE_SIGNING_IDENTITY`, and is refused off macOS. Any
   `APPLE_CERTIFICATE*`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` or `APPLE_API_*` variable arriving
   in its environment is refused; notarization input comes only through `DBA_NOTARIZE_*`, and reaches
-  Tauri only as one complete set, in signed mode.
+  Tauri only as one complete set, in signed mode. Prefer the API-key set when enrolling: in the
+  AppleId set, Tauri passes the app-specific password to `notarytool` as `--password` on its command
+  line, visible to any process listing on the runner for the duration (it is not logged; the API key
+  goes to `notarytool` as a file path instead).
 - `scripts/check-versions.sh <version>`: `package.json`, `gui/package.json`,
   `gui/src-tauri/Cargo.toml` and the `daily-briefing-gui` entry of `gui/src-tauri/Cargo.lock` must all
   equal `<version>`, and every `gui/size-budget.json` path carrying a `_X.Y.Z_` version segment must

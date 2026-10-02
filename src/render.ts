@@ -472,7 +472,11 @@ export function renderBriefing(b: BriefingStruct): string {
     : ["   (none)"]));
   if (b.warnings?.length) { L.push(""); L.push("⚠ " + b.warnings.join("; ")); }
   L.push("");
-  L.push(`— generated locally via ${b.provider}`);
+  // "generated via", not "generated locally via" (known item 10, Phase E final harden): the text is
+  // produced by the model behind `<provider>` — a remote API for an HTTP provider, and for the default
+  // CLI provider too, whose CLI sends the prompt to its own service. Only a local model (Ollama, …)
+  // generates on this machine, so "locally" was false for nearly every briefing.
+  L.push(`— generated via ${b.provider}`);
   // Sanitize each line, THEN join — structural newlines are added here, so no field can inject one.
   return L.map(stripControl).join("\n");
 }

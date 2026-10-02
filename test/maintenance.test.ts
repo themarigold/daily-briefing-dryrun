@@ -17,6 +17,7 @@ test("T4.7: uninstall removes briefing.log.1, audit-*.md and transcript-health.j
   const artifacts = [
     "daily-briefing", "wake-schedule.json", "briefing.log", "briefing-latest.md",
     "briefing.log.1", "transcript-health.json", "audit-2026-07-30.md", "audit-2026-07-31.md",
+    "update-check.json",   // Phase E (E11): the opt-in update check's record
   ];
   for (const f of artifacts) writeFileSync(join(dir, f), "x");
   // The dated archive is a DIRECTORY — a glob `rm -f` would leave the user's whole briefing history

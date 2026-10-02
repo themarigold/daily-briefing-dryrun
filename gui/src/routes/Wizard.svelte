@@ -1,6 +1,9 @@
 <script lang="ts">
   /**
-   * B8 (T16) — the first-run wizard: six steps for a stranger with nothing configured.
+   * B8 (T16) — the first-run wizard: six steps for a stranger with nothing configured, plus Phase
+   * E's update-check consent (E12) — seven in all, the access step conditional. Step numbers in the
+   * comments below are plan R1's (5 = floor and the save gate, 6 = delivery); the screen counts
+   * seven (`lib/wizard.ts`, `STEP_ORDER`).
    *
    * ⚠ THE CONFIG IS WRITTEN ONCE, AT THE END, THROUGH THE VALIDATED PATH. Steps 1–5 build a draft
    * in webview memory and perform NO write of any kind; the one write is the gate into step 6
@@ -26,6 +29,20 @@
    * a literal key at any spelling. (A user CAN paste a key into the command textarea — nothing
    * stops pasted text — but the app never requests one and the engine never echoes one.)
    *
+   * ⚠ THE LOGIN ITEM IS THE LAST STEP'S CHOICE, APPLIED ON FINISH (Phase E M5b, user-directed).
+   * "Start Daily Briefing at login" is pre-ticked from `autostart_wizard_default` — ON for a fresh
+   * install (plan R1's default), otherwise the REAL current state, so a re-run never re-creates a
+   * login item the user removed — and NOTHING is registered until Finish calls
+   * `autostart_set_enabled` with the box's value. Finish waits while that default is still being
+   * read, and if it could not be read Finish leaves the login item alone unless the user ticks or
+   * unticks the box (`lib/wizard.ts`'s `loginItemPlan`). The app registers nothing at launch any more
+   * (`src-tauri/src/autostart.rs`), so "nothing is installed until you confirm at the last step"
+   * holds for the login item too.
+   *
+   * ⚠ THE UPDATE-CHECK CONSENT (E12) DEFAULTS TO NO AND SENDS NOTHING. Its answer is a draft field
+   * written by the one save like every other step's; this component never invokes the update check
+   * itself (the Settings screen's "Check now" is the webview's only call site).
+   *
    * ⚠ EVERY DYNAMIC STRING IS `{}`-INTERPOLATED, NEVER `{@html}` (`docs/gui-seam.md` §5).
    */
   import { onMount } from "svelte";
@@ -40,18 +57,34 @@
     type FieldNote,
     type SaveOutcome,
   } from "../lib/files";
-  import { engineNotifyLine, notifyStatus, NOTIFY_ASK_EXPLANATION, type NotifyStatus } from "../lib/notify";
+  import {
+    autostartSetEnabled,
+    autostartWizardDefault,
+    engineNotifyLine,
+    notifyStatus,
+    NOTIFY_ASK_EXPLANATION,
+    type NotifyStatus,
+  } from "../lib/notify";
   import type { ScheduleState } from "../lib/state";
   import type { VerifyEvidence } from "../lib/verify-flow";
   import ScheduleAccess from "../lib/ScheduleAccess.svelte";
   import ScheduleInstall from "../lib/ScheduleInstall.svelte";
   import ScheduleVerify from "../lib/ScheduleVerify.svelte";
+  import UpdateConsent from "../lib/UpdateConsent.svelte";
+  import { CONSENT_TITLE } from "../lib/update-check";
   import {
     cancelWritesNothing,
+    doctorRepoNotes,
     draftFromConfig,
     draftPaths,
     emptyDraft,
+    finishLoginItem,
     firstWakeSentence,
+    loginItemChecked,
+    loginItemNote,
+    loginItemPlan,
+    settleLoginItemDefault,
+    type LoginItemDefault,
     nextStep,
     previousStep,
     saveGateBlocker,
@@ -125,6 +158,18 @@
   /** Arms the verification loop after a SUCCESSFUL install (`armsVerify` gates `onfinished`). */
   let verifyTrigger = $state(0);
 
+  /** The last step's "Start Daily Briefing at login" (Phase E M5b), APPLIED ONLY ON FINISH. Two
+   *  separate facts, so a late default read can never overwrite the user (checkpoint fix): what
+   *  `autostart_wizard_default` said — pending until it answers — and the user's own tick, `null`
+   *  until they touch the box. `loginItemPlan` (lib/wizard.ts) turns them into what Finish does:
+   *  WAIT while the read is pending and the box untouched (no provisional value is ever applied),
+   *  LEAVE the system as it is if the read failed and the box is untouched, else APPLY. */
+  let loginDefault = $state<LoginItemDefault>({ kind: "pending" });
+  let loginChoice = $state<boolean | null>(null);
+  const loginPlan = $derived(loginItemPlan(loginDefault, loginChoice));
+  let loginItemError = $state<string | null>(null);
+  let finishing = $state(false);
+
   /** Seed the draft from a loaded document — the pre-populate path (onMount) AND the recovery
    *  path (the save catch). A document whose fields cannot be read sets `seedFailed`, which
    *  keeps the save gate shut: the wizard must never merge a draft the user was not shown. */
@@ -151,7 +196,31 @@
       .catch((e) => {
         docError = describeFailure(e);
       });
+    // A READ — it enables nothing. It sets only `loginDefault`; the user's tick is a separate
+    // fact it never touches. A failure is a state of its own (`failed`), never an OFF.
+    void settleLoginItemDefault(() => autostartWizardDefault(), describeFailure).then((settled) => {
+      loginDefault = settled;
+    });
   });
+
+  /** Finish: carry out the login-item plan — the ONE place this screen registers or removes it —
+   *  then leave. The button is disabled while the plan is `wait`; a `leave` plan finishes without
+   *  touching the login item. A failure keeps the user here with the reason; unticking the box
+   *  and pressing Finish again finishes without a login item. */
+  async function finish(): Promise<void> {
+    if (finishing) return;
+    const plan = loginItemPlan(loginDefault, loginChoice);
+    finishing = true;
+    loginItemError = null;
+    try {
+      if (await finishLoginItem(plan, (enabled) => autostartSetEnabled(enabled))) onfinished();
+    } catch (e) {
+      const turning = plan.kind === "apply" && plan.enabled ? "turned on" : "turned off";
+      loginItemError = `Start at login could not be ${turning}: ${describeFailure(e)}. Press Finish to try again, or change the box above and press Finish.`;
+    } finally {
+      finishing = false;
+    }
+  }
 
   /** Continue from step 3: compute the draft's protected-root scope, then route past or into
    *  step 4. A failed snapshot is reported and the flow continues to step 5 — the Schedule &
@@ -170,7 +239,7 @@
     } finally {
       accessLoading = false;
     }
-    step = accessInScope ? "access" : "floor";
+    step = nextStep("repos", accessInScope) ?? "floor";
   }
 
   async function refreshAccess(): Promise<void> {
@@ -254,16 +323,18 @@
     <h2>Set up Daily Briefing</h2>
     <p class="muted">
       {step === "welcome"
-        ? "Step 1 of 6 — what this is"
+        ? "Step 1 of 7 — what this is"
         : step === "provider"
-          ? "Step 2 of 6 — who writes the briefing"
+          ? "Step 2 of 7 — who writes the briefing"
           : step === "repos"
-            ? "Step 3 of 6 — what it reads"
+            ? "Step 3 of 7 — what it reads"
             : step === "access"
-              ? "Step 4 of 6 — macOS folder access"
-              : step === "floor"
-                ? "Step 5 of 6 — your morning time"
-                : "Step 6 of 6 — background delivery"}
+              ? "Step 4 of 7 — macOS folder access"
+              : step === "updates"
+                ? "Step 5 of 7 — new versions"
+                : step === "floor"
+                  ? "Step 6 of 7 — your morning time"
+                  : "Step 7 of 7 — background delivery"}
     </p>
   </header>
 
@@ -296,7 +367,17 @@ the Settings screen.</pre>
           here, the briefing is written here, and the archive stays here
           {doc !== null ? ` (the configuration this wizard creates lives at ${doc.path})` : ""}.
         </li>
-        <li><strong>No telemetry.</strong> Nothing about you or your code is reported anywhere.</li>
+        <li>
+          <strong>No telemetry:</strong> no analytics, no usage or crash reports, no account, and
+          this app turns off the crash reports of Bun, the runtime the engine is built with, for the
+          runs it starts and schedules. What the briefing is built from (commit subjects, short hashes and dates,
+          the names of changed and uncommitted files, repository and branch names, stash messages)
+          goes only to the AI you choose in the next step. The engine also checks that the network is
+          up before it writes, and whenever this app checks your setup (on macOS, also each time it opens) (a connection that
+          sends no data), and asks GitHub whether a newer version exists only if you say yes in step
+          5, turn it on later in Settings, or press Check now there. In a partial clone, git itself
+          may also download missing file contents from that repository's own remote.
+        </li>
         <li>
           <strong>Bring your own AI.</strong> The engine talks to an AI you already have — an
           installed CLI, your own API key, or a local model server. This app never calls a
@@ -388,7 +469,7 @@ the Settings screen.</pre>
           onchange={() => (draft.providerPath = "local")} />
         <span>
           <strong>A local model server.</strong> Ollama, LM Studio, vLLM — an OpenAI-compatible
-          endpoint on this machine. Nothing leaves your Mac.
+          endpoint on this machine. The prompt built from your repositories never leaves your Mac.
         </span>
       </label>
       {#if draft.providerPath === "local"}
@@ -407,7 +488,8 @@ the Settings screen.</pre>
             Two settings are prefilled for a local model: a longer per-call timeout (a local model
             can take minutes where a hosted one takes seconds), and the morning internet check is
             turned off (networkProbeHosts: []) — your briefing needs no internet when the model
-            runs on this machine.
+            runs on this machine (unless one of your repositories is a partial clone, whose missing
+            file contents git downloads from its remote).
           </p>
         </div>
       {/if}
@@ -485,6 +567,11 @@ the Settings screen.</pre>
         not listed yet.
       </p>
     </div>
+  {:else if step === "updates"}
+    <div class="body">
+      <h3 class="step-title">{CONSENT_TITLE}</h3>
+      <UpdateConsent value={draft.updateCheck} onchange={(v) => (draft.updateCheck = v)} />
+    </div>
   {:else if step === "floor"}
     <div class="body">
       <p>
@@ -513,7 +600,11 @@ the Settings screen.</pre>
               : "Your configuration is unchanged"}{doc !== null ? ` at ${doc.path}` : ""}.
         </p>
       {/if}
-      {#each saveWarnings as warning (warning.field + warning.message)}
+      <!-- Keyed by INDEX (round 3, D3-L3): two notes can share a field and message — the engine
+           redacts every note before it reaches here (`src/json.ts`, `redactNote`), and two
+           different texts can redact alike — and a duplicate each-key is a Svelte runtime error,
+           not a render quirk. -->
+      {#each saveWarnings as warning, i (i)}
         <p class="warn-text">{warning.field !== "" ? `${warning.field}: ` : ""}{warning.message}</p>
       {/each}
 
@@ -528,6 +619,7 @@ the Settings screen.</pre>
             provider?: { cli?: string; found?: boolean; path?: string | null;
               anomalies?: string[]; notes?: string[] };
             discoveredCount?: number; reposTimedOut?: boolean; verdict?: string;
+            repos?: { path: string; partialClone?: true; notes?: string[] }[];
           } | null}
           {#if payload?.provider !== undefined}
             <p>
@@ -550,6 +642,11 @@ the Settings screen.</pre>
           {:else}
             <p class="muted">The engine's health check did not include a provider report.</p>
           {/if}
+          <!-- Per-repo notes (today only the partial-clone one), the engine's sentence verbatim after
+               the repo's path; an older engine sends none. Unkeyed: the rows carry no identity. -->
+          {#each doctorRepoNotes(payload?.repos) as row}
+            <p class="muted small">{row.path}: {row.note}</p>
+          {/each}
         {/if}
       </div>
 
@@ -576,6 +673,25 @@ the Settings screen.</pre>
           </p>
         {/if}
         <ScheduleVerify {evidence} trigger={verifyTrigger} />
+      </div>
+
+      <div class="block">
+        <h3>Start at login</h3>
+        <label class="choice">
+          <input type="checkbox" checked={loginItemChecked(loginDefault, loginChoice)}
+            onchange={(e) => (loginChoice = e.currentTarget.checked)} />
+          <span>
+            <strong>Start Daily Briefing at login.</strong> The app opens in the background when
+            you log in, so it is there to show and announce each morning's briefing. It is applied
+            when you press Finish, and you can change it any time under Settings › This app.
+          </span>
+        </label>
+        {#if loginItemNote(loginDefault, loginChoice) !== null}
+          <p class="muted small">{loginItemNote(loginDefault, loginChoice)}</p>
+        {/if}
+        {#if loginItemError !== null}
+          <p class="bad">{loginItemError}</p>
+        {/if}
       </div>
 
       {#if notifyAsk}
@@ -616,7 +732,8 @@ the Settings screen.</pre>
   {#if gateBlocker !== null && step === "floor"}
     <p class="muted small">{gateBlocker}</p>
   {/if}
-  {#each saveErrors as error (error.field + error.message)}
+  <!-- Keyed by index, like `saveWarnings` above: an error list can repeat a field + message too. -->
+  {#each saveErrors as error, i (i)}
     <pre class="bad">{error.field !== "" ? `${error.field}: ` : ""}{error.message}</pre>
   {/each}
 
@@ -643,7 +760,9 @@ the Settings screen.</pre>
             : "Create configuration & continue"}
       </button>
     {:else if step === "delivery"}
-      <button onclick={() => onfinished()}>Finish</button>
+      <button disabled={finishing || loginPlan.kind === "wait"} onclick={() => void finish()}>
+        {finishing ? "Finishing…" : "Finish"}
+      </button>
     {:else}
       <button disabled={blocker !== null}
         onclick={() => (step = nextStep(step, accessInScope) ?? step)}>
@@ -691,7 +810,8 @@ the Settings screen.</pre>
     flex-direction: column;
     gap: 0.6rem;
   }
-  .block h3 {
+  .block h3,
+  .step-title {
     margin: 0;
     font-size: 1rem;
   }

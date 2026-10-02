@@ -208,6 +208,11 @@ pub struct RecordingAutostartSink {
     /// What `is_enabled()` reports. Defaults false (a fresh machine).
     pub enabled: Mutex<bool>,
     pub fail: Option<String>,
+    /// Phase E M5b checkpoint: when set ([`RecordingAutostartSink::observe_lock_of`]), asked from
+    /// INSIDE every `enable()`/`disable()` whether the login-item change lock is held — and the
+    /// answers, in call order, are [`RecordingAutostartSink::locked_during`].
+    pub lock_probe: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+    pub locked_during: Mutex<Vec<(&'static str, bool)>>,
 }
 
 impl RecordingAutostartSink {
@@ -231,18 +236,58 @@ impl RecordingAutostartSink {
     pub fn disables(&self) -> u32 {
         *self.disables.lock().expect("the recorded disables")
     }
+
+    /// Probe `app`'s `AutostartState::changes_locked` from inside every change this sink records.
+    /// (The closure holds an `AppHandle`, which holds the state, which holds this sink: a cycle a
+    /// test binary can afford.)
+    pub fn observe_lock_of(&self, app: tauri::AppHandle<tauri::test::MockRuntime>) {
+        use tauri::Manager;
+        let probe: Box<dyn Fn() -> bool + Send + Sync> = Box::new(move || {
+            app.state::<daily_briefing_gui_lib::autostart::AutostartState>()
+                .changes_locked()
+        });
+        assert!(
+            self.lock_probe.set(probe).is_ok(),
+            "observe_lock_of called twice on one sink"
+        );
+    }
+
+    /// `("enable" | "disable", whether the change lock was held)` per recorded change.
+    pub fn locked_during(&self) -> Vec<(&'static str, bool)> {
+        self.locked_during
+            .lock()
+            .expect("the recorded lock observations")
+            .clone()
+    }
+
+    fn note_lock(&self, op: &'static str) {
+        if let Some(probe) = self.lock_probe.get() {
+            let held = probe();
+            self.locked_during
+                .lock()
+                .expect("the recorded lock observations")
+                .push((op, held));
+        }
+    }
 }
 
 impl daily_briefing_gui_lib::autostart::AutostartSink for RecordingAutostartSink {
     fn enable(&self) -> Result<(), String> {
+        self.note_lock("enable");
         *self.enables.lock().expect("the recorded enables") += 1;
         match &self.fail {
             Some(detail) => Err(detail.clone()),
-            None => Ok(()),
+            None => {
+                // The plist now exists, so `is_enabled()` answers true — `disable()`'s mirror,
+                // which M5b's wizard-default tests read back after an ON.
+                *self.enabled.lock().expect("the recorded enabled state") = true;
+                Ok(())
+            }
         }
     }
 
     fn disable(&self) -> Result<(), String> {
+        self.note_lock("disable");
         *self.disables.lock().expect("the recorded disables") += 1;
         match &self.fail {
             Some(detail) => Err(detail.clone()),
@@ -773,5 +818,173 @@ pub fn platform_config_siblings_on_disk() -> Vec<String> {
         }
     }
     out.sort();
+    out
+}
+
+/* ── an app record's temp file is CREATED, never opened (Phase E final harden, known item 8) ──── */
+
+/// How many temp names [`assert_planted_temp_names_refused`] plants. The record writers draw their
+/// temp names (`<record>.tmp-<pid>-<seq>`) from ONE process-wide counter
+/// (`autostart::replace_atomically`), so a test cannot know which `seq` its write will get; planting
+/// every name from 0 up to here covers the next write as long as fewer than this many names have
+/// been drawn in the test binary so far — a handful, in practice.
+pub const PLANTED_TEMP_NAMES: u64 = 4096;
+
+/// Plant a DANGLING symlink at every temp name a write of `<dir>/<record>` can draw — each pointing
+/// at its own target in `dir`, none of which exists — then run `write` and assert that it REFUSED
+/// them all: an error naming that nothing was written, no target created through any link (what a
+/// `File::create` of the temp did — it follows the link and creates the target), every plant still
+/// the symlink it was, and the record itself byte-identical to before.
+#[cfg(unix)]
+pub fn assert_planted_temp_names_refused(
+    dir: &Path,
+    record: &str,
+    write: impl FnOnce() -> Result<(), String>,
+) {
+    let pid = std::process::id();
+    let target = |seq: u64| dir.join(format!("plant-target-{seq}"));
+    let plant = |seq: u64| dir.join(format!("{record}.tmp-{pid}-{seq}"));
+    let before = std::fs::read(dir.join(record)).ok();
+    for seq in 0..PLANTED_TEMP_NAMES {
+        std::os::unix::fs::symlink(target(seq), plant(seq)).expect("plant a dangling symlink");
+    }
+
+    let err = write().expect_err(
+        "every temp name the write can draw is a planted symlink, so it must refuse — a write that \
+         succeeded went THROUGH one of them",
+    );
+    assert!(err.contains("nothing was written"), "{err}");
+    let through: Vec<u64> = (0..PLANTED_TEMP_NAMES)
+        .filter(|seq| std::fs::symlink_metadata(target(*seq)).is_ok())
+        .collect();
+    assert_eq!(
+        through,
+        Vec::<u64>::new(),
+        "the write created a planted link's target — it followed the symlink"
+    );
+    let replaced: Vec<u64> = (0..PLANTED_TEMP_NAMES)
+        .filter(|seq| {
+            !std::fs::symlink_metadata(plant(*seq)).is_ok_and(|m| m.file_type().is_symlink())
+        })
+        .collect();
+    assert_eq!(
+        replaced,
+        Vec::<u64>::new(),
+        "a planted name is no longer the symlink it was"
+    );
+    assert_eq!(
+        std::fs::read(dir.join(record)).ok(),
+        before,
+        "the record changed although the write refused"
+    );
+}
+
+/// Source with every comment removed — `//` line, doc and inner-doc comments and `/* … */` blocks
+/// (nesting included, newlines kept so line shapes survive) — and everything else kept verbatim.
+///
+/// ⚠ A LEXER, NOT A SEARCH-AND-DELETE. String literals (`"…"` with escapes, raw `r"…"` /
+/// `r#"…"#`, and their `b` forms) and char literals are copied through whole, so a `"/*"` or a
+/// `"https://…"` in code cannot open a comment that swallows the pinned code after it. MEASURED in
+/// review round 3: with a `"/*"` literal in `shell.rs`, the previous version dropped everything
+/// that followed, and a predefined Quit added below it passed the "no predefined Quit" pin.
+/// A `'` is a char literal only when it is one (`'x'`, `'\n'`, `'\u{..}'`); otherwise it is a
+/// lifetime or a label and is copied as code.
+///
+/// Moved here from `tests/shell.rs` (Phase E M5b checkpoint) for its second consumer,
+/// `tests/autostart.rs`'s "nothing enables outside the two commands" pin, which scans every file
+/// under `src/`; its self-tests (`code_only_drops_comments_and_keeps_code` and the literal cases)
+/// stay in `shell.rs`.
+pub fn code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let at = |i: usize| chars.get(i).copied();
+    let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match (c, at(i + 1)) {
+            // A block comment, to its matching close. Only its newlines survive.
+            ('/', Some('*')) => {
+                let mut depth = 0usize;
+                while i < chars.len() {
+                    match (chars[i], at(i + 1)) {
+                        ('/', Some('*')) => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        ('*', Some('/')) => {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        ('\n', _) => {
+                            out.push('\n');
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            // A line comment, to (not including) its newline.
+            ('/', Some('/')) => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            // A string: to the first unescaped `"`.
+            ('"', _) => {
+                let start = i;
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(chars.len());
+                out.extend(&chars[start..i]);
+            }
+            // A raw string (`r`, or `br`, not inside an identifier): to `"` plus as many `#`.
+            ('r', Some('"' | '#'))
+                if !ident(i.checked_sub(1).and_then(at))
+                    || (at(i - 1) == Some('b') && !ident(i.checked_sub(2).and_then(at))) =>
+            {
+                let hashes = chars[i + 1..].iter().take_while(|c| **c == '#').count();
+                if at(i + 1 + hashes) != Some('"') {
+                    // `r#ident` — a raw identifier, not a string.
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                i += hashes + 2;
+                let close: Vec<char> = std::iter::once('"')
+                    .chain(std::iter::repeat_n('#', hashes))
+                    .collect();
+                while i < chars.len() && !chars[i..].starts_with(&close) {
+                    i += 1;
+                }
+                i = (i + close.len()).min(chars.len());
+                out.extend(&chars[start..i]);
+            }
+            // A char literal — `'\…'` or `'x'` — and otherwise a lifetime or label.
+            ('\'', Some('\\')) => {
+                let start = i;
+                i += 3;
+                while i < chars.len() && chars[i] != '\'' {
+                    i += 1;
+                }
+                i = (i + 1).min(chars.len());
+                out.extend(&chars[start..i]);
+            }
+            ('\'', Some(_)) if at(i + 2) == Some('\'') => {
+                out.extend(&chars[i..i + 3]);
+                i += 3;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
     out
 }

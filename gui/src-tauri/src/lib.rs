@@ -68,6 +68,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         engine::engine_schedule_uninstall,
         engine::engine_schedule_status,
         engine::engine_schedule_verify,
+        engine::engine_update_check,
         shell::state_snapshot,
         shell::open_today,
         shell::app_quit,
@@ -88,6 +89,8 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         cli_shim::cli_shim_remove,
         uninstall::uninstall_preview,
         uninstall::uninstall_execute,
+        autostart::autostart_set_enabled,
+        autostart::autostart_wizard_default,
     ]
 }
 
@@ -143,8 +146,10 @@ pub fn run() {
         // is the one place `notifications::on_snapshot` reaches the real plugin post. Tests manage
         // their own `NotifyState` with a recording sink (docs/gui-seam.md §12c).
         .manage(notifications::NotifyState::default())
-        // T19: the default-ON one-shot's record and sink overrides — none in the real app, so
-        // `autostart::startup` (below) reaches the real plugin manager.
+        // T19: the login-item record and sink overrides — none in the real app, so the two
+        // autostart commands reach the real plugin manager (and, on macOS, brand the plist it
+        // writes). ⚠ NOTHING CALLS THEM AT LAUNCH (Phase E M5b): the choice is the setup wizard's
+        // last step, and `tests/autostart.rs` pins that setup enables nothing.
         .manage(autostart::AutostartState::default())
         // B25 (T25): the uninstall action. The DEFAULT state is the one place the real
         // filesystem sink ([`uninstall::SystemFs`]) and the real app directories are wired up;
@@ -162,9 +167,10 @@ pub fn run() {
         // console). Nothing here consumes `window.Notification` — recorded in
         // `capabilities/README.md` and `docs/gui-seam.md` §12c.
         .plugin(tauri_plugin_notification::init())
-        // T19's autostart plugin, `LaunchAgent` on macOS. Its three commands ARE granted — the
-        // Settings toggle calls them from the webview, and `is_enabled()` is the REAL state the
-        // toggle must reflect. ⚠ NO `.app_name(…)` and no builder form: the default derivation
+        // T19's autostart plugin, `LaunchAgent` on macOS. ONE of its commands is granted —
+        // `is_enabled`, the REAL state the Settings toggle reflects; ON/OFF go through the app's
+        // `autostart_set_enabled`, which brands the plist (Phase E M5b; `src/autostart.rs`).
+        // ⚠ NO `.app_name(…)` and no builder form: the default derivation
         // (`package_info().name` = the productName, "Daily Briefing") is what the label test pins
         // against the CLI scheduler's `local.daily-briefing` (`tests/autostart.rs`).
         .plugin(tauri_plugin_autostart::init(
@@ -175,9 +181,10 @@ pub fn run() {
         .on_menu_event(shell::on_menu_event)
         .setup(|app| {
             shell::setup(app.handle());
-            // T19's default-ON one-shot, AFTER the shell's setup: it can write a LaunchAgent
-            // plist on first launch, and nothing about the window or the watcher depends on it.
-            autostart::startup(app.handle());
+            // ⚠ NO LOGIN ITEM IS REGISTERED HERE (Phase E M5b, user-directed). B7 called a
+            // first-launch default-ON one-shot at this point; the default now lives in the setup
+            // wizard's last step (`autostart_set_enabled`, on Finish), so a launch registers
+            // nothing. `tests/autostart.rs` pins this setup's code as enabling nothing.
             Ok(())
         })
         .invoke_handler(handler());

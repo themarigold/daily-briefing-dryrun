@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-autostart-wizard-default"
+description = "Enables the autostart_wizard_default command without any pre-configured scope."
+commands.allow = ["autostart_wizard_default"]
+
+[[permission]]
+identifier = "deny-autostart-wizard-default"
+description = "Denies the autostart_wizard_default command without any pre-configured scope."
+commands.deny = ["autostart_wizard_default"]

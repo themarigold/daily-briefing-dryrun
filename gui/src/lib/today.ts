@@ -20,9 +20,14 @@
  * showed as `[redacted]` was still in the struct. Rendering the struct because the markdown matched
  * put that key on screen (review round 1, H1, reproduced with the real sidecar). Phase E's E1 now
  * redacts the envelope's struct too (`src/json.ts`, `redactStruct`, applied once in `emit`), but this
- * check stays and does not rely on it: per-leaf redaction is measured NOT to render byte-equal to the
- * redacted file in one shape (test/envelope-redaction.test.ts, D2), and an envelope from an
- * engine older than E1 still carries the raw struct. So the struct is
+ * check stays and does not rely on it: per-leaf redaction does NOT always render byte-equal to the
+ * redacted file — in TWO known shapes, both failing closed to the file: D2 (an `env-assignment`
+ * value ending a leaf swallows the renderer's following punctuation only in the post-render scan;
+ * measured, test/envelope-redaction.test.ts) and key over-redaction (`redactStruct` redacts `whys`
+ * KEYS case-insensitively, so a key such as `myapi_token=…` is redacted where the file's
+ * case-sensitive pass leaves its label, e.g. `MyAPI_TOKEN=…`, and the struct render loses that why
+ * line; `src/json.ts`'s `redactStruct` note) — and an envelope from an engine older than E1 still
+ * carries the raw struct. So the struct is
  * used only when it renders to the SAME text the file renders to; any difference — redaction, a
  * model-written `**x**` the markdown renderer interprets, a future engine-side rewrite — falls back
  * to the file. Fail-closed, and with no copy of the engine's credential patterns in this app.

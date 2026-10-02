@@ -68,6 +68,9 @@ fn daily_briefing_gui_commands() -> &'static [&'static str] {
         // B6 (T20): `schedule verify --json`. MUTATING — the kick starts the live launchd job, so
         // this grant is "may make the scheduler run the engine now", not "may check something".
         "engine_schedule_verify",
+        // Phase E (E12): `update --check --json`, the Settings screen's "Check now". NOT mutating —
+        // its one write is the engine's own update-check record — and it takes no operand.
+        "engine_update_check",
         // T11's shell commands. Not `engine_*`: they spawn nothing — they read the app's own
         // window and state. The capability names them one at a time all the same, because the
         // grant is per command name and "may raise the window" is not "may quit the app".
@@ -116,5 +119,13 @@ fn daily_briefing_gui_commands() -> &'static [&'static str] {
         // the webview can name no path.
         "uninstall_preview",
         "uninstall_execute",
+        // Phase E M5b (T19 reworked): the login item. `autostart_set_enabled` takes one boolean —
+        // ON is the plugin's `enable()` plus the macOS branding, OFF its `disable()` — and replaces
+        // the plugin's own enable/disable grants, so no unbranded ON is reachable from the webview;
+        // `autostart_wizard_default` READS the record and the real state for the wizard's last
+        // step. Neither takes a path; the plist's content is the plugin's fixed derivation plus
+        // the fixed bundle identifier.
+        "autostart_set_enabled",
+        "autostart_wizard_default",
     ]
 }

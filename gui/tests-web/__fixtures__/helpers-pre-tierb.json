@@ -30,7 +30,7 @@
       "[accountant_ai] review queue polish",
       "taband bell and C1 stripped",
       "⚠ provider output truncated; 2 repos unreadable",
-      "— generated locally via claude"
+      "— generated via claude"
     ],
     "modelGroups": [
       {
@@ -139,7 +139,7 @@
       "(no commits in the window)",
       "Suggested next",
       "(none)",
-      "— generated locally via anthropic-api"
+      "— generated via anthropic-api"
     ],
     "modelGroups": [],
     "groups": [],
@@ -174,7 +174,7 @@
       "(no commits in the window)",
       "Suggested next",
       "(none)",
-      "— generated locally via anthropic-api"
+      "— generated via anthropic-api"
     ],
     "modelGroups": [],
     "groups": [],
@@ -211,7 +211,7 @@
       "[x] deadbee lost",
       "Suggested next",
       "(none)",
-      "— generated locally via anthropic-api"
+      "— generated via anthropic-api"
     ],
     "modelGroups": [],
     "groups": [],
@@ -250,7 +250,7 @@
       "Suggested next",
       "promoted, no repo  (from resume)",
       "⚠ only one",
-      "— generated locally via anthropic-api"
+      "— generated via anthropic-api"
     ],
     "modelGroups": [],
     "groups": [],
@@ -294,7 +294,7 @@
       "[mono] an ungrouped fix",
       "Suggested next",
       "(none)",
-      "— generated locally via anthropic-api"
+      "— generated via anthropic-api"
     ],
     "modelGroups": [
       {
@@ -364,7 +364,7 @@
       "[b] 🔀 1 PR merged (#2) (Sep 14)  (bbbb222)",
       "Suggested next",
       "(none)",
-      "— generated locally via anthropic-api"
+      "— generated via anthropic-api"
     ],
     "modelGroups": [],
     "groups": [],
@@ -402,7 +402,7 @@
       "(no commits in the window)",
       "Suggested next",
       "see ![diagram](https://example.com/d.png) first",
-      "— generated locally via anthropic-api"
+      "— generated via anthropic-api"
     ],
     "modelGroups": [],
     "groups": [],
@@ -441,7 +441,7 @@
       "[mono] Pop or drop stash@{2}  (from stash · made today)",
       "[mono] Pop or drop stash@{3}  (from stash)",
       "[mono] Pop or drop stash@{4}  (from stash · 2 days old)",
-      "— generated locally via anthropic-api"
+      "— generated via anthropic-api"
     ],
     "modelGroups": [],
     "groups": [],

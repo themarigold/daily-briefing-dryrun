@@ -748,9 +748,10 @@ pub const MAX_RECORD_BYTES: u64 = 64 * 1024;
 /// ⚠ DELIBERATELY NOT `autostart::read_record`'s absent-vs-unusable split, and the difference is
 /// the failure DIRECTION: this record's `Default` is "never asked", which fails toward SILENCE —
 /// nothing posts and no OS prompt can appear — so degrading every read failure to it costs one
-/// withheld banner at worst. The autostart record's `Default` re-fires the default-ON one-shot,
-/// an ACTION that would re-create a login item over a user's recorded OFF, which is why that
-/// module reads a present-but-unusable file as the user's last known choice instead.
+/// withheld banner at worst. The autostart record's `Default` pre-ticks the wizard's
+/// "Start at login" (B7: it re-fired the default-ON one-shot), leading toward an ACTION that would
+/// re-create a login item over a user's recorded OFF, which is why that module reads a
+/// present-but-unusable file as the user's last known choice instead.
 pub fn read_record(dir: &Path) -> NotifyRecord {
     match read_text_capped(&dir.join(STORE_FILE), MAX_RECORD_BYTES) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
@@ -761,31 +762,16 @@ pub fn read_record(dir: &Path) -> NotifyRecord {
 /// Write the record, temp-then-rename (the `access::write_record` shape — a truncate-then-write
 /// crash would manufacture the malformed record whose degrade-to-`Default` silently forgets the
 /// user's choice).
+///
+/// ⚠ THROUGH `autostart::replace_atomically` (Phase E final harden, known item 8), for the reason
+/// `access::write_record` gives: the temp was a `File::create`, which follows a symlink planted at
+/// its predictable name; it is now created `O_CREAT|O_EXCL` with an explicit mode, a clash left as
+/// it was and the next name tried.
 pub fn write_record(dir: &Path, record: &NotifyRecord) -> Result<(), String> {
-    use std::io::Write;
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let path = dir.join(STORE_FILE);
     let text = serde_json::to_string_pretty(record)
         .map_err(|e| format!("the notification record could not be serialised: {e}"))?;
-    let tmp = dir.join(format!(
-        "{STORE_FILE}.tmp-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let staged = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()
-    })();
-    if let Err(e) = staged {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("{}: {e}", tmp.display()));
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })
+    crate::autostart::replace_atomically(&dir.join(STORE_FILE), text.as_bytes())
 }
 
 /// One firing that was decided and then NOT posted, and why — what `notify_status` shows so the

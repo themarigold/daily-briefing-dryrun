@@ -18,6 +18,7 @@ import { isShaShaped } from "./sha";
 // "on" exactly when runCore marks. config.ts is already in this module's graph (via ./subprojects).
 import { resolveVerdictPaths } from "./config";
 import { localDateStr } from "./marker";
+import { redactCredentials } from "./transcripts/credentials";
 
 // Parse the briefing's "state as of HH:MM" stamp (core.ts stateAsOf = local HH:MM, rendered by
 // render.ts) into the generation INSTANT on bDate (local epoch-ms), or null if absent/unparseable.
@@ -851,7 +852,9 @@ export function unknownFailureLine(repos: string[]): string | null {
  *  "re-run" nor "fix that config entry" — nothing about the repo list is wrong. */
 export function gitUnavailableLine(detail: string): string | null {
   if (!detail.trim()) return null;
-  return `GIT UNAVAILABLE: could not start git (${detail.trim().slice(0, 160)}) — no repo could be checked. This audit verified nothing.`;
+  // Redact, THEN clip (the report is redacted again as a whole, but a credential cut at 160 chars can
+  // keep a prefix too short for any pattern to match there).
+  return `GIT UNAVAILABLE: could not start git (${redactCredentials(detail.trim()).slice(0, 160)}) — no repo could be checked. This audit verified nothing.`;
 }
 
 /** Repos git could definitively NOT read (a nonzero exit, not a truncated one): a deleted path left in
@@ -882,7 +885,7 @@ export function unreadableReposLine(repos: string[]): string | null {
  *  trace was a stderr line that never reaches the saved `audit-<date>.md`, so on a scheduled run it was
  *  invisible. A degraded audit outscoring a healthy one is the exact defect this file keeps closing. */
 export function groundTruthUnavailableLine(err: unknown): string {
-  return `GROUND TRUTH UNAVAILABLE: the same-day and uncommitted-coverage checks did NOT run (${String(err).slice(0, 200)}) — this audit is INCOMPLETE and its "no same-day miss" silence means nothing. Do not record a row from it.`;
+  return `GROUND TRUTH UNAVAILABLE: the same-day and uncommitted-coverage checks did NOT run (${redactCredentials(String(err)).slice(0, 200)}) — this audit is INCOMPLETE and its "no same-day miss" silence means nothing. Do not record a row from it.`;
 }
 
 /** The SHA-grounding verdict, which must never be confident about repos it could not read (F2 review).

@@ -25,8 +25,9 @@ import { warnFor, isInaccessible, type PathIssue, type PathIssueKind } from "./p
 import { redactCredentials, redactCredentialsAnyCase } from "./transcripts/credentials";
 import {
   supportDir, markerPath, tickPath, logPath, latestBriefingPath, lastSkipPath, readLastRunDate,
-  readLastSkip, schedulePath, recapCampaignsPath, type LastSkip,
+  readLastSkip, schedulePath, recapCampaignsPath, updateCheckPath, type LastSkip,
 } from "./marker";
+import { publicResult, readUpdateCheckState, resolveUpdateCheck, type UpdateCheckResult } from "./updateCheck";
 import { runLockPath } from "./runlock";
 import { resolveNotify } from "./notify";
 // ⚠ Slice 4's `schedulePath` comes from ./marker, NOT from ./schedule/install — even though the
@@ -49,6 +50,8 @@ import { claudeShaped, WANTED_FLAGS } from "./harden";
 // ⚠ From ./preflight, NOT from ./main — main.ts imports THIS module, and a dynamic `import("./main")`
 // here was measured deadlocking the real `doctor --json` for 20 s (see src/preflight.ts's header).
 import { preflightRepos } from "./preflight";
+import { mapLimit, REPO_SCAN_CONCURRENCY } from "./extractor";
+import { isPartialClone } from "./git";
 
 /** Bumped only by a BREAKING change. Every field added below is additive and leaves this at 1. */
 export const JSON_SCHEMA_VERSION = 1;
@@ -106,6 +109,9 @@ export type StatePaths = {
    *  and here for `schedulePath`'s reason: `engineOwns` protects it from `--json-out` by EXISTING. The
    *  app's Rust mirror is `serde(default)` without `deny_unknown_fields`, so it needs no change. */
   recapCampaignsPath: string;
+  /** Phase E (E11) — `<state>/update-check.json`, the opt-in update check's last answer. ADDITIVE, and
+   *  here for `schedulePath`'s reason: `engineOwns` protects it from `--json-out` by EXISTING. */
+  updateCheckPath: string;
 };
 
 export function briefingsDir(): string {
@@ -126,6 +132,7 @@ export function statePaths(): StatePaths {
     runLockPath: runLockPath(),
     schedulePath: schedulePath(),
     recapCampaignsPath: recapCampaignsPath(),
+    updateCheckPath: updateCheckPath(),
   };
 }
 
@@ -240,13 +247,19 @@ export function redactStruct<T>(v: T): T {
 /** KEYS only (see `redactStruct`): the shared case-sensitive pass, then its case-insensitive clones. */
 const redactKey = redactCredentialsAnyCase;
 
-/** The map over a JSON value (the output of `JSON.parse`, so every object is plain). */
+/** The map over a JSON value (the output of `JSON.parse`, so every object is plain).
+ *  ⚠ KEYS ARE DEFINED, NOT ASSIGNED. `JSON.parse` makes a key spelled `__proto__` an ordinary own
+ *  property (reachable: `whys` is keyed by a git-derived folder name), but `out["__proto__"] = x` hits
+ *  the inherited setter — a string value was silently DROPPED and an object value became `out`'s
+ *  prototype. `defineProperty` keeps it an own, enumerable key that serialises like any other. */
 function redactJson(v: unknown): unknown {
   if (typeof v === "string") return redactCredentials(v);
   if (Array.isArray(v)) return v.map(redactJson);
   if (v !== null && typeof v === "object") {
     const out: Record<string, unknown> = {};
-    for (const [k, x] of Object.entries(v as Record<string, unknown>)) out[redactKey(k)] = redactJson(x);
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+      Object.defineProperty(out, redactKey(k), { value: redactJson(x), enumerable: true, writable: true, configurable: true });
+    }
     return out;
   }
   return v;
@@ -331,6 +344,7 @@ function engineOwns(resolved: string, stateDir: string): string | undefined {
     [sp.runLockPath, "run lock"],
     [sp.schedulePath, "schedule ownership record"],
     [sp.recapCampaignsPath, "recap-campaigns record"],
+    [sp.updateCheckPath, "update-check record"],
   ];
   for (const [path, what] of owned) if (resolved === path) return what;
   // The bare-name form under whichever state dir the caller resolved against — `statePaths()` reads
@@ -411,6 +425,12 @@ export type StatusReport = {
   logBytes: number | null;
   morningTime: { value: string; minutes: number; warning: string | null };
   isPastFloor: boolean;
+  /** Phase E (E11) — the opt-in update check's LAST answer, read from `<state>/update-check.json` with
+   *  NO network (the check itself is `update --check`, or a scheduled run's automatic path). `null`
+   *  when no check has run or the record is unreadable. ADDITIVE-OPTIONAL: a reader written against
+   *  the earlier schema never sees this key, and the desktop app reads it through its existing
+   *  `engine_status` grant. The response's cache tag (`etag`) is internal and never reported. */
+  updateCheck?: UpdateCheckResult | null;
 };
 
 /** The heartbeat line's format, verbatim from `stampTick` (marker.ts:87). Kept as one shared regex
@@ -440,10 +460,13 @@ export async function statusReport(deps: { now?: () => Date } = {}): Promise<Sta
   let configError: string | null = null;
   if (configExists) {
     try { cfg = await loadConfig(); }
-    catch (e) { configError = e instanceof Error ? e.message : String(e); }
+    // Redacted: a parse or validation error can quote the config's own text (the E11 rule — see
+    // `validateCandidate`'s return).
+    catch (e) { configError = redactCredentials(e instanceof Error ? e.message : String(e)); }
   }
 
   const floor = parseFloor(cfg?.morningTime);
+  const morningTime: unknown = cfg?.morningTime ?? DEFAULT_MORNING_TIME;
   const lastTickText = await Bun.file(paths.tickPath).text().catch(() => "");
   const archived = await readdir(briefingsDir()).catch(() => [] as string[]);
   const latestStat = await stat(paths.latestBriefingPath).catch(() => null);
@@ -471,11 +494,18 @@ export async function statusReport(deps: { now?: () => Date } = {}): Promise<Sta
       // become internally inconsistent the day that constant changes — `value` reporting the old
       // default while `minutes` reported the new one, and a Schedule panel displaying a floor the
       // engine does not use. Exactly the drift StatePaths' docstring above exists to prevent.
-      value: cfg?.morningTime ?? DEFAULT_MORNING_TIME,
+      // Redacted like `warning` below, which quotes the same string: an INVALID value is reported
+      // verbatim here (minutes falls back to the default), and is a config echo like any other.
+      // ⚠ ALWAYS A STRING, its declared type: `loadConfig` deliberately does not validate `morningTime`
+      // (config.ts — `parseFloor` degrades a bad one), so a hand-edited 720 / true / {} arrives here as
+      // itself. It is reported as its JSON spelling, the one `warning` quotes — and redacting the raw
+      // value used to THROW on it (round-2 harden D-M1), crashing `status --json` outright.
+      value: redactCredentials(typeof morningTime === "string" ? morningTime : JSON.stringify(morningTime)),
       minutes: floor.minutes,
-      warning: floor.warning ?? null,
+      warning: floor.warning === undefined ? null : redactCredentials(floor.warning),
     },
     isPastFloor: isPastFloor(now, floor.minutes),
+    updateCheck: await readUpdateCheckState().then((st) => (st === undefined ? null : publicResult(st)), () => null),
   };
 }
 
@@ -550,15 +580,31 @@ export function validateCandidate(
     // value is reported here exactly when the engine will disable the marker for it.
     const verdictCheck = resolveVerdictPaths(normalized.verdictPaths);
     if (verdictCheck.warning) warnings.push({ field: "verdictPaths", message: verdictCheck.warning });
+    // Phase E (E11). The update check's own resolver, for the same reason. This report (and `doctor
+    // --json`, which builds its `config` block from it) is the ONLY place a malformed `updateCheck`
+    // block is ever surfaced: no run reports it, by design (src/updateCheck.ts's header).
+    const updateCheck = resolveUpdateCheck(normalized.updateCheck);
+    if (updateCheck.warning) warnings.push({ field: "updateCheck", message: updateCheck.warning });
   }
 
   return {
     schemaVersion: JSON_SCHEMA_VERSION,
     valid: errors.length === 0,
-    errors,
-    warnings,
+    // ⚠ REDACTED HERE, the one place every FieldNote leaves through: `config validate --json` prints
+    // this report and `doctor --json` builds its `config` block from it. Several messages ECHO a config
+    // value (`not a valid regex, ignored: <pattern>`, a `morningTime` that is not HH:MM, a validator
+    // error quoting what it got), and the run envelope already redacts the same strings (E1) — so the
+    // read-only surfaces were the raw copy. `normalized` is NOT touched: it is the caller's own config
+    // handed back to the caller, which a Settings screen writes.
+    errors: errors.map(redactNote),
+    warnings: warnings.map(redactNote),
     normalized,
   };
+}
+
+/** A FieldNote with the shared redaction applied to both strings (the output-boundary rule above). */
+function redactNote(n: FieldNote): FieldNote {
+  return { field: redactCredentials(n.field), message: redactCredentials(n.message) };
 }
 
 // ── T3: `doctor --json` — preflight + capability probe, no generate, no stamp ───────────────────
@@ -567,7 +613,17 @@ export type DoctorReport = {
   schemaVersion: typeof JSON_SCHEMA_VERSION;
   engineVersion: string;
   config: { exists: boolean; valid: boolean; errors: FieldNote[]; warnings: FieldNote[] };
-  repos: { path: string; ok: boolean; issueKind: PathIssueKind | null; advice: string | null }[];
+  repos: {
+    path: string; ok: boolean; issueKind: PathIssueKind | null; advice: string | null;
+    /** ADDITIVE-OPTIONAL, present only as `true`: the repo is a PARTIAL clone (`git clone --filter`),
+     *  so git itself may download missing file contents from its own remote while the tool reads its
+     *  history. Detected read-only (`isPartialClone`, src/git.ts). A FACT, NOT A FAULT: it leaves `ok`
+     *  and the verdict alone. */
+    partialClone?: true;
+    /** ADDITIVE-OPTIONAL, like `provider.notes`: facts about this repo that are not faults. Today only
+     *  `PARTIAL_CLONE_NOTE`. */
+    notes?: string[];
+  }[];
   discoveredCount: number;
   /** TRUE when the repo walk hit its bound and the `repos` list is therefore PARTIAL. `preflightRepos`
    *  descends `discoverRoots`, which on a big home directory is slow; a doctor that hangs is a doctor
@@ -622,6 +678,15 @@ export type DoctorReport = {
 
 export const DOCTOR_WALK_MS = 20_000;
 
+/** The whole partial-clone pass is bounded by this: doctor answers by then, and no probe starts after
+ *  it (a probe already in flight ends within `isPartialClone`'s own timeout). A repo it did not reach
+ *  simply gets no note. */
+export const DOCTOR_PARTIAL_CLONE_MS = 5_000;
+
+/** The one line `doctor` attaches to a partial clone (user-approved 2026-10-01, known item 1 "A+"). */
+export const PARTIAL_CLONE_NOTE =
+  "partial clone: while the tool reads this repository's history, git itself may download missing file contents from the repository's own remote, with your usual git credentials (the tool never fetches)";
+
 export type DoctorDeps = {
   now?: () => Date;
   /** Injected so a test can assert the tcc-denied advice and the 'blocked' verdict without a
@@ -634,6 +699,9 @@ export type DoctorDeps = {
   powerProbe?: (args: string[]) => Promise<{ code: number; out: string }>;
   powerPlatform?: NodeJS.Platform;
   walkMs?: number;
+  /** The partial-clone probe and its overall bound — injectable so a test can assert the bound. */
+  partialClone?: (repo: string) => Promise<boolean>;
+  partialCloneMs?: number;
 };
 
 /**
@@ -670,7 +738,7 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
   }
   const check: ConfigValidateReport = readError === undefined
     ? validateCandidate(raw)
-    : { schemaVersion: JSON_SCHEMA_VERSION, valid: false, errors: [{ field: "", message: readError }], warnings: [], normalized: null };
+    : { schemaVersion: JSON_SCHEMA_VERSION, valid: false, errors: [redactNote({ field: "", message: readError })], warnings: [], normalized: null };
   const cfg = check.normalized;
 
   let repos: DoctorReport["repos"] = [];
@@ -695,6 +763,32 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
       discoveredCount = walked.found.length;
       const byPath = new Map(walked.issues.map((i) => [i.path, i]));
       const all = [...new Set([...walked.found, ...walked.issues.map((i) => i.path)])].sort();
+      // Partial clones, among the repos that read fine: `git config` per repo (read-only, no network),
+      // bounded as a whole so a wedged git cannot hold doctor — a repo not reached gets no note.
+      // ⚠ ONE DEADLINE, SHARED WITH THE WORKERS (round-2 harden): a race alone only stopped AWAITING the
+      // scan, and every worker went on taking queued repos — each a `git config` spawn — after doctor
+      // had returned. Once the timer fires no probe STARTS; one already in flight is bounded by
+      // `isPartialClone`'s own per-call timeout (2 s, then SIGKILL — src/git.ts `runGit`).
+      const partial = new Set<string>();
+      const okPaths = all.filter((p) => !byPath.has(p));
+      const probe = deps.partialClone ?? isPartialClone;
+      let pastDeadline = false;
+      const deadlineHit = new Promise<void>((r) => {
+        setTimeout(() => { pastDeadline = true; r(); }, deps.partialCloneMs ?? DOCTOR_PARTIAL_CLONE_MS).unref?.();
+      });
+      // ⚠ A PROBE THAT THROWS OR REJECTS IS A "NO" (round-3 harden A3-L1). `isPartialClone` fails open
+      // on everything itself; this catch is per probe as well, so no failure — an injected probe, or a
+      // future one — leaves this pass. Before it, an early rejection won the race below and doctor threw.
+      // (A late one was always handled: `Promise.race` attaches a handler to `probing`.) It is a note,
+      // never a reason for doctor not to answer.
+      const probing = mapLimit(okPaths, REPO_SCAN_CONCURRENCY, async (p) => {
+        if (pastDeadline) return;
+        let yes = false;
+        try { yes = await probe(p); } catch { /* fail open: no note */ }
+        if (yes) partial.add(p);
+      });
+      await Promise.race([probing, deadlineHit]);
+      pastDeadline = true;   // either way the pass is over: nothing starts once doctor stops listening
       repos = all.map((p) => {
         const issue = byPath.get(p);
         return {
@@ -702,6 +796,7 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
           ok: !issue,
           issueKind: issue?.kind ?? null,
           advice: issue ? warnFor(issue) : null,
+          ...(partial.has(p) ? { partialClone: true as const, notes: [PARTIAL_CLONE_NOTE] } : {}),
         };
       });
     }

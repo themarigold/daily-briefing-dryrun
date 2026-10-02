@@ -1310,6 +1310,24 @@ fn a_failed_post_is_recorded_and_an_unmanaged_app_is_a_no_op() {
     ));
 }
 
+/// Known item 8 (Phase E final harden): the record's temp file is CREATED, never opened — the
+/// `access` record's test, for this module's own `write_record`. With a dangling symlink planted
+/// at every temp name the write can draw, it refuses; nothing is created through a link, no plant
+/// is replaced, and the recorded opt-in stands.
+#[cfg(unix)]
+#[test]
+fn a_planted_temp_name_is_never_written_through() {
+    let scratch = ScratchDir::new("notify-temp-plant");
+    let seeded = NotifyRecord {
+        enabled: Some(true),
+    };
+    write_record(&scratch.path, &seeded).expect("seed the record");
+    common::assert_planted_temp_names_refused(&scratch.path, "notify-state.json", || {
+        write_record(&scratch.path, &NotifyRecord::default())
+    });
+    assert_eq!(read_record(&scratch.path), seeded);
+}
+
 /// The record round-trips, degrades to `Default` on garbage, and `Facts` extraction stays total
 /// over a stateless snapshot.
 #[test]

@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use common::{env_dumper, parse_env, sleeper, ScratchDir};
 use daily_briefing_gui_lib::engine::{
-    launchd_path, EngineClient, NoProgress, Operation, FORWARDED_ENV,
+    launchd_path, EngineClient, NoProgress, Operation, BUN_CRASH_REPORTING_OFF, FORWARDED_ENV,
 };
 
 /* ── (1) PATH ─────────────────────────────────────────────────────────────────────────────────── */
@@ -204,6 +204,7 @@ async fn the_environment_is_otherwise_minimal() {
         .iter()
         .copied()
         .chain(std::iter::once("PATH"))
+        .chain(std::iter::once(BUN_CRASH_REPORTING_OFF.0))
         .chain(PASS_THROUGH_ARTEFACTS.iter().copied())
         .collect();
     let unexpected: Vec<&String> = child
@@ -240,6 +241,36 @@ async fn the_environment_is_otherwise_minimal() {
         unexpected.is_empty(),
         "the unwrapped child received variables outside the forwarded set: {unexpected:?}"
     );
+}
+
+/// Bun's runtime crash reporter is OFF in the child — the README's Privacy section promises it.
+///
+/// The engine is a Bun-compiled binary whose runtime, by default on macOS and Windows, uploads a crash
+/// trace to `bun.report` if Bun itself panics. `BUN_ENABLE_CRASH_REPORTING=0` in the child's own
+/// environment turns that off. Asserted on BOTH spawn shapes (caffeinate-wrapped and direct) and with
+/// a harness override present, so neither the wrapper nor `with_env` can be what drops it.
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_crash_reporting_is_turned_off_in_the_child() {
+    assert_eq!(BUN_CRASH_REPORTING_OFF, ("BUN_ENABLE_CRASH_REPORTING", "0"));
+    let scratch = ScratchDir::new("bunreport");
+    for client in [
+        EngineClient::with_program(env_dumper(&scratch.path, "env.sh"))
+            .with_env("DAILY_BRIEFING_STATE_DIR", "/tmp/somewhere/state"),
+        EngineClient::with_program(env_dumper(&scratch.path, "env.sh"))
+            .with_caffeinate_path(scratch.join("no-such-caffeinate")),
+    ] {
+        let out = client
+            .invoke(Operation::Status, &NoProgress)
+            .await
+            .expect("the env dumper runs");
+        let child = parse_env(&out.stdout);
+        assert!(child.contains_key("PATH"), "non-vacuity: the dump was parsed: {child:#?}");
+        assert_eq!(
+            child.get("BUN_ENABLE_CRASH_REPORTING").map(String::as_str),
+            Some("0"),
+            "the engine would be spawned with Bun's crash reporter in its default state"
+        );
+    }
 }
 
 /// The override the T15 Settings field will feed. No UI is built here; this is the seam.

@@ -15,7 +15,7 @@
 // Everything that is NOT an IncompleteReadError must keep being swallowed exactly as before: these
 // catches exist because an unborn HEAD, a missing git config, or a detached HEAD are all normal.
 import { test, expect, spyOn } from "bun:test";
-import { runGit, gitDirExists, resolveAuthor, IncompleteReadError } from "../src/git";
+import { runGit, gitDirExists, resolveAuthor, isPartialClone, IncompleteReadError } from "../src/git";
 import { buildRepo } from "./fixtures/build-repo";
 import { fastGitFlush } from "./fixtures/git-flush";   // held-pipe tests only — see the fixture header
 
@@ -76,6 +76,19 @@ test("resolveAuthor short-circuits on an explicit config author without touching
   try {
     expect(await resolveAuthor("/tmp", { emails: ["me@example.com"] })).toEqual({ emails: ["me@example.com"] });
   } finally { spy.mockRestore(); }
+});
+
+// The ONE by-contract exception (round-3 harden A3-L1): `isPartialClone` feeds only doctor's NOTE, so it
+// fails open on EVERY failure — an incomplete read included. Its `orElse` let that rethrow out of doctor.
+test("isPartialClone fails OPEN on an IncompleteReadError — false, not a throw — and on a normal failure", async () => {
+  for (const fake of [heldSpawn, failSpawn]) {
+    const spy = spyOn(Bun, "spawn").mockImplementation(fake);
+    const flush = fastGitFlush();
+    try {
+      expect(`${fake.name}: ${await isPartialClone("/tmp").catch((e) => `threw ${(e as Error).name}`)}`).toBe(`${fake.name}: false`);
+      expect(spy).toHaveBeenCalledTimes(3);   // PREMISE: all three config reads went through the fake
+    } finally { flush.restore(); spy.mockRestore(); }
+  }
 });
 
 test("a real repo still resolves its git identity (no regression on the happy path)", async () => {

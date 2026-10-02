@@ -369,7 +369,7 @@ export const SECTIONS: Section[] = [
         kind: "hosts",
         defaultable: true,
         quote: {
-          text: "TCP connectivity-probe targets; [] disables the gate (local/offline providers). Default anycast 1.1.1.1:443 / 8.8.8.8:443.",
+          text: "TCP connectivity-probe targets; [] disables the gate (local/offline providers). Default when absent: anycast 1.1.1.1:443 / 8.8.8.8:443 with a CLI provider; with provider.api, the endpoint's own host and port ([] for a loopback endpoint).",
           source: TYPES,
         },
         note: "One target per line: `host:port`.",
@@ -384,6 +384,35 @@ export const SECTIONS: Section[] = [
           source: TYPES,
         },
         note: "For a command, give one argument per line; {title}, {body} and {path} are filled in.",
+      },
+    ],
+  },
+  {
+    // Phase E (E12): the AUTOMATIC update check. "Check now" (the panel above the form) ignores both
+    // fields; they gate only the engine's own scheduled-run check (`src/updateCheck.ts`).
+    title: "Update check",
+    fields: [
+      {
+        id: "updateCheck.enabled",
+        path: ["updateCheck", "enabled"],
+        label: "Check for new versions automatically",
+        kind: "bool",
+        quote: {
+          text: "It is notify-only: it downloads nothing and installs nothing, and the answer is only recorded for `status --json` and the desktop app. Absent, or anything other than `true`, means no automatic check at all.",
+          source: TYPES,
+        },
+        note: "The engine default is off.",
+      },
+      {
+        id: "updateCheck.intervalHours",
+        path: ["updateCheck", "intervalHours"],
+        label: "Hours between automatic checks",
+        kind: "number",
+        placeholder: "24",
+        quote: {
+          text: "the minimum number of hours between automatic checks — a whole number from 1 to 720, default 24.",
+          source: TYPES,
+        },
       },
     ],
   },

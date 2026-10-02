@@ -6,7 +6,7 @@
 // never mistake a refused release for a finished one.
 import "./fixtures/isolate-state";
 import { test, expect, describe } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
@@ -68,7 +68,7 @@ const sha256 = (p: string) => new Bun.CryptoHasher("sha256").update(readFileSync
 function toolBin(base: string): string {
   const bin = join(base, "bin");
   mkdirSync(bin);
-  for (const tool of ["bash", "dirname", "basename", "grep", "cat", "awk", "mktemp", "mv", "rm", "ls", "sort", "wc", "tr", "shasum"]) {
+  for (const tool of ["bash", "dirname", "basename", "grep", "cat", "cmp", "sed", "awk", "mktemp", "mv", "rm", "sort", "wc", "tr", "shasum"]) {
     const w = Bun.spawnSync(["/bin/sh", "-c", `command -v ${tool}`], { env: { ...process.env }, stdout: "pipe" }).stdout.toString().trim();
     expect(w, `${tool} is on PATH`).toStartWith("/");
     symlinkSync(w, join(bin, tool));
@@ -78,6 +78,16 @@ function toolBin(base: string): string {
 
 /** Every entry in a directory, hidden ones included, sorted. */
 const entries = (dir: string) => readdirSync(dir).sort();
+
+/** Every letter's case flipped: on a case-insensitive volume the same directory, spelled otherwise. */
+const swapCase = (p: string) => p.replace(/[A-Za-z]/g, (c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()));
+/** Probes of THIS machine (never of the platform's name): does a case variant of the temp directory name
+ *  the same directory, and does macOS's /System/Volumes/Data firmlink spelling of it? */
+const sameDir = (a: string, b: string) => { try { const x = statSync(a), y = statSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
+const TMP_REAL = realpathSync(tmpdir());
+const CASE_FOLDS = swapCase(TMP_REAL) !== TMP_REAL && sameDir(swapCase(TMP_REAL), TMP_REAL);
+const FIRMLINK = "/System/Volumes/Data";
+const FIRMLINKED = sameDir(`${FIRMLINK}${TMP_REAL}`, TMP_REAL);
 
 describe("release-collect.sh — the passing release", () => {
   test("all legs built: SHA256SUMS lists every other asset once, bare basenames, C-sorted, self-excluded", () => {
@@ -166,14 +176,20 @@ describe("release-collect.sh — the passing release", () => {
     expect(n).not.toContain(`daily-briefing-${V}-darwin-x64.dmg`);
   });
 
-  test("every required leg build-failed: the CLI floor still ships, even after a failed bundle download", () => {
-    const f = fixture({ markers: { "macos-arm64": "build-failed\n", "macos-x64": "build-failed\n", "linux-x86_64": "build-failed\n" }, withFiles: [] });
-    const r = collect(f, { dl: "failure" });
-    expect(`${r.code}\n${r.err}`).toBe("0\n");
-    const n = readFileSync(f.notes, "utf8");
-    expect(n).toContain("No desktop bundle built for this release.");
-    for (const leg of ["macos-arm64", "macos-x64", "linux-x86_64"]) expect(n).toContain(`(\`${leg}\`)`);
-    expect(readFileSync(join(f.dist, "SHA256SUMS"), "utf8").trimEnd().split("\n")).toHaveLength(CLI.length);
+  // Exactly one desktop leg built is enough (user-directed 2026-10-02: only ZERO is refused): each leg
+  // alone, the other two named in the notes, SHA256SUMS listing the CLI floor plus that leg's files.
+  test("exactly one leg built (any of the three): passes, and the notes name the other two", () => {
+    for (const only of Object.keys(LEG_FILES)) {
+      const markers: Record<string, string> = { "macos-arm64": "build-failed\n", "macos-x64": "build-failed\n", "linux-x86_64": "build-failed\n", [only]: "built\n" };
+      const f = fixture({ markers, withFiles: [only] });
+      const r = collect(f);
+      expect(`${only}: ${r.code}\n${r.err}`).toBe(`${only}: 0\n`);
+      const n = readFileSync(f.notes, "utf8");
+      for (const leg of Object.keys(LEG_FILES).filter((l) => l !== only)) expect(`${only}: ${n.includes(`(\`${leg}\`)`)}`).toBe(`${only}: true`);
+      expect(n).toMatch(/Not in this release/);
+      for (const d of LEG_FILES[only]!) expect(n).toContain(`\`${d}\``);
+      expect(readFileSync(join(f.dist, "SHA256SUMS"), "utf8").trimEnd().split("\n")).toHaveLength(CLI.length + LEG_FILES[only]!.length);
+    }
   });
 
   test("the windows marker is informational: absent, build-failed, or garbage never fails", () => {
@@ -189,6 +205,21 @@ describe("release-collect.sh — the passing release", () => {
 });
 
 describe("release-collect.sh — the marker contract refuses", () => {
+  // User-directed 2026-10-02 ("Refuse if zero built"): the CLI floor alone is not a release. The windows
+  // marker never counts as a desktop bundle, whatever it says.
+  test("no required leg built: a CLI-only release is refused, whatever the download outcome or the windows marker", () => {
+    for (const dl of ["failure", "success", "skipped"]) {
+      for (const windows of ["built\n", "build-failed\n", undefined]) {
+        const markers: Record<string, string> = { "macos-arm64": "build-failed\n", "macos-x64": "build-failed\n", "linux-x86_64": "build-failed\n" };
+        if (windows !== undefined) markers["windows-x64"] = windows;
+        const f = fixture({ markers, withFiles: [] });
+        const r = collect(f, { dl });
+        expectRefused(f, r, /no desktop bundle built: none of macos-arm64, macos-x64, linux-x86_64 has marker 'built' — a CLI-only release is refused/);
+        expect(`${dl}/${JSON.stringify(windows)}: ${r.err.match(/FAIL:/g)?.length}`).toBe(`${dl}/${JSON.stringify(windows)}: 1`);
+      }
+    }
+  });
+
   test("a required marker absent", () => {
     const { "linux-x86_64": _, ...rest } = ALL_BUILT;
     const f = fixture({ markers: rest, withFiles: ["macos-arm64", "macos-x64"] });
@@ -204,7 +235,8 @@ describe("release-collect.sh — the marker contract refuses", () => {
   });
 
   test("a body that is not exactly one token and a newline", () => {
-    for (const body of ["ok\n", "built", "built \n", "built\nbuilt\n", "BUILT\n", "\n", ""]) {
+    // A NUL is invisible to a `$(...)` read, which once let `built<NUL><newline>` through as built.
+    for (const body of ["ok\n", "built", "built \n", "built\nbuilt\n", "BUILT\n", "\n", "", "built\0\n", "\0built\n", "built\n\0", "build-failed\0\n"]) {
       const f = fixture({ markers: { ...ALL_BUILT, "macos-arm64": body } });
       expectRefused(f, collect(f), /macos-arm64: marker body is not exactly one of/);
     }
@@ -342,6 +374,64 @@ describe("release-collect.sh — the attach set and arguments refuse", () => {
     }
   });
 
+  // Round 5 (G5-1): judged by the CANONICAL path. bash's builtin `pwd -P` keeps a typed case variant and
+  // the /System/Volumes/Data firmlink spelling, so an alias of dist given for <notes-out> compared unequal;
+  // a dot-named notes file then landed in dist, where the `for f in *` checksum pass never sees it, and
+  // collect PASSED. These spellings name the same directory only on a case-insensitive volume / under
+  // macOS's firmlink, so elsewhere (the Linux runner) each case is skipped by a probe of this machine,
+  // never by platform name, as in test/verify-dist-local.test.ts.
+  const aliasCases: [string, boolean, (dist: string) => string][] = [
+    ["a case variant of dist (a case-insensitive volume)", CASE_FOLDS, (d) => swapCase(realpathSync(d))],
+    ["the /System/Volumes/Data firmlink spelling of dist", FIRMLINKED, (d) => `${FIRMLINK}${realpathSync(d)}`],
+  ];
+  for (const [what, probed, alias] of aliasCases) {
+    // Either side may carry the alias: the notes path, or the dist argument itself.
+    for (const side of ["notes-out", "dist"] as const) {
+      test.skipIf(!probed)(`${side} given as ${what}, notes with a hidden basename: refused, and a stale SHA256SUMS dropped`, () => {
+        const f = fixture({ extra: ["SHA256SUMS"] });
+        const viaAlias = alias(f.dist);
+        expect(viaAlias).not.toBe(f.dist);
+        expect(sameDir(viaAlias, f.dist)).toBe(true);      // non-vacuity: the alias names dist itself
+        const before = entries(f.dist).filter((n) => n !== "SHA256SUMS");
+        const r = side === "notes-out"
+          ? collect(f, { notes: join(viaAlias, ".notes.md") })
+          : collect({ ...f, dist: viaAlias }, { notes: join(realpathSync(f.dist), ".notes.md") });
+        expectRefused(f, r, /notes-out '.*' lies inside dist — the notes would be attached as an asset/);
+        expect(r.err).toMatch(/removed dist\/SHA256SUMS left by an earlier run/);
+        expect(entries(f.dist)).toEqual(before);           // no .notes.md, no temp file, no SHA256SUMS
+        expect(entries(f.base)).toEqual(["dist", "markers"]);
+      });
+    }
+  }
+
+  // …and a side that cannot be resolved refuses the release, rather than being judged as an empty path.
+  test.skipIf(process.getuid?.() === 0)("a notes-out directory that cannot be resolved refuses the release (skipped as root: chmod 000 does not stop root)", () => {
+    const f = fixture();
+    const locked = join(f.base, "locked");
+    mkdirSync(locked);
+    chmodSync(locked, 0o000);
+    try {
+      expectRefused(f, collect(f, { notes: join(locked, "notes.md") }), /notes-out's directory '.*' could not be resolved to a canonical path/);
+    } finally {
+      chmodSync(locked, 0o755);
+    }
+    expect(entries(locked)).toEqual([]);
+    expect(entries(f.base)).toEqual(["dist", "locked", "markers"]);
+  });
+
+  test.skipIf(process.getuid?.() === 0)("a dist that cannot be resolved refuses the release, naming it (skipped as root: chmod 000 does not stop root)", () => {
+    const f = fixture();
+    chmodSync(f.dist, 0o000);
+    let r: { code: number; err: string };
+    try {
+      r = collect(f);
+    } finally {
+      chmodSync(f.dist, 0o755);
+    }
+    expectRefused(f, r, /dist '.*' could not be resolved to a canonical path, so notes-out cannot be proven outside it/);
+    expect(entries(f.base)).toEqual(["dist", "markers"]);
+  });
+
   // A pipeline into a `while` loop reported only the LAST hash's status: an unreadable earlier asset
   // printed "Permission denied", vanished from SHA256SUMS, and collect still printed PASS.
   test.skipIf(process.getuid?.() === 0)("an asset that cannot be hashed refuses the release (skipped as root: chmod 000 does not stop root reading)", () => {
@@ -364,7 +454,75 @@ describe("release-collect.sh — the attach set and arguments refuse", () => {
     const bin = toolBin(f.base);
     writeFileSync(join(bin, "sha256sum"), '#!/bin/sh\n[ "$1" = "daily-briefing-linux-arm64" ] && exit 0\nexec shasum -a 256 "$1"\n', { mode: 0o755 });
     const r = collect(f, { env: { PATH: bin } });
-    expectRefused(f, r, /SHA256SUMS would list 8 asset\(s\), the attach set holds 9/);
+    expectRefused(f, r, /SHA256SUMS would list 8 line\(s\), not exactly the 9 asset name\(s\) of the attach set/);
+  });
+
+  // The cross-check compares NAMES, not only the count: a hasher that prints the right number of lines
+  // but labels one asset with another's name must still refuse the release.
+  test("SHA256SUMS naming the wrong asset refuses the release, even with the right line count", () => {
+    const f = fixture();
+    const bin = toolBin(f.base);
+    writeFileSync(join(bin, "sha256sum"),
+      '#!/bin/sh\nif [ "$1" = "daily-briefing-linux-arm64" ]; then shasum -a 256 "$1" | sed "s/daily-briefing-linux-arm64$/daily-briefing-linux-x64/"; exit 0; fi\nexec shasum -a 256 "$1"\n', { mode: 0o755 });
+    const r = collect(f, { env: { PATH: bin } });
+    expectRefused(f, r, /SHA256SUMS would list 9 line\(s\), not exactly the 9 asset name\(s\) of the attach set/);
+  });
+
+  test("a stale SHA256SUMS already in dist is removed when collect refuses", () => {
+    const f = fixture({ markers: { ...ALL_BUILT, "linux-x86_64": "size-rejected\n" }, withFiles: ["macos-arm64", "macos-x64"], extra: ["SHA256SUMS"] });
+    const r = collect(f);
+    expectRefused(f, r, /linux-x86_64: the bundle exceeded its size budget/);
+    expect(r.err).toMatch(/removed dist\/SHA256SUMS left by an earlier run/);
+  });
+
+  // The last step, after SHA256SUMS is in place: a failed move of the notes takes SHA256SUMS back out.
+  test("the notes cannot be moved into place: refused, and SHA256SUMS is taken back out of dist", () => {
+    const f = fixture();
+    const bin = toolBin(f.base);
+    const realMv = Bun.which("mv")!;
+    Bun.spawnSync(["rm", join(bin, "mv")]);
+    writeFileSync(join(bin, "mv"), `#!/bin/sh\n[ "$2" = "${f.notes}" ] && exit 1\nexec "${realMv}" "$@"\n`, { mode: 0o755 });
+    const r = collect(f, { env: { PATH: bin } });
+    expectRefused(f, r, /could not move the notes to .* — nothing written/);
+    expect(entries(f.base)).toEqual(["bin", "dist", "markers"]);   // no temp file left behind either
+  });
+
+  // Paths resolve PHYSICALLY. dist reached through `<link>/../dist`, where a decoy directory sits at the
+  // LOGICAL resolution: a logical `cd` judged the notes against the decoy (and hashed the decoy's bytes)
+  // while every write landed, physically, in the real dist — notes attached as an asset.
+  test("a dist path through a symlink and .. is judged where the kernel resolves it", () => {
+    const f = fixture();
+    const real = join(f.base, "x", "dist");
+    mkdirSync(join(f.base, "x", "y"), { recursive: true });
+    Bun.spawnSync(["mv", f.dist, real]);
+    mkdirSync(f.dist);                                                     // the decoy, at the logical path
+    for (const n of readdirSync(real)) writeFileSync(join(f.dist, n), `DECOY ${n}\n`);
+    symlinkSync(join(f.base, "x", "y"), join(f.base, "lnk"));
+    const viaLink = `${f.base}/lnk/../dist`;          // physically x/dist (not join(): it would fold the ..)
+    const inside = collect({ ...f, dist: viaLink }, { notes: join(real, "notes.md") });
+    expect(inside.code).toBe(1);
+    expect(inside.err).toMatch(/notes-out .* lies inside dist/);
+    expect(readdirSync(real)).not.toContain("notes.md");
+    expect(readdirSync(real)).not.toContain("SHA256SUMS");
+    // Notes outside: passes, and SHA256SUMS hashes the REAL dist's bytes, never the decoy's.
+    const ok = collect({ ...f, dist: viaLink });
+    expect(`${ok.code}\n${ok.err}`).toBe("0\n");
+    for (const l of readFileSync(join(real, "SHA256SUMS"), "utf8").trimEnd().split("\n")) {
+      expect(l.slice(0, 64)).toBe(sha256(join(real, l.slice(66))));
+    }
+    expect(existsSync(join(f.dist, "SHA256SUMS"))).toBe(false);
+  });
+
+  // No CDPATH entry can redirect a relative `cd`: with a decoy `scripts/` on CDPATH, `cd scripts` once
+  // went there (and printed it into the captured path), so the template was "missing".
+  test("a CDPATH in the environment changes nothing", () => {
+    const f = fixture();
+    const decoy = join(f.base, "decoy");
+    mkdirSync(join(decoy, "scripts"), { recursive: true });
+    const r = Bun.spawnSync(["bash", "scripts/release-collect.sh", f.dist, f.markers, V, "unsigned", "success", f.notes],
+      { cwd: ROOT, env: { ...process.env, CDPATH: decoy }, stdout: "pipe", stderr: "pipe" });
+    expect(`${r.exitCode}\n${r.stderr}`).toBe("0\n");
+    expect(readFileSync(f.notes, "utf8")).toContain(`# daily-briefing v${V}`);
   });
 
   test("wrong arity", () => {

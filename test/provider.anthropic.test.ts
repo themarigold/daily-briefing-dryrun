@@ -8,6 +8,7 @@ import { startFakeApi, okJson, status, slow, badJson, sse, type FakeApiHandler }
 import { AnthropicApiProvider, ANTHROPIC_DEFAULT_MAX_TOKENS, ANTHROPIC_VERSION } from "../src/providers/anthropic";
 import { USAGE_WALL_RETRY_AFTER_MS, MAX_RESPONSE_BYTES, DIAG_CHARS, mapStatus, retryAfterMs, parseRegainAccess, postJson } from "../src/providers/http";
 import { PROVIDER_RETRY_DELAYS_MS } from "../src/core";
+import { withRetry } from "../src/provider";
 import { ProviderError, API_LABEL_ANTHROPIC, type ProviderApi } from "../src/types";
 import { isPostureWarning, posturePhrase, API_TRUNCATION_SENTINEL } from "../src/eval/posture";
 import { guardNetworkForThisFile } from "./helpers/netGuard";
@@ -432,3 +433,60 @@ test("⚠ the response body is CAPPED — a pathological body fails loudly inste
   // The production default is unchanged and generous relative to any real briefing.
   expect(MAX_RESPONSE_BYTES).toBe(8 * 1024 * 1024);
 }, 30_000);
+
+// ── redirects are refused, never followed (Phase E M5b checkpoint) ─────────────────────────────────
+
+test("⚠ postJson asks fetch to REFUSE redirects — `redirect: \"error\"` on the request it builds", async () => {
+  // Fetch's default is `"follow"`. MEASURED (bun 1.3.14, two loopback ports): a followed 307/308
+  // re-sends the POST — the prompt — with `x-api-key` to the Location's host, and a 301/302 becomes a
+  // GET that still carries `x-api-key`. The init is asserted directly so the setting cannot quietly go.
+  const inits: RequestInit[] = [];
+  const fetchImpl = (async (_url: unknown, init: RequestInit) => {
+    inits.push(init);
+    return new Response(JSON.stringify(textBody("ok")), { status: 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  await postJson({
+    url: "http://127.0.0.1:1/v1/messages", headers: { "x-api-key": SENTINEL }, body: { x: 1 },
+    timeoutMs: 5_000, label: "anthropic-api", kind: "anthropic", fetchImpl,
+  });
+  expect(inits).toHaveLength(1);
+  expect(inits[0]!.redirect).toBe("error");
+  expect(inits[0]!.method).toBe("POST");
+});
+
+test("⚠ a redirecting endpoint: nothing reaches the Location, and the failure is PERMANENT (never retried) — query withheld", async () => {
+  // End to end, real servers: the endpoint answers 307 to a SECOND server (another port, so another
+  // origin). Followed, that second server would receive the prompt and the key; refused, it receives
+  // NOTHING. The thrown error is the permanent kind (`missing-binary`, as a permanent 4xx — fix round
+  // 2: it was the retryable `nonzero-exit`, which bought ~135 s of backoff per tick for a failure only
+  // a baseUrl edit can fix), and — because bun's own message for a refused redirect quotes the wire
+  // URL — its words are ours, with the query withheld.
+  const URL_SECRET = "qk-REDIRECTSECRET-do-not-log-2222";
+  const elsewhere = await serve(okJson(textBody("followed")));
+  const endpoint = await serve(() => new Response(null, { status: 307, headers: { location: `${elsewhere.origin}/v1/messages` } }));
+  for (const redirectStatus of [307, 308, 302, 301]) {
+    endpoint.setHandler(() => new Response(null, { status: redirectStatus, headers: { location: `${elsewhere.origin}/v1/messages` } }));
+    const p = new AnthropicApiProvider(api(`${endpoint.origin}/gw?api_key=${URL_SECRET}`), { timeoutMs: 5_000, env: { K: SENTINEL } });
+    let e: ProviderError | undefined;
+    try { await p.generate("THE-PROMPT"); } catch (x) { e = x as ProviderError; }
+    expect(`${redirectStatus} → ${e?.code}`).toBe(`${redirectStatus} → missing-binary`);
+    expect(e!.message).toContain("redirect");
+    expect(e!.message).toContain("Set baseUrl to the final URL");
+    expect(e!.message).toContain(`${endpoint.origin}/gw/v1/messages`);
+    expect(e!.message).toContain("query withheld");
+    expect(e!.message).not.toContain(URL_SECRET);
+    expect(e!.message).not.toContain(elsewhere.origin);
+    expect(e!.message).not.toContain(SENTINEL);
+  }
+  // PREMISE: the endpoint really was asked (four times), and the Location really was never reached.
+  expect(endpoint.requests).toHaveLength(4);
+  expect(elsewhere.requests).toEqual([]);
+  // …and the run's retry schedule spends nothing on it: ONE request, no backoff sleep.
+  const sleeps: number[] = [];
+  const p = new AnthropicApiProvider(api(`${endpoint.origin}/gw`), { timeoutMs: 5_000, env: { K: SENTINEL } });
+  await expect(withRetry(() => p.generate("THE-PROMPT"), PROVIDER_RETRY_DELAYS_MS, async (ms) => void sleeps.push(ms)))
+    .rejects.toThrow("answered with a redirect");
+  expect(sleeps).toEqual([]);
+  expect(endpoint.requests).toHaveLength(5);
+  expect(elsewhere.requests).toEqual([]);
+});

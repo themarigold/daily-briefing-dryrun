@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   launchdPlist, systemdUnits, windowsTaskXml, windowsTaskXmlBytes, floorClock, assertNoMountPath,
-  SCHEDULE_LABEL, WINDOWS_XML_BOM, WINDOWS_XML_ENCODING, DEFAULT_INTERVAL_SEC,
+  SCHEDULE_LABEL, WINDOWS_XML_BOM, WINDOWS_XML_ENCODING, DEFAULT_INTERVAL_SEC, BUN_CRASH_REPORTING_OFF, BUN_CRASH_REPORT_URL_EMPTY,
   type ScheduleOpts,
 } from "../src/schedule/units";
 import { parseFloor } from "../src/schedule";
@@ -84,6 +84,24 @@ describe("launchdPlist", () => {
     expect(xml).toContain(`<key>PATH</key><string>${OPTS.pathEnv}</string>`);
   });
 
+  // ⚠ THE README PROMISES THIS (Privacy: the desktop app turns Bun's crash reporter off for every run it
+  // starts, "and so does the schedule `daily-briefing schedule install` sets up on macOS"; Linux Bun does
+  // not send by default). Bun's runtime crash reporter uploads to bun.report by default on macOS unless
+  // the process's own environment says otherwise, and the EnvironmentVariables dict is the one part of
+  // the agent's environment this file controls — so the literal key/value pairs, inside that dict, are
+  // the whole of the mechanism. BUN_CRASH_REPORT_URL is pinned EMPTY because Bun reads it before
+  // BUN_ENABLE_CRASH_REPORTING (a non-empty inherited value would turn reporting back on, to that URL).
+  test("turns Bun's runtime crash reporter off: BUN_ENABLE_CRASH_REPORTING=0 and an EMPTY BUN_CRASH_REPORT_URL in EnvironmentVariables", () => {
+    expect(BUN_CRASH_REPORTING_OFF).toEqual({ name: "BUN_ENABLE_CRASH_REPORTING", value: "0" });
+    expect(BUN_CRASH_REPORT_URL_EMPTY).toEqual({ name: "BUN_CRASH_REPORT_URL", value: "" });
+    const xml = launchdPlist(OPTS);
+    const env = xml.match(/<key>EnvironmentVariables<\/key><dict>(.*?)<\/dict>/)?.[1] ?? "";
+    expect(env).toContain(`<key>PATH</key><string>${OPTS.pathEnv}</string>`);   // non-vacuity: the dict was found
+    expect(env).toContain("<key>BUN_ENABLE_CRASH_REPORTING</key><string>0</string>");
+    expect(env).toContain("<key>BUN_CRASH_REPORT_URL</key><string></string>");
+    expect(xml.split("BUN_CRASH_REPORT_URL").length - 1).toBe(1);                // once, and only in the dict
+  });
+
   test("XML-escapes interpolated paths — the `sed` it replaces did not", () => {
     // A home directory containing `&` produced a malformed plist that launchctl silently refused.
     // No path on the author's machine contains one, which is exactly why it never bit.
@@ -113,6 +131,25 @@ describe("systemdUnits", () => {
     // systemd rejects a relative ExecStart outright; assert the property, not just the string.
     expect(/^ExecStart="\//m.test(service)).toBe(true);
     expect(service).toContain("Type=oneshot");
+  });
+
+  test("turns Bun's runtime crash reporter off too (off by default on Linux; kept so no platform depends on that)", () => {
+    const { service } = systemdUnits(OPTS);
+    // INSIDE the [Service] section's body — from its header up to the NEXT section header (or the end) —
+    // where systemd reads Environment=. "After [Service]" alone would also accept a line stranded under a
+    // later [Install] or [X-…] section, which systemd would ignore or reject.
+    const lines = service.split("\n");
+    const start = lines.indexOf("[Service]");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const rest = lines.slice(start + 1);
+    const nextHeader = rest.findIndex((l) => /^\[.*\]$/.test(l));
+    const body = nextHeader === -1 ? rest : rest.slice(0, nextHeader);
+    expect(body).toContain("Type=oneshot");                                        // non-vacuity: the right section
+    expect(body).toContain(`Environment="BUN_ENABLE_CRASH_REPORTING=0"`);
+    // EMPTY, not absent: an inherited non-empty value (environment.d, `systemctl --user set-environment`)
+    // outranks BUN_ENABLE_CRASH_REPORTING in Bun. `VAR=` is systemd's spelling of an empty value.
+    expect(body).toContain(`Environment="BUN_CRASH_REPORT_URL="`);
+    expect(service.split("BUN_CRASH_REPORT_URL").length - 1).toBe(1);
   });
 
   test("⚠ A SPACE IN THE PATH DOES NOT WORD-SPLIT: ExecStart and Environment are both quoted", () => {

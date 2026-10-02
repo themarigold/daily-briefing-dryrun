@@ -45,7 +45,12 @@ import { appendFile } from "node:fs/promises";
 // Tier B (Stage-2 recap campaigns). The phase module never imports this file (plan §2 / D17; pinned by
 // test/recap-campaigns.imports.test.ts), so this edge cannot close a cycle.
 import { runRecapCampaignsPhase } from "./recapCampaignsPhase";
-import type { RecapImpl } from "./recapCampaigns";
+import { branchWords, type RecapImpl } from "./recapCampaigns";
+import { REDACTION } from "./transcripts/credentials";
+
+/** A PR branch as a printed `🔀 Merged` line shows it: verbatim, unless `branchWords` — Stage 2's
+ *  any-case, before-and-after-the-strip credential decision — redacts it, in which case all of it. */
+const shownBranch = (branch: string): string => (branchWords(branch) === REDACTION ? REDACTION : branch);
 import { claudeShaped } from "./harden";
 import { scanTranscripts } from "./transcripts/scan";
 import { whySourceFor } from "./transcripts/join";
@@ -799,8 +804,13 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // "resume the review". Labeled by the merge's first-parent file plurality (mergeLabel above; bare
   // repo on tie/no-files) and, like the rest of "today so far", rendered deterministically and never
   // sent to the LLM.
+  // ⚠ THE BRANCH IS SHOWN THROUGH STAGE 2's FAIL-CLOSED DECISION (`branchWords`, #567): a branch carrying
+  // a known-shaped credential in ANY case renders as `[redacted]`. The case-sensitive pass the briefing
+  // and envelope get downstream misses a lower-cased one (`fix/akia…`), which this line used to print
+  // raw while the Stage-2 record of the same merge redacted it. Only the PRINTED lines change: the
+  // prompt's suppress subject below keeps the raw branch, like every other raw subject sent there.
   for (const m of mergedToday) {
-    today.push({ repo: mergeLabel(m), text: `🔀 Merged #${m.prNum} (${m.branch}) (${(m.sha ?? "").slice(0, 7)})` });
+    today.push({ repo: mergeLabel(m), text: `🔀 Merged #${m.prNum} (${shownBranch(m.branch)}) (${(m.sha ?? "").slice(0, 7)})` });
   }
   // In-window PR landings (defect D — EVAL day 33, user-directed): same deterministic treatment,
   // rendered as dated lines at the foot of "What you did" (render.ts). Dated like recap bullets —
@@ -811,7 +821,7 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   const windowMergeLines = windowMerges.map((m) => {
     const d = new Date(m.timestamp ?? 0);
     const dateTag = isNaN(d.getTime()) ? "" : ` (${d.toLocaleDateString("en-US", { month: "short", day: "numeric" })})`;
-    return { repo: mergeLabel(m), text: `🔀 Merged #${m.prNum} (${m.branch})${dateTag}  (${(m.sha ?? "").slice(0, 7)})` };
+    return { repo: mergeLabel(m), text: `🔀 Merged #${m.prNum} (${shownBranch(m.branch)})${dateTag}  (${(m.sha ?? "").slice(0, 7)})` };
   });
 
   // SHA-free suppress-context for the prompt (design 2026-07-19): raw subjects + a whenMs sort key so
