@@ -129,6 +129,12 @@ unset DBA_NOTARIZE_APPLE_ID DBA_NOTARIZE_APPLE_PASSWORD DBA_NOTARIZE_APPLE_TEAM_
 
 echo "signing: $MODE"
 echo "notarization: $NOTARIZE"
-echo "ci-tauri-build: $TAURI_CMD build --target $TRIPLE"
+# --verbose, always: without it tauri-bundler runs linuxdeploy at log level Error and DISCARDS its
+# output, so a failed AppImage reports only "failed to run linuxdeploy" (measured, M2b release run,
+# 2026-10-01; tauri-bundler 2.9.4 linux/appimage/linuxdeploy.rs:206-216). One -v sets the bundler's
+# level to Info (tauri-cli 2.11.4 bundle.rs:213-217), which streams every subprocess line to the log.
+# The only behaviour it changes is the verbosity passed to linuxdeploy and makensis; notarytool's
+# credentials are never logged (tauri-macos-sign runs it with `.output()`, not the logging helper).
+echo "ci-tauri-build: $TAURI_CMD build --verbose --target $TRIPLE"
 # Not `exec`: the EXIT trap must still remove the API key file after the build.
-"$TAURI_CMD" build --target "$TRIPLE"
+"$TAURI_CMD" build --verbose --target "$TRIPLE"

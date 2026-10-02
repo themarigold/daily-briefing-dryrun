@@ -28,8 +28,9 @@ ensure_identity() {
   local dir pw; dir="$(mktemp -d)"; pw="dba-local"; trap 'rm -rf "$dir"' RETURN
   # Self-signed leaf cert with EXACTLY the extensions macOS codesign requires: Digital Signature key
   # usage + the codeSigning EKU + CA:FALSE. Omitting keyUsage (or leaving the -x509 default CA:TRUE)
-  # makes codesign reject the identity with "no identity found" even though it lists. -addext needs a
-  # real OpenSSL (LibreSSL's req lacks it) — hence the homebrew preference above.
+  # makes codesign reject the identity with "no identity found" even though it lists. On the homebrew
+  # preference above: macOS's /usr/bin/openssl is LibreSSL, whose req DOES have -addext but whose pkcs12
+  # has no -legacy (measured with LibreSSL 3.3.6, 2026-10-01); the p12 step below retries without it.
   "$OPENSSL" req -x509 -newkey rsa:2048 -keyout "$dir/key.pem" -out "$dir/cert.pem" \
     -days 3650 -nodes -subj "/CN=$SIGN_ID" \
     -addext "basicConstraints=critical,CA:FALSE" \
@@ -53,7 +54,15 @@ ensure_identity() {
   # needs the LOGIN keychain password, which this non-interactive installer can't supply. Properly
   # scoping the ACL therefore requires a DEDICATED keychain (created with a known password → import →
   # set-key-partition-list → reference it at sign time → clean up on uninstall) — a distribution-hardening
-  # step deferred to Slice 7. (The p12 lives briefly in a mktemp dir with a non-empty password, removed on exit.)
+  # step that is NOT done here: on the backlog since 2026-10-01 (Phase E, T19). Why it stays open: this
+  # source install remains a supported path as-is; the release pipeline already signs the app in CI
+  # through exactly that dedicated-keychain pattern (publish/.github/workflows/release.yml); and the
+  # residue an uninstall could not clean — this identity in the login keychain — is now removable with
+  # `bash scripts/uninstall.sh --remove-signing-identity`. Reopen it if this local identity ever signs
+  # anything that leaves this machine. T19's closure (a) — this script printing that it is the legacy
+  # developer path and the app bundle the supported install — is deliberately a NO-OP under the Phase E
+  # plan §1: the source install stays supported, so it prints no such line. (The p12 lives briefly in a
+  # mktemp dir with a non-empty password, removed on exit.)
   security import "$dir/id.p12" -k "$HOME/Library/Keychains/login.keychain-db" -P "$pw" -A >/dev/null 2>&1 \
     || security import "$dir/id.p12" -P "$pw" -A >/dev/null 2>&1 || return 1
   security find-identity -p codesigning 2>/dev/null | grep -q "$SIGN_ID"

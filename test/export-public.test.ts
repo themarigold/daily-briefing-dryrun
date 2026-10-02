@@ -11,9 +11,9 @@
 // excludes itself), so there this reports as a skip. In the monorepo a missing script FAILS rather than
 // skips: `publish/` is the layout marker, the same one publish-prep.test.ts uses.
 import { test, expect } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const ROOT = decodeURIComponent(new URL("..", import.meta.url).pathname);
@@ -71,3 +71,58 @@ test.skipIf(!IN_MONOREPO)("⚠ the public export passes its HARD residual sweep,
     rmSync(parent, { recursive: true, force: true });
   }
 }, 60_000);
+
+// ── The SOFT sweep fails closed too (review L3, 2026-10-01) ─────────────────────────────────────────────
+// It was `grep … | grep -v … | grep -v … || echo "  (none)"`: a first grep that could not search (exit 2)
+// left the filters an empty input, the pipeline exited 1, and "(none)" was printed — which release-check
+// reads as a clean sweep. Driven here on a tiny fixture repo with a PATH `grep` that fails only for the
+// soft pattern, so the HARD sweep (which runs first, over the same tree) still runs for real. The private
+// names are built by concatenation so this file never becomes a soft residual of the real export.
+const SOFT_NAME = "quant_" + "stocks";
+const AUTHOR = "Harsh" + "il";
+const GIT = Bun.which("git")!;
+
+function softFixture(): { repo: string; target: string; stubs: string } {
+  const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-export-soft-")));
+  const repo = join(base, "repo");
+  for (const d of ["scripts", "test", "publish"]) mkdirSync(join(repo, d), { recursive: true });
+  writeFileSync(join(repo, "scripts", "export-public.sh"), readFileSync(SCRIPT));
+  writeFileSync(join(repo, "a.txt"), "hello\n");
+  writeFileSync(join(repo, "LICENSE"), `Copyright (c) 2026 ${AUTHOR}\n`);
+  writeFileSync(join(repo, "README.md"), `MIT (c) ${AUTHOR}\n`);
+  writeFileSync(join(repo, "test", "fixture.ts"), `export const repoName = "${SOFT_NAME}";\n`);
+  writeFileSync(join(repo, "publish", "overlay.txt"), "overlay\n");
+  const env = { PATH: `${dirname(GIT)}:/usr/bin:/bin`, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  for (const args of [["init", "-q"], ["add", "-A"], ["-c", "user.name=f", "-c", "user.email=f@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"]]) {
+    const r = Bun.spawnSync([GIT, ...args], { cwd: repo, env, stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${text(r.stderr)}`);
+  }
+  const stubs = join(base, "bin");
+  mkdirSync(stubs);
+  // Fails only the soft sweep's search; every other grep (the HARD sweep, any filter) is the real one.
+  writeFileSync(join(stubs, "grep"), `#!/bin/sh\ncase "$*" in *"${SOFT_NAME}"*) echo "grep: simulated read error" >&2; exit 2 ;; esac\nexec "${Bun.which("grep")}" "$@"\n`, { mode: 0o755 });
+  return { repo, target: join(base, "export"), stubs };
+}
+function exportWith(fx: { repo: string; target: string }, PATH: string) {
+  const r = Bun.spawnSync(["bash", join(fx.repo, "scripts", "export-public.sh"), fx.target], {
+    env: { PATH, HOME: fx.repo }, stdout: "pipe", stderr: "pipe",
+  });
+  return { code: r.exitCode, out: text(r.stdout), err: text(r.stderr) };
+}
+
+test.skipIf(!IN_MONOREPO)("the SOFT sweep lists its residuals, never LICENSE or README.md, and prints (none) only when there are none", () => {
+  const fx = softFixture();
+  const r = exportWith(fx, `${dirname(GIT)}:/usr/bin:/bin`);
+  expect(r.code, r.out + r.err).toBe(0);
+  const soft = r.out.split("— soft residuals")[1]!.split("\n— ")[0]!.split("\n").slice(1).filter(Boolean);
+  expect(soft).toEqual([join(fx.target, "test", "fixture.ts")]);
+});
+
+test.skipIf(!IN_MONOREPO)("a SOFT sweep that could not run fails the export (exit 1), never prints (none)", () => {
+  const fx = softFixture();
+  const r = exportWith(fx, `${fx.stubs}:${dirname(GIT)}:/usr/bin:/bin`);
+  expect(r.out).toContain("— hard residual sweep: clean");   // the HARD sweep ran for real and passed
+  expect(r.code, r.out + r.err).toBe(1);
+  expect(r.err).toContain("SOFT residual sweep could not run (grep exit 2)");
+  expect(r.out).not.toContain("(none)");
+});

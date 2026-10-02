@@ -23,6 +23,11 @@
 //!     B22 (the retina choice is §15b's deviation 151);
 //!   * Linux ships `["appimage","deb"]`, Windows `["nsis"]` with the downloaded-bootstrapper
 //!     WebView2 mode (CI-only experimental — appendix binding C3);
+//!   * the AppImage (and ONLY the AppImage) carries the engine at
+//!     `/usr/libexec/daily-briefing/daily-briefing`, with the tracked POSIX-sh wrapper standing at
+//!     `/usr/bin/daily-briefing` — the exact `bundle.linux.appimage.files` map, the wrapper's mode,
+//!     shebang and target, user-directed 2026-10-01 ("B: try AppImage, else .deb"; M2b probe:
+//!     linuxdeploy's rpath rewrite of the engine in usr/bin made it segfault);
 //!   * signing is PARAMETERIZED AND EMPTY: `signingIdentity` present-as-null (unsigned build
 //!     today — tauri-bundler 2.9.4 `sign.rs:19-44` returns no keychain when the identity is
 //!     None and `APPLE_CERTIFICATE`/`APPLE_CERTIFICATE_PASSWORD` are absent, which are the CI
@@ -108,7 +113,7 @@ fn the_platform_conf_files_are_the_only_targets_authority() {
 fn the_platform_conf_files_carry_exactly_the_recorded_keys() {
     for (rel, bundle_keys) in [
         ("tauri.macos.conf.json", vec!["macOS", "targets"]),
-        ("tauri.linux.conf.json", vec!["targets"]),
+        ("tauri.linux.conf.json", vec!["linux", "targets"]),
         ("tauri.windows.conf.json", vec!["targets", "windows"]),
     ] {
         let c = conf(rel);
@@ -358,6 +363,148 @@ fn the_windows_webview_mode_is_the_downloaded_bootstrapper() {
         vec!["silent", "type"],
         "webviewInstallMode keys drifted — this host never parses the file at build time, \
          so this pin is its only local reader"
+    );
+}
+
+/// The AppImage carries the engine OUTSIDE linuxdeploy's reach, and only the AppImage does
+/// (user-directed 2026-10-01: "B: try AppImage, else .deb").
+///
+/// MEASURED (M2b linux-bundle-probe, round 1): linuxdeploy, which tauri-bundler 2.9.4 runs over
+/// the AppDir (`linux/appimage/linuxdeploy.rs`), set an RPATH on the Bun-compiled engine that
+/// `externalBin` had put in `usr/bin` (94,943,360 → 94,947,456 bytes); the patched engine
+/// segfaulted (`--version` rc 139) and the gtk plugin's second pass aborted on `ldd` against it.
+/// linuxdeploy (659c9db, `src/core/appdir.cpp`) rewrites top-level ELF files in `usr/bin` and
+/// every ELF under `usr/lib` (nested webkit executables got rpaths in that same run), skips
+/// non-ELF files, and never reads `usr/libexec`. Hence this map:
+///   * the engine goes, unmodified, to `/usr/libexec/daily-briefing/daily-briefing`, and the
+///     tracked wrapper goes OVER `/usr/bin/daily-briefing`, where the GUI resolves its sidecar
+///     (beside its own executable; `engine.rs` `resolve_sidecar` wants a regular, executable
+///     file). `appimage.files` is copied AFTER the externalBin copy, with a plain `fs::copy` that
+///     overwrites and carries the source's mode (`linuxdeploy.rs:80-83`, `fs_utils.rs:81-96`);
+///   * sources resolve against `src-tauri/` (tauri-cli 2.11.4 `build.rs:158` sets the cwd there).
+///     The triple is FIXED: a files map has no per-target placeholder, and the Linux leg is
+///     x86_64 only; any other Linux target fails loudly on the missing source, never ships a
+///     wrong engine;
+///   * `bundle.linux` carries ONLY `appimage`, and `appimage` ONLY `files`: the .deb's bundler
+///     reads `deb.files` and never this map (`debian.rs:82`), so the .deb still ships the engine
+///     itself at `/usr/bin/daily-briefing` (byte-identical in probe round 2).
+/// The release smoke (bundle-linux in `publish/.github/workflows/release.yml`) checks the BUILT
+/// AppImage: this wrapper at usr/bin, the engine byte-identical at usr/libexec, and `--version`
+/// through the wrapper.
+#[test]
+fn the_appimage_carries_the_engine_outside_linuxdeploys_reach() {
+    const WRAPPER_DEST: &str = "/usr/bin/daily-briefing";
+    const ENGINE_DEST: &str = "/usr/libexec/daily-briefing/daily-briefing";
+    const WRAPPER_SRC: &str = "linux/daily-briefing-appimage-wrapper.sh";
+
+    let c = conf("tauri.linux.conf.json");
+    let linux = &c["bundle"]["linux"];
+    let mut linux_keys = keys(linux, "bundle.linux");
+    linux_keys.sort();
+    assert_eq!(
+        linux_keys,
+        vec!["appimage"],
+        "bundle.linux must carry ONLY appimage: a deb (or rpm) key here changes the .deb, which \
+         ships the engine itself and needs no wrapper"
+    );
+    let mut appimage_keys = keys(&linux["appimage"], "bundle.linux.appimage");
+    appimage_keys.sort();
+    assert_eq!(
+        appimage_keys,
+        vec!["files"],
+        "bundle.linux.appimage keys drifted (bundleMediaFramework would add gstreamer to the \
+         AppImage, an unbudgeted size change)"
+    );
+
+    // The engine source is the externalBin sidecar, for the Linux leg's one triple.
+    let base = conf("tauri.conf.json");
+    let external: Vec<&str> = base["bundle"]["externalBin"]
+        .as_array()
+        .expect("tauri.conf.json bundle.externalBin is an array")
+        .iter()
+        .map(|v| v.as_str().expect("externalBin entries are strings"))
+        .collect();
+    assert_eq!(
+        external,
+        vec!["binaries/daily-briefing"],
+        "externalBin drifted; the AppImage engine source below is derived from it"
+    );
+    let engine_src = format!("{}-x86_64-unknown-linux-gnu", external[0]);
+    let mut files: Vec<(&str, &str)> = linux["appimage"]["files"]
+        .as_object()
+        .expect("bundle.linux.appimage.files is an object")
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str(),
+                v.as_str().expect("appimage.files values are strings"),
+            )
+        })
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        vec![
+            (WRAPPER_DEST, WRAPPER_SRC),
+            (ENGINE_DEST, engine_src.as_str())
+        ],
+        "bundle.linux.appimage.files drifted. The engine must stay out of usr/bin and usr/lib \
+         (linuxdeploy rewrites every ELF there, and that rewrite crashed it), and the wrapper \
+         must stand at usr/bin/daily-briefing, where the GUI looks for its sidecar"
+    );
+
+    // The wrapper: a regular file, executable (fs::copy carries this mode into the AppImage, and
+    // the GUI refuses a sidecar with no exec bit), LF-only, POSIX sh, and EXACTLY these two
+    // statements. The exec target is derived from the map, so moving the engine without moving
+    // the wrapper's target fails here.
+    let wrapper = src_tauri(WRAPPER_SRC);
+    let meta =
+        std::fs::metadata(&wrapper).unwrap_or_else(|e| panic!("{WRAPPER_SRC} is statable: {e}"));
+    assert!(meta.is_file(), "{WRAPPER_SRC} is not a regular file");
+    let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions());
+    assert_eq!(
+        mode & 0o777,
+        0o755,
+        "{WRAPPER_SRC} must be mode 0755 (got {:04o}): the AppImage copy keeps this mode",
+        mode & 0o777
+    );
+    let text = std::fs::read_to_string(&wrapper).expect("the wrapper is UTF-8 text");
+    assert!(
+        !text.contains('\r'),
+        "{WRAPPER_SRC} carries a CR: `#!/bin/sh\\r` names an interpreter that does not exist"
+    );
+    assert_eq!(
+        text.lines().next(),
+        Some("#!/bin/sh"),
+        "{WRAPPER_SRC} must start with #!/bin/sh (POSIX sh: dash on Debian/Ubuntu)"
+    );
+    let code: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let engine_from_bin = format!(
+        "../{}",
+        ENGINE_DEST
+            .strip_prefix("/usr/")
+            .expect("the engine destination is under /usr/")
+    );
+    assert_eq!(
+        Path::new(WRAPPER_DEST).parent(),
+        Some(Path::new("/usr/bin")),
+        "the derived exec target below assumes the wrapper stands in /usr/bin"
+    );
+    assert_eq!(
+        code,
+        vec![
+            r#"self=$(readlink -f -- "$0") || { echo "daily-briefing: cannot resolve $0" >&2; exit 127; }"#
+                .to_string(),
+            format!(r#"exec "${{self%/*}}/{engine_from_bin}" "$@""#),
+        ],
+        "{WRAPPER_SRC}'s statements drifted: it must resolve its own path through every symlink \
+         and EXEC the engine (exec, so the engine's process.execPath is the real binary that \
+         `schedule install` copies) with every argument intact"
     );
 }
 

@@ -365,7 +365,10 @@ test("every state-touching test file isolates DAILY_BRIEFING_STATE_DIR", async (
   // files and touching floored two below.
   // Phase E (M2 fix, 2026-10-01): re-measured the same way — files 158, STATE_TRIGGERS 43 (floor stays
   // 41), touching 56; files and touching floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(156);
+  // Phase E (M3, 2026-10-01): re-measured the same way — files 163 (this milestone's release-check and
+  // uninstall tests, plus three added on main since the M2 note), STATE_TRIGGERS 43 (floor stays 41),
+  // touching 56 (unchanged: neither new file touches state); files floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(161);
   expect(STATE_TRIGGERS.length).toBeGreaterThanOrEqual(41);
 
   const touching: string[] = [];
@@ -706,7 +709,8 @@ test("no test spawns a privileged machine-wide binary", async () => {
   // Tier B (T5.2): re-measured at 150; floored two below.
   // Phase E (M1b fix, 2026-10-01): re-measured at 155 `testFiles()`; floored two below.
   // Phase E (M2 fix, 2026-10-01): re-measured at 158 `testFiles()`; floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(156);
+  // Phase E (M3, 2026-10-01): re-measured at 163 `testFiles()`; floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(161);
   const offenders: string[] = [];
   const conditional: string[] = [];
   for (const f of files) {
@@ -839,6 +843,35 @@ test("any test spawning scripts/uninstall.sh passes BOTH DBA_TEST_DIR and DBA_TE
   }
   // The exerciser exists; if it ever stops existing this guard would pass over an empty set.
   expect(spawners).toContain("maintenance.test.ts");
+  // Phase E (E10): the flag's exerciser is a spawner too, and is held to the same two variables.
+  expect(spawners).toContain("uninstall.test.ts");
+  expect(offenders).toEqual([]);
+});
+
+/** Phase E (E10): `scripts/uninstall.sh --remove-signing-identity` DELETES a keychain identity, from the
+ *  keychain named by DBA_TEST_KEYCHAIN when it is set and from the LOGIN keychain otherwise. The script's
+ *  own interlock refuses the flag under DBA_TEST_DIR without that variable; this is the suite-side half, a
+ *  conditional rule in the INSTALLER_REDIRECTABLE shape rather than an exemption: any test file that passes
+ *  the flag must also set DBA_TEST_KEYCHAIN. It reads code, not comments (`sourceWithHelpers`), and carries
+ *  the same file-union residual stated above. Seen failing once before it was relied on: a disposable copy
+ *  of the tree with a fixture test that passed the flag and omitted the variable turned it red. */
+const IDENTITY_FLAG = "--remove-signing-identity";
+
+test("any test passing --remove-signing-identity also sets DBA_TEST_KEYCHAIN", async () => {
+  const files = await testFiles();
+  const users: string[] = [];
+  const offenders: string[] = [];
+  for (const f of files) {
+    if (f === SELF) continue;   // names the flag as data, in the constant above
+    const src = sourceWithHelpers(f);
+    if (!src.includes(IDENTITY_FLAG)) continue;
+    users.push(f);
+    if (!src.includes("DBA_TEST_KEYCHAIN")) {
+      offenders.push(`${f} passes ${IDENTITY_FLAG} without DBA_TEST_KEYCHAIN — uninstall.sh would delete the identity from the LOGIN keychain`);
+    }
+  }
+  // The exerciser exists; without it this rule would pass over an empty set.
+  expect(users).toContain("uninstall.test.ts");
   expect(offenders).toEqual([]);
 });
 
@@ -1131,7 +1164,8 @@ test("every mkdtemp under tmpdir() in test/ is registered for run-end removal", 
   // Tier B (T5.1): re-measured at 166 (+ recap-campaigns.report); floored two below.
   // Tier B (T5.2): re-measured at 167 (+ recap-campaigns.replay); floored two below.
   // Phase E (M2 fix, 2026-10-01): re-measured at 175 `testSources()`; floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(173);
+  // Phase E (M3, 2026-10-01): re-measured at 180 `testSources()`; floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(178);
 
   const offenders: string[] = [];
   const unwrapped: Record<string, number> = {};
@@ -1186,7 +1220,10 @@ test("every mkdtemp under tmpdir() in test/ is registered for run-end removal", 
   // file, so 247 − 32 = 215.
   // Tier B (harden r1): re-measured at 248 (+1, recap-campaigns.report's second-date record dir), still at
   // most 32 in one file, so 248 − 32 = 216.
-  expect(sites).toBeGreaterThanOrEqual(216);
+  // Phase E (M3, 2026-10-01): re-measured at 268 live sites (+6 this milestone: release-check's three and
+  // uninstall's two fixture/stub dirs, maintenance's stub dir; the rest added on main since), still at most
+  // 32 in one file (subprojects.test.ts), so 268 − 32 = 236.
+  expect(sites).toBeGreaterThanOrEqual(236);
   expect(offenders).toEqual([]);
 
   // A stale entry reads as a considered decision while covering nothing — and a file that no longer
@@ -1855,7 +1892,8 @@ test("every child bun that runs an entry point is handed the isolated env", asyn
   // Tier B (T5.1): re-measured at 149; floored two below.
   // Tier B (T5.2): re-measured at 150; floored two below.
   // Phase E (M2 fix, 2026-10-01): re-measured at 158 (scanner 1's count); floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(156);
+  // Phase E (M3, 2026-10-01): re-measured at 163 (scanner 1's count); floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(161);
   // The names that stand for an entry without its path. If these stop being read, every
   // `join(SCRIPTS, "x.ts")` and `bun run audit` spawn silently drops out of the scan.
   expect(ENTRY_NAMES).toEqual(expect.arrayContaining(["audit", "eval", "inspect-whys", "main", "start"]));

@@ -1,6 +1,14 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
-    "targets": ["appimage", "deb"]
+    "targets": ["appimage", "deb"],
+    "linux": {
+      "appimage": {
+        "files": {
+          "/usr/bin/daily-briefing": "linux/daily-briefing-appimage-wrapper.sh",
+          "/usr/libexec/daily-briefing/daily-briefing": "binaries/daily-briefing-x86_64-unknown-linux-gnu"
+        }
+      }
+    }
   }
 }

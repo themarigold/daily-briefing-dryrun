@@ -202,7 +202,17 @@ keep your repos outside those folders.
 ## Uninstall
 
 Run `bash scripts/uninstall.sh` — it unloads the `launchd` agent and removes the installed
-binary, the log, and the latest-briefing file.
+binary, the log, and the latest-briefing file. When a schedule is recorded, it first asks the installed
+engine to remove its own schedule (`schedule uninstall`). If the desktop app owns that schedule, the
+uninstall **refuses and removes nothing** — the app's schedule runs the very binary it would delete:
+remove the schedule from the app's Schedule screen (or uninstall the app), then re-run. It refuses the
+same way when a schedule is recorded but the installed binary is missing or not executable. If nothing
+is actually scheduled (say, an old engine left the record behind), the record is stale: delete
+`~/Library/Application Support/daily-briefing/schedule.json` and re-run; the message names it.
+
+`bash scripts/uninstall.sh --remove-signing-identity` also deletes the `Daily Briefing (local) Signing`
+identity from your login keychain. It is opt-in, and it refuses (removing nothing) while a schedule
+record exists, because the scheduled engine is signed with that identity.
 
 > **Upgrading from a pre-StartInterval build?** An early build used a repeating `pmset` wake for
 > delivery (since replaced by the interval agent). If you ran that, an orphaned daily wake may still be

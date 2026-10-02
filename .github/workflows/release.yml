@@ -29,6 +29,8 @@ name: Release
 #     mapped only to DBA_NOTARIZE_* names (gui/scripts/ci-tauri-build.sh owns the rest).
 #   - TAURI_BUNDLER_DMG_IGNORE_CI is never set: v0.2.0 ships a brandless DMG (CI=true makes the
 #     bundler pass --skip-jenkins, so no Finder AppleScript runs on the runner).
+#   - Every `run:` step resolves to `shell: bash` (Git Bash on Windows): a job-level `defaults.run`
+#     block replaces the workflow-level one, so each such block names the shell itself.
 on:
   push:
     tags: ["v*"]
@@ -36,6 +38,12 @@ on:
 permissions:
   contents: read
 
+# For the jobs with no defaults block of their own (gate, cli-binaries, release). A job-level
+# `defaults.run` REPLACES this block rather than merging with it per key — measured in the M2b release
+# run (2026-10-01): with only `working-directory: gui` at job level, bundle-windows ran every step in
+# PowerShell and the macOS/Linux legs ran `bash -e {0}`, without pipefail. So every job-level block
+# below repeats `shell: bash`, and test/release-workflow.test.ts resolves each run step's shell the
+# same way the runner did.
 defaults:
   run:
     shell: bash
@@ -122,9 +130,14 @@ jobs:
           path: dist/daily-briefing-*
           if-no-files-found: error
 
+  # Each leg builds, tests and smokes NATIVELY, on a runner of its own architecture: arm64 on `macos-26`
+  # (Apple silicon), x64 on `macos-26-intel` (Intel). User-directed 2026-10-01. The x64 leg used to
+  # cross-build on an arm64 macos-14 runner, where its sidecar died with SIGILL under Rosetta (exit 132,
+  # M2b dry run 2026-10-01): only an Intel host runs what x64 users run. macos-14 itself is being
+  # retired (actions/runner-images#13518), and test/release-workflow.test.ts pins that no job uses it.
   bundle-macos:
     needs: gate
-    runs-on: macos-14
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       # One failing leg must never cancel the other: a cancelled leg drops a healthy DMG or leaves its
@@ -133,12 +146,14 @@ jobs:
       matrix:
         include:
           - leg: macos-arm64
+            runner: macos-26
             triple: aarch64-apple-darwin
             asset-arch: arm64
             lipo-arch: arm64
             dmg-row: dmg-aarch64-apple-darwin
             app-row: app-aarch64-apple-darwin
           - leg: macos-x64
+            runner: macos-26-intel
             triple: x86_64-apple-darwin
             asset-arch: x64
             lipo-arch: x86_64
@@ -146,6 +161,7 @@ jobs:
             app-row: app-x86_64-apple-darwin
     defaults:
       run:
+        shell: bash
         working-directory: gui
     env:
       TRIPLE: ${{ matrix.triple }}
@@ -159,24 +175,37 @@ jobs:
           bun-version: "1.3.14"
       - name: Install GUI deps (frozen lockfile)
         run: bun install --frozen-lockfile
-      # Explicit, from gui/rust-toolchain.toml, independent of the runner's rustup version. The x64 leg
-      # cross-compiles from the arm64 runner, so it adds that target's std.
+      # Explicit, from gui/rust-toolchain.toml, independent of the runner's rustup version. Both legs
+      # build natively, so the leg's target IS the toolchain's host and its std comes with the
+      # toolchain: no `rustup target add`. The host check makes that a fact rather than an assumption —
+      # a runner label that resolves to the other architecture fails here, named, instead of producing
+      # a cross build whose sidecar the smoke would then run under Rosetta.
       - name: Rust toolchain
         run: |
           set -euo pipefail
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           [ -n "$toolchain" ] || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
           rustup toolchain install "$toolchain"
-          if [ "$TRIPLE" = x86_64-apple-darwin ]; then
-            rustup target add x86_64-apple-darwin --toolchain "$toolchain"
-          fi
+          host="$(rustc +"$toolchain" --print host-tuple)"
+          [ "$host" = "$TRIPLE" ] || { echo "rust toolchain: the $LEG leg builds $TRIPLE natively, but this runner's host is '$host' — check the leg's runner label" >&2; exit 1; }
       # tauri-build refuses to compile the crate without binaries/daily-briefing-<host triple>, and
       # binaries are not tracked; `cargo test` below needs it. The target-triple sidecar for the bundle
       # is built by `tauri build --target` itself (beforeBuildCommand -> scripts/build-sidecar.sh).
       - name: Host sidecar
         run: bash scripts/build-sidecar.sh
+      # The Intel leg only. packaging.rs's stale-row test re-stats the sidecar gui/size-budget.json
+      # records — binaries/daily-briefing-aarch64-apple-darwin — whenever binaries/ exists, and FAILS
+      # when it is absent. On the arm64 leg that file IS the host sidecar; here it is cross-built (the
+      # script takes the triple as its argument), so `cargo test` runs with no --skip on both legs. The
+      # bundle takes only binaries/daily-briefing-<target> (tauri-bundler settings.rs `copy_binaries`),
+      # so this file never reaches the x64 app: the M2b dry run's x64 leg had both files in binaries/,
+      # and its bundled sidecar was `Mach-O thin (x86_64)`.
+      - name: Size-budget sidecar (aarch64, Intel leg)
+        if: matrix.triple == 'x86_64-apple-darwin'
+        run: bash scripts/build-sidecar.sh aarch64-apple-darwin
       # GUI gates, in BOTH legs: a GUI failure marks every macOS leg build-failed, never just one.
-      # `cargo test` runs unskipped here (the size-budget stale-row test holds on macOS).
+      # `cargo test` runs unskipped on both legs: the size-budget stale-row test holds on each, because
+      # the aarch64 sidecar it re-stats exists on each (above).
       - name: GUI tests (suite, svelte-check, cargo test)
         id: gui-tests
         run: |
@@ -310,15 +339,9 @@ jobs:
               printf '%s\n' "$info" | grep -Fxq "Signature=adhoc" || fail "$bin: no 'Signature=adhoc' line (unsigned mode)"
             fi
           done
-          if [ "$LIPO_ARCH" = arm64 ]; then
-            got="$("$sidecar" --version)"
-            [ "$got" = "$version" ] || fail "sidecar --version printed '$got', expected '$version'"
-          elif arch -x86_64 /usr/bin/true 2>/dev/null; then
-            got="$(arch -x86_64 "$sidecar" --version)"
-            [ "$got" = "$version" ] || fail "sidecar --version (Rosetta) printed '$got', expected '$version'"
-          else
-            echo "SKIP: x86_64 sidecar --version — Rosetta is not available on this runner (arch -x86_64 /usr/bin/true failed)"
-          fi
+          # Natively, on both legs: each runs on its own architecture (the toolchain step checked the host).
+          got="$("$sidecar" --version)"
+          [ "$got" = "$version" ] || fail "sidecar --version printed '$got', expected '$version'"
           echo "smoke: ok ($LEG, $SIGNING)"
       # The bundle-status derivation. Reads .outcome (never .conclusion) of exactly these step ids and
       # nothing else; none of them carries continue-on-error, so no failure can hide outside it.
@@ -378,6 +401,7 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
+        shell: bash
         working-directory: gui
     env:
       TRIPLE: x86_64-unknown-linux-gnu
@@ -436,7 +460,13 @@ jobs:
           exit "$rc"
       # In $RUNNER_TEMP/smoke, never the staged dir: the extraction must leave nothing beside the assets
       # that get uploaded.
-      - name: Smoke (AppImage sidecar --version, deb metadata and contents)
+      # The AppImage half checks the layout gui/src-tauri/tauri.linux.conf.json's
+      # bundle.linux.appimage.files sets up. linuxdeploy rewrites the RPATH of every ELF file in
+      # usr/bin, and that rewrite made the engine segfault (M2b probe, 2026-10-01). So the AppImage keeps
+      # the engine in usr/libexec/daily-briefing/, which linuxdeploy never reads, byte-identical to what
+      # build-sidecar.sh compiled, and puts the tracked shell wrapper at usr/bin/daily-briefing, where
+      # the GUI looks for its sidecar. --version runs THROUGH the wrapper, the path the GUI takes.
+      - name: Smoke (AppImage wrapper and engine, deb metadata and contents)
         id: smoke
         run: |
           set -euo pipefail
@@ -447,8 +477,23 @@ jobs:
           cp "$RUNNER_TEMP/stage/daily-briefing-$version-linux-x86_64.AppImage" "$work/app.AppImage"
           chmod +x "$work/app.AppImage"
           (cd "$work" && ./app.AppImage --appimage-extract >/dev/null)
-          got="$("$work/squashfs-root/usr/bin/daily-briefing" --version)"
-          [ "$got" = "$version" ] || fail "AppImage sidecar --version printed '$got', expected '$version'"
+          wrapper="$work/squashfs-root/usr/bin/daily-briefing"
+          engine="$work/squashfs-root/usr/libexec/daily-briefing/daily-briefing"
+          [ -f "$wrapper" ] || fail "AppImage: usr/bin/daily-briefing is missing"
+          [ -x "$wrapper" ] || fail "AppImage: usr/bin/daily-briefing is not executable"
+          shebang=""
+          IFS= read -r shebang <"$wrapper" || true
+          [ "$shebang" = "#!/bin/sh" ] || fail "AppImage: usr/bin/daily-briefing is not the shell wrapper (its first line is not #!/bin/sh)"
+          cmp -s src-tauri/linux/daily-briefing-appimage-wrapper.sh "$wrapper" \
+            || fail "AppImage: usr/bin/daily-briefing differs from src-tauri/linux/daily-briefing-appimage-wrapper.sh"
+          [ -f "$engine" ] || fail "AppImage: usr/libexec/daily-briefing/daily-briefing is missing"
+          [ -x "$engine" ] || fail "AppImage: usr/libexec/daily-briefing/daily-briefing is not executable"
+          built="$(sha256sum "src-tauri/binaries/daily-briefing-$TRIPLE" | cut -d' ' -f1)"
+          packed="$(sha256sum "$engine" | cut -d' ' -f1)"
+          echo "smoke: AppImage engine sha256 $packed, build-sidecar.sh output sha256 $built"
+          [ "$packed" = "$built" ] || fail "AppImage: the engine is not byte-identical to src-tauri/binaries/daily-briefing-$TRIPLE"
+          got="$("$wrapper" --version)" || fail "AppImage: --version through the wrapper exited non-zero"
+          [ "$got" = "$version" ] || fail "AppImage: --version through the wrapper printed '$got', expected '$version'"
           deb="$RUNNER_TEMP/stage/daily-briefing_${version}_amd64.deb"
           info="$(dpkg-deb --info "$deb")"
           printf '%s\n' "$info"
@@ -511,6 +556,7 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
+        shell: bash
         working-directory: gui
     env:
       LEG: windows-x64

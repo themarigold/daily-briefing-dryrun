@@ -2752,7 +2752,7 @@ the three mechanisms Tauri 2 offers):
 | file | `bundle.targets` | also carries |
 | --- | --- | --- |
 | `tauri.macos.conf.json` | `["app", "dmg"]` — built separately per arch (`--target aarch64-apple-darwin` / `x86_64-apple-darwin`), NOT universal: a universal binary would carry two ~62 MB sidecars | `bundle.macOS`: the signing parameterization and the DMG wiring below |
-| `tauri.linux.conf.json` | `["appimage", "deb"]` | nothing else |
+| `tauri.linux.conf.json` | `["appimage", "deb"]` | `bundle.linux.appimage.files` only (2026-10-01, below): the AppImage carries the engine at `/usr/libexec/daily-briefing/daily-briefing` and the shell wrapper `linux/daily-briefing-appimage-wrapper.sh` at `/usr/bin/daily-briefing`; the .deb is untouched |
 | `tauri.windows.conf.json` | `["nsis"]` — CI-only experimental (binding C3) | `bundle.windows.webviewInstallMode`: `downloadBootstrapper`, silent (the smallest installer; needs network at INSTALL time, which is the installer's disclosure, not the app's) |
 
 The CLI merges the platform file over the base by JSON MERGE PATCH (RFC 7396 — tauri-utils
@@ -2763,6 +2763,21 @@ a platform file silently override the base on one platform only, `tests/packagin
 the EXACT key sets of all three files, the base's `targets` ABSENCE, and `bundle.licenseFile`
 absence in EVERY conf file (dev 149's pin covered the base; the macOS file is the live
 hazard — the DMG target is exactly where `--eula` bites).
+
+**The AppImage keeps the engine out of linuxdeploy's reach** (user-directed 2026-10-01, "B: try
+AppImage, else .deb"). Measured in the M2b linux-bundle-probe: linuxdeploy, which tauri-bundler
+2.9.4 runs over the AppDir, set an RPATH on the Bun-compiled engine that `externalBin` puts in
+`usr/bin`; the patched engine segfaulted and the bundle aborted. linuxdeploy rewrites every ELF
+file directly in `usr/bin` and every ELF under `usr/lib`, skips non-ELF files, and never reads
+`usr/libexec`. So `bundle.linux.appimage.files` (copied after the `externalBin` copy, overwriting
+it) puts the engine, unmodified, at `/usr/libexec/daily-briefing/daily-briefing` and a POSIX `sh`
+wrapper over `/usr/bin/daily-briefing`, where the GUI looks for its sidecar. The wrapper resolves
+its own path with `readlink -f` (so symlinks to it work) and `exec`s the engine with every
+argument. The source triple is fixed at `x86_64-unknown-linux-gnu`, the Linux leg's only target.
+The .deb never reads this map (`deb.files` is its own key) and still ships the engine at
+`/usr/bin/daily-briefing`. `tests/packaging.rs` pins the map, the wrapper's mode and statements;
+the release smoke checks the built AppImage (wrapper at `usr/bin`, engine byte-identical at
+`usr/libexec`, `--version` through the wrapper).
 
 **DMG wiring — §14a's handoff, consumed verbatim** (`bundle.macOS.dmg`): background
 `branding/dmg-background.png` (@1x — deviation 151), window 660×400, app at (180, 210),

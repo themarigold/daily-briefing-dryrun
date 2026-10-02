@@ -279,8 +279,8 @@ export function resolveIdentity(opts: { identity?: string }, env: NodeJS.Process
   return opts.identity || env.DBA_SIGN_IDENTITY || DEFAULT_SIGN_IDENTITY;
 }
 
-/** Mirrors `scripts/install.sh:22-24`: LibreSSL's `req` lacks `-addext`, which the identity needs, so
- *  a Homebrew openssl is preferred when present. Resolved through the exec seam rather than by
+/** Mirrors `scripts/install.sh:22-24`: a Homebrew openssl is preferred when present, because macOS's
+ *  LibreSSL `pkcs12` has no `-legacy` (its `req` does have `-addext`; measured with LibreSSL 3.3.6). Resolved through the exec seam rather than by
  *  stat-ing paths, so a test never depends on what is installed on the runner. */
 async function openssl(exec: Exec): Promise<string> {
   for (const p of ["/opt/homebrew/bin/openssl", "/usr/local/bin/openssl"]) {

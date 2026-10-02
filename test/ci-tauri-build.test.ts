@@ -103,7 +103,8 @@ describe("ci-tauri-build.sh: the signing identity", () => {
     expect(`${r.code} ${r.out}`).toStartWith("0 ");
     expect(r.out).toContain("signing: unsigned");
     expect(r.env?.APPLE_SIGNING_IDENTITY).toBe("-");
-    expect(r.argv).toEqual(["build", "--target", "aarch64-apple-darwin"]);
+    // --verbose on every leg: without it the bundler discards linuxdeploy's output (M2b release run).
+    expect(r.argv).toEqual(["build", "--verbose", "--target", "aarch64-apple-darwin"]);
   });
 
   test("unsigned on macOS overrides an identity that arrived in the environment", () => {
@@ -119,7 +120,7 @@ describe("ci-tauri-build.sh: the signing identity", () => {
       expect(`${r.code} ${r.out}`).toStartWith("0 ");
       expect(r.env).not.toBeNull();
       expect("APPLE_SIGNING_IDENTITY" in r.env!).toBe(false);
-      expect(r.argv).toEqual(["build", "--target", "x86_64-unknown-linux-gnu"]);
+      expect(r.argv).toEqual(["build", "--verbose", "--target", "x86_64-unknown-linux-gnu"]);
     }
   });
 
@@ -161,7 +162,7 @@ describe("ci-tauri-build.sh: the signing identity", () => {
   test("the build's own exit status is the script's", () => {
     const r = run(["aarch64-apple-darwin", "unsigned"], "Darwin", {}, 7);
     expect(r.code).toBe(7);
-    expect(r.argv).toEqual(["build", "--target", "aarch64-apple-darwin"]);
+    expect(r.argv).toEqual(["build", "--verbose", "--target", "aarch64-apple-darwin"]);
   });
 });
 

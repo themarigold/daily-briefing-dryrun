@@ -46,6 +46,7 @@ interface Step {
   with?: Record<string, unknown>;
   "continue-on-error"?: unknown;
   "working-directory"?: string;
+  shell?: string;
 }
 interface Job {
   needs?: string | string[];
@@ -55,12 +56,12 @@ interface Job {
   "continue-on-error"?: unknown;
   permissions?: unknown;
   strategy?: { "fail-fast"?: unknown; matrix?: { include?: Record<string, string>[] } };
-  defaults?: { run?: { "working-directory"?: string } };
+  defaults?: { run?: { shell?: string; "working-directory"?: string } };
   env?: Env;
   outputs?: Env;
   steps: Step[];
 }
-interface Workflow { on: unknown; permissions?: unknown; env?: Env; defaults?: unknown; jobs: Record<string, Job> }
+interface Workflow { on: unknown; permissions?: unknown; env?: Env; defaults?: { run?: { shell?: string; "working-directory"?: string } }; jobs: Record<string, Job> }
 
 const parse = (wf: string): Workflow => Bun.YAML.parse(readFileSync(workflowFile(wf), "utf8")) as Workflow;
 const W = parse("release.yml");
@@ -87,6 +88,30 @@ const allEnvMaps = (wf: Workflow): [string, Env][] => {
   return out;
 };
 const runs = (job: Job): string[] => job.steps.map((s) => s.run ?? "");
+/** Every runner label a job can land on, as `<job>: <label>`: its literal `runs-on`, or — for
+ *  `${{ matrix.<key> }}` — every value that key takes, from the matrix's own list and its `include` rows. */
+const runnerLabels = (wf: Workflow): string[] =>
+  Object.entries(wf.jobs).flatMap(([jn, job]) => {
+    const on = String(job["runs-on"]);
+    const key = /^\$\{\{ matrix\.([\w-]+) \}\}$/.exec(on)?.[1];
+    if (key === undefined) return [`${jn}: ${on}`];
+    const matrix = (job.strategy?.matrix ?? {}) as Record<string, unknown> & { include?: Record<string, string>[] };
+    const values = [...((matrix[key] as string[] | undefined) ?? []), ...(matrix.include ?? []).map((row) => row[key])];
+    // A matrix-valued runs-on that resolves to nothing would make every assertion over it vacuous.
+    expect(`${jn}: ${values.length > 0 && values.every((v) => typeof v === "string")}`).toBe(`${jn}: true`);
+    return values.map((v) => `${jn}: ${v}`);
+  });
+/** The shell a `run:` step gets, resolved the way the runner resolved it in the M2b release run
+ *  (2026-10-01): the step's own `shell`, else — when the job HAS a `defaults.run` block — that block's
+ *  `shell`, else the workflow's. A job-level block REPLACES the workflow-level one; it does not merge per
+ *  key: with only `working-directory: gui` at job level, bundle-windows ran every step in PowerShell and
+ *  the macOS/Linux legs ran `bash -e {0}` (no pipefail), under a workflow-level `shell: bash`. */
+const shellOf = (wf: Workflow, job: Job, step: Step): string | undefined =>
+  step.shell ?? (job.defaults?.run !== undefined ? job.defaults.run.shell : wf.defaults?.run?.shell);
+/** Every `run:` step of every job that carries its own `defaults.run` block, with its resolved shell. */
+const shellsUnderJobDefaults = (wf: Workflow): string[] =>
+  Object.entries(wf.jobs).filter(([, job]) => job.defaults?.run !== undefined).flatMap(([jn, job]) =>
+    job.steps.flatMap((s, i) => (s.run === undefined ? [] : [`${jn}/${s.id ?? s.name ?? i}: ${shellOf(wf, job, s)}`])));
 
 describe("release.yml: trigger, permissions, jobs", () => {
   test("the trigger is exactly a v* tag push — no pull_request leg, so secrets stay unreachable from forks", () => {
@@ -121,6 +146,42 @@ describe("release.yml: trigger, permissions, jobs", () => {
       ["macos-arm64", "aarch64-apple-darwin"],
       ["macos-x64", "x86_64-apple-darwin"],
     ]);
+  });
+
+  test("each macOS leg runs NATIVELY: arm64 on macos-26, x64 on macos-26-intel (user-directed 2026-10-01)", () => {
+    const mac = J["bundle-macos"]!;
+    expect(mac["runs-on"]).toBe("${{ matrix.runner }}");
+    expect(mac.strategy?.matrix?.include?.map((l) => [l.leg, l.runner, l.triple, l["lipo-arch"]])).toEqual([
+      ["macos-arm64", "macos-26", "aarch64-apple-darwin", "arm64"],
+      ["macos-x64", "macos-26-intel", "x86_64-apple-darwin", "x86_64"],
+    ]);
+  });
+
+  test("no job in either public workflow runs on macos-14 (retired: actions/runner-images#13518)", () => {
+    const C = parse("ci.yml");
+    const labels = [...runnerLabels(W), ...runnerLabels(C)];
+    // \b after the 14: every macos-14 variant (-large, -xlarge) is caught too.
+    expect(labels.filter((l) => /\bmacos-14\b/.test(l))).toEqual([]);
+    // Non-vacuity: the resolver reaches both a matrix-valued runs-on and a literal one.
+    expect(labels).toContain("bundle-macos: macos-26-intel");
+    expect(labels).toContain("cargo-macos: macos-26");
+    // Backstop over everything a job carries (comments are not parsed, so prose may still name it).
+    for (const wf of [W, C]) expect(JSON.stringify(wf.jobs)).not.toMatch(/macos-14/);
+  });
+
+  test("every run step resolves to shell: bash (Git Bash on Windows) — a job-level defaults block replaces the workflow's", () => {
+    // The resolver models REPLACEMENT, not a per-key merge (a merge would have hidden the M2b failure).
+    expect(shellOf({ on: null, defaults: { run: { shell: "bash" } }, jobs: {} }, { steps: [], defaults: { run: { "working-directory": "gui" } } }, { run: "x" })).toBeUndefined();
+    expect(shellOf({ on: null, defaults: { run: { shell: "bash" } }, jobs: {} }, { steps: [] }, { run: "x" })).toBe("bash");
+    for (const [jn, job] of Object.entries(J)) {
+      const resolved = job.steps.flatMap((s, i) => (s.run === undefined ? [] : [`${jn}/${s.id ?? s.name ?? i}: ${shellOf(W, job, s)}`]));
+      // Non-vacuity: every job has run steps to resolve.
+      expect(`${jn}: ${resolved.length > 0}`).toBe(`${jn}: true`);
+      for (const r of resolved) expect(r).toEndWith(": bash");
+    }
+    // The bundle jobs' blocks name it themselves (they set working-directory: gui, so the workflow's
+    // `shell: bash` never reaches them).
+    for (const jn of BUNDLE_JOBS) expect(`${jn}: ${J[jn]!.defaults?.run?.shell}`).toBe(`${jn}: bash`);
   });
 
   test("bundle-windows is informational: job-level continue-on-error: true (C3)", () => {
@@ -439,9 +500,11 @@ describe("release.yml: bundle legs", () => {
     expect(run).toMatch(/grep -Fxq "Authority=\$IDENTITY" \|\| fail/);
     expect(run).toMatch(/grep -Fxq "Signature=adhoc" \|\| fail/);
     expect(run).toMatch(/if \[ "\$SIGNING" = signed \]; then/);
-    expect(run).toMatch(/got="\$\("\$sidecar" --version\)"/);
-    expect(run).toMatch(/arch -x86_64 \/usr\/bin\/true/);
-    expect(run).toMatch(/SKIP: x86_64 sidecar --version/);
+    // --version runs NATIVELY on both legs, unconditionally: no Rosetta branch, no arch switch, no SKIP.
+    expect(run).toMatch(/^\s*got="\$\("\$sidecar" --version\)"\n\s*\[ "\$got" = "\$version" \] \|\| fail "sidecar --version printed '\$got', expected '\$version'"$/m);
+    expect(run.match(/"\$sidecar" --version/g)?.length).toBe(1);
+    expect(run).not.toMatch(/\barch -|Rosetta|SKIP/);
+    expect(run).not.toMatch(/if \[ "\$LIPO_ARCH"/);
     // The image never stays attached: an EXIT trap set right after the attach, BEFORE the copy, force-
     // detaches on any exit; the normal detach gets one forced retry and then fails the step.
     // ⚠ AND THE TRAP IS CLEARED ON THE LINE RIGHT AFTER THAT DETACH — so the forced detach never runs
@@ -462,70 +525,159 @@ describe("release.yml: bundle legs", () => {
   });
 
   // The Linux smoke, RUN — not pattern-matched. A stub `dpkg-deb` first on PATH serves a real tarball
-  // (built here with `tar`) as the package's data member, and a stub AppImage extracts a sidecar that
-  // prints the version. The tarball is built in BOTH member-name forms: BARE (`usr/bin/…`, what
-  // tauri-bundler writes — debian.rs `strip_prefix`) and `./`-prefixed (what `dpkg-deb --build` writes).
-  // The old `dpkg-deb --contents | sed -n 's|^.* \./|./|p'` listing found nothing in the bare form, so
-  // every healthy Linux leg was marked build-failed; this test fails on that sed.
-  test("Linux smoke, run: the deb member check passes for bare AND ./-prefixed member names, fails on a missing one", () => {
-    const script = stepById(linux, "smoke").run!;
-    const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-linux-smoke-")));
-    const version = "0.2.0";
-    const required = ["usr/bin/daily-briefing-gui", "usr/bin/daily-briefing", "usr/share/applications/Daily Briefing.desktop"];
+  // (built here with `tar`) as the package's data member, and a stub AppImage extracts the layout the
+  // conf ships (gui/src-tauri/tauri.linux.conf.json, bundle.linux.appimage.files): the TRACKED wrapper
+  // at usr/bin/daily-briefing and the built engine at usr/libexec/daily-briefing/daily-briefing, both
+  // copied from a fake gui/ tree that is the step's working directory. The engine is a stub printing a
+  // version, and the step's `--version` runs it THROUGH the real wrapper. `layout` swaps in each broken
+  // variant the AppImage half must refuse.
+  interface LinuxSmokeOpts {
+    debMembers?: string[];
+    prefixed?: boolean;
+    /** What the AppImage puts at usr/bin/daily-briefing and at usr/libexec/daily-briefing/daily-briefing. */
+    layout?: { bin: "wrapper" | "engine" | "edited-wrapper" | "wrapper-0644" | "missing"; libexec: "engine" | "engine-0644" | "patched-engine" | "missing" };
+    /** What the built engine prints for --version; null makes it exit 3 instead. */
+    engineVersion?: string | null;
+    /** The fake tree's copy of the tracked wrapper (default: the real one), which the AppImage stub copies. */
+    wrapperText?: string;
+  }
+  const SMOKE_VERSION = "0.2.0";
+  const DEB_REQUIRED = ["usr/bin/daily-briefing-gui", "usr/bin/daily-briefing", "usr/share/applications/Daily Briefing.desktop"];
+  const TRACKED_WRAPPER = readFileSync(`${ROOT}gui/src-tauri/linux/daily-briefing-appimage-wrapper.sh`, "utf8");
+  const linuxSmoke = (dir: string, o: LinuxSmokeOpts = {}): { code: number; out: string } => {
+    const members = o.debMembers ?? DEB_REQUIRED;
+    const layout = o.layout ?? { bin: "wrapper", libexec: "engine" };
+    const engineVersion = o.engineVersion === undefined ? SMOKE_VERSION : o.engineVersion;
+    const triple = linux.env!.TRIPLE!;
     const sh = (cmd: string[], cwd?: string) => {
       const r = Bun.spawnSync(cmd, { cwd, env: { PATH: "/usr/bin:/bin" }, stdout: "pipe", stderr: "pipe" });
       expect(`${cmd.join(" ")}: ${r.exitCode} ${r.stderr}`).toBe(`${cmd.join(" ")}: 0 `);
     };
-    const smoke = (name: string, members: string[], prefixed: boolean) => {
-      const dir = join(base, name);
-      const root = join(dir, "root");
-      for (const m of members) {
-        mkdirSync(join(root, m, ".."), { recursive: true });
-        writeFileSync(join(root, m), "");
-      }
-      const tarball = join(dir, "data.tar");
-      sh(prefixed ? ["tar", "-cf", tarball, "-C", root, "."] : ["tar", "-cf", tarball, "-C", root, "usr"]);
-      const bin = join(dir, "bin");
-      const temp = join(dir, "runner-temp");
-      const stage = join(temp, "stage");
-      for (const d of [bin, stage]) mkdirSync(d, { recursive: true });
-      writeFileSync(join(bin, "dpkg-deb"),
-        "#!/bin/sh\n" +
-        "case \"$1\" in\n" +
-        `  --info) printf ' Package: daily-briefing\\n Version: ${version}\\n Architecture: amd64\\n' ;;\n` +
-        `  --fsys-tarfile) cat "${tarball}" ;;\n` +
-        // What the OLD smoke called: an `ls -l`-style listing, as dpkg-deb --contents prints it.
-        `  --contents) tar -tvf "${tarball}" ;;\n` +
-        "  *) echo \"dpkg-deb stub: unexpected $*\" >&2; exit 2 ;;\n" +
-        "esac\n", { mode: 0o755 });
-      writeFileSync(join(stage, `daily-briefing-${version}-linux-x86_64.AppImage`),
-        "#!/bin/sh\n" +
-        "[ \"$1\" = --appimage-extract ] || exit 2\n" +
-        "mkdir -p squashfs-root/usr/bin\n" +
-        `printf '#!/bin/sh\\necho ${version}\\n' > squashfs-root/usr/bin/daily-briefing\n` +
-        "chmod +x squashfs-root/usr/bin/daily-briefing\n", { mode: 0o755 });
-      writeFileSync(join(stage, `daily-briefing_${version}_amd64.deb`), "stub: dpkg-deb never reads it\n");
-      const r = Bun.spawnSync(["bash", "-c", script], {
-        env: { PATH: `${bin}:/usr/bin:/bin`, RUNNER_TEMP: temp, GITHUB_REF_NAME: `v${version}`, LEG: "linux-x86_64" },
-        stdout: "pipe", stderr: "pipe",
-      });
-      return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
-    };
+    const root = join(dir, "root");
+    for (const m of members) {
+      mkdirSync(join(root, m, ".."), { recursive: true });
+      writeFileSync(join(root, m), "");
+    }
+    const tarball = join(dir, "data.tar");
+    sh(o.prefixed ? ["tar", "-cf", tarball, "-C", root, "."] : ["tar", "-cf", tarball, "-C", root, "usr"]);
+    const bin = join(dir, "bin");
+    const temp = join(dir, "runner-temp");
+    const stage = join(temp, "stage");
+    const gui = join(dir, "gui");
+    for (const d of [bin, stage, join(gui, "src-tauri", "linux"), join(gui, "src-tauri", "binaries")]) mkdirSync(d, { recursive: true });
+    const wrapperSrc = join(gui, "src-tauri", "linux", "daily-briefing-appimage-wrapper.sh");
+    const engineSrc = join(gui, "src-tauri", "binaries", `daily-briefing-${triple}`);
+    writeFileSync(wrapperSrc, o.wrapperText ?? TRACKED_WRAPPER, { mode: 0o755 });
+    // The real engine is ELF; the stub only has to differ from the wrapper in its first line, so bash.
+    writeFileSync(engineSrc, engineVersion === null ? "#!/bin/bash\nexit 3\n" : `#!/bin/bash\n[ "$1" = --version ] || exit 2\necho ${engineVersion}\n`, { mode: 0o755 });
+    // macOS keeps sha256sum in /sbin, off this PATH; shasum -a 256 prints the same "<hash>  <file>" line.
+    if (!existsSync("/usr/bin/sha256sum") && !existsSync("/bin/sha256sum")) {
+      writeFileSync(join(bin, "sha256sum"), '#!/bin/sh\nexec shasum -a 256 "$@"\n', { mode: 0o755 });
+    }
+    writeFileSync(join(bin, "dpkg-deb"),
+      "#!/bin/sh\n" +
+      "case \"$1\" in\n" +
+      `  --info) printf ' Package: daily-briefing\\n Version: ${SMOKE_VERSION}\\n Architecture: amd64\\n' ;;\n` +
+      `  --fsys-tarfile) cat "${tarball}" ;;\n` +
+      // What the OLD smoke called: an `ls -l`-style listing, as dpkg-deb --contents prints it.
+      `  --contents) tar -tvf "${tarball}" ;;\n` +
+      "  *) echo \"dpkg-deb stub: unexpected $*\" >&2; exit 2 ;;\n" +
+      "esac\n", { mode: 0o755 });
+    const ub = "squashfs-root/usr/bin/daily-briefing";
+    const ul = "squashfs-root/usr/libexec/daily-briefing/daily-briefing";
+    const binStep = {
+      wrapper: `cp "${wrapperSrc}" ${ub}; chmod 755 ${ub}`,
+      engine: `cp "${engineSrc}" ${ub}; chmod 755 ${ub}`,
+      "edited-wrapper": `cp "${wrapperSrc}" ${ub}; chmod 755 ${ub}; printf '# edited\\n' >> ${ub}`,
+      "wrapper-0644": `cp "${wrapperSrc}" ${ub}; chmod 644 ${ub}`,
+      missing: ":",
+    }[layout.bin];
+    const libexecStep = {
+      engine: `cp "${engineSrc}" ${ul}; chmod 755 ${ul}`,
+      "engine-0644": `cp "${engineSrc}" ${ul}; chmod 644 ${ul}`,
+      // Grown by a few bytes and still runnable, as linuxdeploy's rpath rewrite left it.
+      "patched-engine": `cp "${engineSrc}" ${ul}; chmod 755 ${ul}; printf '# patched\\n' >> ${ul}`,
+      missing: ":",
+    }[layout.libexec];
+    writeFileSync(join(stage, `daily-briefing-${SMOKE_VERSION}-linux-x86_64.AppImage`),
+      "#!/bin/sh\nset -e\n" +
+      "[ \"$1\" = --appimage-extract ] || exit 2\n" +
+      "mkdir -p squashfs-root/usr/bin squashfs-root/usr/libexec/daily-briefing\n" +
+      `${binStep}\n${libexecStep}\n`, { mode: 0o755 });
+    writeFileSync(join(stage, `daily-briefing_${SMOKE_VERSION}_amd64.deb`), "stub: dpkg-deb never reads it\n");
+    const r = Bun.spawnSync(["bash", "-c", stepById(linux, "smoke").run!], {
+      cwd: gui,
+      env: { PATH: `${bin}:/usr/bin:/bin`, RUNNER_TEMP: temp, GITHUB_REF_NAME: `v${SMOKE_VERSION}`, LEG: "linux-x86_64", TRIPLE: triple },
+      stdout: "pipe", stderr: "pipe",
+    });
+    return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
+  };
+
+  // The deb half. The tarball is built in BOTH member-name forms: BARE (`usr/bin/…`, what tauri-bundler
+  // writes — debian.rs `strip_prefix`) and `./`-prefixed (what `dpkg-deb --build` writes). The old
+  // `dpkg-deb --contents | sed -n 's|^.* \./|./|p'` listing found nothing in the bare form, so every
+  // healthy Linux leg was marked build-failed; this test fails on that sed.
+  test("Linux smoke, run: the deb member check passes for bare AND ./-prefixed member names, fails on a missing one", () => {
+    const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-linux-smoke-")));
     for (const prefixed of [false, true]) {
       const form = prefixed ? "./-prefixed" : "bare";
-      const ok = smoke(`ok-${form.replace(/\W/g, "")}`, required, prefixed);
+      const ok = linuxSmoke(join(base, `ok-${form.replace(/\W/g, "")}`), { prefixed });
       expect(`${form}: ${ok.code} ${ok.out}`).toStartWith(`${form}: 0 `);
       expect(ok.out).toContain("smoke: ok (linux-x86_64)");
       // Exact-line match: a missing file is caught even when a longer sibling name starts with it.
-      for (const drop of required) {
-        const r = smoke(`missing-${form.replace(/\W/g, "")}-${required.indexOf(drop)}`, required.filter((m) => m !== drop), prefixed);
+      for (const drop of DEB_REQUIRED) {
+        const r = linuxSmoke(join(base, `missing-${form.replace(/\W/g, "")}-${DEB_REQUIRED.indexOf(drop)}`),
+          { debMembers: DEB_REQUIRED.filter((m) => m !== drop), prefixed });
         expect(`${form} without ${drop}: ${r.code}`).toBe(`${form} without ${drop}: 1`);
         expect(r.out).toContain(`deb: ${drop} is missing from the package contents`);
       }
     }
-    // Eight full smoke runs, each executing three freshly written scripts: macOS scans every new
+    // Eight full smoke runs, each executing several freshly written scripts: macOS scans every new
     // executable on first exec (~0.2 s each, measured 2026-10-01), so the 5 s default is too tight.
   }, 30_000);
+
+  // The AppImage half (user-directed 2026-10-01, "B: try AppImage, else .deb"): the layout the conf sets
+  // up, checked on the extracted AppImage, each broken variant refused by name.
+  test("Linux smoke, run: the AppImage carries the tracked wrapper at usr/bin and the built engine, byte-identical, at usr/libexec; --version goes through the wrapper", () => {
+    const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-linux-appimage-smoke-")));
+    const ok = linuxSmoke(join(base, "ok"));
+    expect(`healthy layout: ${ok.code} ${ok.out}`).toStartWith("healthy layout: 0 ");
+    expect(ok.out).toContain("smoke: ok (linux-x86_64)");
+    expect(ok.out).toMatch(/^smoke: AppImage engine sha256 ([0-9a-f]{64}), build-sidecar\.sh output sha256 \1$/m);
+    const misdirected = TRACKED_WRAPPER.replace("/../libexec/", "/../lib/");
+    expect(misdirected).not.toBe(TRACKED_WRAPPER);
+    const refused: [string, LinuxSmokeOpts, RegExp][] = [
+      ["the engine itself at usr/bin (the layout linuxdeploy broke)", { layout: { bin: "engine", libexec: "engine" } },
+        /AppImage: usr\/bin\/daily-briefing is not the shell wrapper/],
+      ["an edited wrapper", { layout: { bin: "edited-wrapper", libexec: "engine" } },
+        /AppImage: usr\/bin\/daily-briefing differs from src-tauri\/linux\/daily-briefing-appimage-wrapper\.sh/],
+      ["a non-executable wrapper", { layout: { bin: "wrapper-0644", libexec: "engine" } },
+        /AppImage: usr\/bin\/daily-briefing is not executable/],
+      ["no wrapper", { layout: { bin: "missing", libexec: "engine" } },
+        /AppImage: usr\/bin\/daily-briefing is missing/],
+      ["no engine in usr/libexec", { layout: { bin: "wrapper", libexec: "missing" } },
+        /AppImage: usr\/libexec\/daily-briefing\/daily-briefing is missing/],
+      ["a non-executable engine", { layout: { bin: "wrapper", libexec: "engine-0644" } },
+        /AppImage: usr\/libexec\/daily-briefing\/daily-briefing is not executable/],
+      ["a patched engine", { layout: { bin: "wrapper", libexec: "patched-engine" } },
+        /AppImage: the engine is not byte-identical to src-tauri\/binaries\/daily-briefing-x86_64-unknown-linux-gnu/],
+      ["an engine printing another version", { engineVersion: "0.1.9" },
+        /AppImage: --version through the wrapper printed '0\.1\.9', expected '0\.2\.0'/],
+      ["an engine that fails", { engineVersion: null },
+        /AppImage: --version through the wrapper exited non-zero/],
+      // Wrapper and engine both match their sources, but the wrapper points nowhere: only a --version
+      // that goes THROUGH the wrapper can catch this (one run against the engine directly would pass).
+      ["a wrapper whose target is wrong", { wrapperText: misdirected },
+        /AppImage: --version through the wrapper exited non-zero/],
+    ];
+    refused.forEach(([what, opts, why], i) => {
+      const r = linuxSmoke(join(base, `refused-${i}`), opts);
+      expect(`${what}: ${r.code}`).toBe(`${what}: 1`);
+      expect(r.out).toMatch(why);
+      expect(r.out).not.toContain("smoke: ok");
+    });
+    // Eleven full smoke runs (see the deb test's timing note).
+  }, 60_000);
 
   test("the size step checks the staged DMG and the built .app against their matrix rows", () => {
     const run = stepById(mac, "size").run!;
@@ -571,10 +723,66 @@ describe("release.yml: bundle legs", () => {
     for (const job of [mac, linux]) expect(job.steps[0]!.uses).toMatch(/^actions\/checkout@/);
   });
 
-  test("bundle-linux runs on the pinned ubuntu-22.04 image; macOS on macos-14", () => {
+  test("bundle-linux runs on the pinned ubuntu-22.04 image; macOS per leg (matrix.runner, pinned above)", () => {
     expect(linux["runs-on"]).toBe("ubuntu-22.04");
-    expect(mac["runs-on"]).toBe("macos-14");
+    expect(mac["runs-on"]).toBe("${{ matrix.runner }}");
     expect(win["runs-on"]).toBe("windows-latest");
+  });
+
+  // The macOS toolchain step, RUN against stub rustup/rustc: native legs add no target, and a host that
+  // is not the leg's triple (a runner label resolving to the other architecture) fails the step, named.
+  test("macOS toolchain step, run: installs the pinned toolchain, adds no target, refuses a non-native host", () => {
+    const step = mac.steps.filter((s) => s.name === "Rust toolchain");
+    expect(step.length).toBe(1);
+    const script = step[0]!.run!;
+    const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-mac-toolchain-")));
+    const run = (host: string, triple: string) => {
+      const dir = join(base, `${host}--${triple}`);
+      const bin = join(dir, "bin");
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(join(dir, "rust-toolchain.toml"), '[toolchain]\nchannel = "1.98.1"\n');
+      const calls = join(dir, "calls");
+      writeFileSync(calls, "");
+      writeFileSync(join(bin, "rustup"), `#!/bin/sh\necho "rustup $*" >> "${calls}"\n`, { mode: 0o755 });
+      writeFileSync(join(bin, "rustc"),
+        `#!/bin/sh\necho "rustc $*" >> "${calls}"\n[ "$2 $3" = "--print host-tuple" ] && echo ${host}\nexit 0\n`, { mode: 0o755 });
+      const r = Bun.spawnSync(["bash", "-c", script], {
+        cwd: dir, env: { PATH: `${bin}:/usr/bin:/bin`, TRIPLE: triple, LEG: "macos-test" }, stdout: "pipe", stderr: "pipe",
+      });
+      return { code: r.exitCode, err: r.stderr.toString(), calls: readFileSync(calls, "utf8") };
+    };
+    for (const { triple } of mac.strategy!.matrix!.include!) {
+      const ok = run(triple!, triple!);
+      expect(`${triple}: ${ok.code} ${ok.err}`).toBe(`${triple}: 0 `);
+      // Exactly these two calls: no `rustup target add` on a native leg.
+      expect(ok.calls).toBe("rustup toolchain install 1.98.1\nrustc +1.98.1 --print host-tuple\n");
+    }
+    const bad = run("aarch64-apple-darwin", "x86_64-apple-darwin");
+    expect(bad.code).toBe(1);
+    expect(bad.err).toContain("the macos-test leg builds x86_64-apple-darwin natively, but this runner's host is 'aarch64-apple-darwin'");
+  });
+
+  test("the Intel leg also builds the aarch64 sidecar size-budget.json records: after the host sidecar, before gui-tests", () => {
+    const host = mac.steps.findIndex((s) => s.run === "bash scripts/build-sidecar.sh");
+    const extra = mac.steps.map((s, i) => [s, i] as const).filter(([s]) => /build-sidecar\.sh \S/.test(s.run ?? ""));
+    expect(extra.length).toBe(1);
+    const [step, at] = extra[0]!;
+    const built = /^bash scripts\/build-sidecar\.sh ([\w-]+)$/.exec(step.run!)?.[1];
+    expect(built).toBe("aarch64-apple-darwin");
+    // It is the triple of the row packaging.rs's stale-row test re-stats — read, not retyped.
+    const budget = JSON.parse(readFileSync(`${ROOT}gui/size-budget.json`, "utf8")) as { sidecar: { path: string } };
+    expect(budget.sidecar.path).toBe(`src-tauri/binaries/daily-briefing-${built}`);
+    expect(host).toBeGreaterThanOrEqual(0);
+    expect(host).toBeLessThan(at);
+    expect(at).toBeLessThan(indexOfId(mac, "gui-tests"));
+    // It runs on exactly the legs whose host sidecar is NOT that one, i.e. the Intel leg.
+    expect(step.if).toBe("matrix.triple == 'x86_64-apple-darwin'");
+    const legs = mac.strategy!.matrix!.include!;
+    const runsOn = legs.filter((l) => `matrix.triple == '${l.triple}'` === step.if).map((l) => l.leg);
+    expect(runsOn).toEqual(legs.filter((l) => l.triple !== built).map((l) => l.leg));
+    expect(runsOn).toEqual(["macos-x64"]);
+    // And outside the derivation: no id, so the marker never reads it.
+    expect(step.id).toBeUndefined();
   });
 });
 
@@ -720,12 +928,29 @@ describe("ci.yml (public)", () => {
     expect(gui.defaults?.run?.["working-directory"]).toBe("gui");
   });
 
-  test("a full, unskipped cargo test on macos-14", () => {
+  test("a full, unskipped cargo test on macos-26", () => {
     const mac = C.jobs["cargo-macos"]!;
-    expect(mac["runs-on"]).toBe("macos-14");
+    expect(mac["runs-on"]).toBe("macos-26");
     expect(runs(mac)).toContain("cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast");
     expect(runs(mac).join("\n")).not.toContain("--skip");
     expect(runs(mac)).toContain("bash scripts/build-sidecar.sh");
+  });
+
+  test("cargo-macos installs the GUI deps (frozen) in gui/ before its cargo test", () => {
+    // tests/icons.rs `regeneration_check_gate` (macOS-only) runs scripts/generate-branding.sh --check,
+    // which needs gui/node_modules/.bin/tauri; without the install it failed (M2b CI run, 2026-10-01).
+    const mac = C.jobs["cargo-macos"]!;
+    const r = runs(mac);
+    const install = r.indexOf("bun install --frozen-lockfile");
+    expect(install).toBeGreaterThanOrEqual(0);
+    expect(install).toBeLessThan(r.indexOf("cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast"));
+    expect(workdir(mac, mac.steps[install]!)).toBe("gui");
+  });
+
+  test("every job-level defaults block names shell: bash (it replaces, never merges with, a workflow-level one)", () => {
+    const resolved = shellsUnderJobDefaults(C);
+    expect(resolved.length).toBeGreaterThan(5);
+    for (const r of resolved) expect(r).toEndWith(": bash");
   });
 
   test("the only --skip in the public CI is that one", () => {
@@ -747,4 +972,8 @@ test.skipIf(!IN_MONOREPO)("daily-briefing-ci.yml (monorepo): an ubuntu cargo tes
   expect(Object.values(M.jobs).flatMap((j) => runs(j)).join("\n").match(/--skip [\w-]+/g)).toEqual([`--skip ${SKIP}`]);
   // No macOS job in the private monorepo (billed at a multiple).
   expect(Object.values(M.jobs).map((j) => j["runs-on"]).filter((o) => String(o).startsWith("macos"))).toEqual([]);
+  // Every job-level defaults block names shell: bash (it replaces the workflow-level block wholesale).
+  const resolved = shellsUnderJobDefaults(M);
+  expect(resolved.length).toBeGreaterThan(5);
+  for (const r of resolved) expect(r).toEndWith(": bash");
 });

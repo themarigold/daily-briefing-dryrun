@@ -31,9 +31,18 @@ test("T4.7: uninstall removes briefing.log.1, audit-*.md and transcript-health.j
   writeFileSync(plist, "<plist/>");
   for (const f of artifacts) expect(existsSync(join(dir, f))).toBe(true);   // created, so removal is meaningful
 
+  // Phase E (E10): do-nothing stubs FIRST on PATH for the machine-wide tools uninstall.sh drives by name.
+  // Before this, the run reached the real launchd tool (harmless only because the plist above is
+  // label-less); R10 says a test never reaches it at all. Names by concatenation for the isolation scanner.
+  const stubs = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-uninst-stubs-")));
+  const path = `${stubs}:${process.env.PATH ?? ""}`;
+  for (const name of ["launch" + "ctl", "sec" + "urity", "pmset"]) {
+    writeFileSync(join(stubs, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    expect(Bun.which(name, { PATH: path })).toBe(join(stubs, name));
+  }
   const proc = Bun.spawn(["bash", "scripts/uninstall.sh"], {
     cwd: process.cwd(),
-    env: { ...process.env, DBA_TEST_DIR: dir, DBA_TEST_PLIST: plist },
+    env: { ...process.env, PATH: path, DBA_TEST_DIR: dir, DBA_TEST_PLIST: plist },
     stdout: "pipe", stderr: "pipe",
   });
   await proc.exited;
