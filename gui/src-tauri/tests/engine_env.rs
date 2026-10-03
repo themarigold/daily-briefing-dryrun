@@ -36,9 +36,12 @@
 mod common;
 
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
-use common::{env_dumper, parse_env, sleeper, ScratchDir};
+#[cfg(target_os = "macos")]
+use common::sleeper;
+use common::{env_dumper, parse_env, ScratchDir};
 use daily_briefing_gui_lib::engine::{
     forwarded_env, launchd_path, EngineClient, NoProgress, Operation, BUN_CRASH_REPORTING_OFF,
 };

@@ -31,8 +31,12 @@ const GIT = Bun.which("git")!;
 const V = "9.8.7";
 const GIT_ENV = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 
+// maintenance.auto=false: a commit otherwise forks a DETACHED `git maintenance run --auto` that outlives
+// the call and takes .git/objects/maintenance.lock. A case that then removes .git races that child, and
+// rmSync can return with .git still whole (measured with Homebrew git 2.55, which GitHub's macOS runner
+// puts first on PATH: .git survived in 25 of 40 fixtures; 0 of 40 with this flag).
 function git(cwd: string, ...args: string[]): string {
-  const r = Bun.spawnSync([GIT, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+  const r = Bun.spawnSync([GIT, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false", ...args], {
     cwd, env: { PATH: `${dirname(GIT)}:/usr/bin:/bin`, ...GIT_ENV }, stdout: "pipe", stderr: "pipe",
   });
   if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.toString()}`);

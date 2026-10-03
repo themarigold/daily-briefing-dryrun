@@ -361,15 +361,45 @@ impl Drop for ReapTagged {
 /// A script rather than a compiled stub because the thing under test is the SPAWN — argv,
 /// environment, pipes, exit status, caffeinate wrapping — and a script exercises every one of them
 /// through the same syscalls a real binary would.
+///
+/// ⚠ ON UNIX THE BYTES ARE WRITTEN BY A CHILD `/bin/sh`, NEVER BY THIS PROCESS. Writing in-process
+/// opens a write fd to the script; any test thread that forks to spawn a child while that fd is
+/// open hands the child a copy, which lives until that child execs. If this thread then execs the
+/// script, Linux refuses with ETXTBSY ("Text file busy", os error 26) — seen in CI on
+/// `engine_env.rs`'s `env_dumper`. A lock here could not close the window: the forks happen inside
+/// `EngineClient` on other test threads, which take no lock of ours. With `cat` as the writer, the
+/// only write fd to the file lives in that child, and it is gone once the child is reaped — before
+/// this returns — so no fork in this process can ever inherit one. MEASURED in a Linux container
+/// (C, four threads forking while a fifth writes then execs): 25 of 3000 execs failed ETXTBSY with
+/// an in-process write, 0 of 3000 with the child writer.
 pub fn fake_sidecar(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the fake sidecar");
+    let script = format!("#!/bin/sh\n{body}\n");
     #[cfg(unix)]
     {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\"", "sh"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn the fake sidecar's writer");
+        // Dropping the pipe's write end at the end of this statement is the writer's EOF.
+        writer
+            .stdin
+            .take()
+            .expect("the writer's stdin")
+            .write_all(script.as_bytes())
+            .expect("write the fake sidecar");
+        let status = writer.wait().expect("reap the fake sidecar's writer");
+        assert!(status.success(), "writing the fake sidecar failed: {status}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("make the fake sidecar executable");
     }
+    #[cfg(not(unix))]
+    std::fs::write(&path, script).expect("write the fake sidecar");
     path
 }
 
