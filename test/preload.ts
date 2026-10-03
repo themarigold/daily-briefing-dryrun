@@ -47,10 +47,21 @@ afterEach(() => {
 // `(fail) (unnamed)` with a stack naming this file. On a shared sticky /tmp another uid could squat the
 // provider's fixed fallback name — the one registered path the suite does not mkdtemp itself, registered
 // by harden.activation's B3 test; the product refuses such a directory, and this hook reports it rather
-// than hiding it. The hook has bun's 5000 ms timeout; draining a full run's 827 directories measured
-// 0.9 s in-hook (bun 1.3.14). A synchronous hook that overruns still runs to completion — the directories
-// ARE removed — and is then reported `(fail) (unnamed) [<elapsed>ms]` under the LAST test file's header,
-// with no mention of preload.ts.
+// than hiding it.
+//
+// ⚠ ITS TIMEOUT IS 30 s, NOT bun's 5000 ms default — raised 2026-10-03 on measurement, not to hide a hang.
+// The drain is synchronous, so bun's timeout can never stop it: a hook that overruns still runs to
+// completion — the directories ARE removed — and is only then reported `(fail) (unnamed) [<elapsed>ms]`
+// under the LAST test file's header, with no mention of preload.ts (reproduced with a 6 s synchronous
+// preload afterAll, bun 1.3.14). The default bought no protection, only a false failure once the run grew.
+// At #488 a full run's 827 directories drained in 0.9 s. On 2026-10-03 it was 1,540 directories holding
+// 36,343 entries (425 of them `.git` dirs): 2.3 s in-hook on an Apple-silicon Mac; on the GitHub
+// macos-latest runner ~2.4 s in run 36946149314 (log timestamps around the hook) and 5.8 s in run
+// 37112733418, which failed the job as `(fail) (unnamed) [5825.15ms]` after test/eval/checks.g6.test.ts.
+// The cost is unlinking those entries (~80–85% of it; the chmod walk is the rest): legitimate work that
+// grows with what the suite creates, not a stall — and not git's detached auto-maintenance, which was not
+// running at drain time and leaves nothing behind in these repos (both measured). 30 s is 5x the worst
+// observed drain.
 //
 // The isolation check runs here too, for a clear that lands after the last test's `afterEach` — an
 // orphaned continuation from a timed-out test is exactly that shape. Both failures are reported together;
@@ -65,4 +76,4 @@ afterAll(() => {
   }
   if (drainError !== undefined) throw drainError;
   if (report) throw new Error(report);
-});
+}, { timeout: 30_000 });
