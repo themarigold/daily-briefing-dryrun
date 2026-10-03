@@ -135,8 +135,11 @@ release commit from here on. Any later commit means running it again.
 
 ### 3. Read the soft residuals
 
-Check 7 prints the export's SOFT residuals: files that name private projects, in test fixtures. Read
-each one. If they are acceptable, re-run with the sign-off:
+Check 7 prints the export's SOFT residuals: every exported file, anywhere in the tree (not only test
+fixtures), that contains one of the soft sweep's private names: the author's other projects, the
+private development repository, or the author's first name. The top-level `LICENSE` and `README.md` are left out,
+because their copyright lines name the author by design. The names are the `soft=` line of
+`scripts/export-public.sh`. Read each file. If they are acceptable, re-run with the sign-off:
 
 ```sh
 bash scripts/release-check.sh X.Y.Z --soft-ok
@@ -327,7 +330,7 @@ These names are **frozen**. `gui/scripts/stage-bundles.sh` renames Tauri's outpu
 | Linux AppImage | `daily-briefing-<v>-linux-x86_64.AppImage` | renamed from `Daily Briefing_<v>_amd64.AppImage` |
 | Linux deb | `daily-briefing_<v>_amd64.deb` | renamed from `Daily Briefing_<v>_amd64.deb` (Debian convention) |
 | Checksums | `SHA256SUMS`: every other asset, bare basenames (computed from inside `dist/`), `LC_ALL=C` sorted, never listing itself | `scripts/release-collect.sh` |
-| Windows NSIS | none: a workflow artifact only, never attached | — |
+| Windows NSIS | none: a workflow artifact only, kept for one day, never attached | — |
 
 `<v>` is plain semver, `X.Y.Z`: the tag without its leading `v`. There is no release-candidate form.
 
@@ -359,7 +362,7 @@ Each bundle leg of the release workflow reports what it built through a marker. 
 | Marker upload | `if: always()`, after the bundle upload |
 | Job tail | the macOS legs' keychain cleanup (unconditional `if: always()`) is the last step, outside the derivation |
 | CLI artifact | `cli-binaries`, the 5 binaries flat |
-| Windows artifact | `windows-nsis`, which matches no download pattern in the release job |
+| Windows artifact | `windows-nsis`, uploaded with `retention-days: 1` (kept for one day), which matches no download pattern in the release job |
 | Release download | `pattern: cli-binaries` and `pattern: bundle-*` into `dist/`; `pattern: marker-*` into `markers/`; all `merge-multiple: true`. The `bundle-*` step (id `dl-bundles`) and the `marker-*` step are `continue-on-error: true`; collect keeps it fail-closed |
 | Signing mode | computed **once**, in a `gate` step with id `signing-mode` that evaluates `secrets.DBA_SIGNING_P12 != '' && secrets.DBA_SIGNING_P12_PASSWORD != ''` in its `run:` (never materialising a secret value into env), writes `mode=signed\|unsigned` to `$GITHUB_OUTPUT`, and FAILS with a named error when exactly one secret is set. `gate` exposes it as the job output `signing`; the macOS legs and `release` read `needs.gate.outputs.signing`. The Linux and Windows legs pass the literal `unsigned`. Each macOS leg's smoke step proves its artifact matches the mode (E5), so the notes label cannot disagree with what shipped. The marker body stays one token. Collect receives the mode as its `<signed\|unsigned>` argument. (Beside `signing`, `gate` also exposes the job output `identity`, the signing identity's name from the repo variable `DBA_SIGNING_IDENTITY`; E5.) |
 | Notes | rendered from `docs/release-notes.template.md` to a file outside `dist/`, passed with `--notes-file` |

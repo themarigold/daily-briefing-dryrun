@@ -317,6 +317,6 @@ describe("Today's states", () => {
     expect(body).toContain("waiting for network…");
     expect(body).toContain("&lt;img src=x");
     expect(body).toContain(busy);
-    expect(body).toContain("Generates today's briefing if it has not been generated yet.");
+    expect(body).toContain("Generates today's briefing if it has not been generated yet and the morning floor has passed.");
   });
 });

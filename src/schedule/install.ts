@@ -800,7 +800,11 @@ async function kick(d: Resolved, kind: ScheduleKind | null): Promise<boolean> {
     return r.code === 0;
   }
   if (kind === "systemd") {
-    const r = await d.exec(["systemctl", "--user", "start", SYSTEMD_SERVICE_NAME]).catch(() => ({ code: 1, out: "", err: "" }));
+    // ⚠ `--no-block`: the service is `Type=oneshot`, so a plain `start` waits for the whole briefing
+    // run, and a run longer than SCHEDULE_EXEC_TIMEOUT_MS read as a kick that "could not be started"
+    // while it went on to deliver. Queued instead, like `launchctl start`; `verifySchedule`'s polling
+    // sees a short run, and the app's watcher a longer one.
+    const r = await d.exec(["systemctl", "--user", "start", "--no-block", SYSTEMD_SERVICE_NAME]).catch(() => ({ code: 1, out: "", err: "" }));
     return r.code === 0;
   }
   return false;   // windows: gated, and there is no evidence to gather anyway.

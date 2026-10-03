@@ -438,8 +438,13 @@ parser accepts falls the same fail-open way.
   during a generation is the candidate if one ever appears, and it would be dev-only for the same
   reason.
 - **Nothing but PATH and seven session variables reach the engine from the app** (`HOME`, `USER`,
-  `LOGNAME`, `TMPDIR`, `LANG`, `LC_ALL`, `TZ` — `engine::FORWARDED_ENV`, pinned by literal). That
-  is the same as under launchd, whose plist sets `PATH` only. Two consequences for T15:
+  `LOGNAME`, `TMPDIR`, `LANG`, `LC_ALL`, `TZ` — `engine::FORWARDED_ENV`, pinned by literal), **plus
+  two on Linux only**: `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`
+  (`engine::FORWARDED_ENV_LINUX`, pinned with it in
+  `the_forwarded_set_is_these_seven_plus_two_on_linux`), without which the engine's
+  `systemctl --user` calls cannot reach the user's service manager and the app's Linux scheduler
+  install fails. On macOS that is the same as under launchd, whose plist sets `PATH` only. Two
+  consequences for T15:
   - **The engine's `apiKeyEnv` rung (`src/apiKey.ts`) cannot resolve from the app**, exactly as it
     cannot from launchd: `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` in the app's environment are dropped
     on purpose (`secrets_and_overrides_in_the_parent_never_reach_the_child`). A Settings screen

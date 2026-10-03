@@ -96,8 +96,11 @@ A few things worth knowing:
   authenticate. The error you see comes from the CLI itself and will not mention this setting.
 - `"env-api-key"` needs the key in the environment the tool actually runs in. The scheduled agent
   does **not** inherit your interactive shell — but it *does* inherit anything set with
-  `launchctl setenv` or placed in the LaunchAgent plist's `EnvironmentVariables`, which is exactly
-  how a machine-wide key reaches it.
+  `launchctl setenv`, which is exactly how a machine-wide key reaches it. Do not add a key to the
+  LaunchAgent plist's `EnvironmentVariables`: every `schedule install` (the app's scheduler setup
+  runs one too) rewrites the plist with a fixed set of variables, so the key is silently lost. For
+  a key a scheduled run can rely on, use an API provider (`provider.api`, below) and keep the key
+  in a file named by `apiKeyFile`, or behind `apiKeyCommand`.
 
 ## Multiple accounts (failover)
 
@@ -194,6 +197,11 @@ Each init flag takes its value as a **separate argument** (`--model gpt-5`), nev
 those three lines** — the tool refuses to start with both and tells you exactly which keys to remove.
 That is a hard error rather than "the API wins, with a warning" because which transport ran (and
 therefore which credential was spent) must never be invisible state.
+
+A config written for a CLI (by `daily-briefing init` or by the app's setup) also carries an explicit `networkProbeHosts` (the
+two public DNS hosts), and an explicit value always wins over the endpoint-derived check
+([below](#the-connectivity-check-follows-your-endpoint)). Moving to a **local** model, set
+`"networkProbeHosts": []`, or a scheduled run with no network is still skipped as offline.
 
 ### Where the key comes from
 

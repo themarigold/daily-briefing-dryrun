@@ -252,9 +252,8 @@ clock under load, not a chunk boundary, but a **shutdown that waits on a promise
 never settles**. Recorded here because the induction's own verdict warns that it certifies one
 mechanism only.
 
-- **The failure.** `main` at `b7b9f9538`, run
-  [36002014603](https://github.com/themarigold/personal_code/actions/runs/36002014603) attempt 1 —
-  one red test out of **2147** (2145 pass / 1 skip / 1 fail, 127 files):
+- **The failure.** `main` at `b7b9f9538`, run 36002014603 in the private development repository,
+  attempt 1 — one red test out of **2147** (2145 pass / 1 skip / 1 fail, 127 files):
 
   ```
   (fail) T6 — buildProvider > ⚠ the api branch HONOURS opts.timeoutMs … [5276.12ms]

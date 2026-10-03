@@ -165,7 +165,7 @@ fields:
 | `baseUrl` | string | `https://api.anthropic.com` for `anthropic`; required in practice for `openai-compatible` | The endpoint (`http:` or `https:`, no user name or password in it). Name the final URL: a redirect is not followed, so an endpoint that answers with one (an `http://` address that redirects to `https://`, a gateway that moved) fails every attempt. |
 | `maxTokens` | positive whole number | `4096` for `anthropic`; omitted from the request for `openai-compatible` | The output-token limit. |
 | `apiKeyEnv` | string | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` when no key source is set | The name of an environment variable holding the key. |
-| `apiKeyFile` | string | none | A file holding the key; refused if group- or world-readable. |
+| `apiKeyFile` | string | none | A file holding the key (a leading `~` is expanded); refused if group- or world-readable. |
 | `apiKeyCommand` | array of strings | none | A command (argv) whose standard output is the key. |
 | `apiKey` | string | none | The key itself, in this file. Works, and warns on every run. |
 

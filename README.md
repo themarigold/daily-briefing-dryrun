@@ -57,7 +57,9 @@ page; [docs/INSTALL.md](docs/INSTALL.md) has the steps for each platform.
 - **From source**, with [Bun](https://bun.sh): [docs/INSTALL.md](docs/INSTALL.md#from-a-source-checkout).
 
 **You need** git, and an AI to write the briefing: an installed, logged-in `claude` or `codex`; an API
-key for Anthropic or an OpenAI-compatible service; or a local model (Ollama, LM Studio).
+key for Anthropic or an OpenAI-compatible service (the desktop app's setup offers the Anthropic key
+only; an OpenAI-compatible service is set up on a first install with `daily-briefing init --provider openai-compatible
+--model <id> --base-url <url>`, or in the config file); or a local model (Ollama, LM Studio).
 [docs/PROVIDERS.md](docs/PROVIDERS.md) says what each path needs.
 
 **What it costs:** one generation call each morning, on your own plan or key; a morning on which the

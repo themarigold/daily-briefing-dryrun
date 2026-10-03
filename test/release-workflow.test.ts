@@ -439,6 +439,24 @@ describe("release.yml: bundle legs", () => {
     expect(wmarker!.with?.path).toBe("${{ runner.temp }}/marker/windows-x64.status");
   });
 
+  test("D-11: the Windows installer artifact is kept for one day, and no other upload sets a retention", () => {
+    // The maintainer's D-11 decision. Nothing in the workflow downloads `windows-nsis` (the pattern test
+    // under "release.yml: release" pins that), so the retention affects only a person fetching it by hand.
+    const [nsis] = win.steps.filter((s) => s.uses?.startsWith("actions/upload-artifact@"));
+    expect(nsis!.with).toEqual({
+      name: "windows-nsis",
+      path: "gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe",
+      "if-no-files-found": "error",
+      "retention-days": 1,
+    });
+    // Every OTHER upload in the workflow keeps the repository's default retention.
+    const others = Object.entries(J).flatMap(([job, j]) => j.steps
+      .filter((s) => s.uses?.startsWith("actions/upload-artifact@") && s.with?.name !== "windows-nsis")
+      .map((s) => `${job}/${String(s.with?.name)}: ${String(s.with?.["retention-days"])}`));
+    expect(others.length).toBeGreaterThanOrEqual(6);   // cli-binaries, 2 macOS, 2 Linux, the Windows marker
+    for (const o of others) expect(o).toMatch(/: undefined$/);
+  });
+
   test("the marker derivation, run: size failure -> size-rejected; all success -> built; anything else -> build-failed", () => {
     const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-marker-")));
     const derive = (script: string, leg: string, outcomes: Record<string, string>): string => {

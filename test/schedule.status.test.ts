@@ -117,6 +117,19 @@ describe("the three-legged registration triangle", () => {
     expect(r.installedEngineVersion).toBe("0.0.1-ancient");
     expect(r.engineVersion).not.toBe("0.0.1-ancient");
     expect(renderScheduleStatus(r)).toContain("engine skew");
+    // An app-owned schedule refuses a terminal `schedule install`, so the remedy names the app's button.
+    expect(renderScheduleStatus(r)).toContain("click Update background engine on the app's Schedule screen");
+    expect(renderScheduleStatus(r)).not.toContain("re-run `schedule install`");
+  });
+
+  test("engine SKEW on a CLI-owned schedule keeps the terminal remedy", async () => {
+    await writeScheduleRecord({
+      owner: "cli", invoker: "cli", kind: "launchd", unitPath: "/u", binPath: "/b",
+      installedAt: "2026-01-01T00:00:00.000Z", engineVersion: "0.0.1-ancient",
+    });
+    const out = renderScheduleStatus(await scheduleStatusReport(deps()));
+    expect(out).toContain("re-run `schedule install` to refresh it");
+    expect(out).not.toContain("Update background engine");
   });
 });
 

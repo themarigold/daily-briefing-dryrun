@@ -658,7 +658,26 @@ pub fn launchd_path(home: &Path) -> String {
 /// a launchd-started process also receives from the user's session: the engine resolves its state
 /// directory from `HOME` (`src/marker.ts`), git reads `HOME` for its config, and the rest are
 /// locale/temp conveniences that cost nothing and whose absence produces confusing failures.
+/// Linux adds two more — [`FORWARDED_ENV_LINUX`]; [`forwarded_env`] is the set actually forwarded.
 pub const FORWARDED_ENV: &[&str] = &["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "TZ"];
+
+/// Forwarded IN ADDITION on Linux, and only there: how `systemctl --user` reaches the user's
+/// service manager.
+///
+/// The engine schedules itself on Linux by running `systemctl --user` (`src/schedule/install.ts`)
+/// with its own environment (`src/proc.ts`), and that call needs one of these to find the user
+/// bus — without them the app's scheduler install fails at its first `daemon-reload`. Linux-only
+/// so the macOS app's environment stays exactly [`FORWARDED_ENV`].
+pub const FORWARDED_ENV_LINUX: &[&str] = &["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"];
+
+/// The names forwarded on THIS OS: [`FORWARDED_ENV`], plus [`FORWARDED_ENV_LINUX`] on Linux.
+pub fn forwarded_env() -> Vec<&'static str> {
+    let mut names = FORWARDED_ENV.to_vec();
+    if cfg!(target_os = "linux") {
+        names.extend_from_slice(FORWARDED_ENV_LINUX);
+    }
+    names
+}
 
 /// Set (never forwarded) on every spawn: turns off the Bun runtime's own crash reporter.
 ///
@@ -1117,7 +1136,7 @@ impl EngineClient {
         (self.program.clone(), argv)
     }
 
-    /// The environment the child gets: cleared, then [`FORWARDED_ENV`] from this process, then
+    /// The environment the child gets: cleared, then [`forwarded_env`] from this process, then
     /// PATH, then [`BUN_CRASH_REPORTING_OFF`], then the harness overrides.
     ///
     /// ⚠ PATH IS SET LAST AMONG THE INHERITED ONES AND IS NEVER FORWARDED. That ordering is the
@@ -1125,9 +1144,9 @@ impl EngineClient {
     /// reproduce in development and only ever bites the stranger.
     pub fn env_plan(&self) -> Vec<(OsString, OsString)> {
         let mut plan: Vec<(OsString, OsString)> = Vec::new();
-        for key in FORWARDED_ENV {
+        for key in forwarded_env() {
             if let Some(value) = std::env::var_os(key) {
-                plan.push((OsString::from(*key), value));
+                plan.push((OsString::from(key), value));
             }
         }
         let path = self

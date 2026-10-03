@@ -20,7 +20,10 @@ need both.
 - **git**, on your `PATH`. The briefing is built from your local git history.
 - **An AI to write the briefing**, one of:
   - an installed, logged-in AI coding command-line tool: `claude` (the default) or `codex`;
-  - an API key for Anthropic or for an OpenAI-compatible service;
+  - an API key for Anthropic or for an OpenAI-compatible service. The desktop app's setup offers
+    the Anthropic key only; an OpenAI-compatible service is set up from the command line
+    on a first install
+    (`daily-briefing init --provider openai-compatible --model <id> --base-url <url>`) or in the config file;
   - a local model behind an OpenAI-compatible endpoint (Ollama, LM Studio). On this path the
     prompt never leaves your machine.
 

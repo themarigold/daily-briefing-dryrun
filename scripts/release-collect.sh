@@ -220,7 +220,7 @@ fi
 
 # Windows: informational only. Never a FAIL, whatever the marker says.
 case "$(marker_body windows-x64)" in
-  built)        WINDOWS_STATUS="the CI build succeeded; its installer is a workflow artifact only" ;;
+  built)        WINDOWS_STATUS="the CI build succeeded; its installer is a workflow artifact only, kept for one day" ;;
   build-failed|size-rejected) WINDOWS_STATUS="the informational CI build did not succeed" ;;
   absent)       WINDOWS_STATUS="the informational CI build reported no status" ;;
   *)            WINDOWS_STATUS="the informational CI build reported an unreadable status" ;;

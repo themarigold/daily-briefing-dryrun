@@ -7,7 +7,9 @@
    * the briefing itself can all carry repo-controlled text (`docs/gui-seam.md` §5).
    *
    * ⚠ RUN NOW IS `run --json` WITHOUT `--force`: it generates today's briefing only if the engine
-   * has not already done so, and says that beside the button rather than in a help page.
+   * has not already done so and the morning floor has passed (the app's spawn is not a terminal, so
+   * the engine applies its floor, `src/main.ts`), and says that beside the button rather than in a
+   * help page.
    */
   import BriefingView from "../lib/BriefingView.svelte";
   import type { TodayModel } from "../lib/today";
@@ -38,7 +40,7 @@
 
   <div class="actions">
     <button onclick={onrun} disabled={running}>{running ? "Running…" : "Run now"}</button>
-    <span class="hint">Generates today's briefing if it has not been generated yet.</span>
+    <span class="hint">Generates today's briefing if it has not been generated yet and the morning floor has passed.</span>
   </div>
   {#if progress.length > 0}
     <pre class="progress">{progress.join("\n")}</pre>
@@ -54,7 +56,8 @@
       <h3>No briefing yet</h3>
       <p>
         The engine has not written a briefing on this machine yet. The first one is generated on the
-        first check after the morning floor once the machine is awake, or when you run it now.
+        first check after the morning floor once the machine is awake, or when you run it now once the
+        morning floor has passed.
       </p>
     </div>
   {:else if model.source.kind !== "none"}

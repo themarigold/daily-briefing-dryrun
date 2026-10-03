@@ -17,9 +17,10 @@
 //! and `tests/engine_client.rs` already serialises the tests that contend for it — a second binary
 //! doing the same would have no way to take turns with the first.
 //!
-//! ⚠ **AND NOTHING HERE MUTATES THE PROCESS ENVIRONMENT.** The two tests that do — the parent-leak
-//! test and the `FORWARDED_ENV` literal pin that documents it — live in `engine_env_parent.rs`,
-//! which is a SEPARATE TEST BINARY and therefore a separate process. `std::env::set_var` is
+//! ⚠ **AND NOTHING HERE MUTATES THE PROCESS ENVIRONMENT.** The tests that do — the parent-leak
+//! test and the Linux session-bus test, beside the forwarded-set literal pin that documents them —
+//! live in `engine_env_parent.rs`, which is a SEPARATE TEST BINARY and therefore a separate
+//! process. `std::env::set_var` is
 //! process-wide and `cargo test` runs a binary's tests on parallel threads, so a `PATH` sentinel
 //! set for one test was live inside every sibling for the duration. The one that matters is
 //! [`path_is_ours_and_is_never_inherited`]: its anti-vacuity `assert_ne!` compares the launchd PATH
@@ -39,7 +40,7 @@ use std::time::Duration;
 
 use common::{env_dumper, parse_env, sleeper, ScratchDir};
 use daily_briefing_gui_lib::engine::{
-    launchd_path, EngineClient, NoProgress, Operation, BUN_CRASH_REPORTING_OFF, FORWARDED_ENV,
+    forwarded_env, launchd_path, EngineClient, NoProgress, Operation, BUN_CRASH_REPORTING_OFF,
 };
 
 /* ── (1) PATH ─────────────────────────────────────────────────────────────────────────────────── */
@@ -170,7 +171,8 @@ async fn path_is_ours_and_is_never_inherited() {
     );
 }
 
-/// Everything except [`FORWARDED_ENV`], PATH, and the shell's own additions is dropped.
+/// Everything except the forwarded set ([`forwarded_env`]: per OS), PATH, and the shell's own
+/// additions is dropped.
 ///
 /// ⚠ INTERROGATED BEFORE IT IS BELIEVED (prove-it 3b): the assertion is vacuous unless the PARENT
 /// actually carries a variable outside the forwarded set, so that is asserted first. `cargo test`
@@ -200,9 +202,8 @@ async fn the_environment_is_otherwise_minimal() {
         "the parent's environment leaked into the engine: {leaked:?}"
     );
 
-    let allowed: Vec<&str> = FORWARDED_ENV
-        .iter()
-        .copied()
+    let allowed: Vec<&str> = forwarded_env()
+        .into_iter()
         .chain(std::iter::once("PATH"))
         .chain(std::iter::once(BUN_CRASH_REPORTING_OFF.0))
         .chain(PASS_THROUGH_ARTEFACTS.iter().copied())
@@ -214,7 +215,8 @@ async fn the_environment_is_otherwise_minimal() {
     assert!(
         unexpected.is_empty(),
         "the child received variables outside the forwarded set: {unexpected:?}. If one of them is \
-         genuinely needed, add it to engine::FORWARDED_ENV with a reason; do not widen this test."
+         genuinely needed, add it to engine::FORWARDED_ENV (or, Linux-only, FORWARDED_ENV_LINUX) \
+         with a reason; do not widen this test."
     );
 
     // ⚠ THE ARTEFACT LIST IS NOT A LOOPHOLE, and this is what keeps it from becoming one. Spawn the

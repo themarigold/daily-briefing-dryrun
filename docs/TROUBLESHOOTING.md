@@ -125,8 +125,10 @@ needs the grant again. This ends once releases are signed with a stable identity
 
 The scheduled engine copy is not affected the same way: it is re-signed with your local identity each
 time `schedule install` refreshes it (see above). When `daily-briefing schedule status` shows
-`engine skew`, run `daily-briefing schedule install` (or reinstall background delivery from the app) to
-refresh that copy.
+`engine skew`, refresh that copy from the side that owns the schedule (its `owner:` line): for `app`,
+click **Update background engine** on the app's Schedule screen; for `cli`, run
+`daily-briefing schedule install`. A `schedule install` from the terminal is refused for an app-owned
+schedule.
 
 ## macOS: "Not Opened", "damaged", or "cannot be opened"
 
@@ -186,7 +188,7 @@ Start with `daily-briefing schedule status`:
 | `ticks today:` | how many times the scheduler woke the engine today. `none recorded` after the floor means the scheduler is not reaching it. |
 | `last delivery:` | the last time a briefing was delivered. |
 | `last skip:` | why the last tick did not deliver (table below). |
-| `engine skew` | the scheduled copy is an older version: run `schedule install` again. |
+| `engine skew` | the scheduled copy is a different version. If `owner:` is `app`, click **Update background engine** on the app's Schedule screen (a `schedule install` from the terminal is refused for an app-owned schedule); if `cli`, run `schedule install` again. |
 
 `daily-briefing schedule verify` kicks the trigger once and reports whether the kick reached the engine.
 

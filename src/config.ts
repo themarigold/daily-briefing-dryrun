@@ -237,7 +237,11 @@ export function validateConfig(raw: unknown, home: string): Config {
   // sites. `promptVia: "stdin"` is the inert choice — the API transports never read either field; it is
   // spelled out rather than left arbitrary so nothing downstream can read a meaning into "arg".
   if (api !== undefined) {
-    out.provider = { ...out.provider, cli: apiTransportLabel(api.kind), argv: [], promptVia: "stdin", api };
+    // `~` in `apiKeyFile` is expanded here, like the path arrays above: the app's setup suggests
+    // `~/.config/…` and writes it verbatim, and `resolveApiKey` reads the path literally. A COPY, so
+    // the caller's raw object is untouched; the config file itself is never rewritten.
+    const apiOut: ProviderApi = api.apiKeyFile !== undefined ? { ...api, apiKeyFile: expandTilde(api.apiKeyFile, home) } : api;
+    out.provider = { ...out.provider, cli: apiTransportLabel(api.kind), argv: [], promptVia: "stdin", api: apiOut };
   }
   return out;
 }

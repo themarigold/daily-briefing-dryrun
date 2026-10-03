@@ -14,10 +14,10 @@ import {
   installSchedule, uninstallSchedule, verifySchedule, readScheduleRecord, writeScheduleRecord,
   schedulePath, managedBinPath, unitDir, unitPaths, primaryUnitPath, ownsLabel, kindFor,
   resolveIdentity, lingerCommand, isRegistered, verdictLine, verifyExitCode,
-  EXIT_OK, EXIT_NONE, EXIT_FOREIGN, EXIT_ERROR, DEFAULT_SIGN_IDENTITY,
+  EXIT_OK, EXIT_NONE, EXIT_FOREIGN, EXIT_ERROR, DEFAULT_SIGN_IDENTITY, SCHEDULE_EXEC_TIMEOUT_MS,
   type Exec, type ScheduleDeps,
 } from "../src/schedule/install";
-import { SCHEDULE_LABEL, SYSTEMD_TIMER_NAME, WINDOWS_TASK_NAME } from "../src/schedule/units";
+import { SCHEDULE_LABEL, SYSTEMD_SERVICE_NAME, SYSTEMD_TIMER_NAME, WINDOWS_TASK_NAME } from "../src/schedule/units";
 import { markerPath, lastSkipPath, localDateStr } from "../src/marker";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
@@ -432,6 +432,32 @@ describe("verify — the engine-side kickstart (plan R1)", () => {
     const f = fakeExec();
     await verifySchedule({ kind: "launchd", ...V }, deps("darwin", f.exec));
     expect(f.ran("launchctl").map((c) => c.join(" "))).toContain(`launchctl start ${SCHEDULE_LABEL}`);
+  });
+
+  test("linux: the kick is `systemctl --user start --no-block <service>` — queued, never waited on (P9)", async () => {
+    const f = fakeExec();
+    await verifySchedule({ kind: "systemd", ...V }, deps("linux", f.exec));
+    const starts = f.ran("systemctl").filter((c) => c.includes("start")).map((c) => c.join(" "));
+    expect(starts[0]).toBe(`systemctl --user start --no-block ${SYSTEMD_SERVICE_NAME}`);
+    expect(starts.every((s) => s.includes("--no-block"))).toBe(true);
+  });
+
+  test("linux: a run longer than the exec ceiling is observed, not reported as a kick that could not start (P9)", async () => {
+    // A model of SYSTEMD's semantics, not of the code under test: `start` on a `Type=oneshot` unit
+    // returns only when the run exits, unless `--no-block` queues the job and returns at once. The run
+    // modelled here outlasts SCHEDULE_EXEC_TIMEOUT_MS, so a blocking `start` comes back as the exec's
+    // timeout failure (the systemctl client killed) while the run itself goes on to deliver.
+    const marker = markerPath();   // resolved now: the per-test state dir, even if a timer fires late
+    const exec: Exec = async (cmd) => {
+      if (cmd[0] === "systemctl" && cmd.includes("start")) {
+        setTimeout(() => writeFileSync(marker, EVIDENCE_DATE), 5);   // the run delivers a moment later
+        if (!cmd.includes("--no-block")) return { code: 1, out: "", err: `timed out after ${SCHEDULE_EXEC_TIMEOUT_MS}ms` };
+      }
+      return { code: 0, out: "", err: "" };
+    };
+    const v = await verifySchedule({ kind: "systemd", pollMs: 1, deadlineMs: 2_000 }, deps("linux", exec));
+    expect(v).toMatchObject({ kickstarted: true, outcome: "delivered" });
+    expect(verdictLine(v)).not.toContain("could not be started");
   });
 
   test("a DELIVERY ends the loop immediately — it does not retry for a fatter briefing", async () => {

@@ -190,7 +190,10 @@ export function renderScheduleStatus(r: ScheduleStatusReport): string {
   lines.push(`binary:          ${r.binPath ? s(r.binPath) : "—"}`);
   lines.push(`installed:       ${r.installedAt ? s(r.installedAt) : "—"}${r.installedEngineVersion ? ` (engine ${s(r.installedEngineVersion)})` : ""}`);
   if (r.installedEngineVersion && r.installedEngineVersion !== r.engineVersion) {
-    lines.push(`  ⚠ engine skew: the scheduled copy is ${s(r.installedEngineVersion)}, this binary is ${s(r.engineVersion)} — re-run \`schedule install\` to refresh it.`);
+    const refresh = r.owner === "app"
+      ? "click Update background engine on the app's Schedule screen to refresh it"
+      : "re-run \`schedule install\` to refresh it";
+    lines.push(`  ⚠ engine skew: the scheduled copy is ${s(r.installedEngineVersion)}, this binary is ${s(r.engineVersion)} — ${refresh}.`);
   }
   if (r.lingerState !== "not-applicable") lines.push(`linger:          ${s(r.lingerState)}`);
   lines.push(`morning floor:   ${s(r.morningTime.value)} (${r.isPastFloor ? "past" : "not yet reached"})`);
