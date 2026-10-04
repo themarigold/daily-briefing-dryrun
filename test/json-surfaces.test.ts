@@ -810,3 +810,66 @@ describe("config-echo warnings and errors are redacted on status / doctor / conf
     }
   });
 });
+
+// ── v0.2.1 §2.4.5 (plan T1.4): doctor applies the run's DISCOVERY-BLOCKED rule to its own walk ─────────
+// The pre-existing `anyInaccessible` rule is unchanged (the TCC-denied test above, and the incidental-
+// Desktop case below); the addition is only the MISSING configured search folder with no repo found,
+// which `anyInaccessible` cannot see (`not-found` is not inaccessible) while every run is blocked by it.
+// REAL walks: `preflight` and `discover` are not injected, so this is the code doctor actually runs.
+describe("doctor --json: the discovery-blocked rule (v0.2.1)", () => {
+  const REAL_WALK: DoctorDeps = { ...OFFLINE_DEPS, preflight: undefined, discover: undefined, partialClone: async () => false };
+  const scratch = (p: string) => removeAtRunEnd(mkdtempSync(join(tmpdir(), p)));
+
+  test("a MISSING configured search folder with zero repos → blocked (it read 'ready' before)", async () => {
+    const missing = join(scratch("dba-v021-doc-"), "Projcts");
+    const env = withEnv({ discoverRoots: [missing], provider: PROV });
+    try {
+      const d = await doctorReport(REAL_WALK);
+      // PREMISE: the row is there and is NOT inaccessible, so `anyInaccessible` cannot be what blocks.
+      expect(d.repos.map((r) => [r.path, r.issueKind])).toEqual([[missing, "not-found"]]);
+      expect(d.discoveredCount).toBe(0);
+      expect(d.verdict).toBe("blocked");
+    } finally { env.cleanup(); }
+  });
+
+  test("the same missing folder BESIDE a found repo is not blocked — the run would deliver", async () => {
+    const { buildRepo } = await import("./fixtures/build-repo");
+    const repo = await buildRepo([{ file: "a.txt", content: "a", isoDate: new Date(Date.now() - 864e5).toISOString() }]);
+    const missing = join(scratch("dba-v021-doc2-"), "Projcts");
+    const env = withEnv({ discoverRoots: [repo, missing], provider: PROV });
+    try {
+      const d = await doctorReport(REAL_WALK);
+      expect(d.discoveredCount).toBe(1);
+      expect(d.verdict).toBe("ready");
+    } finally { env.cleanup(); }
+  });
+
+  test("an INCIDENTAL denied Desktop under a search folder stays 'blocked' through the EXISTING anyInaccessible rule", async () => {
+    const home = scratch("dba-v021-doc-home-");
+    const desktop = join(home, "Desktop");
+    mkdirSync(desktop);
+    const { chmodSync } = await import("node:fs");
+    chmodSync(desktop, 0o000);
+    const env = withEnv({ discoverRoots: [home], provider: PROV });
+    try {
+      const d = await doctorReport(REAL_WALK);
+      expect(d.repos.find((r) => r.path === desktop)?.issueKind).toBe("unreadable");   // PREMISE
+      expect(d.verdict).toBe("blocked");
+    } finally { env.cleanup(); chmodSync(desktop, 0o755); }
+  });
+
+  test("an explicit `repos` list never discovers in a run, so its missing discoverRoot cannot block doctor — even with every listed repo excluded", async () => {
+    // preflight still walks discoverRoots beside explicit repos (to surface a blocked root up front), and
+    // excluding the only listed repo leaves zero found — exactly the inputs the predicate would block on.
+    // The run, though, short-circuits discovery for explicit `repos`: no discovery issue, a stamped quiet
+    // day. Doctor must agree with the run.
+    const missing = join(scratch("dba-v021-doc3-"), "Projcts");
+    const env = withEnv({ repos: ["/r1"], excludeRepos: ["/r1"], discoverRoots: [missing], provider: PROV });
+    try {
+      const d = await doctorReport(REAL_WALK);
+      expect(d.repos.map((r) => [r.path, r.issueKind])).toEqual([[missing, "not-found"]]);   // PREMISE: the root walk ran
+      expect(d.discoveredCount).toBe(0);
+      expect(d.verdict).toBe("ready");
+    } finally { env.cleanup(); }
+  });
+});

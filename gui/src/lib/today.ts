@@ -78,6 +78,13 @@ export interface TodayModel {
   /** Set when a briefing is shown and its own date is not today's. */
   staleDate: string | null;
   quiet: boolean;
+  /**
+   * A quiet day whose DISPLAYED briefing carries a `warnings` block (v0.2.1 §2.4.3): Today then says
+   * "See the warning below." Read off the rendered blocks, never `struct.warnings`, so a warning the
+   * renderers leave out (the API notice, §2.3) never points at a line that is not there. The wording is
+   * neutral because a quiet day can carry unrelated warnings too (an invalid morning time, transcripts).
+   */
+  quietWithWarning: boolean;
   loading: boolean;
   /** Nothing has been written yet (and the read succeeded). */
   empty: boolean;
@@ -144,12 +151,14 @@ export function todayModel(input: {
   const source = chooseSource(latest.state === "loaded" ? latest.file : null, lastRun);
   const blocks = source.kind === "none" ? [] : source.blocks;
   const date = briefingDate(blocks);
+  const quiet = blocks.some((b) => b.kind === "placeholder" && blockText(b) === "(no commits in the window)");
   return {
     status: state === null ? null : { text: state.statusLine, tone: tone(state) },
     banners,
     source,
     staleDate: date !== null && date !== today ? date : null,
-    quiet: blocks.some((b) => b.kind === "placeholder" && blockText(b) === "(no commits in the window)"),
+    quiet,
+    quietWithWarning: quiet && blocks.some((b) => b.kind === "warnings"),
     loading: latest.state === "loading",
     empty: latest.state === "none",
   };

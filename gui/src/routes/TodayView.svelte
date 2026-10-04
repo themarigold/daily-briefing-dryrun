@@ -20,9 +20,29 @@
     /** The engine's stderr for the current run, verbatim, one line per entry. */
     progress: string[];
     runResult: string;
+    /** Whether the Details disclosure starts open (`detailsOpen`, `lib/engine.ts`): open after a run that
+     *  failed, was refused (configError) or threw; collapsed otherwise. REQUIRED, no default. */
+    detailsOpen: boolean;
     onrun: () => void;
   }
-  let { model, running, progress, runResult, onrun }: Props = $props();
+  let { model, running, progress, runResult, detailsOpen, onrun }: Props = $props();
+
+  /**
+   * Whether the Details disclosure is open: the prop's value whenever the PROP changes, and the user's
+   * own toggle in between (M2 checkpoint).
+   *
+   * ⚠ NOT `<details open={detailsOpen}>`. Svelte 5 compiles that attribute into the SAME render effect
+   * as the `<pre>`'s text, and `App.svelte` appends each stderr line as a new array — so every line
+   * that streamed in re-applied `open = <prop>` and snapped a disclosure the user had opened shut.
+   * A writable `$derived` re-derives only when `detailsOpen` changes (App holds the prop in an explicit
+   * `$derived`, `detailsOpenNow`, so a run that ends `delivered` after a run-start `null` — false to
+   * false — is no change);
+   * `bind:open` writes the user's toggle back into it, through the `toggle` event, in an effect of its
+   * own that the streaming text does not touch. It lives here, outside the `{#if}`, so a new run that
+   * re-creates the element keeps it. Server rendering evaluates the derived, so the `open` attribute is
+   * still emitted when the prop is true. `gui/tests-web/today.check.ts` pins the compiled shape.
+   */
+  let open = $derived(detailsOpen);
 </script>
 
 <section class="today">
@@ -40,13 +60,19 @@
 
   <div class="actions">
     <button onclick={onrun} disabled={running}>{running ? "Running…" : "Run now"}</button>
-    <span class="hint">Generates today's briefing if it has not been generated yet and the morning floor has passed.</span>
+    <span class="hint">Generates today's briefing if it has not been generated yet and your morning time has passed.</span>
   </div>
-  {#if progress.length > 0}
-    <pre class="progress">{progress.join("\n")}</pre>
-  {/if}
+  <!-- The result line sits ABOVE the disclosure: a refused run's text says "see Details below". -->
   {#if runResult !== ""}
     <p class="result">{runResult}</p>
+  {/if}
+  {#if progress.length > 0}
+    <!-- v0.2.1 §2.1: the engine's stderr, verbatim, behind a disclosure — developer diagnostics on a
+         run that went fine, the explanation on one that did not (`detailsOpen`, via `open` above). -->
+    <details class="details" bind:open>
+      <summary>Details</summary>
+      <pre class="progress">{progress.join("\n")}</pre>
+    </details>
   {/if}
 
   {#if model.loading}
@@ -56,8 +82,8 @@
       <h3>No briefing yet</h3>
       <p>
         The engine has not written a briefing on this machine yet. The first one is generated on the
-        first check after the morning floor once the machine is awake, or when you run it now once the
-        morning floor has passed.
+        first check after your morning time once the machine is awake, or when you run it now once
+        your morning time has passed.
       </p>
     </div>
   {:else if model.source.kind !== "none"}
@@ -67,15 +93,12 @@
         generated yet; the status above says why.
       </p>
     {/if}
-    {#if model.quiet}
+    {#if model.quietWithWarning}
+      <p class="state quiet">A quiet day: no commits in the window. See the warning below.</p>
+    {:else if model.quiet}
       <p class="state quiet">A quiet day: there were no commits in the briefing's window.</p>
     {/if}
     <BriefingView blocks={model.source.blocks} />
-    <p class="source muted">
-      {model.source.kind === "struct"
-        ? "Shown from the run this app just started."
-        : "Shown from briefing-latest.md."}
-    </p>
   {/if}
 </section>
 
@@ -140,8 +163,16 @@
     color: var(--muted);
     font-size: 0.85rem;
   }
-  .progress {
+  .details {
     margin-top: 0.8rem;
+  }
+  .details summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+  .progress {
+    margin: 0.4rem 0 0;
     padding: 0.8rem 1rem;
     border-radius: 0.5rem;
     border: 1px solid var(--line);
@@ -158,8 +189,5 @@
   }
   .stale {
     color: var(--muted);
-  }
-  .source {
-    margin-top: 0.4rem;
   }
 </style>

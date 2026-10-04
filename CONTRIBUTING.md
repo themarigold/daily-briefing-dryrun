@@ -6,9 +6,10 @@ covers how to get set up and what to expect.
 
 ## Ground rules
 
-- **Open an issue first for anything non-trivial.** For bugs, a small reproduction helps. For features,
-  a quick "here's the problem / here's the shape of the fix" discussion avoids wasted work — the tool has
-  a deliberate scope (read local git → generate a resumption briefing), and not every idea fits it.
+- **Open an issue first for anything non-trivial.** For bugs, use the bug report form (New issue → Bug
+  report); a small reproduction helps. For features, a quick "here's the problem / here's the shape of
+  the fix" discussion avoids wasted work — the tool has a deliberate scope (read local git → generate a
+  resumption briefing), and not every idea fits it.
 - **Keep it local-first and provider-agnostic.** The tool reads *local* git history and calls the
   **bring-your-own** AI the user configures. Please don't add telemetry, a hardcoded or bundled AI
   provider, or a new network destination: the README's [Privacy](README.md#privacy) section lists every

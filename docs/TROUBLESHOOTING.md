@@ -57,8 +57,13 @@ appear empty. This tool guards against that:
   TCC *or* ordinary permissions — on a configured/discovered repo, even a partial one.
 - A folder it was still **scanning** for repos (a `discoverRoots` entry with no explicit `repos`)
   is reported as a *warning* rather than blocking the day — otherwise a machine with no repos there
-  would error every morning forever. So if your repos live under a protected folder, either grant
-  access or list them explicitly under `repos` (which `init` does for you once access is granted).
+  would error every morning forever. When the briefing has no commits in the window, it names those
+  folders and says where to allow access. The one exception: if **no repository is found at all** and
+  a folder you **listed** in `discoverRoots` (Folders to search, in the app) itself can't be read or
+  doesn't exist, the run does not mark the day done, so it delivers the same day once access is
+  granted. A folder merely reached while scanning (`~/Desktop` under `~`) never holds the day. So if
+  your repos live under a protected folder, either grant access or list them explicitly under `repos`
+  (which `init` does for you once access is granted).
 
 **To grant access:** System Settings → Privacy & Security → **Files & Folders** (enable the
 folders for the `daily-briefing` binary), or **Full Disk Access** for the broad fix. Add the
@@ -184,8 +189,8 @@ Start with `daily-briefing schedule status`:
 | --- | --- |
 | `registered:` | `no` means nothing is scheduled: run `daily-briefing schedule install` (or set up background delivery in the app). |
 | `owner:` | `app` or `cli`. Only one may own the trigger; the other is refused rather than replacing it. |
-| `morning floor:` | `not yet reached` means it is earlier than [`morningTime`](CONFIG.md#morningtime), so ticks do nothing yet. |
-| `ticks today:` | how many times the scheduler woke the engine today. `none recorded` after the floor means the scheduler is not reaching it. |
+| `morning time:` | `not yet reached` means it is earlier than your morning time ([`morningTime`](CONFIG.md#morningtime)), so ticks do nothing yet. |
+| `ticks today:` | how many times the scheduler woke the engine today. `none recorded` after your morning time means the scheduler is not reaching it. |
 | `last delivery:` | the last time a briefing was delivered. |
 | `last skip:` | why the last tick did not deliver (table below). |
 | `engine skew` | the scheduled copy is a different version. If `owner:` is `app`, click **Update background engine** on the app's Schedule screen (a `schedule install` from the terminal is refused for an app-owned schedule); if `cli`, run `schedule install` again. |
@@ -201,7 +206,7 @@ Start with `daily-briefing schedule status`:
 | `offline` | the network did not come up within the wait; the next tick retries. |
 | `darkwake` | the Mac was in a brief maintenance wake; the next real wake delivers. |
 | `limited` | the AI account is at its usage limit; the detail says until when, when the provider stated it. |
-| `blocked` | no activity, and a repository could not be read (on macOS, usually [folder access](#macos-repos-in-protected-folders-desktop--documents--downloads--icloud)). The day is not used up. |
+| `blocked` | no activity, and a repository could not be read — or no repository was found at all and a folder listed in `discoverRoots` could not be read or found (on macOS, usually [folder access](#macos-repos-in-protected-folders-desktop--documents--downloads--icloud)). The day is not used up; when it can, the detail names the folders. |
 | `provider-fail` | the AI call failed after retries; the detail says how. |
 | `no-config`, `config-error` | the config is missing or invalid: `daily-briefing doctor --json`. |
 | `concurrent` | another run was still going. |

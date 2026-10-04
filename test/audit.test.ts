@@ -1,8 +1,10 @@
 import { test, expect } from "bun:test";
 import { extractCitedShas, missingSameDay, coverageGaps, unresolvedFromBatch, factsFromActivities, lastBriefing, buildAuditPrompt, sameDayCommits, branchLinesFromBriefing, branchAtGeneration, branchAxisLine, generationInstant, regenFailureMessage, groundingVerdict, degradedReadLine, unreadableReposLine, groundTruthUnavailableLine, classifyReadFailure, gitUnavailableLine, bucketPathIssues, accessDeniedLine, bucketFailures, degradationLines, degradationBuckets, evalRow, collectDegradation, unknownFailureLine } from "../src/audit";
-import type { Activity } from "../src/types";
+import type { Activity, BriefingStruct } from "../src/types";
 import { activityLine } from "../src/generator"; // D4a: the shared-evidence invariant spans both renderers
-import type { Unit } from "../src/subprojects";
+import { labelBoundary, type Unit } from "../src/subprojects";
+import { renderBriefing } from "../src/render";
+import { DISCOVERY_SUMMARY_LEADS, discoverySummary, isDiscoverySummary } from "../src/discoverySummary";
 
 test("extractCitedShas catches short (6-char) garbled SHAs in a SHA-citation list — the fabrication the tool exists to catch", () => {
   const line = "Built it (ff15ca0, 1faa71d, ffee140, 2ee1... (2ee140), bd65eed, 868f3ac)";
@@ -102,6 +104,70 @@ test("coverageGaps: parent-qualified label matched verbatim (no basename strip)"
   expect(coverageGaps(rws, "[A/api] resume").length).toBe(0);
   expect(coverageGaps(rws, "[api] resume").length).toBe(1); // "A/api" not present → still a gap
 });
+
+// ── v0.2.1 §2.4.2 r9 (user-directed 2026-10-03, split-decision Q2 = D): the discovery summary's own ⚠ line
+// is not a mention. Every briefing here is the ENGINE's render of a struct carrying the REAL builder's
+// summary, so a re-word on either side of the seam (writer or excluder) fails these, not just a literal.
+{
+  const HOME_DIR = "/Users/me";
+  const SUMMARY = discoverySummary(
+    [{ path: `${HOME_DIR}/Desktop`, kind: "tcc-denied", protectedRoot: `${HOME_DIR}/Desktop` }],
+    { noRepos: false, home: HOME_DIR },
+  )!;
+  const QUIET_DAY: BriefingStruct = { date: "2026-10-03", machineScope: "m", provider: "claude", resume: [], recap: [], suggestions: [] };
+  const md = (over: Partial<BriefingStruct>) => renderBriefing({ ...QUIET_DAY, ...over });
+  const dirty = (label: string) => ({ repo: `/Users/me/code/${label}`, labels: [label] });
+  const DRIFT = 'working-tree changed while generating: [settings] was clean → now "M a.ts" — re-verify "Where you left off" before acting';
+
+  test("coverageGaps (r9): a dirty repo labelled `settings` or `app` is STILL a gap when the summary line is the word's only occurrence", () => {
+    const text = md({ warnings: [SUMMARY] });
+    for (const label of ["settings", "app"]) {
+      // PREMISE: the word IS in the briefing, word-bounded the way coverageGaps matches — on the summary line
+      // and nowhere else — so without the exclusion it would count as a mention.
+      expect(text.split("\n").filter((l) => labelBoundary(label).test(l.toLowerCase()))).toEqual([`⚠ ${SUMMARY}`]);
+      expect(coverageGaps([dirty(label)], text)).toEqual([dirty(label)]);
+    }
+  });
+
+  test("coverageGaps (r9): a drift warning naming a repo on the JOINED ordinary line still counts as a mention (unchanged)", () => {
+    const text = md({ warnings: [DRIFT, SUMMARY] });
+    expect(text.split("\n").filter((l) => l.startsWith("⚠ "))).toEqual([`⚠ ${DRIFT}`, `⚠ ${SUMMARY}`]);   // PREMISE: two lines
+    expect(coverageGaps([dirty("settings")], text)).toEqual([]);              // named by the drift line
+    expect(coverageGaps([dirty("app")], text)).toEqual([dirty("app")]);       // only the summary says "app"
+  });
+
+  test("coverageGaps (r9): excluding the summary line scores exactly like DELETING it — no other line moves", () => {
+    const texts = [
+      md({ warnings: [SUMMARY] }),
+      md({ warnings: ["a real warning naming [app]", SUMMARY] }),
+      md({ resume: [{ repo: "desktop", text: "resume the folder access work" }], warnings: [SUMMARY, DRIFT] }),
+    ];
+    // (Not the summary's "Security": test/isolation.meta.test.ts reads that word, alone in a literal, as a
+    // spawn of the macOS `security` binary.)
+    const labels = ["settings", "app", "desktop", "macos", "folder", "schedule", "privacy", "files", "repos", "access", "claude", "warning"];
+    for (const text of texts) {
+      const deleted = text.split("\n").filter((l) => l !== `⚠ ${SUMMARY}`).join("\n");
+      expect(deleted).not.toBe(text);   // PREMISE: the summary had its own line to delete
+      for (const label of labels) {
+        expect(`${label}: ${JSON.stringify(coverageGaps([dirty(label)], text))}`)
+          .toBe(`${label}: ${JSON.stringify(coverageGaps([dirty(label)], deleted))}`);
+      }
+    }
+  });
+
+  test("coverageGaps (r9): a briefing with NO summary line scores as before — the exclusion matches none of its lines", () => {
+    // Every briefing saved before v0.2.1 is of this kind: the leads entered src/ with v0.2.1 (50cd51c12).
+    const text = md({ resume: [{ repo: "app", text: "resume" }], warnings: ["a real warning", DRIFT] });
+    expect(text.split("\n").filter((l) => l.startsWith("⚠ ") && isDiscoverySummary(l.slice(2)))).toEqual([]);
+    expect(coverageGaps([dirty("settings"), dirty("app"), dirty("missing")], text)).toEqual([dirty("missing")]);
+  });
+
+  test("wiring (r9): audit.ts reads the writer's own predicate — no lead is spelled in it (the LEGEND_PREFIX rule)", async () => {
+    const audit = await Bun.file(new URL("../src/audit.ts", import.meta.url)).text();
+    expect(audit).toMatch(/import \{ isDiscoverySummary \} from "\.\/discoverySummary";/);
+    for (const lead of DISCOVERY_SUMMARY_LEADS) expect(audit).not.toContain(lead.trim());
+  });
+}
 
 test("unresolvedFromBatch: a SHA missing in EVERY repo is unresolved; resolved/ambiguous anywhere clears it", () => {
   const cited = ["2ee140", "ff15ca0", "a1b2c3"];

@@ -13,9 +13,12 @@
  * is a human gate, not an app setting, and the save path refuses any change to it
  * (`src-tauri/src/config_save.rs`) whether it comes from here or from the raw-JSON tab.
  *
- * ⚠ HELP TEXT IS QUOTED, NOT PARAPHRASED. Every `quote` below is a verbatim fragment of the engine
- * source it names; `gui/tests-web/settings.check.ts` reads those files and requires each fragment
- * to be there. `note` is this app's own wording, and says only what the quote does not.
+ * ⚠ THE FORM SHOWS `help`, AND KEEPS `quote` UNSHOWN (v0.2.1 §4.1). `help` is this app's own plain
+ * wording for a person setting the field: one or two sentences, no file names, no code terms
+ * (`gui/tests-web/settings.check.ts` refuses the obvious leaks). Every `quote` is still a verbatim
+ * fragment of the engine source it names, and that test still reads those files and requires each
+ * fragment to be there — so the model keeps tracking the engine's documented semantics even though
+ * the quote is no longer rendered. `note` is extra wording a field needs beyond its help.
  *
  * ⚠ AN UNTOUCHED FORM SAVES NOTHING. The form round-trips the config through JavaScript, which
  * rewrites some spellings — `1.0` → `1`, `-0` → `0`, integer-like keys ("1", "42") listed first — so
@@ -26,6 +29,7 @@
  */
 
 import type { SaveOutcome } from "./files";
+import { parseMorningTime, storedTimeNote } from "./morning-time";
 
 export type Draft = Record<string, unknown>;
 
@@ -45,7 +49,9 @@ export type FieldKind =
   | "accounts"
   | "subprojects"
   | "hosts"
-  | "notify";
+  | "notify"
+  /** v0.2.1 §3.2: an hour and a minute dropdown writing `HH:MM` (`lib/MorningTimeSelect.svelte`). */
+  | "time";
 
 export interface Field {
   /** Stable id, also the input's DOM id suffix. */
@@ -59,6 +65,12 @@ export interface Field {
   required?: boolean;
   /** An empty list is meaningful and different from an absent key (offered as a separate toggle). */
   defaultable?: boolean;
+  /** v0.2.1 §4.1: what the form shows under the field — plain sentences, this app's own words. */
+  help: string;
+  /** Which provider shape this field applies to; absent = always. Needed where a section mixes
+   *  shapes (Advanced); `sectionsFor` applies it as well as the section's own `when`. */
+  when?: "cli" | "api";
+  /** The engine source's own comment, verbatim. NOT shown (v0.2.1 §4.1); pinned by a test. */
   quote?: Quote;
   note?: string;
   placeholder?: string;
@@ -68,6 +80,8 @@ export interface Section {
   title: string;
   /** Which provider shape the section applies to; absent = always. */
   when?: "cli" | "api";
+  /** v0.2.1 §4.1: drawn collapsed (a closed `<details>`), for the Advanced section. */
+  collapsed?: boolean;
   fields: Field[];
 }
 
@@ -91,11 +105,18 @@ export const ARGV_NOTE =
 export const SECTIONS: Section[] = [
   {
     title: "Repositories",
+    // ⚠ EITHER/OR, NOT BOTH (M3b checkpoint fix): the engine's `discoverRepos` (`src/config.ts`)
+    // returns a non-empty `repos` as-is and never walks `discoverRoots` for the briefing — the
+    // folders are searched only while `repos` is empty. `init` and the wizard write both keys, so
+    // help that promised "in addition to" described the opposite of most users' config.
+    // `settings.check.ts` runs the engine's function against both help strings.
     fields: [
       {
         id: "repos",
         path: ["repos"],
         label: "Repositories",
+        help:
+          "Repositories the briefing reads. When this list has anything in it, the briefing reads only these and does not search the folders below for more.",
         kind: "lines",
         note: "One path per line. A leading ~ is expanded by the engine.",
         placeholder: "~/code/my-project",
@@ -103,7 +124,9 @@ export const SECTIONS: Section[] = [
       {
         id: "discoverRoots",
         path: ["discoverRoots"],
-        label: "Folders to search for repositories",
+        label: "Folders to search",
+        help:
+          "Folders the briefing searches for repositories, two levels deep, each time it runs — but only while the Repositories list above is empty.",
         kind: "lines",
         note: "One path per line. A leading ~ is expanded by the engine.",
       },
@@ -111,23 +134,13 @@ export const SECTIONS: Section[] = [
         id: "excludeRepos",
         path: ["excludeRepos"],
         label: "Repositories to leave out",
+        help:
+          "Repositories to leave out of the briefing, even when they are listed above or found in a searched folder. Give the full path, or just the folder's name.",
         kind: "lines",
         quote: {
           text: "repos to drop from BOTH explicit `repos` and discovery — by absolute path or basename (e.g. a stale/work checkout you don't want in the briefing)",
           source: TYPES,
         },
-      },
-      {
-        id: "subprojects",
-        path: ["subprojects"],
-        label: "Sub-project roots",
-        kind: "subprojects",
-        defaultable: true,
-        quote: {
-          text: "per-repo project-root globs; [] = force single-unit despite a manifest",
-          source: TYPES,
-        },
-        note: "One repository per line: `repo: glob, glob`. `repo:` with nothing after it is an empty list.",
       },
     ],
   },
@@ -138,6 +151,8 @@ export const SECTIONS: Section[] = [
         id: "author.names",
         path: ["author", "names"],
         label: "Your git author names",
+        help:
+          "The names your commits are made under, so the briefing reports your work and not your coworkers'. With both lists empty, each repository's own git identity is used.",
         kind: "lines",
         quote: { text: "author: MUST be an object of string-ARRAYS.", source: CONFIG },
       },
@@ -145,6 +160,8 @@ export const SECTIONS: Section[] = [
         id: "author.emails",
         path: ["author", "emails"],
         label: "Your git author emails",
+        help:
+          "The email addresses your commits are made under. A commit that matches any name or email here counts as yours.",
         kind: "lines",
       },
     ],
@@ -157,6 +174,7 @@ export const SECTIONS: Section[] = [
         id: "provider.cli",
         path: ["provider", "cli"],
         label: "Command",
+        help: "The AI command-line tool that writes your briefing, for example claude or codex.",
         kind: "text",
         required: true,
         quote: {
@@ -165,9 +183,192 @@ export const SECTIONS: Section[] = [
         },
       },
       {
+        id: "provider.credential",
+        path: ["provider", "credential"],
+        label: "Credential",
+        help:
+          "Subscription, the default, makes the tool use its own logged-in account, so a key in your environment is never billed by accident. The other choice lets the tool use that key.",
+        kind: "choice",
+        options: ["subscription", "env-api-key"],
+        quote: {
+          text: '"subscription" (the default, and what an omitted field resolves to) withholds the key so the CLI uses its logged-in session; "env-api-key" passes whatever is in the environment through.',
+          source: TYPES,
+        },
+      },
+    ],
+  },
+  {
+    title: "Provider (API)",
+    when: "api",
+    fields: [
+      {
+        id: "provider.api.kind",
+        path: ["provider", "api", "kind"],
+        label: "API",
+        help:
+          "Which kind of API the engine calls: Anthropic's own, or a service that speaks the OpenAI-compatible format, such as a local model server.",
+        kind: "choice",
+        options: ["anthropic", "openai-compatible"],
+        required: true,
+      },
+      {
+        id: "provider.api.model",
+        path: ["provider", "api", "model"],
+        label: "Model",
+        help:
+          "The model that writes your briefing. It has no default, because a different model changes what your briefing says.",
+        kind: "text",
+        required: true,
+        quote: {
+          text: "REQUIRED and deliberately never defaulted: a silently-chosen model changes briefing content without a config change",
+          source: TYPES,
+        },
+      },
+      {
+        id: "provider.api.baseUrl",
+        path: ["provider", "api", "baseUrl"],
+        label: "Endpoint",
+        help:
+          "The address the engine sends its requests to. Anthropic needs none; an OpenAI-compatible service, such as a local model server, does.",
+        kind: "text",
+        quote: {
+          text: "Anthropic: defaults to `https://api.anthropic.com`; set it to front a gateway or proxy. openai-compatible: REQUIRED in practice (there is no universal default endpoint).",
+          source: TYPES,
+        },
+      },
+      // ⚠ FIRST HIT WINS (M3b checkpoint fix): `resolveApiKey` (`src/apiKey.ts`) tries only the
+      // CONFIGURED sources, in the order environment variable → key file → key command → a key
+      // stored in the config, and stops at the first that gives a key. So the file is not read,
+      // and the command is not run, on a run where a higher source already answered — the help
+      // below must not promise "each time".
+      {
+        id: "provider.api.apiKeyFile",
+        path: ["provider", "api", "apiKeyFile"],
+        label: "Key file",
+        help:
+          "A file that contains only your API key, readable by you alone. The engine reads it when it writes your briefing, unless the key environment variable has already supplied a key.",
+        kind: "text",
+        quote: {
+          text: "KEY SOURCING is a four-rung, first-hit-wins ladder, and only CONFIGURED rungs are tried",
+          source: TYPES,
+        },
+      },
+      {
+        id: "provider.api.apiKeyCommand",
+        path: ["provider", "api", "apiKeyCommand"],
+        label: "Key command",
+        help:
+          "A command that prints your API key, such as a password manager's command-line tool. The engine runs it when it writes your briefing, unless the key environment variable or the key file has already supplied a key.",
+        kind: "lines",
+        note: "One argument per line — the command is run directly, never through a shell.",
+      },
+    ],
+  },
+  {
+    title: "Briefing",
+    fields: [
+      {
+        id: "lookbackCapDays",
+        path: ["lookbackCapDays"],
+        label: "Look back at most (days)",
+        help:
+          "How many days back the briefing looks for your last day of work. After a longer break, work older than this is left out.",
+        kind: "number",
+        note: "The engine's default is 4.",
+      },
+      {
+        id: "morningTime",
+        path: ["morningTime"],
+        label: "Morning time",
+        help: "Your briefing is generated on the first check after this time once your machine is awake.",
+        kind: "time",
+        quote: {
+          text: '24h "HH:MM" local floor; below it, scheduled runs no-op. Default "07:20".',
+          source: TYPES,
+        },
+      },
+    ],
+  },
+  {
+    title: "Notifications",
+    fields: [
+      {
+        id: "notify",
+        path: ["notify"],
+        label: "The engine's own notification",
+        help:
+          "Whether the engine itself announces a new briefing: off, the system's own notification where there is one, or a command you choose. This app's notifications are set separately.",
+        kind: "notify",
+        quote: {
+          text: '`"auto"` — best effort per OS: `osascript` on darwin, `notify-send` on linux, NOTHING on win32.',
+          source: TYPES,
+        },
+        note: "For a command, give one argument per line; {title}, {body} and {path} are filled in.",
+      },
+    ],
+  },
+  // Phase E (E12): the AUTOMATIC update check. "Check now" (the panel above the form) ignores both
+  // fields; they gate only the engine's own scheduled-run check (`src/updateCheck.ts`).
+  {
+    title: "Update check",
+    fields: [
+      {
+        id: "updateCheck.enabled",
+        path: ["updateCheck", "enabled"],
+        label: "Check for new versions automatically",
+        help:
+          "When on, a scheduled run that has just delivered your briefing asks GitHub whether a newer version exists; it downloads nothing and installs nothing.",
+        kind: "bool",
+        quote: {
+          text: "It is notify-only: it downloads nothing and installs nothing, and the answer is only recorded for `status --json` and the desktop app. Absent, or anything other than `true`, means no automatic check at all.",
+          source: TYPES,
+        },
+        note: "The engine default is off.",
+      },
+      {
+        id: "updateCheck.intervalHours",
+        path: ["updateCheck", "intervalHours"],
+        label: "Hours between automatic checks",
+        help:
+          "The fewest hours between two automatic checks, a whole number from 1 to 720. The default is 24.",
+        kind: "number",
+        placeholder: "24",
+        quote: {
+          text: "the minimum number of hours between automatic checks — a whole number from 1 to 720, default 24.",
+          source: TYPES,
+        },
+      },
+    ],
+  },
+  // v0.2.1 §4.1: the twelve fields most people never change, at the bottom and collapsed. CLI-only
+  // and API-only fields are mixed here, so each carries its own `when`. `provider.timeoutMs` has
+  // none: it bounds BOTH provider kinds (`src/config.ts`: "EVERY check below applies to BOTH
+  // shapes"). The key environment variable is here while the key file and key command are not, on
+  // purpose: neither this app nor the background scheduler passes the shell's environment.
+  {
+    title: "Advanced",
+    collapsed: true,
+    fields: [
+      {
+        id: "subprojects",
+        path: ["subprojects"],
+        label: "Sub-project roots",
+        help:
+          "For a repository that holds several projects, which folders inside it count as separate projects. An empty list makes the briefing treat the whole repository as one project.",
+        kind: "subprojects",
+        defaultable: true,
+        quote: {
+          text: "per-repo project-root globs; [] = force single-unit despite a manifest",
+          source: TYPES,
+        },
+        note: "One repository per line: `repo: glob, glob`. `repo:` with nothing after it is an empty list.",
+      },
+      {
         id: "provider.argv",
         path: ["provider", "argv"],
         label: "Arguments",
+        help: "The options the engine gives the command-line tool every time it writes your briefing.",
+        when: "cli",
         kind: "lines",
         required: true,
         quote: {
@@ -180,6 +381,9 @@ export const SECTIONS: Section[] = [
         id: "provider.promptVia",
         path: ["provider", "promptVia"],
         label: "How the prompt is passed",
+        help:
+          "How the engine hands the prompt to the tool: on its standard input, or as the last argument. Standard input suits most tools.",
+        when: "cli",
         kind: "choice",
         options: ["stdin", "arg"],
         required: true,
@@ -188,6 +392,9 @@ export const SECTIONS: Section[] = [
         id: "provider.harden",
         path: ["provider", "harden"],
         label: "Harden the provider call",
+        help:
+          "On by default: the tool runs with its own tools, project settings and add-on servers switched off for the briefing call. Off turns all of them back on at once; there is no partial setting.",
+        when: "cli",
         kind: "bool",
         quote: {
           text: "All-or-nothing — a partial opt-out (re-enabling tools via `--tools default`) would silently drop ALL MCP servers, measured 2 → 0, with no way for the user to decline. `false` also skips the capability probe entirely.",
@@ -195,20 +402,12 @@ export const SECTIONS: Section[] = [
         },
       },
       {
-        id: "provider.credential",
-        path: ["provider", "credential"],
-        label: "Credential",
-        kind: "choice",
-        options: ["subscription", "env-api-key"],
-        quote: {
-          text: '"subscription" (the default, and what an omitted field resolves to) withholds the key so the CLI uses its logged-in session; "env-api-key" passes whatever is in the environment through.',
-          source: TYPES,
-        },
-      },
-      {
         id: "provider.accounts",
         path: ["provider", "accounts"],
         label: "Failover accounts, in order",
+        help:
+          "Logins for the tool to use in this order: when one reaches its usage limit, the next is tried. Leave it empty to use the tool's own login.",
+        when: "cli",
         kind: "accounts",
         quote: {
           text: 'ordered failover list. Absent/empty ⇒ the CLI\'s own default login, i.e. today\'s behaviour exactly (no CLAUDE_CONFIG_DIR is set). `label` is what limit marks are keyed by and must be unique; `configDir` absent means "use the default login", which is how the primary is expressed without rewriting a working setup.',
@@ -216,45 +415,13 @@ export const SECTIONS: Section[] = [
         },
         note: "One account per line: `label` or `label = config directory`.",
       },
-    ],
-  },
-  {
-    title: "Provider (API)",
-    when: "api",
-    fields: [
-      {
-        id: "provider.api.kind",
-        path: ["provider", "api", "kind"],
-        label: "API",
-        kind: "choice",
-        options: ["anthropic", "openai-compatible"],
-        required: true,
-      },
-      {
-        id: "provider.api.model",
-        path: ["provider", "api", "model"],
-        label: "Model",
-        kind: "text",
-        required: true,
-        quote: {
-          text: "REQUIRED and deliberately never defaulted: a silently-chosen model changes briefing content without a config change",
-          source: TYPES,
-        },
-      },
-      {
-        id: "provider.api.baseUrl",
-        path: ["provider", "api", "baseUrl"],
-        label: "Endpoint",
-        kind: "text",
-        quote: {
-          text: "Anthropic: defaults to `https://api.anthropic.com`; set it to front a gateway or proxy. openai-compatible: REQUIRED in practice (there is no universal default endpoint).",
-          source: TYPES,
-        },
-      },
       {
         id: "provider.api.maxTokens",
         path: ["provider", "api", "maxTokens"],
         label: "Maximum output tokens",
+        help:
+          "The longest reply the model may write. Left empty, Anthropic gets the engine's built-in limit and an OpenAI-compatible service uses its own.",
+        when: "api",
         kind: "number",
         quote: {
           text: "Anthropic REQUIRES `max_tokens`, so an absent value means the built-in default.",
@@ -262,40 +429,21 @@ export const SECTIONS: Section[] = [
         },
       },
       {
-        id: "provider.api.apiKeyFile",
-        path: ["provider", "api", "apiKeyFile"],
-        label: "Key file",
-        kind: "text",
-        quote: {
-          text: "KEY SOURCING is a four-rung, first-hit-wins ladder, and only CONFIGURED rungs are tried",
-          source: TYPES,
-        },
-      },
-      {
-        id: "provider.api.apiKeyCommand",
-        path: ["provider", "api", "apiKeyCommand"],
-        label: "Key command",
-        kind: "lines",
-        note: "One argument per line — the command is run directly, never through a shell.",
-      },
-      {
         id: "provider.api.apiKeyEnv",
         path: ["provider", "api", "apiKeyEnv"],
         label: "Key environment variable",
+        help:
+          "The name of an environment variable that holds your API key. It is found only when you run the engine from your own terminal.",
+        when: "api",
         kind: "text",
         note: "Neither this app nor the background scheduler passes your shell's environment to the engine, so a key named here is not found when the briefing runs from either — only a run from your own terminal sees it. Prefer a key file or a key command.",
       },
-    ],
-  },
-  {
-    // `timeoutMs` bounds BOTH provider kinds (`src/config.ts`: "EVERY check below applies to BOTH
-    // shapes"), so it is not in either kind's section.
-    title: "Provider timeout",
-    fields: [
       {
         id: "provider.timeoutMs",
         path: ["provider", "timeoutMs"],
         label: "Timeout (milliseconds)",
+        help:
+          "How long one call to the AI may take, in milliseconds, before the engine gives up on it; the default is two minutes. Raise it for a slow local model or a very large briefing.",
         kind: "number",
         quote: {
           text: "timeoutMs: per-provider-call timeout (default 120s) — raise for a slow local model / big multi-repo window",
@@ -303,22 +451,12 @@ export const SECTIONS: Section[] = [
         },
         note: "Applies to a command-line provider and to an API provider alike.",
       },
-    ],
-  },
-  {
-    title: "Briefing",
-    fields: [
-      {
-        id: "lookbackCapDays",
-        path: ["lookbackCapDays"],
-        label: "Look back at most (days)",
-        kind: "number",
-        note: "The engine's default is 4.",
-      },
       {
         id: "tokenBudget.maxChars",
         path: ["tokenBudget", "maxChars"],
         label: "Prompt budget (characters)",
+        help:
+          "The most repository detail, in characters, the engine gathers for one briefing's prompt; the instructions around it are not counted. Keep it high: past it, the engine trims that detail to fit.",
         kind: "number",
         quote: {
           text: "Keep this high so stage 2 of reduce() (which drops activities/evidence, see src/reduce.ts) stays a rare safety net for pathological monorepos rather than tripping on a normal busy day.",
@@ -329,6 +467,8 @@ export const SECTIONS: Section[] = [
         id: "excludeCommitPatterns",
         path: ["excludeCommitPatterns"],
         label: "Commit subjects to ignore (regular expressions)",
+        help:
+          "Commits whose subject matches any of these patterns, such as a bot's automatic commits, are left out of your briefing.",
         kind: "lines",
         defaultable: true,
         quote: {
@@ -340,6 +480,8 @@ export const SECTIONS: Section[] = [
         id: "auditJudgeArgv",
         path: ["auditJudgeArgv"],
         label: "Extra arguments for the audit judge",
+        help:
+          "Extra options for the developer self-audit, which this app never runs. The call that writes your briefing never uses them.",
         kind: "lines",
         quote: {
           text: "Extra argv for the AUDIT JUDGE only — the briefing generator never sees it.",
@@ -347,25 +489,11 @@ export const SECTIONS: Section[] = [
         },
       },
       {
-        id: "morningTime",
-        path: ["morningTime"],
-        label: "Morning floor (HH:MM)",
-        kind: "text",
-        placeholder: "07:20",
-        quote: {
-          text: '24h "HH:MM" local floor; below it, scheduled runs no-op. Default "07:20".',
-          source: TYPES,
-        },
-      },
-    ],
-  },
-  {
-    title: "Network and notifications",
-    fields: [
-      {
         id: "networkProbeHosts",
         path: ["networkProbeHosts"],
         label: "Connectivity check targets",
+        help:
+          "Before it writes, the engine checks that the network is up by connecting to these addresses, sending no data. An empty list turns the check off, which suits a local model.",
         kind: "hosts",
         defaultable: true,
         quote: {
@@ -373,46 +501,6 @@ export const SECTIONS: Section[] = [
           source: TYPES,
         },
         note: "One target per line: `host:port`.",
-      },
-      {
-        id: "notify",
-        path: ["notify"],
-        label: "The engine's own notification",
-        kind: "notify",
-        quote: {
-          text: '`"auto"` — best effort per OS: `osascript` on darwin, `notify-send` on linux, NOTHING on win32.',
-          source: TYPES,
-        },
-        note: "For a command, give one argument per line; {title}, {body} and {path} are filled in.",
-      },
-    ],
-  },
-  {
-    // Phase E (E12): the AUTOMATIC update check. "Check now" (the panel above the form) ignores both
-    // fields; they gate only the engine's own scheduled-run check (`src/updateCheck.ts`).
-    title: "Update check",
-    fields: [
-      {
-        id: "updateCheck.enabled",
-        path: ["updateCheck", "enabled"],
-        label: "Check for new versions automatically",
-        kind: "bool",
-        quote: {
-          text: "It is notify-only: it downloads nothing and installs nothing, and the answer is only recorded for `status --json` and the desktop app. Absent, or anything other than `true`, means no automatic check at all.",
-          source: TYPES,
-        },
-        note: "The engine default is off.",
-      },
-      {
-        id: "updateCheck.intervalHours",
-        path: ["updateCheck", "intervalHours"],
-        label: "Hours between automatic checks",
-        kind: "number",
-        placeholder: "24",
-        quote: {
-          text: "the minimum number of hours between automatic checks — a whole number from 1 to 720, default 24.",
-          source: TYPES,
-        },
       },
     ],
   },
@@ -467,9 +555,15 @@ export function providerShape(draft: Draft): "cli" | "api" {
   return isObject(getPath(draft, ["provider", "api"])) ? "api" : "cli";
 }
 
+/** The sections, and within each the fields, that apply to this draft's provider shape. A section
+ *  left with no field is dropped. The `Field` objects are the model's own (not copies), so
+ *  `fieldIsLive`'s identity check holds. */
 export function sectionsFor(draft: Draft): Section[] {
   const shape = providerShape(draft);
-  return SECTIONS.filter((s) => s.when === undefined || s.when === shape);
+  const applies = (when: "cli" | "api" | undefined) => when === undefined || when === shape;
+  return SECTIONS.filter((s) => applies(s.when))
+    .map((s) => ({ ...s, fields: s.fields.filter((f) => applies(f.when)) }))
+    .filter((s) => s.fields.length > 0);
 }
 
 /* ── reading a field into its input ───────────────────────────────────────────────────────────── */
@@ -490,6 +584,8 @@ export function readField(draft: Draft, field: Field): string {
   switch (field.kind) {
     case "text":
     case "choice":
+    // `time`: the STORED text, raw. What its dropdowns show is [`readTime`]'s normalised reading.
+    case "time":
       return typeof v === "string" ? v : v === undefined ? "" : JSON.stringify(v);
     case "number":
       return typeof v === "number" ? String(v) : v === undefined ? "" : JSON.stringify(v);
@@ -516,6 +612,20 @@ export function readField(draft: Draft, field: Field): string {
     case "notify":
       return typeof v === "string" ? v : isObject(v) ? "command" : "";
   }
+}
+
+/**
+ * A `time` field as its dropdowns show it (v0.2.1 §3.2): the stored value read the engine's way
+ * (`lib/morning-time.ts`), and — when the stored value is not already `HH:MM` — the note that says
+ * so, which the form pairs with a "Use HH:MM" button.
+ *
+ * ⚠ ONLY THE DISPLAY IS NORMALISED. The draft keeps the RAW stored string (`"7:05"`) until the user
+ * changes a dropdown or presses the button, so an untouched field leaves `jsonEqual(draft, loaded)`
+ * true: it never makes the form dirty, and a save of another field never rewrites it.
+ */
+export function readTime(draft: Draft, field: Field): { hhmm: string; note: string | null } {
+  const stored = getPath(draft, field.path);
+  return { hhmm: parseMorningTime(stored).hhmm, note: storedTimeNote(stored) };
 }
 
 /** The command lines of a `{ command: [...] }` notify value. */
@@ -568,6 +678,15 @@ export function writeField(draft: Draft, field: Field, input: string): string | 
       }
       setPath(draft, field.path, text);
       return null;
+    case "time": {
+      // The dropdowns and the "Use HH:MM" button write `HH:MM` only; anything else is refused, not
+      // written. Empty (no control sends it) removes the key, the engine's default, like `text`.
+      if (text === "") return empty("");
+      const time = parseMorningTime(text);
+      if (time.unparseable || time.hhmm !== text) return "must be HH:MM, e.g. 07:20";
+      setPath(draft, field.path, text);
+      return null;
+    }
     case "number": {
       if (text === "") {
         deletePath(draft, field.path);

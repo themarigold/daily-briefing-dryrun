@@ -22,8 +22,8 @@ import { notifyArgv, notifyPayload } from "../../src/notify";
 import AppSettings from "../src/lib/AppSettings.svelte";
 import {
   engineNotifyLine,
+  notifyAskExplanation,
   suppressedLine,
-  NOTIFY_ASK_EXPLANATION,
   type NotifyStatus,
   type Suppressed,
 } from "../src/lib/notify";
@@ -102,9 +102,11 @@ describe("the wording helpers", () => {
     ).toContain("engine's own notifier");
   });
 
-  test("the ask explains before anything can post, and never promises silence about macOS", () => {
-    expect(NOTIFY_ASK_EXPLANATION).toContain("Nothing is shown until");
-    expect(NOTIFY_ASK_EXPLANATION).toContain("macOS may ask");
+  test("the ask explains before anything can post, and on macOS never promises silence about macOS", () => {
+    // v0.2.1 §3.5 (M3b checkpoint fix): the constant became `notifyAskExplanation(os)`; the
+    // macOS answer is the old constant byte for byte (pinned exactly in the §3.5 block below).
+    expect(notifyAskExplanation("macos")).toContain("Nothing is shown until");
+    expect(notifyAskExplanation("macos")).toContain("macOS may ask");
   });
 });
 
@@ -218,5 +220,113 @@ describe("the Schedule screen's ask", () => {
     expect(buttons(asked)).toContain("Not now");
     const not = html(Schedule, { ...base, notifyAsk: false });
     expect(not).not.toContain("Nothing is shown until");
+  });
+});
+
+/* ── v0.2.1 §3.5 (M3b checkpoint fix): the ask names macOS only on macOS ─────────────────────── */
+
+describe("v0.2.1 §3.5: the notification ask follows the OS", () => {
+  // v0.2.0's NOTIFY_ASK_EXPLANATION, byte for byte — macOS keeps it.
+  const MACOS =
+    "Daily Briefing can show a system notification when your morning briefing arrives — and when " +
+    "a run fails or is blocked, so a silent morning is never a mystery. Nothing is shown until " +
+    "you turn this on; macOS may ask for its own permission the first time one appears.";
+  // Everywhere else the sentence ends at "until you turn this on."
+  const ELSEWHERE =
+    "Daily Briefing can show a system notification when your morning briefing arrives — and when " +
+    "a run fails or is blocked, so a silent morning is never a mystery. Nothing is shown until " +
+    "you turn this on.";
+  const OFF_MAC = ["linux", "windows", "other"] as const;
+  // Spec §3.5's criterion: neither "Mac" nor "macOS".
+  const noMac = (text: string): boolean => !text.includes("Mac") && !text.includes("macOS");
+  /** The one rendered paragraph that carries the ask. */
+  const askParagraph = (body: string): string => {
+    const found = [...body.matchAll(/<p[^>]*>([^<]*Nothing is shown until[^<]*)<\/p>/g)].map((m) => m[1] ?? "");
+    expect(found).toHaveLength(1);
+    return found[0] ?? "";
+  };
+
+  test("the function: macOS is v0.2.0's text exactly; Linux, Windows and other name no Mac", () => {
+    expect(notifyAskExplanation("macos")).toBe(MACOS);
+    for (const os of OFF_MAC) {
+      const text = notifyAskExplanation(os);
+      expect({ os, text, noMac: noMac(text) }).toEqual({ os, text: ELSEWHERE, noMac: true });
+    }
+    // prove-it 3b: the check can fail.
+    expect(noMac(MACOS)).toBe(false);
+  });
+
+  test("AppSettings, rendered never-asked and turned-off: no Mac off macOS; macOS reads as before", () => {
+    for (const enabled of [null, false] as const) {
+      const lead = enabled === null ? "" : "Notifications are off. ";
+      const ask = (os: string) =>
+        askParagraph(html(AppSettings, { notify: status(enabled), autostart: true, onrefresh: () => {}, os }));
+      for (const os of OFF_MAC) {
+        const p = ask(os);
+        expect({ enabled, os, p, noMac: noMac(p) }).toEqual({ enabled, os, p: lead + ELSEWHERE, noMac: true });
+      }
+      expect(ask("macos")).toBe(lead + MACOS);
+    }
+  });
+
+  test("Schedule, rendered with the ask: no Mac off macOS; macOS reads as before", () => {
+    const ask = (os: string) =>
+      askParagraph(html(Schedule, { state: null, error: null, notifyAsk: true, onnotifychoice: () => {}, os }));
+    for (const os of OFF_MAC) {
+      const p = ask(os);
+      expect({ os, p, noMac: noMac(p) }).toEqual({ os, p: ELSEWHERE, noMac: true });
+    }
+    expect(ask("macos")).toBe(MACOS);
+  });
+
+  test("every consumer calls notifyAskExplanation(os), and os is a required prop from App down (source pins)", () => {
+    // The wizard's ask is on its last step, which a server render cannot reach (only step 1
+    // renders), and Settings shows the panel's "Checking…" until a live status read — so those two
+    // are held by source, like `wizard.check.ts`'s OS-wording template pins.
+    const root = new URL("../src/", import.meta.url).pathname;
+    const files = [...new Bun.Glob("**/*.{svelte,ts}").scanSync({ cwd: root })].sort();
+    // prove-it 3b: the glob found the tree, callers and definition included.
+    expect(files.length).toBeGreaterThan(20);
+    for (const rel of ["lib/notify.ts", "lib/AppSettings.svelte", "routes/Schedule.svelte", "routes/Wizard.svelte"]) {
+      expect(files).toContain(rel);
+    }
+    const src = (rel: string): string => readFileSync(`${root}${rel}`, "utf8");
+    const calls: string[] = [];
+    for (const rel of files) {
+      const text = src(rel);
+      // The old constant is gone everywhere, definition included.
+      expect({ rel, old: text.includes("NOTIFY_ASK_EXPLANATION") }).toEqual({ rel, old: false });
+      if (rel === "lib/notify.ts") continue;
+      const n = (text.match(/notifyAskExplanation\(/g) ?? []).length;
+      if (n > 0) calls.push(`${rel}:${n}`);
+      // Every call passes `os` itself — never a literal platform.
+      const withOs = (text.match(/notifyAskExplanation\(os\)/g) ?? []).length;
+      expect({ rel, withOs }).toEqual({ rel, withOs: n });
+    }
+    expect(calls).toEqual(["lib/AppSettings.svelte:2", "routes/Schedule.svelte:1", "routes/Wizard.svelte:1"]);
+    // REQUIRED (no `?`) with no default, in each consumer and in Settings, which passes it on.
+    for (const rel of ["lib/AppSettings.svelte", "routes/Schedule.svelte", "routes/Wizard.svelte", "routes/Settings.svelte"]) {
+      const text = src(rel);
+      const end = text.indexOf("$props()");
+      const destructure = text.slice(text.lastIndexOf("let {", end), end);
+      expect({
+        rel,
+        required: /\n    os: Os;\n/.test(text),
+        destructured: /[{,\s]os[,\s}]/.test(destructure),
+        defaulted: /\bos\s*=/.test(destructure),
+      }).toEqual({ rel, required: true, destructured: true, defaulted: false });
+    }
+    // Settings hands it to the panel; App hands it to Schedule, Settings and the Wizard.
+    const tag = (text: string, open: string): string => {
+      const at = text.indexOf(open);
+      expect({ open, found: at >= 0 }).toEqual({ open, found: true });
+      return text.slice(at, text.indexOf("/>", at));
+    };
+    expect(tag(src("routes/Settings.svelte"), "<AppSettings")).toContain("{os}");
+    const app = src("App.svelte");
+    expect(app).toContain("const os = osFromUserAgent(navigator.userAgent);");
+    for (const open of ["<Schedule", "<Settings ", "<Wizard"]) {
+      expect({ open, os: tag(app, open).includes("{os}") }).toEqual({ open, os: true });
+    }
   });
 });

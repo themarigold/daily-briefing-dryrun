@@ -222,7 +222,7 @@ Environment=${systemdQuote(`${BUN_CRASH_REPORTING_OFF.name}=${BUN_CRASH_REPORTIN
 Environment=${systemdQuote(`${BUN_CRASH_REPORT_URL_EMPTY.name}=${BUN_CRASH_REPORT_URL_EMPTY.value}`)}
 `;
   const timer = `[Unit]
-Description=Daily Briefing — poll for the first wake past the morning floor
+Description=Daily Briefing — poll for the first wake past your morning time
 
 [Timer]
 OnBootSec=2min

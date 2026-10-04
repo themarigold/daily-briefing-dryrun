@@ -40,11 +40,11 @@ It writes two files into `~/.config/systemd/user/`:
 | File | What it does |
 | --- | --- |
 | `daily-briefing.service` | `Type=oneshot`, absolute `ExecStart=<managed copy> run` |
-| `daily-briefing.timer` | `OnBootSec=2min`, `OnUnitActiveSec=10min`, `OnCalendar` at your morning floor, `Persistent=true` |
+| `daily-briefing.timer` | `OnBootSec=2min`, `OnUnitActiveSec=10min`, `OnCalendar` at your morning time, `Persistent=true` |
 
 Two triggers, for the same reason macOS gets two: the monotonic arm polls, and the calendar arm
-fires once at the floor and — thanks to `Persistent=true`, which systemd only honours for calendar
-timers — **catches up a fire the machine missed while it was down**. The once-a-day marker dedupes
+fires once at your morning time and — thanks to `Persistent=true`, which systemd only honours for
+calendar timers — **catches up a fire the machine missed while it was down**. The once-a-day marker dedupes
 the second fire, so the cost is one no-op run per day.
 
 ## 2. ⚠ Lingering — the difference between working and silently never firing

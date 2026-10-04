@@ -61,15 +61,17 @@
     autostartSetEnabled,
     autostartWizardDefault,
     engineNotifyLine,
+    notifyAskExplanation,
     notifyStatus,
-    NOTIFY_ASK_EXPLANATION,
     type NotifyStatus,
   } from "../lib/notify";
+  import type { Os } from "../lib/platform";
   import type { ScheduleState } from "../lib/state";
   import type { VerifyEvidence } from "../lib/verify-flow";
   import ScheduleAccess from "../lib/ScheduleAccess.svelte";
   import ScheduleInstall from "../lib/ScheduleInstall.svelte";
   import ScheduleVerify from "../lib/ScheduleVerify.svelte";
+  import MorningTimeSelect from "../lib/MorningTimeSelect.svelte";
   import UpdateConsent from "../lib/UpdateConsent.svelte";
   import { CONSENT_TITLE } from "../lib/update-check";
   import {
@@ -95,12 +97,17 @@
     ROOT_DOCUMENTS,
     ROOT_DOWNLOADS,
     type StepId,
+    wizardOsWording,
   } from "../lib/wizard";
 
   interface Props {
     /** ⚠ Named `scheduleState`, not `state` — a `state` prop makes `$state(...)` parse as a
      *  store subscription (`svelte.dev/e/store_rune_conflict`, deviation 91). */
     scheduleState: ScheduleState | null;
+    /** v0.2.1 §3.5: the OS this window runs on (`osFromUserAgent`, from App). REQUIRED, with no
+     *  default, so a caller that forgets it fails `svelte-check` instead of silently getting one
+     *  platform's wording. */
+    os: Os;
     /** The live facts the step-6 verification loop watches — from the pushed `Snapshot`. */
     evidence?: VerifyEvidence;
     /** True while the notification opt-in has never been asked (the explained ask shows). */
@@ -114,6 +121,7 @@
   }
   let {
     scheduleState,
+    os,
     evidence = { skipIso: null, delivered: false },
     notifyAsk = false,
     notifyAskError = null,
@@ -123,6 +131,8 @@
   }: Props = $props();
 
   let step = $state<StepId>("welcome");
+  /** v0.2.1 §3.5: every OS-dependent string the steps below show (macOS: the pre-v0.2.1 text). */
+  const wording = $derived(wizardOsWording(os));
   let draft = $state(emptyDraft());
   /** The loaded document — `null` until `config_read` answers. Its `exists` picks create vs edit. */
   let doc = $state<ConfigDocument | null>(null);
@@ -363,7 +373,7 @@ the Settings screen.</pre>
       </p>
       <ul>
         <li>
-          <strong>Local-first.</strong> Everything runs on this Mac. Your repositories are read
+          <strong>Local-first.</strong> Everything runs on {wording.machine}. Your repositories are read
           here, the briefing is written here, and the archive stays here
           {doc !== null ? ` (the configuration this wizard creates lives at ${doc.path})` : ""}.
         </li>
@@ -373,7 +383,7 @@ the Settings screen.</pre>
           runs it starts and schedules. What the briefing is built from (commit subjects, short hashes and dates,
           the names of changed and uncommitted files, repository and branch names, stash messages)
           goes only to the AI you choose in the next step. The engine also checks that the network is
-          up before it writes, and whenever this app checks your setup (on macOS, also each time it opens) (a connection that
+          up before it writes, and whenever this app checks your setup{wording.checkOnOpen} (a connection that
           sends no data), and asks GitHub whether a newer version exists only if you say yes in step
           5, turn it on later in Settings, or press Check now there. In a partial clone, git itself
           may also download missing file contents from that repository's own remote.
@@ -385,8 +395,8 @@ the Settings screen.</pre>
         </li>
         <li>
           <strong>Nothing happens until the end.</strong> No configuration is written and nothing
-          is installed until you confirm at the last step; the folder-access step asks macOS for
-          permission only when you press its button. Cancelling now changes nothing.
+          is installed until you confirm at the last step{wording.folderAccessClause}.
+          Cancelling now changes nothing.
         </li>
       </ul>
     </div>
@@ -469,7 +479,8 @@ the Settings screen.</pre>
           onchange={() => (draft.providerPath = "local")} />
         <span>
           <strong>A local model server.</strong> Ollama, LM Studio, vLLM — an OpenAI-compatible
-          endpoint on this machine. The prompt built from your repositories never leaves your Mac.
+          endpoint on this machine. The prompt built from your repositories never leaves
+          {wording.localModelStaysOn}.
         </span>
       </label>
       {#if draft.providerPath === "local"}
@@ -507,15 +518,17 @@ the Settings screen.</pre>
         <span>
           <strong>Home folder (~)</strong> — what the engine's own setup uses.
           <span class="muted">The scan looks inside every non-hidden folder, including Desktop,
-          Documents and Downloads — macOS may ask about those the first time. Untick this and
-          list folders yourself to keep the scan narrow.</span>
+          Documents and Downloads{wording.homeScanAsks}. Untick this and list folders yourself to
+          keep the scan narrow.</span>
         </span>
       </label>
-      <p class="muted small">
-        These three are macOS-protected and start UNTICKED on purpose: nothing should trigger a
-        permission dialog you did not choose. Tick one only if your repositories live there —
-        the next step then walks you through the grant.
-      </p>
+      {#if wording.protectedFoldersNote}
+        <p class="muted small">
+          These three are macOS-protected and start UNTICKED on purpose: nothing should trigger a
+          permission dialog you did not choose. Tick one only if your repositories live there —
+          the next step then walks you through the grant.
+        </p>
+      {/if}
       <label class="choice">
         <input type="checkbox" checked={draft.rootDesktop}
           onchange={(e) => (draft.rootDesktop = e.currentTarget.checked)} />
@@ -578,14 +591,21 @@ the Settings screen.</pre>
         When should your briefing be ready? This is the <strong>earliest</strong> time, not an
         exact one.
       </p>
-      <label class="field narrow">
-        <span>Earliest time (24-hour HH:MM)</span>
-        <input type="text" value={draft.floor}
-          oninput={(e) => (draft.floor = e.currentTarget.value)} />
-      </label>
+      <!-- v0.2.1 §3.2: two dropdowns writing HH:MM (`lib/MorningTimeSelect.svelte`), not free
+           text. A re-run seed is already normalised (`draftFromConfig`), and a stored value the
+           engine cannot read is named in the note below — as text. Picking a time clears that
+           note: it describes the stored value, which the pick has just replaced. -->
+      <div class="field">
+        <label for="wizard-morning-time">Morning time</label>
+        <MorningTimeSelect id="wizard-morning-time" value={draft.floor}
+          onchange={(hhmm) => { draft.floor = hhmm; draft.floorNote = null; }} />
+      </div>
+      {#if draft.floorNote !== null}
+        <p class="warn-text">{draft.floorNote}</p>
+      {/if}
       <p class="first-wake">{firstWakeSentence(draft.floor)}</p>
       <p class="muted small">
-        The background check runs every ten minutes while your Mac is awake. A closed laptop
+        The background check runs every ten minutes while {wording.awake} is awake. A closed laptop
         generates nothing — the briefing arrives shortly after the first wake past this time.
       </p>
     </div>
@@ -696,7 +716,7 @@ the Settings screen.</pre>
 
       {#if notifyAsk}
         <div class="block notify-ask">
-          <p>{NOTIFY_ASK_EXPLANATION}</p>
+          <p>{notifyAskExplanation(os)}</p>
           <div class="buttons">
             <button type="button" onclick={() => onnotifychoice(true)}>Enable notifications</button>
             <button type="button" onclick={() => onnotifychoice(false)}>Not now</button>
@@ -834,7 +854,8 @@ the Settings screen.</pre>
     flex-direction: column;
     gap: 0.25rem;
   }
-  .field span {
+  .field span,
+  .field > label {
     font-size: 0.85rem;
     color: var(--muted);
   }
@@ -846,9 +867,6 @@ the Settings screen.</pre>
     border: 1px solid var(--line);
     background: transparent;
     color: inherit;
-  }
-  .field.narrow input {
-    max-width: 8rem;
   }
   .first-wake {
     font-weight: 600;

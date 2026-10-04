@@ -70,7 +70,7 @@ const STRUCT: BriefingStruct = {
 
 function coreResult(over: Partial<CoreResult> = {}): CoreResult {
   return {
-    emptyWindow: false, blocked: false, offlineSkipped: false,
+    emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: false,
     net: { online: true, waitedMs: 0 },
     struct: STRUCT, rawText: MODEL_OUT, promptText: "p",
     ctx: { repos: [] }, units: [], activities: [], repos: [],

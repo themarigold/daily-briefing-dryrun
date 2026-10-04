@@ -70,7 +70,8 @@
   <h2>History</h2>
   <p class="retention">
     Every briefing is kept, on purpose: the archive grows by about 8 KB a day (roughly 3 MB a year)
-    because it is the engine's calibration record. Daily Briefing never offers to remove any of it.
+    because it is the engine's calibration record. This screen never removes any of it. Only
+    Uninstall (Settings › This app), with "Also remove the engine's data" ticked, does.
   </p>
 
   {#if error !== null}

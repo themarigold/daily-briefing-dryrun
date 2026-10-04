@@ -59,6 +59,7 @@ import { whySourceFor } from "./transcripts/join";
  *  morning", while a wider window admits stale claimants. */
 export const TRANSCRIPT_READ_MARGIN_MS = 24 * 3_600_000;
 import { isInaccessible, warnFor, type PathIssue, type GuardOpts } from "./protectedPath";
+import { countedIssues, discoveryBlocked, discoverySummary } from "./discoverySummary";
 import { uncommittedFileList, isBranchNotable } from "./git";
 import { ProviderError, type DoneItem, type Provider, type BriefingStruct, type Activity, type Config, type ReducedContext } from "./types";
 import { resolveUnits, unitForCommit, unitForFiles, repoLabelFor, rootsForRepo, unitKey, subprojectLegend, INFRA_DENYLIST, labelBoundary, type Unit } from "./subprojects";
@@ -659,18 +660,41 @@ export async function workingTreeDriftWarnings(
   return driftWarnings(await computeWorkingTreeDrift(uncommitted, repoPaths, statusNow, contributing));
 }
 
-// A run must NOT stamp the day (retryable) when it produced nothing AND at least one repo we
-// actually tried to read was inaccessible — TCC- OR ordinary-perms-blocked. The emptiness may be
-// caused by that block, so consuming the day would silently drop that repo's work. A genuine quiet
-// day (all repos readable, just no activity) or a merely-absent (not-a-repo) path still stamps.
-// NB: keyed on RESOLVED-repo issues, not discovery-root issues, so an incidental blocked folder
-// for a user with genuinely no repos can't create a permanent non-stamping loop.
+// A run must NOT stamp the day (retryable) — `CoreResult.blocked` — under either of TWO rules:
+//  1. EXTRACTION-BLOCKED (this function): it produced nothing AND at least one repo we actually tried
+//     to read was inaccessible — TCC- OR ordinary-perms-blocked. The emptiness may be caused by that
+//     block, so consuming the day would silently drop that repo's work. A genuine quiet day (all repos
+//     readable, just no activity) or a merely-absent (not-a-repo) path still stamps.
+//  2. DISCOVERY-BLOCKED (`discoveryBlocked`, src/discoverySummary.ts — v0.2.1 §2.4.5): discovery found
+//     NO repos at all AND a folder the user LISTED in Folders to search (`discoverRoots`, as expanded at
+//     load) was itself denied, unreadable or missing. The user named that folder, so an empty day is a
+//     delivery failure with a remedy, and not stamping is what lets the same day deliver once access is
+//     granted (or the typo is fixed).
+// NB: rule 1 is keyed on RESOLVED-repo issues and rule 2 on CONFIGURED roots only — never on a folder
+// merely reached while walking a root (e.g. ~/Desktop under ~). That is what keeps an incidental
+// blocked folder, for a user with genuinely no repos, from creating a permanent non-stamping loop: it is
+// named in the quiet day's warning (`discoverySummary`) and the day still stamps.
 export function blockedDelivery(activityCount: number, resolvedRepoIssues: PathIssue[]): boolean {
   return activityCount === 0 && resolvedRepoIssues.some(isInaccessible);
 }
 
 export type CoreResult = {
   emptyWindow: boolean; blocked: boolean;
+  /** v0.2.1 §2.4.5: `blocked` came from the DISCOVERY rule (no repos found, and a configured search
+   *  folder itself could not be read or was missing) — the shell words its stderr line for that case.
+   *  False on every path that is not blocked by that rule, including an extraction-blocked run. */
+  discoveryBlocked: boolean;
+  /** v0.2.1 §2.4.2: the one-sentence explanation of the folders discovery could not read, set only when a
+   *  counted issue exists, on exactly two paths:
+   *   - the EARLY-RETURN path (empty window, extraction-blocked or discovery-blocked): it is ALSO in the
+   *     pipeline `warnings` (so stderr prints it and a delivered quiet day shows it), and carried here so
+   *     the shell can use it as the skip detail of a blocked run;
+   *   - the PROVIDER path when the window has NO commits (r7 — every readable repo contributes a `branch`
+   *     activity, so a found repo makes `emptyWindow` false and this is the common quiet day): it is in
+   *     `struct.warnings` (the rendered ⚠ line, folded in with the late warnings) AND, since r8, at the
+   *     end of the pipeline `warnings` (so stderr, briefing.log and the `run --json` envelope carry it).
+   *  A window with commits never gets one: the folders stay in stderr/briefing.log only (§2.4.4). */
+  discoverySummary?: string;
   /** Why a scheduled run declined to call the provider. "offline" = the net gate never came up;
    *  "darkwake" = the machine is in a maintenance wake where the provider call cannot complete even
    *  though a TCP probe succeeds. Distinct because the REMEDY differs and, on 2026-08-08, an
@@ -878,16 +902,29 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // the shell must NOT stamp and must exit non-zero so the next run retries once access is fixed.
   // BUT if there IS today's work (from readable repos), don't discard it — not blocked; the shell
   // renders it via the emptyWindow path (the block still shows as a warning).
-  const blocked = blockedDelivery(realActivities.length, extrIssues) && today.length === 0;
+  // v0.2.1 §2.4: the discovery issues worth naming (deduped; excludeRepos applied), and the second
+  // blocked rule — see the comment above `blockedDelivery`. `repos` is discovery's own output, already
+  // after `excludeRepos`; an explicit `repos` config yields no discovery issues, so neither can fire there.
+  const counted = countedIssues(discIssues, cfg);
+  const discBlocked = discoveryBlocked(repos, counted, cfg.discoverRoots ?? []);
+  const blocked = (blockedDelivery(realActivities.length, extrIssues) && today.length === 0) || discBlocked;
 
   if (blocked || emptyWindow) {
     // Zero activity is an HONEST empty briefing enforced in code (§7): skip the provider entirely so a
     // quiet day can never be hallucinated. A day with only resumption signals (a half-done branch) is
     // NOT empty and still briefs.
+    // v0.2.1 §2.4.2: name the folders discovery could not read — an otherwise-empty briefing is exactly
+    // where a blocked folder can be the reason. (The provider path does the same for a window with no
+    // commits; see `quietSummary` near the `late` warnings fold.) Pushed onto the shared `warnings`
+    // (mkStruct below shares the array), so stderr prints it after the per-folder `warnFor` lines and a
+    // delivered quiet day carries it on its ⚠ line; returned as well for the blocked run's skip detail.
+    const summary = discoverySummary(counted, { noRepos: repos.length === 0, home: homedir() });
+    if (summary !== undefined) warnings.push(summary);
     const empty = mkStruct("(no window activity)");
     return {
-      emptyWindow, blocked, offlineSkipped: false, net: null, struct: empty, rawText: "", promptText: "",
+      emptyWindow, blocked, discoveryBlocked: discBlocked, offlineSkipped: false, net: null, struct: empty, rawText: "", promptText: "",
       ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
+      ...(summary !== undefined ? { discoverySummary: summary } : {}),
     };
   }
 
@@ -933,7 +970,7 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     const walled = accountState.accounts[reportLabel];
     const skip = mkStruct("(skipped: limited)");
     return {
-      emptyWindow: false, blocked: false, offlineSkipped: true, skipReason: "limited",
+      emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "limited",
       limited: {
         label: reportLabel,
         until: walled?.limitedUntil ?? "",
@@ -1003,7 +1040,7 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   if (!force && !(await isFullyAwake(deps.powerPlatform, deps.powerProbe))) {
     const skip = mkStruct("(skipped: darkwake)");
     return {
-      emptyWindow: false, blocked: false, offlineSkipped: true, skipReason: "darkwake",
+      emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "darkwake",
       net: null, struct: skip, rawText: "", promptText: "",
       ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
     };
@@ -1014,7 +1051,7 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     // scheduled + offline: don't call the provider. struct is unused by the shell (it returns 0 on offlineSkipped).
     const skip = mkStruct("(skipped: offline)");
     return {
-      emptyWindow: false, blocked: false, offlineSkipped: true, skipReason: "offline", net, struct: skip, rawText: "", promptText: "",
+      emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "offline", net, struct: skip, rawText: "", promptText: "",
       ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
     };
   }
@@ -1119,7 +1156,7 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
       const remaining = resolveAccount(acc.accounts, await loadAccountState(), now);
       const skip = mkStruct("(skipped: limited)");
       return {
-        emptyWindow: false, blocked: false, offlineSkipped: true, skipReason: "limited",
+        emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "limited",
         limited: { label: account.label, until: reset.until.toISOString(), isProbe: reset.isProbe, exhausted: !remaining },
         net, struct: skip, rawText: "", promptText: "",
         ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
@@ -1171,8 +1208,30 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // `struct.warnings` whenever a cited SHA fails verification, detaching the alias. That reassignment
   // is conditional, so aliasing survives on some mornings and not others; relying on it would make a
   // warning appear or vanish depending on whether a SHA happened to fail that day.
-  const late = [...drift, ...runtimeWarningsOf(provider)];
+  //
+  // v0.2.1 §2.4.2 (r7): the discovery summary on the PROVIDER path, for a window with NO commits — the
+  // approved rule is "the warning appears only on briefings with no commits in the window", and this is
+  // the common such day: every readable repo contributes a `branch` resumption activity (git.ts
+  // `resumptionSignals`), so a found repo makes `emptyWindow` false and the early return above never
+  // runs. Folded in with `late` for the reason given just above — `struct.warnings` may no longer alias
+  // the pipeline `warnings`, so pushing there would make the ⚠ line depend on SHA verification.
+  // r8 (M1 checkpoint): it is ALSO pushed onto the pipeline `warnings`, AFTER the fold below, so stderr
+  // (the shell's `r.warnings` loop, after every per-folder `warnFor` line), briefing.log and the
+  // `run --json` envelope's `warnings` carry it on this quiet day exactly as on the early-return path.
+  // The order is load-bearing: a non-empty `late` makes `appendUnique` return a FRESH array, so by the
+  // time of the push `struct.warnings` no longer aliases `warnings` whatever the generator did, and the
+  // push cannot move or duplicate the summary inside the rendered ⚠ line.
+  // "No commits" = no `kind === "commit"` among `realActivities`: bot-excluded commits do not count (they
+  // are invisible to every other consumer), and a MERGE-ONLY window counts as no commits — `listCommits`
+  // drops every merge, so merges are never activities, and a merge-only briefing renders "(no commits in
+  // the window)" with its 🔀 lines beneath, which is where this ⚠ line belongs. Not blocked by
+  // construction: every blocked run took the early return. Same `counted` and `noRepos` as there.
+  const quietSummary = realActivities.some((a) => a.kind === "commit")
+    ? undefined
+    : discoverySummary(counted, { noRepos: repos.length === 0, home: homedir() });
+  const late = [...drift, ...runtimeWarningsOf(provider), ...(quietSummary !== undefined ? [quietSummary] : [])];
   if (late.length) struct.warnings = appendUnique(struct.warnings ?? [], late);
+  if (quietSummary !== undefined) warnings.push(quietSummary);   // r8: after the fold — see above
 
   // ── T4.3: await the scan started before generation. ── T4.4: route EVERY degradation.
   const scanned = await scanPromise;
@@ -1522,7 +1581,7 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   }
 
   return {
-    emptyWindow: false, blocked: false, offlineSkipped: false, net, struct, rawText, promptText,
+    emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: false, net, struct, rawText, promptText,
     ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
     transcripts,
     // Provenance, only when there was a real choice to make — see CoreResult.account.
@@ -1541,6 +1600,9 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     // that would be free to drift from this one — the defect fixed in #177. Existing destructurers
     // are unaffected.
     todaySuppress,
+    // v0.2.1 §2.4.2 (r7): the same value folded into `struct.warnings` above, so a caller reads the
+    // summary from one field whichever path produced it.
+    ...(quietSummary !== undefined ? { discoverySummary: quietSummary } : {}),
   };
 }
 

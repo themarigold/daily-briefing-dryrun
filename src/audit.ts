@@ -19,6 +19,9 @@ import { isShaShaped } from "./sha";
 import { resolveVerdictPaths } from "./config";
 import { localDateStr } from "./marker";
 import { redactCredentials } from "./transcripts/credentials";
+// coverageGaps' discovery-summary exclusion reads the WRITER's own predicate (v0.2.1 §2.4.2 r9) — the
+// LEGEND_PREFIX rule below: one shared definition, never a second literal.
+import { isDiscoverySummary } from "./discoverySummary";
 
 // Parse the briefing's "state as of HH:MM" stamp (core.ts stateAsOf = local HH:MM, rendered by
 // render.ts) into the generation INSTANT on bDate (local epoch-ms), or null if absent/unparseable.
@@ -284,7 +287,15 @@ export function coverageGaps(
     // and conditioned on by EVAL.md's 2026-09-17 comparability boundary): the marker is an annotation
     // UNDER a suggestion, and the suggestion line itself stays in the haystack — only the added line
     // is excluded, so no flag can move because the marker was switched on. See the constant's header.
-    .filter((l) => !l.startsWith(LEGEND_PREFIX) && !l.startsWith(NOT_SHOWN_PREFIX) && !l.startsWith(VERDICT_MARKER_PREFIX))
+    // The DISCOVERY SUMMARY line joins them (v0.2.1 §2.4.2 r9, user-directed 2026-10-03, split-decision
+    // Q2 = D): render.ts puts the summary on its OWN `⚠ ` line, and it names folders and "System
+    // Settings … (in the app: Schedule → Folder access)" — so left in, a dirty repo labelled `settings`,
+    // `app` or `desktop` would count as surfaced by a sentence about unreadable folders. Matched by the
+    // writer's own `isDiscoverySummary` on the line after `⚠ `; every other line, the joined
+    // ordinary-warnings line (drift warnings and all) included, is scored exactly as before, and a
+    // briefing saved before v0.2.1 has no such line, so past EVAL rows cannot move.
+    .filter((l) => !l.startsWith(LEGEND_PREFIX) && !l.startsWith(NOT_SHOWN_PREFIX) && !l.startsWith(VERDICT_MARKER_PREFIX)
+      && !(l.startsWith("⚠ ") && isDiscoverySummary(l.slice("⚠ ".length))))
     .join("\n")
     .toLowerCase();
   return reposWithState.filter(({ labels }) =>

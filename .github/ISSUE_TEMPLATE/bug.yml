@@ -1,0 +1,107 @@
+name: Bug report
+description: Something in Daily Briefing did not work, or showed the wrong thing.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Daily Briefing. The more exactly you can say what you saw, the faster it gets fixed.
+        Everything you paste here is public, so blank out anything you don't want other testers to see.
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: "macOS 15.4, Ubuntu 24.04, Fedora 41"
+    validations:
+      required: true
+
+  - type: input
+    id: arch
+    attributes:
+      label: Architecture
+      placeholder: "Apple Silicon, Intel x86_64, AMD x86_64, ARM64"
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: Shown on the Schedule screen, on the "Engine" line.
+      placeholder: "0.2.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-type
+    attributes:
+      label: How you installed it
+      options:
+        - DMG
+        - AppImage
+        - .deb
+        - command-line binary
+        - built from source
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps you took
+      placeholder: |
+        1. Opened the app
+        2. Pressed Run now on Today
+        3. …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected to see on screen
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What you actually saw on screen
+      description: Copy the exact text if you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Drag a screenshot here. For a missing or late briefing, include the Schedule screen.
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        Run the command for your system in a terminal and paste the output here. Each command replaces your home folder with `~` and your machine's name with `<this-machine>`.
+
+        macOS:
+        ```
+        tail -n 30 ~/Library/Application\ Support/daily-briefing/briefing.log | H="$(uname -n)" perl -pe 's/\Q$ENV{HOME}\E/~/g; s/\Q$ENV{H}\E/<this-machine>/gi if length $ENV{H}'
+        ```
+
+        Linux:
+        ```
+        journalctl --user -u daily-briefing.service -n 30 --no-pager -o cat | H="$(uname -n)" perl -pe 's/\Q$ENV{HOME}\E/~/g; s/\Q$ENV{H}\E/<this-machine>/gi if length $ENV{H}'
+        ```
+
+        Or press Run now on the Today screen and paste the text from its **Details** box. That output is not written to the log.
+      render: text
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: "I blanked out repo names, commit messages, paths and my machine's name where I don't want other testers to see them."
+          required: true

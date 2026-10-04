@@ -1,6 +1,6 @@
 [package]
 name = "daily-briefing-gui"
-version = "0.2.0"
+version = "0.2.1"
 description = "Desktop shell for the daily-briefing engine"
 authors = ["themarigold"]
 license = "MIT"

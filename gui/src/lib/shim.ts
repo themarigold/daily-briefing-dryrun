@@ -11,6 +11,7 @@
  * this app does not have (the app never runs `sudo`; the user does, in their own terminal).
  */
 import { invoke } from "@tauri-apps/api/core";
+import type { Os } from "./platform";
 
 /** What sits at the shim name, judged by Rust against the engine's reported target. */
 export type ShimPlacement =
@@ -68,8 +69,13 @@ export function placementLine(status: CliShimStatus): string {
   }
 }
 
-/** One sentence for a rejection from these commands. Plain text. */
-export function describeShimFailure(e: unknown): string {
+/** One sentence for a rejection from these commands. Plain text.
+ *
+ *  `os` because the refusal names who refused: `cli_shim.rs` supports every unix, so a Linux user can
+ *  reach `needsManualStep` too. On macOS the text is the v0.2.0 text, byte for byte; anywhere else it
+ *  says "The system" (as `notifyAskExplanation` in `notify.ts` does). Required, so a caller that
+ *  forgets it fails `svelte-check` rather than showing a Linux user macOS's name. */
+export function describeShimFailure(e: unknown, os: Os): string {
   if (e instanceof Error) return e.message;
   if (typeof e === "string") return e;
   if (typeof e !== "object" || e === null) return JSON.stringify(e);
@@ -85,7 +91,7 @@ export function describeShimFailure(e: unknown): string {
     case "foreign":
       return `${f("path")} is already taken by ${f("detail")}. Daily Briefing will not replace or remove a file it did not make; move it aside yourself if you want the name.`;
     case "needsManualStep":
-      return `macOS did not let this app write there (${f("detail")}). Run this in a terminal instead:\n${f("command")}`;
+      return `${os === "macos" ? "macOS" : "The system"} did not let this app write there (${f("detail")}). Run this in a terminal instead:\n${f("command")}`;
     default:
       return JSON.stringify(e);
   }

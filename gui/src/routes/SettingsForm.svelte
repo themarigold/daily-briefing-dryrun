@@ -10,17 +10,29 @@
    *
    * Inputs commit on `change` (blur or Enter), not on every keystroke, so a half-typed number is not
    * normalised under the cursor.
+   *
+   * v0.2.1 §4.1: each field shows its plain `help`, never the engine-source `quote` the model keeps
+   * for its verbatim test; the Advanced section is drawn collapsed (a `<details>` with no `open`) —
+   * unless one of its fields has a live error. Save refuses with "fix the fields marked above", so a
+   * marked field must be on screen: the section opens, and stays open while the error does. Closing it
+   * while the error lives re-opens it in `ontoggle`: the `open` expression is still `true` then, so
+   * Svelte never re-applies it, and the section would stay shut over the field Save refuses on
+   * (cold verifier, LOW pass). Once the error is fixed the section is the user's again — it stays as
+   * they left it (`ontoggle` records that), so fixing a field does not snap it shut under them.
    */
   import {
     hasPath,
     hasStoredApiKey,
+    liveErrors,
     providerShape,
     readField,
     readNotifyCommand,
+    readTime,
     sectionsFor,
     type Draft,
     type Field,
   } from "../lib/settings-model";
+  import MorningTimeSelect from "../lib/MorningTimeSelect.svelte";
 
   interface Props {
     draft: Draft;
@@ -34,6 +46,11 @@
   let { draft, errors, onfield, onnotifycommand, ondefault, onremovekey }: Props = $props();
 
   const value = (e: Event) => (e.currentTarget as HTMLInputElement).value;
+
+  /** The errors Save refuses on (`formSubmission` checks the same `liveErrors`). */
+  const live = $derived(liveErrors(draft, errors));
+  /** Each collapsed section's open state as the user (or an error, below) last left it. */
+  let opened = $state<Record<string, boolean>>({});
 </script>
 
 <div class="form">
@@ -51,10 +68,8 @@
     engine refuses a config that has both.
   </p>
 
-  {#each sectionsFor(draft) as section (section.title)}
-    <fieldset>
-      <legend>{section.title}</legend>
-      {#each section.fields as field (field.id)}
+  {#snippet fieldList(fields: Field[])}
+      {#each fields as field (field.id)}
         {@const current = readField(draft, field)}
         {@const usesDefault = field.defaultable === true && !hasPath(draft, field.path)}
         <div class="field">
@@ -84,6 +99,17 @@
                 <option value={current}>{current} (not a valid value)</option>
               {/if}
             </select>
+          {:else if field.kind === "time"}
+            <!-- v0.2.1 §3.2: the stored value is SHOWN the engine's way; the draft keeps it raw
+                 until a dropdown changes or the button below is pressed (`readTime`). -->
+            {@const time = readTime(draft, field)}
+            <MorningTimeSelect id="f-{field.id}" value={time.hhmm} onchange={(hhmm) => onfield(field, hhmm)} />
+            {#if time.note !== null}
+              <p class="note">
+                {time.note}
+                <button type="button" onclick={() => onfield(field, time.hhmm)}>Use HH:MM</button>
+              </p>
+            {/if}
           {:else if field.kind === "notify"}
             <select id="f-{field.id}" value={current} onchange={(e) => onfield(field, value(e))}>
               <option value="">Engine default (off)</option>
@@ -124,15 +150,36 @@
           {#if errors[field.id]}
             <p class="field-error">{errors[field.id]}</p>
           {/if}
-          {#if field.quote}
-            <p class="help"><q>{field.quote.text}</q> <span class="src">({field.quote.source})</span></p>
-          {/if}
+          <p class="help">{field.help}</p>
           {#if field.note}
             <p class="note">{field.note}</p>
           {/if}
         </div>
       {/each}
-    </fieldset>
+  {/snippet}
+
+  {#each sectionsFor(draft) as section (section.title)}
+    {#if section.collapsed}
+      <details
+        class="collapsed"
+        open={opened[section.title] === true || section.fields.some((f) => live[f.id] !== undefined)}
+        ontoggle={(e) => {
+          const el = e.currentTarget;
+          if (!el.open && section.fields.some((f) => live[f.id] !== undefined)) el.open = true;
+          opened[section.title] = el.open;
+        }}
+      >
+        <summary>{section.title}</summary>
+        <fieldset>
+          {@render fieldList(section.fields)}
+        </fieldset>
+      </details>
+    {:else}
+      <fieldset>
+        <legend>{section.title}</legend>
+        {@render fieldList(section.fields)}
+      </fieldset>
+    {/if}
   {/each}
 </div>
 
@@ -185,8 +232,12 @@
     font-size: 0.82rem;
     color: var(--muted);
   }
-  .src {
-    font-size: 0.75rem;
+  details.collapsed {
+    margin: 1rem 0 0;
+  }
+  details.collapsed > summary {
+    font-weight: 600;
+    cursor: pointer;
   }
   .field-error {
     margin: 0.25rem 0 0;

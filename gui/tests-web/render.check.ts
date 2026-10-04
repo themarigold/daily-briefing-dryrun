@@ -138,7 +138,7 @@ describe("Schedule.svelte", () => {
       html(Schedule, {
         state: state(
           { phase: "skipped", reason: "blocked", detail: HOSTILE, iso: null },
-          "Blocked — a repo could not be read",
+          "Blocked — a folder or repo could not be read or found",
           { unitPath: HOSTILE, floorWarning: HOSTILE },
         ),
         error: HOSTILE,

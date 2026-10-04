@@ -1364,6 +1364,32 @@ fn a_skip_carries_the_records_instant() {
     assert_eq!(marker.status_line, "Delivered, but the day marker failed");
 }
 
+/// v0.2.1 §2.4.5: a blocked run can now be blocked by a FOLDER (a configured search folder that
+/// could not be read, or is missing), so the line says "folder or repo" and "or found"; the engine's
+/// discovery summary rides in `detail`, verbatim, for Today's and Schedule's banner.
+#[test]
+fn a_blocked_skip_says_folder_or_repo_and_keeps_the_summary_as_detail() {
+    let summary = "No repositories were found in Folders to search. Couldn't read 1 folder \
+                   (~/Documents) because macOS blocked access, so repos in it may be missing.";
+    let state = derive(
+        &status(),
+        Some(&skip("blocked", TODAY, Some(summary))),
+        Some(&schedule()),
+        &at_0910(),
+    );
+    assert_eq!(
+        state.status_line,
+        "Blocked — a folder or repo could not be read or found"
+    );
+    match &state.phase {
+        Phase::Skipped { reason, detail, .. } => {
+            assert_eq!(reason, &SkipReason::Blocked);
+            assert_eq!(detail.as_deref(), Some(summary));
+        }
+        other => panic!("expected a skip, got {other:?}"),
+    }
+}
+
 /// ⚠ AN INVALID `morningTime` SHOWS THE FLOOR THE ENGINE USES. `parseFloor` falls back to the
 /// default for "25:99"; showing "25:99" as the floor would describe a schedule that is not running.
 #[test]

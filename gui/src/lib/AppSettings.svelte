@@ -6,7 +6,7 @@
    *
    * ⚠ THE NOTIFICATION ASK IS EXPLAINED, AND NOTHING POSTS BEFORE IT IS ANSWERED. Rust suppresses
    * every firing while the opt-in record says never-asked or off (`notifications::on_snapshot`);
-   * this panel is where the record is set, with `NOTIFY_ASK_EXPLANATION` on screen — plan T18's
+   * this panel is where the record is set, with `notifyAskExplanation`'s text on screen — plan T18's
    * "requested with an explanation, never on first fire".
    *
    * ⚠ THE AUTOSTART TOGGLE REFLECTS REAL STATE. `autostart` is `is_enabled()`'s answer (a stat of
@@ -44,11 +44,12 @@
   import {
     autostartSetEnabled,
     engineNotifyLine,
+    notifyAskExplanation,
     notifySetEnabled,
     suppressedLine,
-    NOTIFY_ASK_EXPLANATION,
     type NotifyStatus,
   } from "./notify";
+  import type { Os } from "./platform";
   import { notifyOffer, offerNote, offerTakeable, type NotifyOffer } from "./settings-model";
 
   interface Props {
@@ -60,8 +61,12 @@
     autostartError?: string;
     /** Re-fetch both after a change. */
     onrefresh: () => void | Promise<void>;
+    /** v0.2.1 §3.5: the OS this window runs on (App's `osFromUserAgent`, through Settings), for
+     *  the ask's wording. REQUIRED, with no default, so a mount that forgets it fails
+     *  `svelte-check` instead of silently getting one platform's wording. */
+    os: Os;
   }
-  let { notify, notifyError = "", autostart, autostartError = "", onrefresh }: Props = $props();
+  let { notify, notifyError = "", autostart, autostartError = "", onrefresh, os }: Props = $props();
 
   let busy = $state(false);
   let failure = $state("");
@@ -134,7 +139,7 @@
       shimError = "";
     } catch (e) {
       shim = null;
-      shimError = describeShimFailure(e);
+      shimError = describeShimFailure(e, os);
     }
   }
 
@@ -149,7 +154,7 @@
     try {
       shim = await action();
     } catch (e) {
-      shimError = describeShimFailure(e);
+      shimError = describeShimFailure(e, os);
     } finally {
       shimBusy = false;
     }
@@ -245,7 +250,7 @@
       {#if notify.enabled === null}
         <!-- Never asked: the explained ask, plan T18. Nothing has been posted and nothing will
              be until Enable is pressed. -->
-        <p>{NOTIFY_ASK_EXPLANATION}</p>
+        <p>{notifyAskExplanation(os)}</p>
         <div class="row">
           <button disabled={busy} onclick={() => setNotifications(true)}>Enable notifications</button>
           <button disabled={busy} onclick={() => setNotifications(false)}>Not now</button>
@@ -256,7 +261,7 @@
           <button disabled={busy} onclick={() => setNotifications(false)}>Turn off</button>
         </div>
       {:else}
-        <p>Notifications are off. {NOTIFY_ASK_EXPLANATION}</p>
+        <p>Notifications are off. {notifyAskExplanation(os)}</p>
         <div class="row">
           <button disabled={busy} onclick={() => setNotifications(true)}>Enable notifications</button>
         </div>

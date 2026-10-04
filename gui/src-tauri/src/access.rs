@@ -268,6 +268,18 @@ struct DoctorView {
     verdict: Option<String>,
 }
 
+/// Doctor's `config.exists` (`DoctorReport.config.exists`, `src/json.ts`), or `None` when the
+/// envelope does not carry it as a boolean.
+///
+/// ⚠ `None` IS TODAY'S BEHAVIOUR, NOT "NO CONFIG" (v0.2.1 §3.4). Only an explicit `false` means the
+/// engine looked and found no config file — the state a person is in while the setup wizard is
+/// still open. Read straight from the `Value` rather than through [`DoctorView`], because that view
+/// is parsed all-or-nothing: a `config` object of an unexpected shape there would also discard
+/// `repos`, `reposTimedOut` and `verdict`.
+pub fn doctor_config_exists(doctor: &Value) -> Option<bool> {
+    doctor.get("config")?.get("exists")?.as_bool()
+}
+
 /// The config fields scope detection reads. Both are optional in the engine's schema.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -809,6 +821,12 @@ pub struct AccessSnapshot {
     /// wording. `null` when nothing is installed. DISPLAY ONLY: [`access_reveal_engine`] re-reads
     /// it rather than taking it back.
     pub managed_engine_path: Option<String>,
+    /// v0.2.1 §3.4: TRUE ONLY WHEN DOCTOR SAID `config.exists: false` ([`doctor_config_exists`]
+    /// is `Some(false)`) — setup has not written a config yet. The panel then says the engine
+    /// check is available once setup is finished instead of printing doctor's `blocked`, and the
+    /// "config could not be read" note is not added. An envelope without the field leaves this
+    /// false, which is the pre-v0.2.1 behaviour.
+    pub config_missing: bool,
     /// Non-fatal trouble: the config could not be read, the record could not be written, the
     /// schedule could not be read. The panel still works; it says what it could not do.
     pub notes: Vec<String>,
@@ -828,6 +846,7 @@ impl AccessSnapshot {
             version_change: VersionChange::Same,
             app_version,
             managed_engine_path: None,
+            config_missing: false,
             notes: Vec::new(),
         }
     }
@@ -928,13 +947,18 @@ pub async fn access_snapshot<R: Runtime>(
     let doctor = read_envelope(client, Operation::Doctor)
         .await
         .map_err(|detail| AccessError::Engine { detail })?;
+    // v0.2.1 §3.4: read BEFORE the note below. With no config yet (the wizard is still open), the
+    // read is expected to fail and saying so would only alarm; an absent field is today's path.
+    let config_missing = doctor_config_exists(&doctor) == Some(false);
     let config = match read_config(client).await {
         Ok(value) => Some(value),
         Err(detail) => {
-            notes.push(format!(
-                "The config could not be read, so only the folders the engine already reported are \
-                 listed here: {detail}"
-            ));
+            if !config_missing {
+                notes.push(format!(
+                    "The config could not be read, so only the folders the engine already \
+                     reported are listed here: {detail}"
+                ));
+            }
             None
         }
     };
@@ -1000,6 +1024,7 @@ pub async fn access_snapshot<R: Runtime>(
         version_change,
         app_version: version,
         managed_engine_path,
+        config_missing,
         notes,
     })
 }

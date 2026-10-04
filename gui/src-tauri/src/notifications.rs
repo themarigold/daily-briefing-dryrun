@@ -23,8 +23,12 @@
 //!     stripped, §5's sanitization boundary, which is not redaction). Click route: the Schedule
 //!     screen — there is no Diagnostics route in this app (deviation register, `docs/gui-seam.md`
 //!     §12b).
-//!   * **BLOCKED** — the `blocked` skip: zero activity AND an unreadable repo. Click route: the
-//!     Schedule screen, whose Schedule & Access panel is the T17 grant flow.
+//!   * **BLOCKED** — the `blocked` skip: zero activity AND an unreadable repo, or (v0.2.1 §2.4.5)
+//!     no repos found AND a configured search folder that could not be read or is missing. The
+//!     body is ALWAYS the fixed generic one, never the skip record's `detail`: since v0.2.1 that
+//!     detail names folders, and an OS notification preview can appear on a lock screen. Today and
+//!     Schedule still show the detail. Click route: the Schedule screen, whose Schedule & Access
+//!     panel is the T17 grant flow.
 //!   * **NEVER for a legitimate skip.** [`skip_notify_class`] enumerates the ENGINE's whole
 //!     `SKIP_REASONS` vocabulary (pinned against `src/json.ts` by
 //!     `the_skip_vocabulary_matches_the_engine`) and maps `already-ran`, `below-floor`, `offline`,
@@ -696,13 +700,17 @@ pub fn build_notification(firing: &Firing, briefing: Option<&str>) -> Notificati
                 NotifyClass::Blocked => format!("Briefing blocked — {date}"),
                 _ => format!("Briefing failed — {date}"),
             };
-            let body = match detail.as_deref().map(notification_line) {
-                Some(line) if !line.is_empty() => line,
-                _ => match class {
-                    NotifyClass::Blocked => "A repository could not be read, so no briefing was \
-                                             generated. Open the Schedule screen to restore \
-                                             folder access."
-                        .to_string(),
+            let body = match class {
+                // v0.2.1 §2.4.5 (r5): never `detail` — it can name folders (the discovery summary),
+                // and a notification preview can sit on a lock screen. Today and Schedule show it.
+                // "or found": the engine also blocks on a configured search folder that is MISSING.
+                // "for details", not "to see which one": a blocked run can carry no detail at all.
+                NotifyClass::Blocked => "A folder or repository could not be read or found, so no \
+                                         briefing was generated. Open the Schedule screen for \
+                                         details."
+                    .to_string(),
+                _ => match detail.as_deref().map(notification_line) {
+                    Some(line) if !line.is_empty() => line,
                     _ => format!("The engine's run failed ({}).", notification_line(reason)),
                 },
             };

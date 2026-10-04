@@ -185,8 +185,8 @@ On macOS, a source checkout can also install the morning agent itself:
   local self-signed identity** (created on demand into your login keychain, `Daily Briefing (local)
   Signing`) so macOS Gatekeeper doesn't block the unattended scheduled run **and** the folder-access
   grant persists across rebuilds, and loads a `launchd` agent that ticks every 10 minutes
-  (`StartInterval` + `RunAtLoad`) and delivers on the first tick past your `morningTime` floor
-  (default 07:20 — see [delivery timing](CONFIG.md#delivery-timing-in-full)). Re-run the script any
+  (`StartInterval` + `RunAtLoad`) and delivers on the first tick past your morning time (`morningTime`,
+  default 07:20 — see [delivery timing](CONFIG.md#delivery-timing-in-full)). Re-run the script any
   time to rebuild and reload — the grant survives. (If no real `openssl` is available it degrades to an
   ad-hoc signature with a warning; hermetic/CI installs still succeed.)
 - **Running the installed binary directly** (e.g. to re-run `init` or trigger a manual briefing

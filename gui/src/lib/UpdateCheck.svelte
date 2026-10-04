@@ -10,7 +10,8 @@
    * reintroduce the coupling.
    *
    * ⚠ THE AUTOMATIC CHECK IS NOT SWITCHED HERE. It is the engine's `updateCheck` config, edited in
-   * the form further down this screen with the engine's own help text (`lib/settings-model.ts`).
+   * the form further down this screen (`lib/settings-model.ts`, whose help says it downloads and
+   * installs nothing).
    *
    * ⚠ EVERY ENGINE-DERIVED STRING IS `{}`-INTERPOLATED, and the release page is shown as TEXT to
    * copy, never as a link the webview would navigate to.

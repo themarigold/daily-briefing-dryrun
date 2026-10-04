@@ -28,10 +28,18 @@
     type AccessSnapshot,
     type ProbeResult,
   } from "./lib/access";
-  import { onProgress, run, type EngineOutcome, type ProgressEvent } from "./lib/engine";
+  import {
+    detailsOpen,
+    onProgress,
+    run,
+    type EngineOutcome,
+    type LastRunResult,
+    type ProgressEvent,
+  } from "./lib/engine";
   import { configRead, describeFailure } from "./lib/files";
   import { archiveList, keepArchive } from "./lib/history";
   import { notifySetEnabled, notifyStatus } from "./lib/notify";
+  import { osFromUserAgent } from "./lib/platform";
   import { notifyOffer, type NotifyOffer } from "./lib/settings-model";
   import QuitDialog from "./lib/QuitDialog.svelte";
   import { envelopeOf, type RunEnvelope } from "./lib/today";
@@ -53,6 +61,10 @@
   } from "./lib/state";
 
   let route = $state<Route>("today");
+  /** v0.2.1 §3.5: the OS wording (the wizard's, and the notification ask's on Schedule and
+   *  Settings) comes from the webview's own user agent — no Tauri command (that would change the
+   *  pinned capability surface). */
+  const os = osFromUserAgent(navigator.userAgent);
   let snapshot = $state<Snapshot | null>(null);
   /** Why the very first snapshot could not be fetched at all (a missing sidecar, typically). */
   let snapshotError = $state<string | null>(null);
@@ -109,6 +121,12 @@
   let running = $state(false);
   let progress = $state<string[]>([]);
   let runResult = $state("");
+  /** The last Run Now's result — whether Today's Details disclosure starts open (`detailsOpen`). */
+  let lastRunResult = $state.raw<LastRunResult>(null);
+  /** Today's `detailsOpen` prop, held in an explicit `$derived` so it changes only when its VALUE does:
+   *  a run that ends `delivered` after the run-start `null` (false to false) is no change, and Today's
+   *  disclosure keeps the user's toggle (`routes/TodayView.svelte`, the comment on `open`). */
+  const detailsOpenNow = $derived(detailsOpen(lastRunResult));
   /** The envelope of the last run this app started — Today shows its struct while it is the file. */
   let lastRun = $state.raw<RunEnvelope | null>(null);
 
@@ -192,7 +210,7 @@
       case "failed":
         return `The run failed (${outcome.outcome.reason ?? `exit ${outcome.exitCode ?? "by signal"}`}).`;
       case "configError":
-        return "The engine refused to run — see its message above.";
+        return "The engine refused to run — see Details below.";
     }
   }
 
@@ -201,14 +219,17 @@
     running = true;
     progress = [];
     runResult = "";
+    lastRunResult = null;
     try {
       const outcome = await run({ force: false });
       runResult = describe(outcome);
+      lastRunResult = { outcome };
       const envelope = envelopeOf(outcome.payload);
       if (envelope !== null) lastRun = envelope;
     } catch (e) {
       // A `busy` refusal says which operation is already running; nothing was started.
       runResult = describeFailure(e);
+      lastRunResult = { threw: true };
     } finally {
       running = false;
       // The watcher will push a `state:changed` of its own once the engine's files settle; this
@@ -304,7 +325,15 @@
 
   <div class="screen">
   {#if route === "today"}
-    <Today {snapshot} {lastRun} {running} {progress} {runResult} onrun={runNow} />
+    <Today
+      {snapshot}
+      {lastRun}
+      {running}
+      {progress}
+      {runResult}
+      detailsOpen={detailsOpenNow}
+      onrun={runNow}
+    />
     {#if snapshot === null && snapshotError !== null}
       <pre class="failed">{snapshotError}</pre>
     {/if}
@@ -330,6 +359,7 @@
       notifyAsk={notifyEnabled === null}
       {notifyAskError}
       onnotifychoice={(enabled) => void chooseNotifications(enabled)}
+      {os}
     />
   {:else if route === "wizard"}
     <!-- B8 (T16): the first-run wizard. It performs its OWN config_read / access_snapshot /
@@ -337,6 +367,7 @@
          and the notification ask's record state (dev 107: same command, same copy). -->
     <Wizard
       scheduleState={snapshot?.scheduleState ?? null}
+      {os}
       evidence={{
         skipIso: snapshot?.lastSkip?.iso ?? null,
         delivered: snapshot?.scheduleState?.phase.phase === "delivered",
@@ -352,7 +383,7 @@
       }}
     />
   {:else}
-    <Settings />
+    <Settings {os} />
   {/if}
   </div>
 </main>

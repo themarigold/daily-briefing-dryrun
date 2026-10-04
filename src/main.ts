@@ -414,14 +414,27 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
   }
 
   // Surface every protected-path/read + pipeline issue (§5.11): discovery-side issues have no warning
-  // string of their own, so format them here; the rest are already strings in r.warnings.
+  // string of their own, so format them here; the rest are already strings in r.warnings. Whenever
+  // runCore built a discovery summary (v0.2.1 §2.4.2: an empty-window or blocked run, or — r8 — a
+  // provider run whose window has no commits), r.warnings ends with it, so it prints AFTER every
+  // per-folder line it summarises — nothing here is deduplicated.
   for (const w of [...r.discIssues.map(warnFor), ...r.warnings]) diagError(stripControl(`⚠ ${w}`));
 
   // Empty run + an inaccessible repo we tried to read = delivery FAILURE, not a quiet day (§5.11):
-  // don't stamp, exit non-zero so the next run retries once access is fixed.
+  // don't stamp, exit non-zero so the next run retries once access is fixed. Since v0.2.1 (§2.4.5) also
+  // when discovery found no repos and a configured search folder itself could not be read or was
+  // missing (`r.discoveryBlocked`) — a forced run included, so `--force` cannot stamp that day either.
   if (r.blocked) {
-    console.error("Some configured repo(s) could not be read and no other activity was found — today NOT marked done. Fix access (see warnings above) and re-run.");
-    await writeLastSkip({ iso: now.toISOString(), localDate, reason: "blocked" }).catch(() => {});
+    console.error(r.discoveryBlocked
+      ? "No repositories were found, and a folder listed in Folders to search could not be read or found — today NOT marked done. Fix access (see warnings above) and re-run."
+      : "Some configured repo(s) could not be read and no other activity was found — today NOT marked done. Fix access (see warnings above) and re-run.");
+    // The summary is the skip detail whenever one exists — discovery-blocked, or extraction-blocked
+    // beside a counted discovery issue — so Today and Schedule can say WHICH folder. A blocked run with
+    // no counted issue keeps the old record, no detail. `writeLastSkip` redacts `detail` at the file.
+    await writeLastSkip({
+      iso: now.toISOString(), localDate, reason: "blocked",
+      ...(r.discoverySummary !== undefined ? { detail: r.discoverySummary } : {}),
+    }).catch(() => {});
     return await emit(envelopeFrom(r, "", 1));
   }
   // Scheduled tick still offline after the grace: the provider was NOT called — skip without stamping;

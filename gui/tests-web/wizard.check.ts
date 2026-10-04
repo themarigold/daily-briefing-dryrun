@@ -25,6 +25,7 @@ import {
 } from "../../src/config";
 import Wizard from "../src/routes/Wizard.svelte";
 import { REDACTED_API_KEY } from "../src/lib/files";
+import { osFromUserAgent, type Os } from "../src/lib/platform";
 import { describeShimFailure, placementLine, type CliShimStatus } from "../src/lib/shim";
 import {
   buildConfig,
@@ -55,6 +56,7 @@ import {
   stepBlocker,
   STEP_ORDER,
   type WizardDraft,
+  wizardOsWording,
 } from "../src/lib/wizard";
 
 const FULL = readFileSync(
@@ -64,7 +66,7 @@ const FULL = readFileSync(
 
 function html(props: Record<string, unknown> = {}): string {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return render(Wizard as any, { props: { scheduleState: null, ...props } }).body;
+  return render(Wizard as any, { props: { scheduleState: null, os: "macos", ...props } }).body;
 }
 
 /* ── the engine's template, mirrored not re-invented ──────────────────────────────────────────── */
@@ -258,7 +260,9 @@ describe("the repos step", () => {
     for (const bad of ["24:00", "7:20", "07:60", "0720", "late", ""]) {
       expect(floorValid(bad)).toBe(false);
     }
-    expect(stepBlocker("floor", { ...emptyDraft(), floor: "25:00" })).toContain("HH:MM");
+    // v0.2.1 §3.1: one name for the setting. (The dropdowns write HH:MM only, so this guard is a
+    // backstop — `morning-time.check.ts` pins that a seeded draft never trips it.)
+    expect(stepBlocker("floor", { ...emptyDraft(), floor: "25:00" })).toBe("Choose a morning time.");
   });
 });
 
@@ -513,6 +517,120 @@ describe("the wizard renders", () => {
   });
 });
 
+/* ── v0.2.1 §3.5: the wording follows the OS the webview reports ─────────────────────────────── */
+
+describe("v0.2.1 §3.5: osFromUserAgent", () => {
+  // Measured 2026-10-03 on this Mac: a plain WKWebView's `navigator.userAgent` (no Safari suffix).
+  const WKWEBVIEW = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)";
+  // WebKitGTK's default shape, "(X11; <sysname> <machine>)" (not measured here; the VM re-check sees it).
+  const WEBKITGTK = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+  const WEBKITGTK_ARM = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/605.1.15 (KHTML, like Gecko)";
+  const WEBVIEW2 =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0";
+
+  test("WKWebView is macOS, WebKitGTK is Linux, WebView2 is Windows", () => {
+    expect(osFromUserAgent(WKWEBVIEW)).toBe("macos");
+    expect(osFromUserAgent(WEBKITGTK)).toBe("linux");
+    expect(osFromUserAgent(WEBKITGTK_ARM)).toBe("linux");
+    expect(osFromUserAgent(WEBVIEW2)).toBe("windows");
+  });
+
+  test("Android and ChromeOS say Linux too, and are not Linux; iOS and anything unknown are other", () => {
+    const cases: [string, Os][] = [
+      ["Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36", "other"],
+      ["Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36", "other"],
+      ["Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1", "other"],
+      ["Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)", "other"],
+      ["Bun/1.3.14", "other"],
+      ["", "other"],
+    ];
+    for (const [ua, os] of cases) expect({ ua, os: osFromUserAgent(ua) }).toEqual({ ua, os });
+  });
+});
+
+describe("v0.2.1 §3.5: the wizard's OS wording", () => {
+  const MAC = /\bMac\b|macOS/;
+
+  test("macOS keeps the pre-v0.2.1 text exactly", () => {
+    expect(wizardOsWording("macos")).toEqual({
+      machine: "this Mac",
+      checkOnOpen: " (on macOS, also each time it opens)",
+      folderAccessClause: "; the folder-access step asks macOS for permission only when you press its button",
+      localModelStaysOn: "your Mac",
+      homeScanAsks: " — macOS may ask about those the first time",
+      protectedFoldersNote: true,
+      awake: "your Mac",
+    });
+  });
+
+  test("everywhere else, every row says \"this computer\" or nothing — never the Mac", () => {
+    const linux = wizardOsWording("linux");
+    expect(linux).toEqual({
+      machine: "this computer",
+      checkOnOpen: "",
+      folderAccessClause: "",
+      localModelStaysOn: "this computer",
+      homeScanAsks: "",
+      protectedFoldersNote: false,
+      awake: "your computer",
+    });
+    for (const os of ["linux", "windows", "other"] as const) {
+      const w = wizardOsWording(os);
+      expect(w).toEqual(linux);
+      for (const value of Object.values(w)) {
+        if (typeof value === "string") expect({ os, value, mac: MAC.test(value) }).toEqual({ os, value, mac: false });
+      }
+    }
+  });
+
+  test("step 1 rendered: Linux names no Mac anywhere; macOS reads as before", () => {
+    const flat = (body: string) => body.replace(/<!--[\s\S]*?-->/g, "").replace(/\s+/g, " ");
+    const linux = flat(html({ os: "linux" }));
+    expect(linux).not.toMatch(MAC);
+    expect(linux).toContain("Everything runs on this computer. Your repositories are read here");
+    expect(linux).toContain("whenever this app checks your setup (a connection that sends no data)");
+    expect(linux).toContain("until you confirm at the last step. Cancelling now changes nothing.");
+    const mac = flat(html({ os: "macos" }));
+    expect(mac).toContain("Everything runs on this Mac. Your repositories are read here");
+    expect(mac).toContain(
+      "whenever this app checks your setup (on macOS, also each time it opens) (a connection that sends no data)",
+    );
+    expect(mac).toContain(
+      "until you confirm at the last step; the folder-access step asks macOS for permission only when you press its button. Cancelling now changes nothing.",
+    );
+  });
+
+  test("the template reads each row from wizardOsWording, inside the step it belongs to", () => {
+    // Source-pinned: steps 2–6 are internal state a server render cannot reach (only step 1
+    // renders), so this is what holds the template to the function the tests above execute.
+    const wizard = readFileSync(new URL("../src/routes/Wizard.svelte", import.meta.url), "utf8");
+    expect(wizard).toContain("const wording = $derived(wizardOsWording(os));");
+    expect(wizard).toMatch(/\n    os: Os;\n/); // required: no `?`
+    expect(wizard).toMatch(/\n    os,\n/); // and no default in the destructuring
+    const branch = (from: string, to: string) => wizard.slice(wizard.indexOf(from), wizard.indexOf(to));
+    const welcome = branch('{#if step === "welcome"}', '{:else if step === "provider"}');
+    const provider = branch('{:else if step === "provider"}', '{:else if step === "repos"}');
+    const repos = branch('{:else if step === "repos"}', '{:else if step === "access"}');
+    const floor = branch('{:else if step === "floor"}', "{:else}\n    <div class=\"body\">\n      {#if saved !== null}");
+    for (const [where, slice, uses] of [
+      ["welcome", welcome, ["Everything runs on {wording.machine}.", "checks your setup{wording.checkOnOpen} (a connection", "at the last step{wording.folderAccessClause}.\n          Cancelling now changes nothing."]],
+      ["provider", provider, ["never leaves\n          {wording.localModelStaysOn}."]],
+      ["repos", repos, ["Documents and Downloads{wording.homeScanAsks}. Untick this", "{#if wording.protectedFoldersNote}"]],
+      ["floor", floor, ["while {wording.awake} is awake."]],
+    ] as const) {
+      expect(slice.length).toBeGreaterThan(0);
+      for (const use of uses) expect({ where, use, found: slice.includes(use) }).toEqual({ where, use, found: true });
+    }
+    // The protected-folders note is INSIDE the gate, not after it.
+    const gate = repos.slice(repos.indexOf("{#if wording.protectedFoldersNote}"));
+    expect(gate.indexOf("These three are macOS-protected")).toBeLessThan(gate.indexOf("{/if}"));
+    // App passes the webview's own answer.
+    const app = readFileSync(new URL("../src/App.svelte", import.meta.url), "utf8");
+    expect(app).toContain("const os = osFromUserAgent(navigator.userAgent);");
+    expect(app).toMatch(/<Wizard\n      scheduleState=\{snapshot\?\.scheduleState \?\? null\}\n      \{os\}\n/);
+  });
+});
+
 /* ── the login item: the last step's choice, applied on Finish (Phase E M5b) ──────────────────── */
 
 describe("the login item is the wizard's LAST step — default ON, applied only on Finish", () => {
@@ -719,16 +837,36 @@ describe("the CLI-shim wording", () => {
   });
 
   test("a permission refusal shows the exact manual command and never escalates in-app", () => {
-    const text = describeShimFailure({
-      kind: "needsManualStep",
-      command: "sudo ln -sfn /target /usr/local/bin/daily-briefing",
-      detail: "Permission denied (os error 13)",
-    });
+    const text = describeShimFailure(
+      {
+        kind: "needsManualStep",
+        command: "sudo ln -sfn /target /usr/local/bin/daily-briefing",
+        detail: "Permission denied (os error 13)",
+      },
+      "macos",
+    );
     expect(text).toContain("sudo ln -sfn /target /usr/local/bin/daily-briefing");
     expect(text).toContain("in a terminal");
     expect(
-      describeShimFailure({ kind: "foreign", path: "/usr/local/bin/daily-briefing", detail: "a regular file" }),
+      describeShimFailure({ kind: "foreign", path: "/usr/local/bin/daily-briefing", detail: "a regular file" }, "macos"),
     ).toContain("will not replace or remove");
+  });
+
+  test("the refusal names macOS only on macOS: v0.2.0's text there, \"The system\" anywhere else", () => {
+    // `cli_shim.rs` supports every unix, so a Linux user reaches `needsManualStep` too.
+    const refusal = { kind: "needsManualStep", command: "sudo ln -sfn /t /usr/local/bin/daily-briefing", detail: "Permission denied" };
+    const tail = " did not let this app write there (Permission denied). Run this in a terminal instead:\nsudo ln -sfn /t /usr/local/bin/daily-briefing";
+    expect(describeShimFailure(refusal, "macos")).toBe(`macOS${tail}`);
+    const noMac = (t: string): boolean => !t.includes("Mac") && !t.includes("macOS");
+    for (const os of ["linux", "windows", "other"] as const) {
+      const text = describeShimFailure(refusal, os);
+      expect({ os, text, noMac: noMac(text) }).toEqual({ os, text: `The system${tail}`, noMac: true });
+    }
+    expect(noMac(describeShimFailure(refusal, "macos"))).toBe(false);   // prove-it 3b: the check can fail
+    // AppSettings, where the refusal is shown, passes its own required `os` prop to both calls.
+    const settings = readFileSync(new URL("../src/lib/AppSettings.svelte", import.meta.url), "utf8");
+    expect(settings.match(/describeShimFailure\(e, os\)/g)).toHaveLength(2);
+    expect(settings.match(/describeShimFailure\(/g)).toHaveLength(2);
   });
 });
 

@@ -22,6 +22,7 @@ import pkg from "../package.json";
 import type { BriefingStruct, Config } from "./types";
 import type { CoreResult } from "./core";
 import { warnFor, isInaccessible, type PathIssue, type PathIssueKind } from "./protectedPath";
+import { countedIssues, discoveryBlocked } from "./discoverySummary";
 import { redactCredentials, redactCredentialsAnyCase } from "./transcripts/credentials";
 import {
   supportDir, markerPath, tickPath, logPath, latestBriefingPath, lastSkipPath, readLastRunDate,
@@ -744,6 +745,8 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
   let repos: DoctorReport["repos"] = [];
   let discoveredCount = 0;
   let reposTimedOut = false;
+  /** v0.2.1 §2.4.5: the run's DISCOVERY-BLOCKED rule held for doctor's own walk. */
+  let searchFolderBlocked = false;
   if (cfg) {
     const preflight = deps.preflight ?? ((c: Config) => preflightRepos(c));
     const discover = deps.discover ?? ((c: Config) => discoverRepos(c));
@@ -761,6 +764,15 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
     if (walked === "timeout") reposTimedOut = true;
     else {
       discoveredCount = walked.found.length;
+      // v0.2.1 §2.4.5: the SAME predicate runCore applies (src/discoverySummary.ts), so a typo'd or
+      // denied only search folder reads "blocked" here while every run is blocked, not "ready". Only
+      // when the run would discover at all: an explicit `repos` list short-circuits discovery in the run
+      // (config.ts discoverRepos), so preflight's extra root walk for that case can never block a run
+      // and must not block doctor. With no repo found, preflight's issues ARE discovery's (it probes
+      // only found repos), deduplicated by path.
+      if (!cfg.repos?.length) {
+        searchFolderBlocked = discoveryBlocked(walked.found, countedIssues(walked.issues, cfg), cfg.discoverRoots ?? []);
+      }
       const byPath = new Map(walked.issues.map((i) => [i.path, i]));
       const all = [...new Set([...walked.found, ...walked.issues.map((i) => i.path)])].sort();
       // Partial clones, among the repos that read fine: `git config` per repo (read-only, no network),
@@ -894,9 +906,11 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
 
   const fullyAwake = await isFullyAwake(deps.powerPlatform, deps.powerProbe);
 
+  // `anyInaccessible` is the pre-v0.2.1 rule, unchanged: ANY inaccessible path, incidental ones included.
+  // `searchFolderBlocked` adds only what it misses — a MISSING configured search folder with no repo found.
   const anyInaccessible = repos.some((r) => r.issueKind !== null && isInaccessible({ path: r.path, kind: r.issueKind }));
   const verdict: DoctorReport["verdict"] =
-    !check.valid || !found || anyInaccessible ? "blocked"
+    !check.valid || !found || anyInaccessible || searchFolderBlocked ? "blocked"
     : anomalies.length > 0 || check.warnings.length > 0 || (enabled && !reachable) || !fullyAwake || reposTimedOut ? "degraded"
     : "ready";
 

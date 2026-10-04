@@ -19,6 +19,7 @@
  * library.
  */
 import { invoke } from "@tauri-apps/api/core";
+import type { Os } from "./platform";
 
 /** One suppressed firing, for the "a notification was withheld" line. */
 export interface Suppressed {
@@ -83,11 +84,20 @@ export function autostartWizardDefault(): Promise<boolean> {
 
 /** The explanation the ask carries — shown BEFORE any notification can exist. Plan T18's
  *  "requested with an explanation, never on first fire": nothing posts, and no OS prompt can
- *  appear, until this has been answered with Enable. */
-export const NOTIFY_ASK_EXPLANATION =
-  "Daily Briefing can show a system notification when your morning briefing arrives — and when " +
-  "a run fails or is blocked, so a silent morning is never a mystery. Nothing is shown until " +
-  "you turn this on; macOS may ask for its own permission the first time one appears.";
+ *  appear, until this has been answered with Enable.
+ *
+ *  v0.2.1 §3.5 (M3b checkpoint fix): a function of the OS, because the macOS permission clause was
+ *  shown to Linux users. On macOS the text is byte-identical to v0.2.0's constant; anywhere else
+ *  the sentence ends at "until you turn this on." The constant is GONE rather than kept beside
+ *  this, so an import of the old name fails `svelte-check` instead of quietly showing macOS's
+ *  wording; every caller passes App's `os`, a required prop all the way down. */
+export function notifyAskExplanation(os: Os): string {
+  const head =
+    "Daily Briefing can show a system notification when your morning briefing arrives — and when " +
+    "a run fails or is blocked, so a silent morning is never a mystery. Nothing is shown until " +
+    "you turn this on";
+  return os === "macos" ? `${head}; macOS may ask for its own permission the first time one appears.` : `${head}.`;
+}
 
 /** One line for the engine's resolved notify value, so Settings can say who notifies.
  *

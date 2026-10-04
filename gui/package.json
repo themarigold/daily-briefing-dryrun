@@ -1,6 +1,6 @@
 {
   "name": "daily-briefing-gui",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "Desktop shell for the daily-briefing engine. A SEPARATE package on purpose: the engine keeps zero runtime dependencies, and nothing here is importable from it — the app spawns the engine binary as a sidecar and speaks argv + stdout (see ../docs/gui-seam.md).",

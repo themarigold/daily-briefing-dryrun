@@ -55,6 +55,36 @@ export interface BriefingStruct {
 /** `src/render.ts`, `LEGEND_LABEL_CAP`. */
 export const LEGEND_LABEL_CAP = 8;
 
+/**
+ * `src/render.ts`, `API_NOTICE_TEXTS` (v0.2.1 §2.3): the API provider's fixed "provider hardening does
+ * not apply" sentence, one per `api.kind`, built from the same template in the same kind order. The
+ * engine leaves it out of the rendered briefing, so this renderer must too — or the struct view would
+ * show a line the file does not, and Today would fall back to the file on every API morning.
+ *
+ * ⚠ EXACT ELEMENT MATCH, NEVER A SUBSTRING: warnings embed filenames, CLI output and folder names, and
+ * a substring filter would let a file named "no CLI process to harden" hide a real warning.
+ * `gui/tests-web/briefing.check.ts` deep-equals this list against the engine's export.
+ */
+const apiNoticeText = (kind: string): string =>
+  `provider hardening does not apply to this run: the ${kind} API provider spawns nothing, so there is no CLI process to harden — no flags were injected, no working directory was narrowed, and no child environment was withheld`;
+export const API_NOTICE_TEXTS: readonly string[] = Object.freeze(["anthropic", "openai-compatible"].map(apiNoticeText));
+const API_NOTICE_SET: ReadonlySet<string> = new Set(API_NOTICE_TEXTS);
+
+/**
+ * `src/discoverySummary.ts`, `DISCOVERY_SUMMARY_LEADS` (v0.2.1 §2.4.2 r9): the three ways the discovery
+ * summary — "which folders could not be read" — can begin, in the engine's order. The engine renders each
+ * summary on its OWN `⚠` line after the joined line of every other warning, so this renderer must too, or
+ * Today would fall back to the file on every quiet day that carries one.
+ * `gui/tests-web/briefing.check.ts` deep-equals this list against the engine's export.
+ */
+export const DISCOVERY_SUMMARY_LEADS: readonly string[] = Object.freeze([
+  "No repositories were found in Folders to search.",
+  "Couldn't read ",
+  "Couldn't find ",
+]);
+/** `src/discoverySummary.ts`, `isDiscoverySummary`. */
+const isDiscoverySummary = (w: string): boolean => DISCOVERY_SUMMARY_LEADS.some((lead) => w.startsWith(lead));
+
 /** `src/render.ts`, `stripControl`: every C0 control, DEL and C1 byte. */
 export function stripControl(s: string): string {
   return s.replace(/[\x00-\x1f\x7f-\x9f]/g, "");
@@ -262,7 +292,14 @@ export function renderStruct(b: BriefingStruct): Block[] {
   } else {
     push("placeholder", "(none)");
   }
-  if (b.warnings?.length) push("warnings", `⚠ ${b.warnings.join("; ")}`);
+  // v0.2.1 §2.3: the API notice is left out by exact element match, as the engine does; when nothing
+  // else remains there is no warnings line at all.
+  // v0.2.1 §2.4.2 (r9): ordinary warnings keep the joined line; each discovery summary follows it on a
+  // `warnings` line of its own. Classified on the control-stripped text, exactly as the engine does.
+  const shownWarnings = (b.warnings ?? []).filter((w) => !API_NOTICE_SET.has(w));
+  const ordinaryWarnings = shownWarnings.filter((w) => !isDiscoverySummary(stripControl(w)));
+  if (ordinaryWarnings.length) push("warnings", `⚠ ${ordinaryWarnings.join("; ")}`);
+  for (const w of shownWarnings) if (isDiscoverySummary(stripControl(w))) push("warnings", `⚠ ${w}`);
   push("footer", `— generated via ${b.provider}`);
   return out;
 }

@@ -1298,3 +1298,133 @@ fn the_snapshot_takes_the_wizard_draft_into_scope() {
         "the refusal must come before any engine spawn"
     );
 }
+
+/* ── v0.2.1 §3.4: the engine check while setup is still open ──────────────────────────────────── */
+
+/// `config.exists` is read as `Option<bool>`: only an explicit `false` means "no config yet". The
+/// `doctor_with()` fixtures above carry no `config` key at all, so they read `None` — today's
+/// behaviour — and keep every assertion they had.
+#[test]
+fn doctor_config_exists_is_read_only_from_an_explicit_boolean() {
+    use daily_briefing_gui_lib::access::doctor_config_exists;
+    assert_eq!(
+        doctor_config_exists(&doctor_with(serde_json::json!([]))),
+        None,
+        "the existing fixtures carry no `config` key, so they must keep today's behaviour"
+    );
+    let no_config = serde_json::json!({
+        "schemaVersion": 1,
+        "config": { "exists": false, "valid": false, "errors": [], "warnings": [] },
+        "repos": [],
+        "reposTimedOut": false,
+        "verdict": "blocked",
+    });
+    assert_eq!(doctor_config_exists(&no_config), Some(false));
+    let with_config = serde_json::json!({ "config": { "exists": true } });
+    assert_eq!(doctor_config_exists(&with_config), Some(true));
+    for odd in [
+        serde_json::json!({ "config": null }),
+        serde_json::json!({ "config": {} }),
+        serde_json::json!({ "config": { "exists": "false" } }),
+        serde_json::json!({ "config": { "exists": 0 } }),
+        serde_json::json!("not an object"),
+    ] {
+        assert_eq!(
+            doctor_config_exists(&odd),
+            None,
+            "anything but a literal boolean is `None`, never \"no config\": {odd}"
+        );
+    }
+}
+
+/// Through IPC, the three states of `config.exists` with NO config file on disk (the wizard's
+/// case): `false` sets the flag and adds no "could not be read" note; `true` and an absent field
+/// both keep today's note and leave the flag unset.
+#[test]
+#[cfg(target_os = "macos")]
+fn with_no_config_yet_the_snapshot_flags_it_and_adds_no_read_note() {
+    let doctor_dir = ScratchDir::new("access-no-config");
+    let doctor_file = doctor_dir.join("doctor.json");
+    let no_config = serde_json::json!({
+        "schemaVersion": 1,
+        "config": {
+            "exists": false, "valid": false,
+            "errors": [{ "field": "", "message": "the config is not a JSON object" }],
+            "warnings": [],
+        },
+        "repos": [],
+        "reposTimedOut": false,
+        "verdict": "blocked",
+    });
+    std::fs::write(&doctor_file, no_config.to_string()).expect("the no-config doctor answer");
+    let h = harness_doctor_file(&doctor_file, None);
+    let w = main_webview(&h.app);
+
+    let snapshot = call(&w, "access_snapshot", serde_json::json!({})).expect("a snapshot");
+    assert_eq!(snapshot["configMissing"], true, "{snapshot}");
+    assert_eq!(
+        snapshot["doctorVerdict"], "blocked",
+        "the verdict is still carried verbatim; the panel decides which line to show: {snapshot}"
+    );
+    let notes = snapshot["notes"].as_array().expect("notes");
+    for note in notes {
+        let text = note.as_str().unwrap_or_default();
+        assert!(
+            !text.contains("could not be read") && !text.contains("config.json"),
+            "with no config yet, the expected read failure must not be reported: {snapshot}"
+        );
+    }
+    // The config read still ran — only its note is suppressed.
+    let argv = std::fs::read_to_string(&h.argv_file).expect("the fake was spawned");
+    assert!(argv.contains("status\n--json\n"), "{argv:?}");
+
+    // `exists: true` with the file unreadable: today's note, flag unset.
+    let with_config = serde_json::json!({
+        "schemaVersion": 1,
+        "config": { "exists": true, "valid": true, "errors": [], "warnings": [] },
+        "repos": [],
+        "reposTimedOut": false,
+        "verdict": "blocked",
+    });
+    std::fs::write(&doctor_file, with_config.to_string()).expect("the with-config answer");
+    let present = call(&w, "access_snapshot", serde_json::json!({})).expect("a snapshot");
+    assert_eq!(present["configMissing"], false, "{present}");
+    assert!(
+        present["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .any(|n| n.as_str().unwrap_or_default().contains(
+                "The config could not be read, so only the folders the engine already reported"
+            ) && n.as_str().unwrap_or_default().contains("config.json does not exist")),
+        "a config doctor says exists but that cannot be read keeps today's note: {present}"
+    );
+
+    // No `config` key at all (an older envelope): today's behaviour, exactly as `true`.
+    let absent = serde_json::json!({
+        "schemaVersion": 1, "repos": [], "reposTimedOut": false, "verdict": "blocked",
+    });
+    std::fs::write(&doctor_file, absent.to_string()).expect("the field-less answer");
+    let legacy = call(&w, "access_snapshot", serde_json::json!({})).expect("a snapshot");
+    assert_eq!(legacy["configMissing"], false, "{legacy}");
+    assert!(
+        legacy["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .any(|n| n.as_str().unwrap_or_default().contains("could not be read")),
+        "{legacy}"
+    );
+}
+
+/// Off macOS the flag is false like every other field of the unsupported answer.
+#[test]
+fn the_unsupported_snapshot_does_not_claim_setup_is_unfinished() {
+    let snapshot = AccessSnapshot::unsupported("0.1.1");
+    assert!(!snapshot.config_missing);
+    let wire = serde_json::to_value(&snapshot).expect("serialises");
+    assert_eq!(
+        wire["configMissing"], false,
+        "the wire name is camelCase, as `gui/src/lib/access.ts` declares it: {wire}"
+    );
+}

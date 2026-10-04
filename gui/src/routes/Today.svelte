@@ -30,9 +30,12 @@
     running: boolean;
     progress: string[];
     runResult: string;
+    /** Whether the run's Details start open — `detailsOpen` in `lib/engine.ts`, decided in App.svelte.
+     *  REQUIRED, no default: a missing pass-through fails `bun run check` (no test renders this file). */
+    detailsOpen: boolean;
     onrun: () => void;
   }
-  let { snapshot, lastRun, running, progress, runResult, onrun }: Props = $props();
+  let { snapshot, lastRun, running, progress, runResult, detailsOpen, onrun }: Props = $props();
 
   let latest = $state<LatestLoad>({ state: "loading" });
   let seq = 0;
@@ -74,4 +77,4 @@
   );
 </script>
 
-<TodayView {model} {running} {progress} {runResult} {onrun} />
+<TodayView {model} {running} {progress} {runResult} {detailsOpen} {onrun} />

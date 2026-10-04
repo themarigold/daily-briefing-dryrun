@@ -69,6 +69,35 @@ export interface EngineOutcome<P = unknown> {
   stderr: string;
 }
 
+/**
+ * The last Run Now, as Today needs it: the finished invocation, the `catch` path (the run threw
+ * before an outcome existed — a `busy` refusal, an unresolved sidecar, a spawn failure), or no run
+ * yet (`null`, which is also the state WHILE a run is in flight).
+ */
+export type LastRunResult = { outcome: EngineOutcome } | { threw: true } | null;
+
+/**
+ * Whether Today's "Details" disclosure (the engine's stderr for the run) starts OPEN (v0.2.1 §2.1).
+ * The lines are the engine's diagnostics — `postcheck-info …`, `waited ~0s …` — which say nothing to a
+ * user whose run went fine, so it is collapsed unless they explain a problem: a `failed` run (exit 1 —
+ * `blocked` included — another non-zero exit, a signal, or non-JSON output), a `configError` (exit 2,
+ * whose result line says "see Details below"), or a run that threw. A `delivered` or `skipped` run
+ * stays collapsed: for `skipped` the result line already names the reason. Reads the outcome's
+ * `.outcome.kind`.
+ */
+export function detailsOpen(run: LastRunResult): boolean {
+  if (run === null) return false;
+  if ("threw" in run) return true;
+  switch (run.outcome.outcome.kind) {
+    case "failed":
+    case "configError":
+      return true;
+    case "delivered":
+    case "skipped":
+      return false;
+  }
+}
+
 /** Why an invocation failed before or around the engine, as opposed to *in* it. */
 export type EngineError =
   /** An operand was refused. **No process was spawned.** */

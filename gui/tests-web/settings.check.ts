@@ -9,8 +9,19 @@
  * drives it.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { render } from "svelte/server";
+
+// READ-ONLY imports of the engine's own repo discovery and key ladder, so the help text for those
+// fields is checked against what the engine does (M3b checkpoint fix), not against a paraphrase.
+// The same for the prompt budget (`reduce`) and the search setting's name (`discoverySummary`).
+import { resolveApiKey } from "../../src/apiKey";
+import { discoverRepos } from "../../src/config";
+import { discoverySummary } from "../../src/discoverySummary";
+import { reduce } from "../../src/reduce";
+import type { Activity } from "../../src/types";
 
 import { describeFailure, REDACTED_API_KEY, type SaveOutcome } from "../src/lib/files";
 import {
@@ -321,9 +332,11 @@ describe("the form model", () => {
     }
     // prove-it 3b: a paraphrase is not found.
     expect(flatSource("src/types.ts").includes("repos to remove from the briefing")).toBe(false);
-    // And the form shows them.
+    // v0.2.1 §4.1: the form shows each field's plain `help` instead — no quote, no `(src/…)` tag.
     const body = formHtml(parse(FULL));
-    expect(body).toContain("per-repo project-root globs; [] = force single-unit despite a manifest");
+    expect(body).toContain(field("subprojects").help);
+    expect(body).not.toContain("per-repo project-root globs; [] = force single-unit despite a manifest");
+    expect(body).not.toContain("(src/");
   });
 
   test("field errors and engine values stay text", () => {
@@ -332,6 +345,262 @@ describe("the form model", () => {
     const body = formHtml(draft, { lookbackCapDays: `must be a number ${HOSTILE}` });
     expect(body).not.toContain("<img");
     expect(body).toContain('class="field-error');
+  });
+});
+
+/* ── v0.2.1 §4.1: plain help, and a collapsed Advanced section ───────────────────────────────── */
+
+describe("v0.2.1 §4.1: Settings help and Advanced", () => {
+  const ALL = SECTIONS.flatMap((s) => s.fields);
+  // Spec §4.1's twelve labels, as field ids, in the spec's order.
+  const ADVANCED = [
+    "subprojects", // Sub-project roots
+    "provider.argv", // Arguments
+    "provider.promptVia", // How the prompt is passed
+    "provider.harden", // Harden the provider call
+    "provider.accounts", // Failover accounts
+    "provider.api.maxTokens", // Maximum output tokens
+    "provider.api.apiKeyEnv", // Key environment variable
+    "provider.timeoutMs", // Timeout (milliseconds)
+    "tokenBudget.maxChars", // Prompt budget
+    "excludeCommitPatterns", // Commit subjects to ignore
+    "auditJudgeArgv", // Extra arguments for the audit judge
+    "networkProbeHosts", // Connectivity check targets
+  ];
+  const CLI_ONLY = ["provider.argv", "provider.promptVia", "provider.harden", "provider.accounts"];
+  const API_ONLY = ["provider.api.maxTokens", "provider.api.apiKeyEnv"];
+  const api = () => parse(API.replace("sk-ant-SENTINEL-DO-NOT-LEAK-0000", PLACEHOLDER));
+
+  test("every one of the 29 fields has non-empty help, and every quote is still in the model", () => {
+    expect(ALL).toHaveLength(29);
+    for (const f of ALL) expect({ id: f.id, help: f.help.trim().length > 0 }).toEqual({ id: f.id, help: true });
+    // The quote is kept, undisplayed — the verbatim test above still checks each one.
+    expect(allQuotes().length).toBe(ALL.filter((f) => f.quote !== undefined).length);
+  });
+
+  test("help is plain: one or two sentences, no file name, no code term", () => {
+    const BANNED = ["src/", ".ts", "argv", "no-op", "`"];
+    for (const f of ALL) {
+      const found = BANNED.filter((b) => f.help.includes(b));
+      expect({ id: f.id, found }).toEqual({ id: f.id, found: [] });
+      const sentences = f.help.split(/[.!?](?:\s|$)/).filter((x) => x.trim() !== "").length;
+      expect({ id: f.id, sentences: sentences >= 1 && sentences <= 2 }).toEqual({ id: f.id, sentences: true });
+    }
+    // The spec's own example, word for word.
+    expect(field("morningTime").help).toBe(
+      "Your briefing is generated on the first check after this time once your machine is awake.",
+    );
+    // The deny-list can fail.
+    for (const leak of ["see src/types.ts", "the argv list", "a no-op", "`x`"]) {
+      expect({ leak, caught: BANNED.some((b) => leak.includes(b)) }).toEqual({ leak, caught: true });
+    }
+  });
+
+  test("Advanced holds exactly the listed fields, last; the other seventeen stay in their sections", () => {
+    const titles = SECTIONS.map((s) => s.title);
+    expect(titles[titles.length - 1]).toBe("Advanced");
+    const advanced = SECTIONS.find((s) => s.title === "Advanced")!;
+    expect(advanced.collapsed).toBe(true);
+    expect(advanced.fields.map((f) => f.id)).toEqual(ADVANCED);
+    expect(SECTIONS.filter((s) => s.collapsed === true)).toHaveLength(1);
+    const rest = SECTIONS.filter((s) => s !== advanced).map((s) => [s.title, s.fields.map((f) => f.id)]);
+    expect(rest).toEqual([
+      ["Repositories", ["repos", "discoverRoots", "excludeRepos"]],
+      ["Author", ["author.names", "author.emails"]],
+      ["Provider (command-line tool)", ["provider.cli", "provider.credential"]],
+      ["Provider (API)", ["provider.api.kind", "provider.api.model", "provider.api.baseUrl", "provider.api.apiKeyFile", "provider.api.apiKeyCommand"]],
+      ["Briefing", ["lookbackCapDays", "morningTime"]],
+      ["Notifications", ["notify"]],
+      ["Update check", ["updateCheck.enabled", "updateCheck.intervalHours"]],
+    ]);
+    expect(rest.flatMap(([, ids]) => ids as string[])).toHaveLength(17);
+    // CLI-only and API-only fields say so themselves; the timeout applies to both.
+    for (const id of CLI_ONLY) expect({ id, when: field(id).when }).toEqual({ id, when: "cli" });
+    for (const id of API_ONLY) expect({ id, when: field(id).when }).toEqual({ id, when: "api" });
+    expect(ALL.filter((f) => f.when !== undefined).map((f) => f.id).sort()).toEqual([...CLI_ONLY, ...API_ONLY].sort());
+  });
+
+  test("sectionsFor filters Advanced's fields by provider", () => {
+    const ids = (d: Draft, title: string) =>
+      sectionsFor(d).find((s) => s.title === title)?.fields.map((f) => f.id) ?? [];
+    expect(ids(parse(FULL), "Advanced")).toEqual(ADVANCED.filter((id) => !API_ONLY.includes(id)));
+    expect(ids(api(), "Advanced")).toEqual(ADVANCED.filter((id) => !CLI_ONLY.includes(id)));
+    // Nowhere else either: a filtered field is not live, so its stale error cannot block a save.
+    expect(fieldIsLive(api(), field("provider.argv"))).toBe(false);
+    expect(fieldIsLive(parse(FULL), field("provider.api.maxTokens"))).toBe(false);
+    expect(fieldIsLive(api(), field("provider.api.maxTokens"))).toBe(true);
+    expect(fieldIsLive(parse(FULL), field("provider.argv"))).toBe(true);
+  });
+
+  test("the form draws Advanced collapsed, at the bottom, with only the provider's own fields", () => {
+    for (const [draft, kept, hidden] of [
+      [parse(FULL), "provider.argv", "provider.api.maxTokens"],
+      [api(), "provider.api.maxTokens", "provider.argv"],
+    ] as const) {
+      const body = formHtml(draft);
+      const details = /<details class="collapsed[^"]*"( [^>]*)?>/.exec(body);
+      expect(details).not.toBeNull();
+      expect(details![1] ?? "").not.toContain("open");
+      expect(body).toMatch(/<details class="collapsed[^"]*"[^>]*>\s*<summary[^>]*>Advanced<\/summary>/);
+      expect(body.match(/<details/g)).toHaveLength(1);
+      const inside = body.slice(body.indexOf("<details"), body.indexOf("</details>"));
+      const before = body.slice(0, body.indexOf("<details"));
+      expect(inside).toContain(`id="f-${kept}"`);
+      expect(body).not.toContain(`id="f-${hidden}"`);
+      expect(inside).toContain('id="f-provider.timeoutMs"');
+      // The seventeen are outside it, and nothing follows it.
+      expect(before).toContain('id="f-morningTime"');
+      expect(inside).not.toContain('id="f-morningTime"');
+      expect(body.slice(body.indexOf("</details>"))).not.toContain('class="field');
+    }
+  });
+
+  test("Advanced opens when one of its fields has a live error — Save refuses with \"fix the fields marked above\"", () => {
+    const attrs = (body: string): string => /<details class="collapsed[^"]*"( [^>]*)?>/.exec(body)?.[1] ?? "";
+    const isOpen = (draft: Draft, errors: Record<string, string>): boolean => /\bopen\b/.test(attrs(formHtml(draft, errors)));
+    const bad = { "provider.timeoutMs": "must be a number" };
+    // The save is refused on exactly this error…
+    expect(formSubmission(parse(FULL), FULL, bad).kind).toBe("blocked");
+    // …so the details render open, with the marked field inside them.
+    const body = formHtml(parse(FULL), bad);
+    expect(attrs(body)).toMatch(/\bopen\b/);
+    expect(body.slice(body.indexOf("<details"), body.indexOf("</details>"))).toContain(
+      '<p class="field-error svelte-',
+    );
+    expect(isOpen(api(), { "provider.api.maxTokens": "must be a number" })).toBe(true);
+    // Closed otherwise: no error; an error outside Advanced; a cleared error; an error on an Advanced
+    // field that is not live (API-only, on a command-line config), which Save does not refuse on either.
+    expect(isOpen(parse(FULL), {})).toBe(false);
+    expect(isOpen(parse(FULL), { lookbackCapDays: "must be a number" })).toBe(false);
+    expect(isOpen(parse(FULL), { "provider.timeoutMs": "" })).toBe(false);
+    expect(isOpen(parse(FULL), { "provider.api.maxTokens": "stale" })).toBe(false);
+    expect(formSubmission(parse(FULL), FULL, { "provider.api.maxTokens": "stale" }).kind).not.toBe("blocked");
+  });
+
+  test("closing Advanced while one of its fields has a live error re-opens it (source pin: no DOM here)", () => {
+    // The `open` expression stays `true` while the error lives, so Svelte never re-applies it after the
+    // user collapses the section; only the toggle handler can put the marked field back on screen.
+    const src = readFileSync(new URL("../src/routes/SettingsForm.svelte", import.meta.url), "utf8");
+    const handler = /ontoggle=\{\(e\) => \{([\s\S]*?)\n\s*\}\}/.exec(src)?.[1] ?? "";
+    expect(handler).toContain("if (!el.open && section.fields.some((f) => live[f.id] !== undefined)) el.open = true;");
+    // …and the re-open comes BEFORE the record, so `opened` holds what the DOM ends up showing.
+    expect(handler.indexOf("el.open = true")).toBeLessThan(handler.indexOf("opened[section.title] = el.open;"));
+    expect(handler.indexOf("opened[section.title] = el.open;")).toBeGreaterThan(-1);
+  });
+});
+
+/* ── post-convergence LOW pass: Advanced help, and one name for the search setting ─────────────── */
+
+describe("Advanced help says what each field governs, and the search setting has one name", () => {
+  test("Prompt budget bounds the repository detail — what the engine's reduce() measures — not the whole prompt", () => {
+    const help = field("tokenBudget.maxChars").help;
+    expect(help).toContain("repository detail");
+    expect(help).toContain("the instructions around it are not counted");
+    expect(help).not.toContain("sends to the AI");
+    // reduce() measures the repository context alone: at exactly its length nothing is trimmed; one
+    // character under it, the detail is trimmed (and a note says so).
+    const acts: Activity[] = [{ source: "git", kind: "commit", event_id: "e1", repo: "/r", text: "x".repeat(400) }];
+    const whole = JSON.stringify(reduce(acts, { maxChars: Number.MAX_SAFE_INTEGER })).length;
+    expect(reduce(acts, { maxChars: whole }).note).toBeUndefined();
+    expect(reduce(acts, { maxChars: whole - 1 }).note).toBeDefined();
+  });
+
+  test("the audit judge's options are for the developer self-audit, which the engine's run never reads", () => {
+    expect(field("auditJudgeArgv").help).toContain("developer self-audit, which this app never runs");
+    // In the engine's runtime source only its type and the config check name it; the self-audit script reads it.
+    const users = readdirSync(`${ENGINE}src`, { recursive: true })
+      .map(String)
+      .filter((rel) => rel.endsWith(".ts") && readFileSync(`${ENGINE}src/${rel}`, "utf8").includes("auditJudgeArgv"));
+    expect(users.sort()).toEqual(["config.ts", "types.ts"]);
+    expect(readFileSync(`${ENGINE}scripts/audit.ts`, "utf8")).toContain("cfg.auditJudgeArgv");
+  });
+
+  test("Arguments names the tool its options are for", () => {
+    expect(field("provider.argv").help).toContain("the command-line tool");
+    expect(field("provider.argv").help).not.toContain("that tool");
+  });
+
+  test("the search setting is labelled in the engine summary's own words", () => {
+    const label = field("discoverRoots").label;
+    expect(label).toBe("Folders to search");
+    const said = discoverySummary([{ path: "/x/typo", kind: "not-found" }], { noRepos: true, home: "/h" })!;
+    expect(said).toContain(`No repositories were found in ${label}.`);
+    expect(said).toContain(`listed in ${label} (/x/typo)`);
+  });
+});
+
+/* ── M3b checkpoint fix: help that says what the ENGINE does ──────────────────────────────────── */
+
+describe("M3b checkpoint: the help for repositories and key sources matches the engine", () => {
+  test("Repositories and the folders to search are either/or, as the engine's discoverRepos is", async () => {
+    const repos = field("repos").help;
+    const roots = field("discoverRoots").help;
+    // The old wording promised the opposite ("in addition to", "on every run").
+    expect(repos).not.toContain("in addition to");
+    expect(roots).not.toContain("on every run");
+    expect(repos).toContain(
+      "When this list has anything in it, the briefing reads only these and does not search the folders below for more.",
+    );
+    expect(roots).toContain("but only while the Repositories list above is empty.");
+    // "below" and "above" are true on screen: the list is drawn before the folders.
+    const body = formHtml(parse(FULL));
+    expect(body.indexOf('id="f-repos"')).toBeGreaterThan(0);
+    expect(body.indexOf('id="f-repos"')).toBeLessThan(body.indexOf('id="f-discoverRoots"'));
+    expect(body).toContain(repos);
+    expect(body).toContain(roots);
+    // …and the engine does what the two strings say, on a folder holding one repository.
+    const scratch = mkdtempSync(join(tmpdir(), "dba-m3b-roots-"));
+    try {
+      const found = join(scratch, "proj");
+      mkdirSync(join(found, ".git"), { recursive: true });
+      const provider = { cli: "claude", argv: ["-p"], promptVia: "stdin" as const };
+      // The list empty: the folder is searched, and its repository is read.
+      expect((await discoverRepos({ discoverRoots: [scratch], provider })).repos).toEqual([found]);
+      // Anything in the list: the same folder is not searched, and only the list is read.
+      const listed = join(scratch, "listed-elsewhere");
+      expect(await discoverRepos({ repos: [listed], discoverRoots: [scratch], provider })).toEqual({
+        repos: [listed],
+        issues: [],
+      });
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("the key file and key command say a higher source wins, as the engine's resolveApiKey does", async () => {
+    const file = field("provider.api.apiKeyFile").help;
+    const command = field("provider.api.apiKeyCommand").help;
+    // The old wording promised every run ("each time it writes your briefing").
+    for (const help of [file, command]) expect(help).not.toContain("each time");
+    expect(file).toContain("unless the key environment variable has already supplied a key.");
+    expect(command).toContain("unless the key environment variable or the key file has already supplied a key.");
+    // …and the engine's ladder is that order, first hit wins: environment variable, file, command.
+    const scratch = mkdtempSync(join(tmpdir(), "dba-m3b-key-"));
+    try {
+      const keyFile = join(scratch, "key");
+      writeFileSync(keyFile, "from-file\n");
+      chmodSync(keyFile, 0o600);
+      const api = {
+        kind: "anthropic" as const,
+        model: "m",
+        apiKeyEnv: "DBA_M3B_KEY",
+        apiKeyFile: keyFile,
+        apiKeyCommand: ["key-helper"],
+      };
+      let ran = 0;
+      const exec = async () => {
+        ran += 1;
+        return { out: "from-command", err: "", code: 0, complete: true, spawned: true, signal: null, timedOut: false };
+      };
+      const env = await resolveApiKey(api, { DBA_M3B_KEY: "from-env" }, { exec });
+      expect([env.source, env.key, ran]).toEqual(["env", "from-env", 0]);
+      const fromFile = await resolveApiKey(api, {}, { exec });
+      expect([fromFile.source, fromFile.key, ran]).toEqual(["file", "from-file", 0]);
+      const fromCommand = await resolveApiKey({ ...api, apiKeyFile: join(scratch, "missing") }, {}, { exec });
+      expect([fromCommand.source, fromCommand.key, ran]).toEqual(["command", "from-command", 1]);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 });
 

@@ -109,7 +109,11 @@ describe("History.svelte", () => {
     const body = html(dates(3));
     expect(body).toContain("Every briefing is kept, on purpose");
     expect(body).toContain("about 8 KB a day");
-    expect(body).toContain("never offers to remove any of it");
+    // v0.2.1 §4.2: Uninstall CAN remove the archive (its "Also remove the engine's data" box), so the
+    // paragraph says what is true — this screen never does — and names the one place that can.
+    expect(body).toContain(
+      "because it is the engine's calibration record. This screen never removes any of it. Only Uninstall (Settings › This app), with \"Also remove the engine's data\" ticked, does.",
+    );
     const buttons = [...body.matchAll(/<button[^>]*>([\s\S]*?)<\/button>/g)].map((m) => (m[1] ?? "").trim());
     expect(buttons).toEqual(dates(3));
     for (const word of ["delete", "prune", "clean up", "clear", "trash"]) {

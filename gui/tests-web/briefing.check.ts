@@ -18,6 +18,7 @@ import { parse } from "svelte/compiler";
 import { render } from "svelte/server";
 
 import {
+  API_NOTICE_TEXTS as ENGINE_API_NOTICE_TEXTS,
   collapseWindowMerges as engineCollapseWindowMerges,
   renderBriefing,
   stripControl as engineStripControl,
@@ -25,6 +26,10 @@ import {
   CAMPAIGN_L3_PREFIX as ENGINE_L3,
 } from "../../src/render";
 import { LEGEND_PREFIX as ENGINE_LEGEND, NOT_SHOWN_PREFIX as ENGINE_NOT_SHOWN } from "../../src/subprojects";
+import {
+  DISCOVERY_SUMMARY_LEADS as ENGINE_DISCOVERY_SUMMARY_LEADS,
+  discoverySummary as engineDiscoverySummary,
+} from "../../src/discoverySummary";
 import { WHY_PREFIX as ENGINE_WHY } from "../../src/transcripts/frame";
 import { isShaShaped as engineIsShaShaped } from "../../src/sha";
 import type { BriefingStruct as EngineStruct } from "../../src/types";
@@ -45,13 +50,16 @@ import {
   type Block,
 } from "../src/lib/briefing-md";
 import {
+  API_NOTICE_TEXTS,
   collapseWindowMerges,
+  DISCOVERY_SUMMARY_LEADS,
   LEGEND_LABEL_CAP,
   renderStruct,
   stripControl,
   type BriefingStruct,
 } from "../src/lib/briefing-struct";
 import { groupRows, rowKey, subRowKey, type Member, type Row } from "../src/lib/briefing-rows";
+import { chooseSource } from "../src/lib/today";
 
 const ESC = String.fromCharCode(0x1b);
 const BEL = String.fromCharCode(7);
@@ -87,6 +95,11 @@ const HOSTILE = "<img src=x onerror=alert(1)>";
  * | suggestions none / repo / no repo / promoted              | QUIET / RICH / RICH / RICH    |
  * | stash label: no branch / name hidden / today / 1 day / bare | "stash suggestions" (IN-10)  |
  * | warnings absent / present                                 | QUIET / RICH                  |
+ * | API notice (v0.2.1 §2.3): alone (no ⚠ line) / beside real | "api run, notice only" /      |
+ * |   warnings, one of which embeds the notice's phrase       | "api run, mixed warnings"     |
+ * | discovery summary (v0.2.1 §2.4.2 r9) on its own ⚠ line:   | "discovery summary alone" /   |
+ * |   alone / after the joined ordinary line (a drift warning | "discovery summary, ordinary  |
+ * |   in it) / beside the API notice, which is still left out |   warnings" / "…, API notice" |
  * | control bytes stripped per line                           | RICH                          |
  * | campaign (tier B, spec §4.7): header at level 1, its      | "campaign"                    |
  * |   group at level 2 with members at level 3, its single at |                               |
@@ -159,6 +172,18 @@ const QUIET: BriefingStruct = {
   recap: [],
   suggestions: [],
 };
+
+/** v0.2.1 §2.4.2 r9: a discovery summary exactly as the ENGINE's builder writes it — no repos found, one
+ *  folder macOS denied and one unreadable — so the fixtures below exercise the GUI mirror on real text. */
+const DISCOVERY_SUMMARY = engineDiscoverySummary(
+  [
+    { path: "/Users/me/Desktop", kind: "tcc-denied", protectedRoot: "/Users/me/Desktop" },
+    { path: "/Users/me/code/locked", kind: "unreadable" },
+  ],
+  { noRepos: true, home: "/Users/me" },
+)!;
+/** A drift warning naming a repo — the shape that must stay on the JOINED ordinary line. */
+const DRIFT = 'working-tree changed while generating: [app] was clean → now "M x.ts" — re-verify "Where you left off" before acting';
 
 const VARIANTS: [string, BriefingStruct][] = [
   ["rich", RICH],
@@ -249,6 +274,30 @@ const VARIANTS: [string, BriefingStruct][] = [
       ],
     },
   ],
+  // v0.2.1 §2.3: the API provider's fixed notice is left out by BOTH renderers, by exact element match.
+  // The fixtures carry the ENGINE's own sentences, so the GUI mirror is exercised against the real text.
+  ["api run, notice only", { ...QUIET, provider: "anthropic: claude-x", warnings: [ENGINE_API_NOTICE_TEXTS[0]!] }],
+  [
+    "api run, mixed warnings",
+    {
+      ...QUIET,
+      provider: "openai-compatible: local",
+      warnings: [
+        "a real warning",
+        ENGINE_API_NOTICE_TEXTS[1]!,
+        // drift-shaped, embedding the notice's phrase in a filename: a SUBSTRING, so it must still render
+        "working tree changed during generation: M no CLI process to harden.txt",
+      ],
+    },
+  ],
+  // v0.2.1 §2.4.2 r9: the discovery summary renders on its OWN ⚠ line, after the joined line of every
+  // other warning, in BOTH renderers — the engine's builder wrote the text (DISCOVERY_SUMMARY above).
+  ["discovery summary alone", { ...QUIET, warnings: [DISCOVERY_SUMMARY] }],
+  ["discovery summary, ordinary warnings", { ...QUIET, warnings: ["a real warning", DISCOVERY_SUMMARY, DRIFT] }],
+  [
+    "discovery summary, API notice",
+    { ...QUIET, provider: "anthropic: claude-x", warnings: [ENGINE_API_NOTICE_TEXTS[0]!, DISCOVERY_SUMMARY] },
+  ],
 ];
 
 // The two struct types agree on every variant (a compile-time check under `tsc`, a no-op here).
@@ -325,6 +374,12 @@ describe("the engine's line vocabulary", () => {
     expect(NOT_SHOWN_PREFIX).toBe(ENGINE_NOT_SHOWN);
     expect(WHY_PREFIX).toBe(ENGINE_WHY);
     expect(LEGEND_LABEL_CAP).toBe(ENGINE_CAP);
+    // v0.2.1 §2.3: the API notice list is the engine's, element for element and in order.
+    expect(API_NOTICE_TEXTS).toEqual(ENGINE_API_NOTICE_TEXTS);
+    expect(API_NOTICE_TEXTS).toHaveLength(2);
+    // v0.2.1 §2.4.2 r9: the discovery-summary leads are the engine's, element for element and in order.
+    expect(DISCOVERY_SUMMARY_LEADS).toEqual(ENGINE_DISCOVERY_SUMMARY_LEADS);
+    expect(DISCOVERY_SUMMARY_LEADS).toHaveLength(3);
     let all = "";
     for (let c = 0; c < 0x300; c++) all += String.fromCharCode(c);
     all += `é sun ${String.fromCodePoint(0x2600, 0xfe0f, 0x202e, 0x1f600)}`;
@@ -490,6 +545,70 @@ describe("the struct renderer mirrors renderBriefing", () => {
       "[mono] Pop or drop stash@{3}  (from stash)",
       "[mono] Pop or drop stash@{4}  (from stash · 2 days old)",
     ]);
+  });
+
+  test("v0.2.1 §2.3: the API notice is dropped by exact element match — alone it leaves no ⚠ line; a substring never hides a warning", () => {
+    const only = variant("api run, notice only");
+    expect(renderBriefing(only as EngineStruct)).not.toContain("⚠");                // the engine's golden
+    expect(renderStruct(only).some((b) => b.kind === "warnings")).toBe(false);       // …and the mirror
+    expect(only.warnings).toEqual([ENGINE_API_NOTICE_TEXTS[0]]);                    // the struct keeps it
+    const mixed = renderStruct(variant("api run, mixed warnings")).filter((b) => b.kind === "warnings").map(blockText);
+    expect(mixed).toEqual([
+      "⚠ a real warning; working tree changed during generation: M no CLI process to harden.txt",
+    ]);
+  });
+
+  test("v0.2.1 §2.3: chooseSource shows an API run from the STRUCT — the two renderers agree once the notice is dropped", () => {
+    for (const name of ["api run, notice only", "api run, mixed warnings"]) {
+      const struct = variant(name);
+      const markdown = renderBriefing(struct as EngineStruct);
+      const source = chooseSource(
+        { path: "/state/briefing-latest.md", text: markdown, bytes: markdown.length },
+        { runDate: struct.date, delivered: true, markdown, struct },
+      );
+      expect(source.kind).toBe("struct");
+    }
+  });
+
+  const SUMMARY_VARIANTS = ["discovery summary alone", "discovery summary, ordinary warnings", "discovery summary, API notice"];
+
+  test("v0.2.1 §2.4.2 r9: the discovery summary is a warnings line of its own, after the joined one — in both renderers", () => {
+    const warnLines = (blocks: Block[]) => blocks.filter((b) => b.kind === "warnings").map(blockText);
+    const expected: Record<string, string[]> = {
+      "discovery summary alone": [`⚠ ${DISCOVERY_SUMMARY}`],
+      "discovery summary, ordinary warnings": [`⚠ a real warning; ${DRIFT}`, `⚠ ${DISCOVERY_SUMMARY}`],
+      "discovery summary, API notice": [`⚠ ${DISCOVERY_SUMMARY}`],
+    };
+    for (const name of SUMMARY_VARIANTS) {
+      const struct = variant(name);
+      expect(warnLines(renderStruct(struct))).toEqual(expected[name]!);
+      // The file's lines classify the same way: each ⚠ line is a `warnings` block (red, and what Today's
+      // quiet-day pointer keys on), from the escape-first renderer too.
+      expect(warnLines(renderMarkdown(renderBriefing(struct as EngineStruct)))).toEqual(expected[name]!);
+    }
+    // PREMISE: the fixture's text is a real summary, opening with a lead the mirror knows.
+    expect(DISCOVERY_SUMMARY.startsWith(DISCOVERY_SUMMARY_LEADS[0]!)).toBe(true);
+  });
+
+  test("v0.2.1 §2.4.2 r9: chooseSource shows a run carrying the summary from the STRUCT — the renderers agree", () => {
+    for (const name of SUMMARY_VARIANTS) {
+      const struct = variant(name);
+      const markdown = renderBriefing(struct as EngineStruct);
+      const source = chooseSource(
+        { path: "/state/briefing-latest.md", text: markdown, bytes: markdown.length },
+        { runDate: struct.date, delivered: true, markdown, struct },
+      );
+      expect(`${name}: ${source.kind}`).toBe(`${name}: struct`);
+    }
+  });
+
+  test("prove-it 3b: a GUI renderer that still JOINED the summary would fail the parity on these fixtures", () => {
+    // What the pre-r9 mirror drew: one joined line. The engine's golden now has two, so it differs.
+    const struct = variant("discovery summary, ordinary warnings");
+    const joined = renderStruct({ ...struct, warnings: [] }).map(blockText);
+    joined.splice(joined.length - 1, 0, `⚠ ${(struct.warnings ?? []).join("; ")}`);
+    expect(joined).not.toEqual(golden(struct));
+    expect(renderStruct(struct).map(blockText)).toEqual(golden(struct));
   });
 
   test("prove-it 3b: a reordered or dropped line fails the parity", () => {

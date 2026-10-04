@@ -24,6 +24,8 @@
  * it.)
  */
 import { REDACTED_API_KEY } from "./files";
+import { DEFAULT_MORNING_TIME, parseMorningTime, unparseableNote } from "./morning-time";
+import type { Os } from "./platform";
 
 /* ── the steps ────────────────────────────────────────────────────────────────────────────────── */
 
@@ -105,8 +107,14 @@ export interface WizardDraft {
   explicitRepos: string;
   /** `excludeRepos` entries, one per line — by absolute path or basename. */
   excludeRepos: string;
-  /** Step 5: the morning FLOOR, HH:MM. Earliest, not exact ([`firstWakeSentence`]). */
+  /** Step 5: the morning FLOOR, HH:MM. Earliest, not exact ([`firstWakeSentence`]). Always the
+   *  dropdowns' `HH:MM`: a re-run seed is NORMALISED the engine's way ([`draftFromConfig`]), so the
+   *  step is never blocked by a value the user cannot see (v0.2.1 §3.2). */
   floor: string;
+  /** v0.2.1 §3.2: the morning-time step's note when the seeded config holds a value the engine
+   *  cannot read (`floor` is then 07:20, what the engine uses), else `null`. Display only — never
+   *  written to the config. */
+  floorNote: string | null;
   /** Phase E (E12): the update-check consent answer — `config.updateCheck.enabled`. `false` ("No")
    *  is the DEFAULT; only an explicit "Yes" turns the engine's automatic check on. */
   updateCheck: boolean;
@@ -115,7 +123,7 @@ export interface WizardDraft {
 /** The engine's own defaults, mirrored — each pinned against `src/config.ts` /
  *  `src/schedule.ts` exports by `wizard.check.ts`, because this module cannot import engine
  *  source into a webview bundle (15 of 26 engine modules use Bun APIs). */
-export const DEFAULT_FLOOR = "07:20";
+export const DEFAULT_FLOOR = DEFAULT_MORNING_TIME;
 export const DEFAULT_TOKEN_BUDGET = { maxChars: 200000 };
 export const DEFAULT_LOOKBACK_CAP_DAYS = 4;
 export const DEFAULT_NETWORK_PROBE_HOSTS = [
@@ -147,6 +155,7 @@ export function emptyDraft(): WizardDraft {
     explicitRepos: "",
     excludeRepos: "",
     floor: DEFAULT_FLOOR,
+    floorNote: null,
     updateCheck: false,
   };
 }
@@ -215,7 +224,7 @@ export function stepBlocker(step: StepId, draft: WizardDraft): string | null {
       }
       return null;
     case "floor":
-      return floorValid(draft.floor) ? null : "The earliest time must be HH:MM, e.g. 07:20.";
+      return floorValid(draft.floor) ? null : "Choose a morning time.";
     default:
       return null;
   }
@@ -230,6 +239,61 @@ export function stepBlocker(step: StepId, draft: WizardDraft): string | null {
  */
 export function firstWakeSentence(floor: string): string {
   return `Your briefing is generated on the first check after ${floor} once your machine is awake — not at ${floor}.`;
+}
+
+/* ── v0.2.1 §3.5: the wording that depends on the OS ──────────────────────────────────────────── */
+
+/**
+ * Every piece of `Wizard.svelte`'s text that names the Mac, by OS — one function, so the template
+ * and `wizard.check.ts` read the same strings (the wizard only server-renders its first step, so a
+ * render alone cannot reach the others).
+ *
+ * ⚠ THE macOS VALUES ARE THE PRE-v0.2.1 TEXT, UNCHANGED. Elsewhere (Linux, Windows, unknown) the
+ * Mac is "this computer"; the "each time it opens" aside goes (the launch-time `access_snapshot`,
+ * which runs the engine's check, answers `unsupported` without spawning anything off macOS); the
+ * folder-access clause and the protected-folders note go (that step is skipped off macOS).
+ *
+ * The step title "Step 4 of 7 — macOS folder access" is not here: that step never shows off macOS.
+ */
+export interface WizardOsWording {
+  /** Step 1: "Everything runs on {machine}." */
+  machine: string;
+  /** Step 1: "whenever this app checks your setup{checkOnOpen} (a connection…". Starts with a space. */
+  checkOnOpen: string;
+  /** Step 1: "until you confirm at the last step{folderAccessClause}. Cancelling…". */
+  folderAccessClause: string;
+  /** Step 2, the local-model option: "never leaves {localModelStaysOn}." */
+  localModelStaysOn: string;
+  /** Step 3, the Home folder option: "…Documents and Downloads{homeScanAsks}. Untick this…". */
+  homeScanAsks: string;
+  /** Step 3: whether the "These three are macOS-protected…" note shows. */
+  protectedFoldersNote: boolean;
+  /** The morning-time step: "runs every ten minutes while {awake} is awake." */
+  awake: string;
+}
+
+export function wizardOsWording(os: Os): WizardOsWording {
+  if (os === "macos") {
+    return {
+      machine: "this Mac",
+      checkOnOpen: " (on macOS, also each time it opens)",
+      folderAccessClause:
+        "; the folder-access step asks macOS for permission only when you press its button",
+      localModelStaysOn: "your Mac",
+      homeScanAsks: " — macOS may ask about those the first time",
+      protectedFoldersNote: true,
+      awake: "your Mac",
+    };
+  }
+  return {
+    machine: "this computer",
+    checkOnOpen: "",
+    folderAccessClause: "",
+    localModelStaysOn: "this computer",
+    homeScanAsks: "",
+    protectedFoldersNote: false,
+    awake: "your computer",
+  };
 }
 
 /* ── the candidate config ─────────────────────────────────────────────────────────────────────── */
@@ -521,7 +585,12 @@ export function draftFromConfig(text: string): WizardDraft | null {
       .join("\n");
     draft.explicitRepos = asStrings(c["repos"]).join("\n");
     draft.excludeRepos = asStrings(c["excludeRepos"]).join("\n");
-    draft.floor = typeof c["morningTime"] === "string" ? c["morningTime"] : DEFAULT_FLOOR;
+    // v0.2.1 §3.2: NORMALISED through the engine's own reading (`lib/morning-time.ts`): a lenient
+    // `7:05` becomes `07:05`, and a value the engine cannot read becomes the 07:20 it uses, with a
+    // note naming the stored value — so the dropdowns show the time in force and Next is never
+    // blocked by a value the user cannot see. A re-run's save then writes the normalised value.
+    draft.floor = parseMorningTime(c["morningTime"]).hhmm;
+    draft.floorNote = unparseableNote(c["morningTime"]);
     // Phase E (E12): on only when the config says exactly `enabled: true` — the engine's rule.
     const check = c["updateCheck"];
     draft.updateCheck = isObj(check) && check["enabled"] === true;

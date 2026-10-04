@@ -191,6 +191,14 @@ describe("systemdUnits", () => {
     expect(timer).toContain("OnCalendar=*-*-* 06:05:00");
   });
 
+  test("the timer's Description= names the setting the way the app does — 'morning time' (v0.2.1 §3.1)", () => {
+    // `systemctl --user status` and `list-timers` show this line to the user. Units already installed keep
+    // the old text until the scheduler is reinstalled; nothing reads it back.
+    const { service, timer } = systemdUnits(OPTS);
+    expect(timer).toContain("Description=Daily Briefing — poll for the first wake past your morning time\n");
+    expect(`${service}${timer}`).not.toMatch(/floor/i);
+  });
+
   test("no unit ever references an AppImage mount path", () => {
     const { service, timer } = systemdUnits(OPTS);
     for (const u of [service, timer]) expect(u).not.toContain("/tmp/.mount");

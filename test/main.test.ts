@@ -1,12 +1,12 @@
 import "./fixtures/isolate-state";   // armed before this file's first save, from any cwd (see test/fixtures/isolate-state.ts)
 import { test, expect, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync, unlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, readdirSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildRepo, branchCommit, mergeBranchWith } from "./fixtures/build-repo";
 import { run, blockedDelivery, preflightRepos, limitedSkipMessage } from "../src/main";
 import { waitForNetwork } from "../src/net";
-import { alreadyRanToday, checkRanToday, latestBriefingPath, archivedBriefingPath, markerPath, localDateStr, readLastRunDate } from "../src/marker";
+import { alreadyRanToday, checkRanToday, latestBriefingPath, archivedBriefingPath, markerPath, localDateStr, readLastRunDate, readLastSkip } from "../src/marker";
 import { ProviderError, type Provider } from "../src/types";
 import { REDACTION } from "../src/transcripts/credentials";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
@@ -1123,6 +1123,142 @@ describe("output credential scan is unconditional", () => {
       const latest = await Bun.file(latestBriefingPath()).text();
       expect(latest).not.toContain(KEY);
       expect(latest).toContain(REDACTION);
+    } finally { cap.restore(); cleanup(); }
+  });
+});
+
+// ---- v0.2.1 §2.4.5 (plan T1.3): the shell half of the discovery summary and the discovery-blocked rule ----
+// The pipeline half (which runs are blocked, what the summary says) is pinned in
+// test/core.discovery-blocked.test.ts; these pin what run() does with it: exit code, stamp, the
+// last-skip record, the engine notifier, and the order of the stderr lines.
+describe("v0.2.1 §2.4: folders discovery could not read", () => {
+  /** A directory this process cannot list (chmod 000 → EACCES → `unreadable`). PREMISE-checked. */
+  function lockedRoot(): { path: string; unlock: () => void } {
+    const path = join(removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-v021-"))), "Documents");
+    mkdirSync(path);
+    chmodSync(path, 0o000);
+    expect(() => readdirSync(path)).toThrow();
+    return { path, unlock: () => chmodSync(path, 0o755) };
+  }
+  /** The engine notifier as a marker-writing command (src/notify.ts `{ command }`, an absolute path so no
+   *  PATH lookup): the marker file exists iff run() reached the notify call. */
+  function notifier(): { notify: { command: string[] }; fired: () => boolean } {
+    const marker = join(removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-v021-notify-"))), "fired");
+    return { notify: { command: ["/usr/bin/touch", marker] }, fired: () => existsSync(marker) };
+  }
+  const BLOCKED_DISCOVERY_LINE = "No repositories were found, and a folder listed in Folders to search could not be read or found — today NOT marked done.";
+
+  for (const force of [false, true]) {
+    test(`a configured search folder that cannot be read, zero repos (force=${force}): exit 1, NOT stamped, last-skip carries the summary, no notification`, async () => {
+      const root = lockedRoot();
+      const n = notifier();
+      const cleanup = withEnv({ discoverRoots: [root.path], provider: PROV, morningTime: "07:20", notify: n.notify });
+      const cap = captureConsole();
+      const fp = fakeProvider();
+      try {
+        const code = await runT(force, { provider: fp.provider });
+        expect(code).toBe(1);
+        expect(fp.calls()).toBe(0);
+        expect(await alreadyRanToday()).toBe(false);                        // retryable: the next tick tries again
+        expect(await Bun.file(latestBriefingPath()).exists()).toBe(false);
+        expect(n.fired()).toBe(false);                                     // the engine notifier stays delivery-only
+        const summary = `No repositories were found in Folders to search. Couldn't read 1 folder (${root.path}) — check its permissions — so repos in it may be missing.`;
+        const skip = await readLastSkip();
+        expect(skip?.reason).toBe("blocked");
+        expect(skip?.detail).toBe(summary);
+        // stderr: every per-folder warnFor line FIRST, then the summary, then the blocked line.
+        const at = (needle: string) => cap.err.findIndex((l) => l.includes(needle));
+        const perFolder = at(`skipped repo (unreadable): ${root.path}`);
+        expect(perFolder).toBeGreaterThanOrEqual(0);
+        expect(at(`⚠ ${summary}`)).toBeGreaterThan(perFolder);
+        expect(at(BLOCKED_DISCOVERY_LINE)).toBeGreaterThan(at(`⚠ ${summary}`));
+        expect(at("Some configured repo(s) could not be read")).toBe(-1);   // the explicit-repos wording is not used
+      } finally { cap.restore(); cleanup(); root.unlock(); }
+    });
+  }
+
+  test("an INCIDENTAL denied folder under a search folder, zero repos: a stamped quiet day that names it (the notifier fires — control)", async () => {
+    const home = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-v021-home-")));
+    mkdirSync(join(home, "code", "team", "proj", ".git"), { recursive: true });   // three levels: past discovery's reach
+    const desktop = join(home, "Desktop");
+    mkdirSync(desktop);
+    chmodSync(desktop, 0o000);
+    const n = notifier();
+    const cleanup = withEnv({ discoverRoots: [home], provider: PROV, morningTime: "07:20", notify: n.notify });
+    const cap = captureConsole();
+    try {
+      const code = await runT(false, { provider: fakeProvider().provider });
+      expect(code).toBe(0);
+      expect(await alreadyRanToday()).toBe(true);
+      expect(n.fired()).toBe(true);   // CONTROL: the marker mechanism the blocked test relies on does observe a notify call
+      const out = cap.out.join("\n");
+      expect(out).toContain("(no commits in the window)");
+      expect(out).toContain(`⚠ No repositories were found in Folders to search. Couldn't read 1 folder (${desktop})`);
+      expect(await readLastSkip()).toBeUndefined();   // delivered ⇒ no skip record
+    } finally { cap.restore(); cleanup(); chmodSync(desktop, 0o755); }
+  });
+
+  // r7/r8 (M1 checkpoint): the PROVIDER path. A found repo always briefs (it contributes a `branch`
+  // activity), so this — not the empty window — is the common quiet day; the summary must reach the
+  // written briefing AND stderr (so briefing.log), after the per-folder warnFor line.
+  test("repos found, NO commits in the window, an incidental denied folder: exit 0, stamped, the briefing file carries the ⚠ summary, and stderr prints it after the per-folder line", async () => {
+    const home = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-v021-pp-")));
+    const repo = await buildRepo([{ file: "old.txt", content: "o", isoDate: new Date(Date.now() - 10 * 864e5).toISOString() }]);
+    renameSync(repo, join(home, "proj"));                     // found by discovery; its only commit is outside the window
+    const desktop = join(home, "Desktop");
+    mkdirSync(desktop);
+    chmodSync(desktop, 0o000);
+    expect(() => readdirSync(desktop)).toThrow();            // PREMISE: the folder really is unreadable
+    const cleanup = withEnv({ discoverRoots: [home], provider: PROV, morningTime: "07:20", lookbackCapDays: 3 });
+    const cap = captureConsole();
+    let calls = 0;
+    // A no-commit window yields no recap: the RECAP header is omitted (an empty one followed directly by
+    // "## SUGGESTIONS" parses as recap bullets), so the render takes its "(no commits in the window)" branch.
+    const quiet: Provider = { async generate() { calls++; return "## RESUME\n- [proj] resume\n## SUGGESTIONS\n- next"; } };
+    try {
+      const code = await runT(false, { provider: quiet });
+      expect(code).toBe(0);
+      expect(calls).toBe(1);                                  // PREMISE: the provider path, not the early return
+      expect(await alreadyRanToday()).toBe(true);             // stamped: an incidental folder never blocks
+      expect(await readLastSkip()).toBeUndefined();
+      const summary = `Couldn't read 1 folder (${desktop}) — check its permissions — so repos in it may be missing.`;
+      const latest = await Bun.file(latestBriefingPath()).text();
+      expect(latest).toContain("(no commits in the window)");
+      expect(latest.split("\n").find((l) => l.startsWith("⚠ "))).toContain(summary);
+      // stderr (fd 2 = briefing.log under launchd): the per-folder warnFor line FIRST, then the summary.
+      const at = (needle: string) => cap.err.findIndex((l) => l.includes(needle));
+      const perFolder = at(`skipped repo (unreadable): ${desktop}`);
+      expect(perFolder).toBeGreaterThanOrEqual(0);
+      expect(at(`⚠ ${summary}`)).toBeGreaterThan(perFolder);
+      expect(cap.err.filter((l) => l.includes(summary))).toHaveLength(1);   // printed once
+    } finally { cap.restore(); cleanup(); chmodSync(desktop, 0o755); }
+  });
+
+  test("extraction-blocked BESIDE a denied search folder: the old blocked line, and the summary as the skip detail", async () => {
+    const good = await buildRepo([{ file: "a.txt", content: "a", isoDate: yesterdayISO() }]);
+    const root = lockedRoot();
+    const cleanup = withEnv({ discoverRoots: [good, root.path], provider: PROV });
+    const cap = captureConsole();
+    try {
+      const code = await runT(true, { provider: fakeProvider().provider, probe: async (repo) => (repo === good ? ({ code: "EACCES" } as NodeJS.ErrnoException) : null) });
+      expect(code).toBe(1);
+      expect(await alreadyRanToday()).toBe(false);
+      expect(cap.err.some((l) => l.includes("Some configured repo(s) could not be read"))).toBe(true);
+      const skip = await readLastSkip();
+      expect(skip?.reason).toBe("blocked");
+      expect(skip?.detail).toBe(`Couldn't read 1 folder (${root.path}) — check its permissions — so repos in it may be missing.`);
+    } finally { cap.restore(); cleanup(); root.unlock(); }
+  });
+
+  test("extraction-blocked with NO counted discovery issue keeps today's record: reason blocked, no detail", async () => {
+    const cleanup = withEnv({ repos: ["/some/eacces/repo"], provider: PROV });
+    const cap = captureConsole();
+    try {
+      const code = await runT(true, { provider: fakeProvider().provider, probe: async () => ({ code: "EACCES" } as NodeJS.ErrnoException) });
+      expect(code).toBe(1);
+      const skip = await readLastSkip();
+      expect(skip?.reason).toBe("blocked");
+      expect(skip !== undefined && "detail" in skip).toBe(false);
     } finally { cap.restore(); cleanup(); }
   });
 });

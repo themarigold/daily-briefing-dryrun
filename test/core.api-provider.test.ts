@@ -19,7 +19,7 @@ import { runCore } from "../src/core";
 import { buildProvider, providerLabel } from "../src/providerFactory";
 import { buildRepo } from "./fixtures/build-repo";
 import { loadAccountState, accountStatePath, recordLimit, DEFAULT_LABEL } from "../src/account";
-import { renderBriefing } from "../src/render";
+import { renderBriefing, API_NOTICE_TEXTS } from "../src/render";
 import { ProviderError, API_LABEL_ANTHROPIC, type Config, type Provider } from "../src/types";
 import { startFakeApi, okJson, status, type FakeApi, type FakeApiHandler } from "./helpers/fakeApi";
 import { guardNetworkForThisFile } from "./helpers/netGuard";
@@ -389,11 +389,17 @@ describe("T13 — the no-comparability-boundary claim, MEASURED", () => {
 
       // TWO fields differ, both deliberately and both PROVENANCE rather than content:
       //  • `provider` carries the model for an API run (and is byte-identical for a CLI run);
-      //  • the API run carries the hardening carve-out warning, which RENDERS as a ⚠ line in the
-      //    briefing. That is the honest disclosure the design chose over an unearned `posture: full`,
-      //    and it is the same shape a `harden: false` user already sees every morning.
+      //  • the API run's `struct.warnings` carries the hardening carve-out warning — the honest disclosure
+      //    the design chose over an unearned `posture: full`, read by the posture readers. Since v0.2.1
+      //    (§2.3) it does NOT render: renderBriefing drops that exact element (src/render.ts
+      //    API_NOTICE_TEXTS), so the footer's `generated via <provider>` is the briefing's only mark of
+      //    an API run. `strip` below is kept as-is; with the line gone it filters nothing on either side.
       expect(cliRun.struct.provider).toBe(cli);                        // CLI: byte-identical to before
       expect(apiRun.struct.provider).toBe("anthropic-api (claude-sonnet-5)");
+      const carve = (apiRun.struct.warnings ?? []).filter((w) => w.includes("no CLI process to harden"));
+      expect(carve).toHaveLength(1);                                   // the struct still carries it…
+      expect(API_NOTICE_TEXTS).toContain(carve[0]!);
+      expect(renderBriefing(apiRun.struct)).not.toContain("no CLI process to harden");   // …the briefing does not
       const strip = (m: string, provider: string) => m
         .split("\n")
         .filter((l) => !l.includes("no CLI process to harden"))

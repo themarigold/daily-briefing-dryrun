@@ -243,3 +243,22 @@ test("the human rendering is a pure function of the report, so text and JSON can
   expect(renderScheduleStatus(r)).toBe(renderScheduleStatus(r));
   expect(renderScheduleStatus({ ...r, owner: "app" })).toContain("app");
 });
+
+// v0.2.1 §3.1: one name, "Morning time", on every surface a user reads. The two lines below are the CLI's
+// `schedule status` text, and docs/TROUBLESHOOTING.md documents the label as a lookup key — so the exact
+// text is pinned here (no test pinned it before), and the doc changes in the same commit.
+describe("the human text says 'morning time', never 'floor' (v0.2.1 §3.1)", () => {
+  test("past the morning time, with a current heartbeat", async () => {
+    writeFileSync(tickPath(), `2026-07-16T16:00:00.000Z local=${localDateStr(NOW())} today=11\n`);
+    const text = renderScheduleStatus(await scheduleStatusReport(deps()));
+    expect(text).toContain("morning time:    07:20 (past)");
+    expect(text).toContain("ticks today:     11 of ~11 expected since the morning time");
+    expect(text).not.toMatch(/floor/i);
+  });
+
+  test("before the morning time", async () => {
+    const text = renderScheduleStatus(await scheduleStatusReport(deps({ now: () => new Date(2026, 6, 16, 7, 0) })));
+    expect(text).toContain("morning time:    07:20 (not yet reached)");
+    expect(text).not.toMatch(/floor/i);
+  });
+});

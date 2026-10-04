@@ -196,10 +196,12 @@ export function renderScheduleStatus(r: ScheduleStatusReport): string {
     lines.push(`  ⚠ engine skew: the scheduled copy is ${s(r.installedEngineVersion)}, this binary is ${s(r.engineVersion)} — ${refresh}.`);
   }
   if (r.lingerState !== "not-applicable") lines.push(`linger:          ${s(r.lingerState)}`);
-  lines.push(`morning floor:   ${s(r.morningTime.value)} (${r.isPastFloor ? "past" : "not yet reached"})`);
+  // v0.2.1 §3.1: the setting is called "Morning time" everywhere a user reads it. The label is a lookup
+  // key in docs/TROUBLESHOOTING.md's `schedule status` table — change the two together.
+  lines.push(`morning time:    ${s(r.morningTime.value)} (${r.isPastFloor ? "past" : "not yet reached"})`);
   lines.push(
     r.lastTickState === "ok"
-      ? `ticks today:     ${r.ticksToday} of ~${r.ticksExpectedSinceFloor ?? 0} expected since the floor`
+      ? `ticks today:     ${r.ticksToday} of ~${r.ticksExpectedSinceFloor ?? 0} expected since the morning time`
       : r.lastTickState === "legacy"
         // ⚠ NOT "0". See LastTickState — 0 is the value that reads as "launchd never fired".
         ? `ticks today:     UNKNOWN — the heartbeat file is in a pre-2026-08-20 format and cannot be counted (this is not the same as zero)`

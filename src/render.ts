@@ -1,8 +1,12 @@
 // src/render.ts
-import type { BriefingStruct } from "./types";
+import type { BriefingStruct, ProviderApi } from "./types";
 import { norm } from "./generator";
 import { LEGEND_PREFIX, NOT_SHOWN_PREFIX, VERDICT_MARKER_PREFIX } from "./subprojects";
 import { renderWhy } from "./transcripts/frame";
+// A CYCLE, deliberately and safely: discoverySummary.ts imports `stripControl` from here. Neither module
+// reads the other's bindings at top level (both are used only inside functions), so either load order
+// works — under bun and in the compiled binary. Keep it that way.
+import { isDiscoverySummary } from "./discoverySummary";
 
 /** The VERDICT-PATH MARKER's body (IN-2), rendered after `VERDICT_MARKER_PREFIX` under a suggestion
  *  whose `verdictPath` is set. A FIXED sentence, deliberately — no matched path, no SHA, no label:
@@ -233,6 +237,37 @@ export const stripControl = (s: string): string => s.replace(/[\x00-\x1f\x7f-\x9
 // nor a per-array-element map, which flattens any element that is itself multi-line) for text with
 // genuine internal newlines — e.g. the audit report's LLM-judge verdict.
 export const stripControlLines = (s: string): string => s.split("\n").map(stripControl).join("\n");
+
+/** v0.2.1 §2.3: the API transport's hardening carve-out sentence, ONE per `api.kind` — built from one
+ *  template, the same words `ApiTransport`'s constructor pushes into `runtimeWarnings`
+ *  (src/providers/base.ts), which core.ts then folds into `struct.warnings`.
+ *
+ *  WHY THE BRIEFING LEAVES IT OUT. It is true of every correct API install, every day, and it rendered as
+ *  the briefing's red `⚠` line — a daily alarm for a considered configuration teaches people to ignore
+ *  the line that carries real warnings (base.ts makes the same argument about loopback http). The fact
+ *  is NOT dropped: `struct.warnings` and `runtimeWarnings` still carry it, the posture readers (eval,
+ *  audit) read those and never the rendered line, and the footer (`— generated via <provider>`) and
+ *  `doctor`'s note still say the run used an API provider.
+ *
+ *  ⚠ EXACT ELEMENT MATCH, NEVER A SUBSTRING. Several warnings embed text a user or a repository controls —
+ *  the drift warning carries `git status` filenames, the latch-off warning carries CLI output, the
+ *  discovery summary carries folder names — so a substring filter would let a file named
+ *  "no CLI process to harden" hide a real warning.
+ *  ⚠ A COPY, NOT AN IMPORT. The emission in base.ts stays an inline literal (test/posture.test.ts scans
+ *  push sites for literals), and runtime code may not import `src/eval/**` — `src/eval/posture.ts`
+ *  imports `stripControl` from this file, so that edge would also close a cycle.
+ *  test/render.api-notice.test.ts pins this list to the providers' REAL `runtimeWarnings`.
+ *  ⚠ MIRRORED in gui/src/lib/briefing-struct.ts (the GUI's struct renderer must drop the same elements,
+ *  or the app falls back to its markdown view on every API morning); gui/tests-web/briefing.check.ts pins
+ *  the mirror against this export. */
+const apiNoticeText = (kind: ProviderApi["kind"]): string =>
+  `provider hardening does not apply to this run: the ${kind} API provider spawns nothing, so there is no CLI process to harden — no flags were injected, no working directory was narrowed, and no child environment was withheld`;
+/** Every `ProviderApi["kind"]`, as a Record so a new kind without a sentence fails to compile. */
+const API_KINDS: Record<ProviderApi["kind"], true> = { anthropic: true, "openai-compatible": true };
+export const API_NOTICE_TEXTS: readonly string[] = Object.freeze(
+  (Object.keys(API_KINDS) as ProviderApi["kind"][]).map(apiNoticeText),
+);
+const API_NOTICE_SET: ReadonlySet<string> = new Set(API_NOTICE_TEXTS);
 
 export function renderBriefing(b: BriefingStruct): string {
   const L: string[] = [];
@@ -470,7 +505,23 @@ export function renderBriefing(b: BriefingStruct): string {
       return s.verdictPath ? [line, `${VERDICT_MARKER_PREFIX}${VERDICT_MARKER_TEXT}`] : [line];
     })
     : ["   (none)"]));
-  if (b.warnings?.length) { L.push(""); L.push("⚠ " + b.warnings.join("; ")); }
+  // v0.2.1 §2.3: the API carve-out sentence is left out by EXACT element match (see API_NOTICE_TEXTS);
+  // when nothing else remains, neither the blank line nor the `⚠` line is emitted.
+  // v0.2.1 §2.4.2 (r9, user-directed 2026-10-03, Q2 = D): a discovery summary (`isDiscoverySummary`)
+  // renders on its OWN `⚠` line, AFTER the joined line of every other warning — one blank line before
+  // the block, as before. `audit.coverageGaps` drops exactly that line from its haystack, so the summary's
+  // folder names and "System Settings … (in the app: …)" can never count as naming a repo, while the joined
+  // line (drift warnings included) is scored as it always was. Classified on the CONTROL-STRIPPED text,
+  // which is how the line is displayed and how the audit reads it back: an element is on its own line
+  // here exactly when the audit would take its line for a summary, so the joined line can never be
+  // mistaken for one. ⚠ MIRRORED in gui/src/lib/briefing-struct.ts (`renderStruct`).
+  const shownWarnings = (b.warnings ?? []).filter((w) => !API_NOTICE_SET.has(w));
+  const ordinaryWarnings = shownWarnings.filter((w) => !isDiscoverySummary(stripControl(w)));
+  if (shownWarnings.length) {
+    L.push("");
+    if (ordinaryWarnings.length) L.push("⚠ " + ordinaryWarnings.join("; "));
+    for (const w of shownWarnings) if (isDiscoverySummary(stripControl(w))) L.push("⚠ " + w);
+  }
   L.push("");
   // "generated via", not "generated locally via" (known item 10, Phase E final harden): the text is
   // produced by the model behind `<provider>` — a remote API for an HTTP provider, and for the default

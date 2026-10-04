@@ -914,7 +914,7 @@ fn nested_brackets_in_link_text_reduce_to_the_text() {
 }
 
 /// FAILED carries the engine's literal error line (first line, control-stripped, capped) and
-/// routes to Schedule; BLOCKED has a fixed body when the record has no detail.
+/// routes to Schedule; BLOCKED always has the fixed body (v0.2.1 §2.4.5 — see the test below).
 #[test]
 fn failure_bodies_relay_the_engines_line_within_the_boundary() {
     let n = build_notification(
@@ -953,13 +953,107 @@ fn failure_bodies_relay_the_engines_line_within_the_boundary() {
         },
         None,
     );
-    assert!(n.body.contains("could not be read"), "{}", n.body);
+    assert_eq!(n.body, BLOCKED_BODY);
     assert_eq!(n.title, "Briefing blocked — 2026-09-17");
     assert_eq!(n.route, "schedule");
 
     let long = "x".repeat(500);
     assert_eq!(notification_line(&long).chars().count(), 180);
     assert!(notification_line(&long).ends_with('…'));
+}
+
+/// The Blocked banner's one body, for every blocked skip (v0.2.1 §2.4.5, r5).
+const BLOCKED_BODY: &str =
+    "A folder or repository could not be read or found, so no briefing was generated. \
+     Open the Schedule screen for details.";
+
+/// v0.2.1 §2.4.5 (r5): since v0.2.1 a blocked skip's `detail` is the engine's discovery summary,
+/// which NAMES FOLDERS — and an OS notification preview can sit on a lock screen. So the Blocked
+/// banner never relays `detail`: the generic body every time, one banner per (class, date) however
+/// often the failing morning rewrites the record, and no path from the detail anywhere in it.
+/// Driven through `AppState::changed` (the literal shipping sink) with the opt-in on.
+#[test]
+fn a_blocked_skip_with_a_discovery_summary_posts_the_generic_body_once_per_day_and_no_path() {
+    let summary = "No repositories were found in Folders to search. Couldn't read 1 folder \
+                   (/Users/me/Documents) because macOS blocked access, so repos in it may be \
+                   missing. Allow access in System Settings → Privacy & Security → Files & Folders \
+                   (in the app: Schedule → Folder access).";
+
+    // The pure builder: the detail is ignored for BLOCKED, whatever it holds.
+    let n = build_notification(
+        &Firing::Skip {
+            class: NotifyClass::Blocked,
+            date: "2026-09-17".into(),
+            detail: Some(summary.into()),
+            reason: "blocked".into(),
+        },
+        None,
+    );
+    assert_eq!(n.body, BLOCKED_BODY);
+    assert_eq!(n.title, "Briefing blocked — 2026-09-17");
+
+    // End to end, opted in.
+    let scratch = ScratchDir::new("notify-blocked-summary");
+    let store = scratch.join("app-data");
+    write_record(
+        &store,
+        &NotifyRecord {
+            enabled: Some(true),
+        },
+    )
+    .expect("record written");
+    let recorder = Arc::new(RecordingNotifySink::default());
+    let app = mock_app(Some(
+        NotifyState::default()
+            .with_sink(recorder.clone())
+            .with_store_dir(&store),
+    ));
+    let sink = AppState::new(app.handle().clone());
+    // The baseline: absorbed, never fires.
+    sink.changed(&waiting_snapshot("2026-09-17", None));
+    // The failing morning: a new record every ten-minute tick, the summary re-worded once.
+    for detail in [
+        summary,
+        summary,
+        "Couldn't find 1 folder listed in Folders to search (/Users/me/typo).",
+    ] {
+        sink.changed(&skipped_snapshot(
+            "2026-09-17",
+            "blocked",
+            Some(detail),
+            None,
+        ));
+    }
+    let posted = recorder.posted();
+    assert_eq!(posted.len(), 1, "one banner per (class, date): {posted:?}");
+    assert_eq!(posted[0].class, NotifyClass::Blocked);
+    assert_eq!(posted[0].title, "Briefing blocked — 2026-09-17");
+    assert_eq!(posted[0].body, BLOCKED_BODY);
+    assert_eq!(posted[0].route, "schedule");
+    for leak in [
+        "/Users/me",
+        "Documents",
+        "typo",
+        "Couldn't",
+        "Folders to search",
+    ] {
+        assert!(
+            !posted[0].title.contains(leak) && !posted[0].body.contains(leak),
+            "the banner carries {leak:?} from the detail: {:?}",
+            posted[0]
+        );
+    }
+    // The next day's blocked morning is a new (class, date): it fires again, still generic.
+    sink.changed(&skipped_snapshot(
+        "2026-09-18",
+        "blocked",
+        Some(summary),
+        None,
+    ));
+    let posted = recorder.posted();
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(posted[1].title, "Briefing blocked — 2026-09-18");
+    assert_eq!(posted[1].body, BLOCKED_BODY);
 }
 
 /* ── the ownership predicate, over the shared fixtures ────────────────────────────────────────── */

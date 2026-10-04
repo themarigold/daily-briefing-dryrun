@@ -283,8 +283,8 @@ after `provider.argv` so they win on a repeated flag; the briefing itself never 
 ## Delivery timing, in full
 
 - **Delivery timing (`morningTime` / `networkProbeHosts`):** the installed agent ticks every 10
-  minutes (see `schedule install` in the README) but only *delivers* once it's past a configurable
-  local-time floor, `morningTime` (24h `"HH:MM"`, default `"07:20"`) — every tick before the floor is a
+  minutes (see `schedule install` in the README) but only *delivers* once it's past your morning time,
+  `morningTime` (24h `"HH:MM"` in local time, default `"07:20"`) — every tick before it is a
   silent no-op, and the first tick at or after it (whether that's a scheduled interval fire or the
   wake/login `RunAtLoad` fire) generates and marks the day done. An invalid `morningTime` falls back to
   the default and surfaces a warning in the briefing. Before generating, a non-`--force` run (whether
@@ -295,14 +295,14 @@ after `provider.argv` so they win on a repeated flag; the briefing itself never 
   offline after the grace period it skips (no stamp), and the scheduled agent's next 10-minute tick
   retries (a manual run you simply re-run once you're back online). Set `networkProbeHosts: []` to
   **disable** this gate entirely — useful for a local/offline provider that needs no network at all.
-  `--force` always bypasses the floor and the once-per-day marker; on the network step it still waits
-  briefly (same bounded poll), but if still offline afterward it **proceeds anyway** — a forced run
-  always calls the provider — whereas a non-`--force` run instead skips (no stamp; retried as just
+  `--force` always bypasses the morning time and the once-per-day marker; on the network step it still
+  waits briefly (same bounded poll), but if still offline afterward it **proceeds anyway** — a forced
+  run always calls the provider — whereas a non-`--force` run instead skips (no stamp; retried as just
   described).
 
-In plain words: the "floor" is `morningTime`, a "tick" is one scheduled wake-up of the engine, and the
-"marker" is the engine's record that today's briefing was delivered, which makes every later tick that
-day a no-op.
+In plain words: the "morning time" is `morningTime` (**Morning time** in the app), a "tick" is one
+scheduled wake-up of the engine, and the "marker" is the engine's record that today's briefing was
+delivered, which makes every later tick that day a no-op.
 
 ## Recap campaigns, in full
 

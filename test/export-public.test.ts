@@ -41,6 +41,10 @@ test.skipIf(!IN_MONOREPO)("⚠ the public export passes its HARD residual sweep,
     // a regression of that fix cannot pass silently.
     expect(err, `the HARD sweep's grep errored, so its "clean" verdict is void:\n${err}`).not.toMatch(/grep:/);
 
+    // v0.2.1 §5: the bug-report form ships at the export ROOT, through the tracked `publish/**` overlay.
+    // Tracked-only, so a form left uncommitted (or only on disk) is missing here and this fails.
+    expect(existsSync(join(target, ".github", "ISSUE_TEMPLATE", "bug.yml")), "the export has no .github/ISSUE_TEMPLATE/bug.yml — is publish/.github/ISSUE_TEMPLATE/bug.yml tracked?").toBe(true);
+
     // Paths that resolve in the monorepo can be missing in the exported layout; this is the suite that
     // guards the npm tarball, and the public CI and release.yml run it there. No `bun install` needed:
     // it imports only bun:test and node builtins (measured: 0.11 s in an uninstalled export).

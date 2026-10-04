@@ -1990,7 +1990,8 @@ constant-`Granted` stub (deviation 107), so the honest gate is the app's OWN rec
 on). While it is not `true`, every firing is recorded in a bounded suppression log (visible via
 `notify_status`, rendered by Settings) and NOTHING posts — so no notification and no OS prompt
 can come out of a background event before the user answers the EXPLAINED ask (the Settings panel
-and the Schedule screen's one-time ask block, both carrying `NOTIFY_ASK_EXPLANATION`). Two new
+and the Schedule screen's one-time ask block, both carrying `notifyAskExplanation(os)` — the
+v0.2.0 constant `NOTIFY_ASK_EXPLANATION`, made a function of the OS in v0.2.1 §3.5). Two new
 commands carry it: `notify_status` (record + the engine probe + the log; one `status --json`
 spawn, on Settings mount / app mount, never a timer) and `notify_set_enabled` (the answer; posts
 nothing). B8/T16's wizard step wires the same command (deviation 107).
@@ -2030,7 +2031,8 @@ Numbered from 105, continuing §11e. §9's retire-in-place convention applies.
      state; nothing posts and nothing prompts until the explained ask is answered
      (`notify_set_enabled`). **T16 handoff (B8): the wizard's notifications step calls
      `notify_status` / `notify_set_enabled` — the ask copy is `lib/notify.ts`'s
-     `NOTIFY_ASK_EXPLANATION`; no new command, grant or record is needed.**
+     `NOTIFY_ASK_EXPLANATION` (since v0.2.1 §3.5, `notifyAskExplanation(os)`); no new command,
+     grant or record is needed.**
 108. **The never-notify set, member by member** (the appendix's list, resolved against the
      engine's real vocabulary): `already-ran`/`below-floor` are the ordinary day;
      `offline`/`darkwake` are the machine's own mornings (the next tick retries);

@@ -56,8 +56,17 @@
     notifyStatus,
     type NotifyStatus,
   } from "../lib/notify";
+  import type { Os } from "../lib/platform";
   import SaveReport from "./SaveReport.svelte";
   import SettingsForm from "./SettingsForm.svelte";
+
+  interface Props {
+    /** v0.2.1 §3.5: the OS this window runs on (App's `osFromUserAgent`), handed to the "This app"
+     *  panel for the notification ask's wording. REQUIRED, with no default, so a mount that
+     *  forgets it fails `svelte-check` instead of silently getting one platform's wording. */
+    os: Os;
+  }
+  let { os }: Props = $props();
 
   /** B7 (T18/T19): the "This app" panel's state — the notification opt-in and the REAL autostart
    *  state (`is_enabled()`, re-fetched after every change; never a cached boolean). */
@@ -270,10 +279,11 @@
     autostart={appAutostart}
     autostartError={appAutostartError}
     onrefresh={loadApp}
+    {os}
   />
 
   <!-- Phase E (E12): the update panel — the last answer and "Check now". The AUTOMATIC check is the
-       engine's `updateCheck` config, edited in the form below with the engine's own help text. -->
+       engine's `updateCheck` config, edited in the form below (v0.2.1 §4.1: with plain help text). -->
   <UpdateCheck
     result={update}
     loading={updateLoading}

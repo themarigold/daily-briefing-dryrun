@@ -168,7 +168,7 @@ const STRUCT: BriefingStruct = { date: "2026-09-14", machineScope: "host", provi
 
 function coreResult(over: Partial<CoreResult> = {}): CoreResult {
   return {
-    emptyWindow: false, blocked: false, offlineSkipped: false, net: { online: true, waitedMs: 0 },
+    emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: false, net: { online: true, waitedMs: 0 },
     struct: STRUCT, rawText: "", promptText: "p", ctx: { repos: [] }, units: [], activities: [], repos: [],
     runDate: "2026-09-14", discIssues: [], extrIssues: [], warnings: [], today: [],
     windowStartUtc: "2026-09-10T00:00:00.000Z",

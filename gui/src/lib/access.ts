@@ -74,6 +74,12 @@ export interface AccessSnapshot {
   appVersion: string;
   /** The managed engine copy, from `schedule status --json`'s `binPath`. Display only. */
   managedEnginePath: string | null;
+  /**
+   * v0.2.1 §3.4: true only when doctor said `config.exists: false` — setup has not written a config
+   * yet. The panel then shows "Engine check: available once setup is finished." instead of the
+   * verdict, and Rust adds no "config could not be read" note. False when doctor did not say.
+   */
+  configMissing: boolean;
   /** Non-fatal trouble, in the app's own words. */
   notes: string[];
 }

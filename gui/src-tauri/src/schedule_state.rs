@@ -496,7 +496,9 @@ fn status_line(phase: &Phase, floor: &str) -> String {
             SkipReason::Offline => "Offline".to_string(),
             SkipReason::Darkwake => "Waiting for a real wake".to_string(),
             SkipReason::Limited => "Provider limit reached".to_string(),
-            SkipReason::Blocked => "Blocked — a repo could not be read".to_string(),
+            SkipReason::Blocked => {
+                "Blocked — a folder or repo could not be read or found".to_string()
+            }
             SkipReason::Concurrent => "A run is already in progress".to_string(),
             SkipReason::ProviderFail => "The provider failed".to_string(),
             SkipReason::ParseEmpty => "The briefing came back empty".to_string(),

@@ -15,7 +15,8 @@
    * through them and requires it to stay literal.
    */
   import type { AccessSnapshot, ProbeResult } from "../lib/access";
-  import { NOTIFY_ASK_EXPLANATION } from "../lib/notify";
+  import { notifyAskExplanation } from "../lib/notify";
+  import type { Os } from "../lib/platform";
   import type { ScheduleState } from "../lib/state";
   import type { VerifyEvidence } from "../lib/verify-flow";
   import ScheduleAccess from "../lib/ScheduleAccess.svelte";
@@ -71,6 +72,10 @@
      *  actionable, and a click that changed nothing says why instead of looking accepted. */
     notifyAskError?: string | null;
     onnotifychoice?: (enabled: boolean) => void;
+    /** v0.2.1 §3.5: the OS this window runs on (App's `osFromUserAgent`), for the ask's wording.
+     *  REQUIRED, with no default, so a mount that forgets it fails `svelte-check` instead of
+     *  silently getting one platform's wording. */
+    os: Os;
   }
   let {
     state,
@@ -88,6 +93,7 @@
     notifyAsk = false,
     notifyAskError = null,
     onnotifychoice = () => {},
+    os,
   }: Props = $props();
 
   /** A local date-and-time for a UTC instant. The browser's own conversion — no date maths here. */
@@ -106,7 +112,7 @@
     <!-- B7 (T18): the explained notification ask, never a system prompt. "Not now" records the
          choice so the ask does not nag; Settings keeps the toggle either way. -->
     <div class="notify-ask">
-      <p>{NOTIFY_ASK_EXPLANATION}</p>
+      <p>{notifyAskExplanation(os)}</p>
       <div class="ask-row">
         <button type="button" onclick={() => onnotifychoice(true)}>Enable notifications</button>
         <button type="button" onclick={() => onnotifychoice(false)}>Not now</button>
