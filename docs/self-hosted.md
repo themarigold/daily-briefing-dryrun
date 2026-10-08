@@ -105,8 +105,14 @@ run is reaching the engine and declining — and `last skip` then says why.
 ## 5. Removing it
 
 ```sh
-daily-briefing schedule uninstall       # disables + deletes the units and the ownership record
+daily-briefing schedule uninstall       # stops + disables, checks, then deletes the units and the ownership record
 ```
+
+It stops and disables the timer and service, checks that systemd no longer has them running or
+enabled, and only then deletes the unit files and the ownership record. If that check still finds
+them, or cannot reach your user's systemd manager (for one, from a shell outside your login
+session), it deletes nothing more, exits 3, and prints the steps to finish by hand (also in
+[TROUBLESHOOTING](TROUBLESHOOTING.md#removing-the-background-scheduler-by-hand)).
 
 This removes the **schedule**, not the tool: the managed copy of the engine is left where it is.
 Delete `~/.local/share/daily-briefing` and `~/.local/state/daily-briefing` by hand if you want the

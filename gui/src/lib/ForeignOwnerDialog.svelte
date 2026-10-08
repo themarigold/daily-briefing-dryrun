@@ -8,19 +8,32 @@
    * deliberately.
    *
    * ⚠ `message` IS THE ENGINE'S STDERR, VERBATIM, and it names paths — text, never markup.
+   *
+   * ⚠ `lead` IS OPTIONAL, AND ITS DEFAULT IS TODAY'S LEAD (Batch 2 spec 3.4.3), so the install flow's
+   * dialog — which passes none — is drawn exactly as before. Only the Schedule screen's removal passes
+   * one, for a scheduler no record names an owner for (`uninstall-flow.ts`, `foreignOwnerLead`); an
+   * `undefined` lead is the default too. The order never changes: Keep first.
    */
   interface Props {
     message: string;
     /** What the take-over does, in the button: "install the background scheduler", … */
     purpose: string;
+    /** The first line. Text, never markup. */
+    lead?: string | undefined;
     onkeep: () => void;
     ontakeover: () => void;
   }
-  let { message, purpose, onkeep, ontakeover }: Props = $props();
+  let {
+    message,
+    purpose,
+    lead = "Something else already owns the background schedule.",
+    onkeep,
+    ontakeover,
+  }: Props = $props();
 </script>
 
 <div class="dialog" role="group" aria-label="Another scheduler owns this trigger">
-  <p class="lead">Something else already owns the background schedule.</p>
+  <p class="lead">{lead}</p>
   {#if message !== ""}
     <pre>{message}</pre>
   {/if}

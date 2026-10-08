@@ -691,8 +691,9 @@ pub const ENGINE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Produces a [`Snapshot`] by invoking the engine. The app's [`SnapshotSource`].
 ///
 /// ⚠ EVERY SNAPSHOT READS BOTH ENVELOPES, AND THE CACHE IS ONLY A FALLBACK. `schedule status
-/// --json` recomputes the tick count, the tick state, the unit's presence and — through a real
-/// `launchctl list` (`src/schedule/status.ts`, `isRegistered`) — its registration on every call, so
+/// --json` recomputes the tick count, the tick state, the unit's presence and — through the engine's
+/// read-only registration check (`probeRegistration` in `src/schedule/install.ts`: real `launchctl
+/// print`/`list`, or `systemctl --user is-active`/`is-enabled`) — its registration on every call, so
 /// an envelope from an earlier read is an answer about an earlier moment. (An earlier version
 /// cached it until `schedule.json` changed, reasoning that it "changes when somebody installs or
 /// removes a schedule"; measured, that held `ticksToday` at 4 while `last-tick` said 11, kept a

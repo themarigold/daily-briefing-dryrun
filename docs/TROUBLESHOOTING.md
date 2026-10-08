@@ -187,7 +187,7 @@ Start with `daily-briefing schedule status`:
 
 | Line | What to look for |
 | --- | --- |
-| `registered:` | `no` means nothing is scheduled: run `daily-briefing schedule install` (or set up background delivery in the app). |
+| `registered:` | `no` means nothing is scheduled: run `daily-briefing schedule install` (or set up background delivery in the app). `unknown` means the check could not run, which says nothing either way: over SSH there is no desktop session to ask, and on Linux your user's systemd manager may be out of reach from that shell. Run it again from a terminal in your desktop session; `schedule status --json` gives the reason as `registeredReason`. |
 | `owner:` | `app` or `cli`. Only one may own the trigger; the other is refused rather than replacing it. |
 | `morning time:` | `not yet reached` means it is earlier than your morning time ([`morningTime`](CONFIG.md#morningtime)), so ticks do nothing yet. |
 | `ticks today:` | how many times the scheduler woke the engine today. `none recorded` after your morning time means the scheduler is not reaching it. |
@@ -235,6 +235,53 @@ empty to keep Bun's crash upload off, and nothing was sent.
   [CLI not found](#cli-not-found-or-no-ai-cli-found-on-path).
 - **Repositories in protected folders on macOS:** the run reports `blocked`; see
   [folder access](#macos-repos-in-protected-folders-desktop--documents--downloads--icloud).
+
+## Removing the background scheduler by hand
+
+`daily-briefing schedule uninstall`, the app's **Remove background scheduler…** and the app's
+Uninstall all remove the background scheduler the same way: they unregister the job by its label,
+check that it is gone, and only then delete its files, the `schedule.json` record last. When the
+check still finds the job registered, or cannot run, nothing more is deleted. The message then
+says why, what is still there and what, if anything, was removed, and gives the steps below,
+written for your machine's own folders (`daily-briefing schedule status --json` carries the same
+steps as `removeSteps`). Copy them from that message; the ones here are for the default folders.
+
+On macOS:
+
+```text
+Run these in a terminal (bash or zsh) inside your desktop session.
+1. Unregister the job:
+   launchctl bootout gui/$(id -u)/local.daily-briefing; launchctl bootout user/$(id -u)/local.daily-briefing
+2. Wait a few seconds.
+3. Confirm it is gone. Each of these must report not found: it prints "Could not find service", or its last line is "exit 113".
+   launchctl print gui/$(id -u)/local.daily-briefing; echo "exit $?"
+   launchctl print user/$(id -u)/local.daily-briefing; echo "exit $?"
+   launchctl list local.daily-briefing; echo "exit $?"
+   If the first one says "Could not find domain", this terminal is not in your desktop session (over SSH, for example): run these steps from a desktop session instead. The second one may say "Could not find domain"; that is fine.
+   If the last one still finds the job (one loaded in another session), run this in the same terminal, wait a few seconds, and confirm again:
+   launchctl remove local.daily-briefing
+4. Delete the files:
+   rm -f -- "$HOME"/'Library/LaunchAgents/local.daily-briefing.plist' "$HOME"/'Library/Application Support/daily-briefing/schedule.json'
+```
+
+On Linux:
+
+```text
+Run these in a terminal (bash or zsh) inside your desktop session.
+1. Unregister the timer and service (a "not found" from disable is fine):
+   systemctl --user stop daily-briefing.timer daily-briefing.service; systemctl --user disable daily-briefing.timer
+2. Confirm they are gone:
+   systemctl --user is-active daily-briefing.timer daily-briefing.service
+   must print only inactive, failed or unknown, and
+   systemctl --user is-enabled daily-briefing.timer
+   must print static, disabled, linked, linked-runtime, masked, masked-runtime, bad or not-found, or report that the unit file does not exist.
+3. Delete the files and reload:
+   rm -f -- "$HOME"/'.config/systemd/user/daily-briefing.timer' "$HOME"/'.config/systemd/user/daily-briefing.service' "$HOME"/'.local/state/daily-briefing/schedule.json'; systemctl --user daemon-reload; systemctl --user reset-failed daily-briefing.timer daily-briefing.service
+```
+
+Then run `daily-briefing schedule uninstall` again (in the app: press **Remove background
+scheduler…** again, or run Uninstall again). With everything gone it reports "Nothing installed by
+daily-briefing was found."
 
 ## The app's login item
 

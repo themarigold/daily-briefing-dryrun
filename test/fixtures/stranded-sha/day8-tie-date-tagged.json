@@ -1,0 +1,5 @@
+[
+  "Edit packages/a/index.ts, packages/b/index.ts, sync shared config values across both — evidence: 36c4738 (Oct 5)",
+  "`index.ts` in packages/a and packages/b updated, shared config synced across both — evidence: 36c4738 (Oct 5)",
+  "Edit packages/a/index.ts and packages/b/index.ts, sync shared config across both — evidence: 36c4738 (Oct 5)"
+]

@@ -35,6 +35,10 @@
 #      hold on Linux.
 #   6. bun run eval --json — exit exactly 0, and stdout (parsed with `bun -e`; no jq) is a JSON object
 #      with pass === true, posture === "full" and truncated === false. Empty or non-JSON stdout is a FAIL.
+#      It also counts the eval's `parse-info [recap-evidence-…]` stderr lines for a report-only note;
+#      that count sits outside the contract the EVAL-INTEGRITY paragraph describes (check 6 consumes the
+#      eval's exit code and its `pass`, `posture` and `truncated` fields) and never reaches the verdict
+#      (user-directed, 2026-10-06).
 #      ⚠ This calls your configured provider for real, several times per gold case.
 #   7. bash scripts/export-public.sh into a fresh directory (it refuses an existing one) — but first the
 #      worktree's tracked files must still be exactly HEAD's (as in 9): the export copies them from disk,
@@ -232,6 +236,8 @@ check_eval() {
   local out="$LOGS/6.stdout" rc=0 verdict prc=0
   # stdout to its own file (the payload); stderr (diagnostics, the per-case lines) to the log
   ( cd "$WD" && bun run eval --json ) >"$out" || rc=$?
+  local n; n="$(grep -c 'parse-info \[recap-evidence-' "$LOGS/6.log" || true)"
+  note "recap evidence recoveries during eval: ${n} line(s) (report only; never changes the verdict)"
   if [ "$rc" -ne 0 ]; then
     note "bun run eval --json exited $rc; only 0 counts (1 = a gold case failed, 2 = an unknown --case filter)"
     return 1

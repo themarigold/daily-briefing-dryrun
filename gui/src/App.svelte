@@ -43,6 +43,8 @@
   import { notifyOffer, type NotifyOffer } from "./lib/settings-model";
   import QuitDialog from "./lib/QuitDialog.svelte";
   import { envelopeOf, type RunEnvelope } from "./lib/today";
+  import type { UninstallReport } from "./lib/app-uninstall";
+  import type { UninstallLine } from "./lib/uninstall-flow";
   import History from "./routes/History.svelte";
   import Schedule from "./routes/Schedule.svelte";
   import Settings from "./routes/Settings.svelte";
@@ -96,6 +98,52 @@
   let verifyTrigger = $state(0);
 
   /**
+   * Batch 2 (spec 3.4.4): the Schedule screen's last removal line — what `ScheduleUninstall` reported
+   * when its attempt ended (removed, nothing installed, kept, or failed with the engine's words).
+   *
+   * ⚠ IT LIVES HERE, and is passed back down, for the same two reasons. A removal takes away what the
+   * remove control's block keys on, so a line drawn inside it unmounted with the success it reported
+   * (`docs/gui-seam.md` known limit 104); and a rune in `Schedule.svelte` would collide with its `state`
+   * prop. It is cleared when an install or a removal starts (`oninstallstarted`, `onremovalstarted`) and on
+   * a route change (the effect below), so it never outlives the attempt it describes on another screen.
+   */
+  let removalLine = $state<UninstallLine | null>(null);
+  /**
+   * Checkpoint M6b: the last removal attempt on the Schedule screen ended failed, so its remove control
+   * stays mounted — and keeps its Try again (spec 3.4.6) — even when the refresh after it reads nothing
+   * on disk and an unknown registration, or no state at all (M9 round 1; `Schedule.svelte`'s rule). Set
+   * from each attempt's END; cleared by an end that did not fail, by an INSTALL starting (M9 round 2,
+   * which also resets the control: `removalReset`), by an install ENDING (M9 round 3: a removal pressed while
+   * an install ran is refused Busy and ends failed, and its Try again would repeat a first attempt against
+   * the scheduler that install just made) and by a route change. ⚠ NOT CLEARED WHEN A REMOVAL
+   * STARTS, unlike the line: Try again starts from that very control, and clearing this there would unmount
+   * it mid-run.
+   */
+  let removalFailed = $state(false);
+  /**
+   * M9 round 2: a removal attempt has started and not ended — running, or with its foreign-owner dialog open
+   * (that stage reports no end) — so the remove control stays mounted whatever a refresh reads meanwhile.
+   * Set by the removal's START; cleared by its end (success and failure alike: a failure keeps the control
+   * through `removalFailed`), by an install starting and by a route change — a dialog left open on a screen
+   * that unmounts never ends its attempt, so nothing else would clear it.
+   */
+  let removalInProgress = $state(false);
+  /**
+   * M9 round 2: bumped when an INSTALL, repair or update starts — and, since M9 round 3, when one ENDS,
+   * whatever came of it (never when a removal does). The Schedule screen keys its remove control on it, so
+   * the control remounts at idle and a failed removal's Try again — which repeats the old attempt, take-over
+   * included, with no confirmation — never sits beside the new scheduler.
+   */
+  let removalReset = $state(0);
+  $effect(() => {
+    // Reading `route` makes every route change re-run this.
+    void route;
+    removalLine = null;
+    removalFailed = false;
+    removalInProgress = false;
+  });
+
+  /**
    * B7 (T18): the app's notification opt-in as last read — `undefined` before the first read (no
    * ask shown yet), `null` = never asked (the Schedule screen surfaces the explained ask),
    * `true`/`false` = answered. The record and every posting decision are Rust's; this is only
@@ -134,8 +182,44 @@
    * B8 (T16): the wizard's entry is the existing no-config state (`docs/gui-seam.md` :1180) —
    * ONCE per session, on the first snapshot that reports it, so leaving the wizard ("Set up
    * later") is respected rather than re-routed on the next `state:changed`.
+   *
+   * Two writers, both setting it true and neither ever setting it back: `applySnapshot`, as it routes to the
+   * wizard; and an Uninstall execute's START (`onuninstallstarted`, M9 round 3), so a consented settings
+   * removal's not-configured snapshot never takes the done screen away.
    */
   let wizardOffered = $state(false);
+
+  /**
+   * M9 round 3: the Uninstall execute's report (spec 3.6.3's done screen) and whether an execute is in
+   * flight, held HERE and passed back down through `Settings` — the way `removalLine` is held — because
+   * `AppSettings`, which draws them, unmounts with the Settings screen: on a route change mid-execute (it can
+   * take about two minutes), and since M9 round 4 when a report arrives (the `{#key}` below). A consented
+   * settings removal's not-configured snapshot no longer takes the screen away: the START sets `wizardOffered`,
+   * before the IPC call — the watcher's event for the removed config.json can arrive before the call returns —
+   * and from then on this session never routes to the wizard on its own. Set from the execute's start and end
+   * callbacks; the report is the record of what the execute did, and is replaced only when the NEXT execute
+   * starts (`onuninstallstarted`) — M9 LOW pass (L2): "Uninstall again…" no longer clears it on the press, so a
+   * preview that fails, or a Cancel, in the flow it opens leaves the done screen and its manual steps there.
+   */
+  let uninstallReport = $state<UninstallReport | null>(null);
+  let uninstallRunning = $state(false);
+  /**
+   * M9 LOW pass (L1): an execute's report said its settings step removed `config.json`, which sets Rust's
+   * "settings removed" latch (`config_save.rs`) — and that latch refuses every settings write, the wizard's
+   * `config_create` included, until the app restarts. So this is latched for the SESSION too: set when such a
+   * report arrives, never set back (not by the next execute's start, which replaces the report), and handed to
+   * Settings, whose no-config sentence then points at what still works instead of the Setup wizard.
+   */
+  let settingsRemovedByUninstall = $state(false);
+  /**
+   * M9 round 4: how many reports have ARRIVED — the Settings mount's key. A report arriving remounts Settings,
+   * so everything it shows is read again (the config form, the "This app" panel, the update panel) the way
+   * re-entering the screen reads it, an unsaved edit kept and restored by the same path — and a Settings
+   * mounted mid-execute, whose own panel never sees that execute end, is remounted too. Not the report
+   * itself: clearing it (when the next execute starts, M9 LOW pass L2) is not an arrival, and a remount then
+   * would take away the flow whose execute is starting.
+   */
+  let uninstallReportSeq = $state(0);
 
   function applySnapshot(next: Snapshot): void {
     snapshot = next;
@@ -352,6 +436,30 @@
       onaccessrefresh={() => refreshAccess(false)}
       {verifyTrigger}
       oninstalled={() => (verifyTrigger += 1)}
+      {removalLine}
+      {removalFailed}
+      {removalInProgress}
+      {removalReset}
+      oninstallstarted={() => {
+        removalLine = null;
+        removalFailed = false;
+        removalInProgress = false;
+        removalReset += 1;
+      }}
+      oninstallended={() => {
+        removalFailed = false;
+        removalReset += 1;
+      }}
+      onremovalstarted={() => {
+        removalLine = null;
+        removalInProgress = true;
+      }}
+      onremovalended={(line) => {
+        removalLine = line;
+        removalInProgress = false;
+        removalFailed = line.kind === "failed";
+        void refresh();
+      }}
       evidence={{
         skipIso: snapshot?.lastSkip?.iso ?? null,
         delivered: snapshot?.scheduleState?.phase.phase === "delivered",
@@ -383,7 +491,27 @@
       }}
     />
   {:else}
-    <Settings {os} />
+    {#key uninstallReportSeq}
+    <Settings
+      {os}
+      {uninstallReport}
+      {uninstallRunning}
+      {settingsRemovedByUninstall}
+      onuninstallstarted={() => {
+        wizardOffered = true;
+        uninstallRunning = true;
+        uninstallReport = null;
+      }}
+      onuninstallended={(report) => {
+        uninstallRunning = false;
+        if (report !== null) {
+          uninstallReport = report;
+          if (report.settings.removed.includes("config.json")) settingsRemovedByUninstall = true;
+          uninstallReportSeq += 1;
+        }
+      }}
+    />
+    {/key}
   {/if}
   </div>
 </main>

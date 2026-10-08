@@ -15,9 +15,11 @@
    * through them and requires it to stay literal.
    */
   import type { AccessSnapshot, ProbeResult } from "../lib/access";
+  import { MANUAL_STEPS_APP_CLOSING, reasonPhrase } from "../lib/app-uninstall";
   import { notifyAskExplanation } from "../lib/notify";
   import type { Os } from "../lib/platform";
   import type { ScheduleState } from "../lib/state";
+  import type { UninstallLine } from "../lib/uninstall-flow";
   import type { VerifyEvidence } from "../lib/verify-flow";
   import ScheduleAccess from "../lib/ScheduleAccess.svelte";
   import ScheduleInstall from "../lib/ScheduleInstall.svelte";
@@ -62,6 +64,50 @@
     verifyTrigger?: number;
     oninstalled?: () => void;
     /**
+     * Batch 2 (spec 3.4.4): the last removal's line — what `ScheduleUninstall` reported when its attempt
+     * ended — drawn by THIS screen, below the remove control, so it outlives that control: a removal
+     * takes away the record, unit or registration the control's block keys on, and the block unmounts.
+     *
+     * ⚠ IT LIVES IN `App.svelte`, NOT HERE, for the same reason as `verifyTrigger` above: a rune in this
+     * file would collide with the `state` prop. App sets it from `onremovalended` and clears it when an
+     * install or a removal starts (`oninstallstarted`, `onremovalstarted`) and on a route change.
+     */
+    removalLine?: UninstallLine | null;
+    /**
+     * Checkpoint M6b: the last removal attempt on this screen ended FAILED. While it is set the remove
+     * control stays mounted whatever the refresh finds — so its Try again (spec 3.4.6), which lives in
+     * that control's failed stage, is not taken away by a refresh that reads nothing on disk and an
+     * unknown registration, or no state at all (M9 round 1). App holds it beside `removalLine` (same rune
+     * collision) and clears it when an attempt ends without failing, when an INSTALL starts (M9 round 2:
+     * the control is reset then too, `removalReset`) and when one ends (M9 round 3), or when the route
+     * changes — NOT when a removal starts: Try again starts from this very control, which must stay
+     * mounted through the retry.
+     */
+    removalFailed?: boolean;
+    /**
+     * M9 round 2: a removal attempt has STARTED and not yet ended — it is running, or its foreign-owner
+     * dialog is open (that stage reports no end). While it is set the remove control stays mounted whatever a
+     * refresh reads, so a refresh mid-attempt neither takes the dialog away nor remounts the control at idle.
+     * App sets it from `onremovalstarted` and clears it when the attempt ends, when an install starts and on a
+     * route change (an open dialog that unmounts with the screen never ends its attempt).
+     */
+    removalInProgress?: boolean;
+    /**
+     * M9 round 2: bumped by App when an INSTALL, repair or update starts, and when one ends (M9 round 3). The
+     * remove control is keyed on it, so it remounts at idle — a failed stage's Try again, which would repeat
+     * the old attempt (take-over included) with no confirmation, never sits beside a new scheduler. A
+     * removal's own start never bumps it.
+     */
+    removalReset?: number;
+    /** An install, repair or update is starting (spec 3.4.4) — any of the `ScheduleInstall` controls. */
+    oninstallstarted?: () => void;
+    /** M9 round 3: an install, repair or update attempt has ENDED, whatever came of it (its call returned). */
+    oninstallended?: () => void;
+    /** A removal attempt is starting (spec 3.4.4) — the first, a take-over or Try again. */
+    onremovalstarted?: () => void;
+    /** A removal attempt ended, with its line. */
+    onremovalended?: (line: UninstallLine) => void;
+    /**
      * B7 (T18): true while the app's notification opt-in has NEVER been asked — the explained
      * ask is surfaced here (and on Settings) because plan T18 forbids a prompt, or a first
      * notification, from a background fire. The choice is `onnotifychoice`; the record and every
@@ -90,6 +136,14 @@
     evidence = { skipIso: null, delivered: false },
     verifyTrigger = 0,
     oninstalled = () => {},
+    removalLine = null,
+    removalFailed = false,
+    removalInProgress = false,
+    removalReset = 0,
+    oninstallstarted = () => {},
+    oninstallended = () => {},
+    onremovalstarted = () => {},
+    onremovalended = () => {},
     notifyAsk = false,
     notifyAskError = null,
     onnotifychoice = () => {},
@@ -159,15 +213,39 @@
           <p class="muted">Today's briefing had already been delivered before this happened.</p>
         {/if}
       {:else if state.phase.phase === "not-scheduled"}
+        <!-- M9 round 2: "no briefing will arrive on its own" only when NOTHING of a scheduler is there. With a
+             unit, a record file or a registration, the line below says Daily Briefing cannot tell what it will
+             do, and this intro must not claim to know. M9 round 3: nor when the registration check could not
+             run (`registered === null`) — the engine treats that state as not-nothing (exit 3), and the
+             "Couldn't check" line below says so — so the clause needs `registered === false`. -->
         <p>
-          Nothing owns the background trigger, so no briefing will arrive on its own. Installing
-          one takes a second and does not change anything else.
+          Nothing owns the background trigger{!state.recordFilePresent &&
+          !state.unitPresent &&
+          state.registered === false
+            ? ", so no briefing will arrive on its own"
+            : ""}. Installing one takes a second and does not change anything else.
         </p>
-        {#if state.unitPresent || state.registered === true}
+        <!-- Batch 2 (spec 3.4.9): what IS there, in one of three wordings. "No ownership record" only
+             when no record FILE exists — a malformed one (or a dangling link) is a record that can't
+             be read. A unit's path only when the unit is there: with none, `unitPath` is the engine's
+             COMPUTED default (`status.ts`), and naming it would claim a file nobody found. -->
+        {#if state.recordFilePresent}
+          <p class="muted">
+            There is a schedule record on this machine, but it can't be read{state.unitPresent &&
+            state.unitPath !== null
+              ? `, and a scheduler unit is there too (${state.unitPath})`
+              : ""} — so Daily Briefing cannot tell who set the scheduler up or what it will do.
+          </p>
+        {:else if state.unitPresent}
           <p class="muted">
             A scheduler unit does exist on this machine
             {state.unitPath !== null ? ` (${state.unitPath})` : ""}, but there is no ownership
             record beside it — so Daily Briefing cannot tell what it will do.
+          </p>
+        {:else if state.registered === true}
+          <p class="muted">
+            A background scheduler is registered with the operating system, but no unit file is
+            present and there is no ownership record — so Daily Briefing cannot tell what it will do.
           </p>
         {/if}
       {:else if state.phase.phase === "scheduler-broken"}
@@ -183,7 +261,9 @@
             label="Repair background scheduler"
             purpose="repair the background scheduler"
             owner={state.owner}
+            onstarted={oninstallstarted}
             onfinished={oninstalled}
+            onended={oninstallended}
           />
         </div>
       {:else if state.phase.phase === "delivered"}
@@ -287,13 +367,17 @@
         {/if}
       </dd>
 
+      <!-- Checkpoint M6b: a path only when a unit file IS there. With none, `unitPath` is the engine's
+           COMPUTED default (`status.ts`) — the same rule as spec 3.4.8's confirmation and 3.4.9's line. -->
       <dt>Trigger file</dt>
-      <dd>{state.unitPath ?? "none"}</dd>
+      <dd>{state.unitPresent && state.unitPath !== null ? state.unitPath : "none"}</dd>
 
+      <!-- M9 LOW pass (L3): a record FILE with no readable record (malformed, a dangling link) is "unreadable",
+           never "absent" — the 3.4.9 line above says there is a record that can't be read. -->
       <dt>Registered</dt>
       <dd>
         {state.registered === null ? "unknown" : state.registered ? "yes" : "no"} · record
-        {state.recordPresent ? "present" : "absent"} · unit
+        {state.recordPresent ? "present" : state.recordFilePresent ? "unreadable" : "absent"} · unit
         {state.unitPresent ? "present" : "absent"}
       </dd>
 
@@ -324,6 +408,25 @@
       </p>
     {/if}
 
+    <!-- Batch 2 (spec 3.4.2): the registration check could not run. Said whatever is on disk — with a
+         record or a unit the remove control shows below as well (3.4.1); with nothing on disk this is
+         all there is, unless a removal from here is in progress or has failed (`removalInProgress`,
+         `removalFailed`), which keeps the remove control too. The reason in words, never its token;
+         the engine's manual steps VERBATIM (`removeSteps`, engine text, so `{}`-interpolated like every
+         other), then the app's own closing line, once (spec 3.1.8 "Framing"; plan SQ6). `removeSteps`
+         is `null` where spec 3.1 does not apply, and then there is nothing to close. -->
+    {#if state.registered === null}
+      <div class="unchecked">
+        <p class="warn-text">
+          Couldn't check whether the scheduler is registered ({reasonPhrase(state.registeredReason)}).
+        </p>
+        {#if state.removeSteps !== null}
+          <pre>{state.removeSteps}</pre>
+          <p class="muted closing">{MANUAL_STEPS_APP_CLOSING}</p>
+        {/if}
+      </div>
+    {/if}
+
     {#if state.engineUpdateAvailable}
       <div class="prompt">
         <p>
@@ -335,7 +438,9 @@
           label="Update background engine"
           purpose="update the background engine"
           owner={state.owner}
+          onstarted={oninstallstarted}
           onfinished={oninstalled}
+          onended={oninstallended}
         />
       </div>
     {/if}
@@ -344,20 +449,58 @@
          so the generic one is not repeated there. -->
     {#if state.phase.phase !== "scheduler-broken"}
       <div class="actions">
-        <ScheduleInstall owner={state.owner} onfinished={oninstalled} />
+        <ScheduleInstall owner={state.owner} onstarted={oninstallstarted} onfinished={oninstalled} onended={oninstallended} />
       </div>
     {/if}
 
-    <!-- B6 (T20): the post-install verification loop, and the removal. Both are offered only where
-         there is a record to verify or remove — `recordPresent` is authoritative (gui-seam §3). -->
+    <!-- B6 (T20): the post-install verification loop — offered only where there is a readable record
+         to verify (`recordPresent` is authoritative, gui-seam §3). -->
     {#if state.recordPresent}
       <div class="actions">
         <ScheduleVerify {evidence} trigger={verifyTrigger} />
       </div>
-      <div class="actions">
-        <ScheduleUninstall scheduleState={state} />
-      </div>
     {/if}
+  {/if}
+
+  <!-- The removal (Batch 2, spec 3.4.1): offered wherever the engine sees anything of a scheduler —
+       the record FILE, readable or not; a unit file; or a registration with no files — so a job
+       left loaded after its files went, or a malformed record, can still be removed here. The
+       engine decides whose it is (a first attempt never takes over). And while a removal from here
+       is in progress (`removalInProgress`, M9 round 2: from its start until it ends — running, or with
+       its foreign-owner dialog open) or has failed (`removalFailed`, checkpoint M6b): the condition stays
+       true, so the control is the SAME instance — still running, still asking, or still at its failed
+       stage with its Try again — whatever the refresh read, a refresh with NO state included, which is
+       why this block sits OUTSIDE the `state === null` guard (M9 round 1: inside it, a null state
+       unmounted the control and took Try again with it). It comes right after that guard closes, so it
+       is drawn where it always was; `ScheduleUninstall` takes a null state as it is (its confirmation
+       then names no unit file, claims no owner and no loaded job, M9 round 2). The `{#key}`: an install
+       starting bumps `removalReset` (M9 round 2), and so does one ending (M9 round 3), which remounts the
+       control at idle, so a failed removal's Try again never sits beside a new scheduler; a removal's own
+       start does not. -->
+  {#if state?.recordFilePresent || state?.unitPresent || state?.registered === true || removalFailed || removalInProgress}
+    <div class="actions">
+      {#key removalReset}
+        <ScheduleUninstall scheduleState={state} {os} onstarted={onremovalstarted} onfinished={onremovalended} />
+      {/key}
+    </div>
+  {/if}
+
+  <!-- Batch 2 (spec 3.4.4): the last removal's line, OUTSIDE the remove control's block, which a successful
+       removal unmounts — and outside the `state === null` guard too (checkpoint M6b), so a refresh whose
+       status read failed does not hide it. The engine's text verbatim — `{}`-interpolated and pre-wrapped,
+       a failure's manual steps with their line breaks — then the app's closing line once when it carries
+       steps (spec 3.1.8; SQ6). -->
+  {#if removalLine !== null}
+    <div class="removal">
+      {#if removalLine.kind === "failed"}
+        <pre class="bad">{removalLine.line}</pre>
+      {:else}
+        <p class="muted">{removalLine.line}</p>
+      {/if}
+      {#if removalLine.closing !== null}
+        <p class="muted">{removalLine.closing}</p>
+      {/if}
+    </div>
   {/if}
 
   <!-- B6 (T17): the folder-access flow. ALWAYS rendered — it is the Schedule & Access panel plan R1
@@ -465,5 +608,15 @@
   }
   .bad {
     color: var(--danger);
+  }
+  .unchecked,
+  .removal {
+    max-width: 44rem;
+  }
+  .removal p {
+    margin: 0 0 0.5rem;
+  }
+  .unchecked .closing {
+    margin: 0;
   }
 </style>

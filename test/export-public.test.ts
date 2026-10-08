@@ -50,7 +50,9 @@ test.skipIf(!IN_MONOREPO)("⚠ the public export passes its HARD residual sweep,
     // it imports only bun:test and node builtins (measured: 0.11 s in an uninstalled export).
     // The inner run's preload arms its OWN isolation baselines (test/fixtures/isolate-state.ts) under its
     // TMPDIR and, by design, never removes them. Left to inherit ours, that was a second
-    // `dba-isolated-*` pair in TMPDIR after every full run, against the documented one pair (measured).
+    // `dba-isolated-*` set in TMPDIR after every full run, against the documented one set (measured when
+    // it was a pair; Batch 2 added `dba-isolated-units-*`, which the assertion below lists since the M9 LOW
+    // pass, L19).
     // So its TMPDIR lives inside `parent`, which the `finally` below removes. It is handed over through
     // `env` (wrapping the command in `env TMPDIR=…` would also work); assigning process.env.TMPDIR here
     // would not, because a child spawned without `env` gets bun's STARTUP environment. The spread also forwards what earlier test files left
@@ -66,8 +68,8 @@ test.skipIf(!IN_MONOREPO)("⚠ the public export passes its HARD residual sweep,
     // …and they did land there, which also shows the exported tree's own isolation is live. Missing
     // entries mean one of two things: the redirect stopped reaching the child (the pair is back in the
     // shared TMPDIR), or the export no longer arms its preload (bunfig.toml or the fixture dropped).
-    const armed = readdirSync(innerTmp).map((n) => /^dba-isolated-(config|state)-/.exec(n)?.[1]).filter(Boolean).sort();
-    expect(armed, "the inner run's isolation baselines are not in its own TMPDIR: either `env` no longer hands the child innerTmp, or the exported tree no longer loads its preload").toEqual(["config", "state"]);
+    const armed = readdirSync(innerTmp).map((n) => /^dba-isolated-(config|state|units)-/.exec(n)?.[1]).filter(Boolean).sort();
+    expect(armed, "the inner run's isolation baselines are not in its own TMPDIR: either `env` no longer hands the child innerTmp, or the exported tree no longer loads its preload").toEqual(["config", "state", "units"]);
     // A green exit is also what a test "fixed" by skipping it in the exported layout produces. That file
     // has no conditional tests, so any skip there is exactly that.
     expect(innerOut, `publish-prep.test.ts SKIPPED tests inside the export:\n${innerOut}`).not.toMatch(/^\s*[1-9]\d* skip\s*$/m);

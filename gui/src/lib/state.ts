@@ -118,6 +118,16 @@ export interface ScheduleState {
   intervalSec: number | null;
   experimental: boolean;
   lingerState: string | null;
+  /** Anything at `schedule.json`, readable or not (the engine's `lstat`). NOT `recordPresent`, which
+   *  is a READABLE record: a malformed, symlinked or oversized record is `recordPresent: false` and
+   *  `recordFilePresent: true`. `false` when the schedule envelope is missing. */
+  recordFilePresent: boolean;
+  /** Why `registered` is `null` (the engine's reason: `"no-user-manager"`, `"no-gui-session"`,
+   *  `"timeout"`, `"spawn"` or `"unexpected"`), verbatim; `null` whenever `registered` is not. */
+  registeredReason: string | null;
+  /** The engine's manual removal steps for this machine, as text with no closing line — each
+   *  surface adds its own. `null` off launchd and systemd, or when the schedule envelope is missing. */
+  removeSteps: string | null;
 }
 
 /** The `state:changed` payload, and what `state_snapshot` returns. */

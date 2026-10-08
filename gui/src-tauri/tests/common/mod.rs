@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1017,4 +1017,42 @@ pub fn code_only(source: &str) -> String {
         }
     }
     out
+}
+
+/* ── the serialiser ───────────────────────────────────────────────────────────────────────────── */
+
+/// The turn [`serialise`] hands out. One per test BINARY: each binary compiles its own copy of this
+/// module, and the in-flight guard it serialises is process-global (`engine::IN_FLIGHT`), so a turn
+/// only needs to be exclusive within the process that holds that guard.
+static SERIAL: AtomicBool = AtomicBool::new(false);
+
+/// A held turn; dropping it gives the turn back.
+pub struct Serial;
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        SERIAL.store(false, Ordering::Release);
+    }
+}
+
+/// Take the turn for a test that invokes a MUTATING operation.
+///
+/// `engine::Operation::is_mutating` decides whether an invocation takes the process-global in-flight
+/// guard, and `cargo test` runs a binary's tests on parallel threads — so two tests that each spawn
+/// a mutating operation would contend for that guard and one would fail with a `Busy` it never
+/// asked for. It is an atomic with an async back-off rather than a `Mutex` held across the test
+/// body because a lock guard alive across an `.await` is what `clippy::await_holding_lock` objects
+/// to. Moved here from `tests/engine_client.rs` (Batch 2, T5.2) for its second consumer:
+/// `tests/uninstall.rs`, whose `uninstall_execute` now runs `schedule uninstall` (spec 3.7).
+pub async fn serialise() -> Serial {
+    for _ in 0..4000 {
+        if SERIAL
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Serial;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("a mutating-operation test held the serialiser for more than 20s");
 }

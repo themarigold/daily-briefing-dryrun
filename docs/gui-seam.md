@@ -262,10 +262,16 @@ does not have to reconstruct it from a commit message:
 ### 1b. What the app's suite does NOT execute (VM-gated)
 
 `schedule install` and `schedule uninstall` are never executed against the REAL engine by the
-suite. The unit FILE location is redirectable (`DBA_TEST_UNIT_DIR`, `src/schedule/install.ts:130`),
-but the registration is a real `launchctl`/`systemctl` call into the live user domain (`:562`) that
-no environment variable redirects — so executing either would install or remove a LaunchAgent on
-the machine running the tests. Plan line 70's live-domain register owns those legs. Against a FAKE
+suite. The unit FILE location is redirectable (`DBA_TEST_UNIT_DIR`, `src/schedule/install.ts`,
+`unitDir`), but the registration is a real `launchctl`/`systemctl` call into the live user domain,
+which acts by the job's label and the user's uid, so no environment variable can point it anywhere
+else. What `DBA_TEST_UNIT_DIR` does instead is make the engine's default exec REFUSE every scheduler
+change (`defaultExec` and `isRegistrationChange`): a `launchctl load`, `unload` or `bootout`, a
+`systemctl` change or a `loginctl enable-linger` spawns nothing and comes back as code -2 with
+`SCHEDULER_CHANGE_REFUSED`. That refusal is a backstop, never a licence to execute either command:
+the read-only probes (`launchctl print` and `list`, `systemctl is-active` and `is-enabled`) still
+reach the live user domain, and `schedule install`'s signing tools (`codesign`, `security`,
+`openssl`) still run for real. Plan line 70's live-domain register owns those legs. Against a FAKE
 sidecar they are executed end to end — through real IPC in `tests/capability.rs`, asserting the
 literal argv — so the command bodies are covered; only the engine's side of the call is not.
 
@@ -285,7 +291,15 @@ Fields a panel will want first:
 
 - `registered` / `recordPresent` / `unitPresent` — three separate legs, deliberately. A record with
   no unit is "somebody deleted my plist"; a unit with no registration is "on disk but not loaded".
-  Collapsing them into one boolean hides both.
+  Collapsing them into one boolean hides both. `registered` is the engine's one registration check
+  (`probeRegistration`, shared with `schedule uninstall`), and it is `null`, never `false`, when the
+  check could not run; `registeredReason` then says why (`no-user-manager`, `no-gui-session`,
+  `timeout`, `spawn` or `unexpected`). `recordPresent` is a READABLE record; `recordFilePresent` is
+  anything at `schedule.json` by `lstat` (a malformed, oversized or symlinked record is `false` in
+  the first and `true` in the second), and `unitPresent` is an `lstat` too, so a dangling symlink
+  counts.
+- `removeSteps` — the manual removal steps for this machine's paths, as text with no closing line
+  (each surface adds its own); `null` off launchd and systemd.
 - `owner` — `"cli"` or `"app"`. See §3.
 - `installedEngineVersion` vs `engineVersion` — **engine/app skew**. This is what the "update
   background engine" prompt keys on.
@@ -314,7 +328,20 @@ a single-owner record is what keeps that race unreachable rather than merely nar
   typed `Outcome` `{ kind: "failed", reason: null }` with `exitCode: 1` retained.** The classifier
   does not invent a reason string for it and has no separate variant; a panel that wants to render
   "there was nothing to remove" keys on `operation === "schedule-uninstall" && exitCode === 1`,
-  not on `reason`.
+  not on `reason`. A genuine exit 1 always prints its line on stdout ("Nothing installed by
+  daily-briefing was found."); an exit 1 with nothing on stdout is a crash, and is a failure.
+- **`schedule uninstall --invoker app` refuses more than the terminal's does** (launchd and
+  systemd; Windows keeps its old path, an owner check and an unchecked `schtasks /Delete`). Without
+  `--take-over` it exits 2 whenever anything is installed that no readable record says the app set
+  up — a terminal record, a malformed or dangling one, a unit with no record, a registration with no
+  files — with fixed stderr: *"This background scheduler wasn't set up by this app (<what was
+  found>). Removing it needs your go-ahead."* `<what was found>` names the record and the unit paths
+  a take-over would remove, or "a loaded job with no files" ("a timer and service with no files" on
+  Linux). The terminal's gate refuses only a readable record owned by someone else. Either way the
+  removal unregisters by label and deletes the files only once its own check finds the job gone;
+  otherwise it exits 3, and stderr says why, what is still there and what, if anything, the attempt
+  removed, and carries the manual steps (`removeSteps`' text). For `--invoker app` they end with no
+  closing line: the app adds its own.
 - Exit codes for `verify`: `0` the kick produced evidence it reached the engine · `1` the kick was
   accepted but produced **no new** evidence · `3` the scheduler refused the kick. ⚠ `outcome:
   "already-delivered-before-kick"` means today's delivery was recorded **before** the kick, so the
@@ -780,6 +807,9 @@ interface ScheduleState {
   intervalSec: number | null;      // null when missing or outside 1..86400
   experimental: boolean;
   lingerState: string | null;
+  recordFilePresent: boolean;      // anything at schedule.json (lstat), readable or not
+  registeredReason: string | null; // why `registered` is null; null whenever it is not
+  removeSteps: string | null;      // the engine's manual removal steps, no closing line
 }
 ```
 
@@ -790,7 +820,9 @@ interface ScheduleState {
 - **`gui/src/lib/ScheduleInstall.svelte`** — the install/repair flow; T16's wizard step 6 is THIS
   component (plan R1: "the SAME flow component"). Props: `label` (the button text; default
   "Install / repair scheduler"), `purpose` (the take-over button's verb phrase, "Take over and
-  {purpose}"), `owner` (`ScheduleState.owner` as last seen — `null` when there is no record), and
+  {purpose}"), `owner` (`ScheduleState.owner` as last seen — `null` when there is no record),
+  `onstarted` (an attempt is starting; the Schedule screen clears the last removal's line on it, and
+  it carries no side effect of its own), and
   `onfinished(outcome: EngineOutcome)`, called only when `afterInstall` resolves the attempt to
   `done` (`armsVerify` — B7's F2; a failed or foreign-owner attempt does not fire it, nor does an IPC
   rejection). It owns no route and no layout beyond its own controls. ⚠ **The first attempt never
@@ -800,7 +832,10 @@ interface ScheduleState {
   generic one (the separate "Update background engine" prompt, shown only for app-owned version
   skew, is an update rather than a second repair).
 - **`gui/src/lib/ForeignOwnerDialog.svelte`** — props `message` (the engine's stderr, rendered as
-  text), `purpose`, `onkeep`, `ontakeover`. KEEP-EXISTING is the first, primary button; take-over is
+  text), `purpose`, `onkeep`, `ontakeover`, and an optional `lead` (the first line, as text). Without
+  one the lead is "Something else already owns the background schedule.", as the install flow draws
+  it; the Schedule screen's removal passes "A background scheduler is set up, but nothing records who
+  set it up." when no record names an owner. KEEP-EXISTING is the first, primary button; take-over is
   the second, marked dangerous.
 - **`gui/src/lib/install-flow.ts` `afterInstall(outcome, takeOver, owner) → { stage, message }`** —
   pure. `delivered` → `done` (stdout as the message); `configError` (exit 2) → `foreign-owner` ONLY
@@ -829,9 +864,14 @@ interface ScheduleState {
   (the parent re-runs `access_snapshot`) and `refreshing`. It owns no route and no layout beyond its
   own controls, and **renders nothing at all** when `snapshot` is `null` or `supported` is false.
 - **`gui/src/lib/ScheduleUninstall.svelte`** (B6) — props `scheduleState` (⚠ not `state`: a local
-  binding by that name makes `$state(...)` parse as a store subscription) and `onfinished`. Two
-  confirmations: the first names the unit file and the consequence, the second is
-  `ForeignOwnerDialog` for a record this app does not own.
+  binding by that name makes `$state(...)` parse as a store subscription), `os` (what the first
+  confirmation says stops), `stage` (where the panel starts: `idle` on the screen, another stage only
+  for a server render), `onstarted` (an attempt is starting: the first, a take-over or Try again) and
+  `onfinished(line)` (an attempt has ended, with `uninstall-flow.ts`'s `UninstallLine` to show; also
+  on an IPC error or a busy refusal, never while the dialog asks). It draws no outcome line of its
+  own: the line outlives the control (§11c). Two confirmations: the first names the unit file only
+  when one is there, and the consequence; the second is `ForeignOwnerDialog`, after EVERY exit 2 of
+  an attempt without take-over.
 - **`gui/src/lib/ScheduleVerify.svelte`** (B6) — props `evidence` (`{ skipIso, delivered }` from the
   pushed `Snapshot`), `trigger` (a counter the parent bumps after an install) and `onfinished`. The
   loop's rules are pure (`lib/verify-flow.ts`).
@@ -841,7 +881,9 @@ interface ScheduleState {
   (steps 1–5: leaves with NOTHING written) and `onfinished`. It HOSTS `ScheduleAccess` (its step
   4) and `ScheduleInstall` + `ScheduleVerify` (its step 6) — the same flow components, not forks —
   and its rules are pure (`lib/wizard.ts`). Entry: App.svelte routes to it ONCE per session on the
-  first snapshot whose phase is `not-configured` (:1180's state); a `Setup` nav button shows while
+  first snapshot whose phase is `not-configured` (:1180's state) — but not once an Uninstall execute
+  has started (Batch 2, M9 round 3: from that start on, the session never routes to it on its own, so a
+  consented settings removal does not take the done screen away); a `Setup` nav button shows while
   that phase holds. `Route` gained `"wizard"`; `NavigateTarget` did not (deviation 54's rule).
 
 ## 9. Deviations recorded by T10/T11/T14 (B4)
@@ -1668,21 +1710,64 @@ the app asks again. Widen it deliberately, with a test.
 
 ### 11c. Uninstall, and who owns the trigger
 
-`engine_schedule_uninstall` existed since B3; B6 exposes it. Two confirmations:
+`engine_schedule_uninstall` existed since B3; B6 exposes it. It runs `schedule uninstall --invoker
+app`, which unregisters the job by its label and deletes its files only once its own check finds the
+job gone (§3). Two confirmations:
 
-1. The first names the unit **file** (`ScheduleState.unitPath` — never a path this app computed) and
-   the consequence: under R1 the OS trigger is the ONLY thing that delivers, so removing it stops
-   the product until one is installed again. With no `unitPath` it says so rather than naming one.
-2. The second is `ForeignOwnerDialog`, and only for a record this app does not own (`owner !== "app"`,
-   §3). KEEP-EXISTING is the default; take-over is explicit. A refused take-over is a failure, never
-   a loop back into the dialog.
+1. The first names the unit **file** only when one is there (`ScheduleState.unitPath` while
+   `unitPresent` is true — never a path this app computed; with no unit file, `unitPath` is the
+   engine's computed default, a file nobody found, so no path is named). It says what stops by the
+   scheduler's label: on macOS "unloads the loaded job `local.daily-briefing`" while `registered` is
+   `true` or `null`, and "unregisters `local.daily-briefing` if it is still loaded" when it is
+   `false`; on Linux "stops the `daily-briefing` timer and service". Then the consequence: under R1
+   the OS trigger is the ONLY thing that delivers, so removing it stops the product until one is
+   installed again. For an owner of `cli` it says a second confirmation follows; with no owner on
+   record it says "Nothing records who set up this background scheduler." and the same.
+2. The second is `ForeignOwnerDialog`, after EVERY exit 2 of an attempt without take-over, whatever
+   owner the screen last read: the removal has no confirmation gate, so its exit 2 only ever means
+   "not yours" (§3), and the cached owner can be stale. Its `message` is the engine's stderr, which
+   names what was found, including the unit files a take-over removes; with no owner on record its
+   `lead` is "A background scheduler is set up, but nothing records who set it up." KEEP-EXISTING is
+   the default and ends the flow with "Kept — nothing was removed."; take-over is explicit. A refused
+   take-over is a failure, never a loop back into the dialog.
 
 ⚠ **Exit 1 is "there was nothing to remove", keyed on the EXIT CODE.** §3: the classifier invents no
 reason string for it, so `reason` is `null` and a panel keying on it would show an empty error for a
-perfectly ordinary outcome. The key is `operation === "schedule-uninstall" && exitCode === 1`.
+perfectly ordinary outcome. The key is `operation === "schedule-uninstall" && exitCode === 1`. The
+panel shows the engine's own stdout line; an exit 1 with nothing on stdout is a crash, and shows as
+failed, with its stderr.
 
-Both the verification and the removal controls are offered on **`recordPresent`**, which §3 calls
-authoritative — not on the phase, and not on `unitPresent`.
+Exit 3, and every other failure, shows the engine's stderr verbatim (never trimmed), with **Try
+again**, which repeats the attempt it follows, take-over or not. When that text carries the manual
+steps, the app's own closing line follows it once: "Then press Remove again, or run Uninstall again."
+(`MANUAL_STEPS_APP_CLOSING`).
+
+**Where the controls show.** Verification is offered on **`recordPresent`**, which §3 calls
+authoritative. The removal is offered wherever the engine sees anything of a scheduler —
+`recordFilePresent || unitPresent || registered === true`, so a malformed or dangling record, a unit
+with no record and a job left loaded with no files can each be removed here — and also while the
+last removal from this screen has failed (`removalFailed`, held by `App.svelte`), so its Try again
+survives a refresh that would otherwise hide the control, and while a removal has started and not
+ended — running, or with its foreign-owner dialog open (`removalInProgress`). An install, repair or
+update that STARTS clears the line and both states and remounts the control at idle (`removalReset`,
+bumped from `ScheduleInstall`'s `onstarted`); one that ENDS, whatever came of it, clears the failed
+state and remounts it again (`onended`), so a failed removal's Try again never repeats against the
+scheduler that install made; a route change clears all three. When `registered` is `null` the screen
+adds "Couldn't check whether the scheduler is registered (<reason>).", the reason as a plain phrase,
+never its token, then `removeSteps` verbatim and the app's closing line; with a record or a unit on
+disk the remove control shows as well. The not-scheduled phase says what is there in one of three
+wordings: a schedule record that can't be read, a unit with no ownership record (with its path), or
+a registration with no unit file and no record. The facts row's "Trigger file" names the unit path
+only when a unit file is present, otherwise "none"; its record fact reads "present", "unreadable" (a
+record file with no readable record — a malformed one, or a dangling link) or "absent".
+
+**The outcome line outlives the control.** A removal takes away what the remove control's block keys
+on, so `ScheduleUninstall` draws no outcome line. Every ended attempt hands its line up through
+`onfinished`; `App.svelte` holds it (beside `verifyTrigger`, for the same rune collision, deviation
+91), refreshes, and passes it back down, and `Schedule.svelte` draws it below the control and outside
+its `state === null` guard. It is cleared when an install, repair, update or removal starts
+(`onstarted`, on `ScheduleInstall` and `ScheduleUninstall` both) and on a route change. This closes
+known limit 104 for this path.
 
 ### 11d. T17 — two TCC principals, both guided
 
@@ -1894,7 +1979,10 @@ not a gap.) Entries 93 onward were added by the round-1 review consolidation.
 104. **KNOWN LIMIT — the uninstall success message unmounts with the `recordPresent` block.** The
     state display is honest (the record IS gone); the confirmation's lifetime is a UX defect.
     Holding the message would mean lifting `ScheduleUninstall`'s state into the route, against
-    §11c's recordPresent gating — deferred rather than smuggled in.
+    §11c's recordPresent gating — deferred rather than smuggled in. *Closed for the removal:*
+    `ScheduleUninstall` hands every ended attempt's line up through `onfinished`, and `App.svelte`
+    holds it and the Schedule screen draws it outside the remove control's block, so the line
+    outlives the control (§11c, "The outcome line outlives the control").
 
 ### 11f. What B6 does NOT execute, and what is therefore UNRUN
 
@@ -3258,7 +3346,95 @@ tempdirs: HOME + XDG_CONFIG_HOME + DAILY_BRIEFING_STATE_DIR + DBA_TEST_UNIT_DIR,
 | Both installed, GUI delegating | owner `"cli"` record + FULL app presence: byte-identical, corpus, audit all hold | the delegated watcher against a real tick |
 | Transition CLI→app (take-over) | engine's foreign-owner exit-2 + `--take-over` argv covered by the engine's own tests and `tests/capability.rs`'s IPC legs (§1b) | the real `launchctl` swap (plan line 70's live-domain register) |
 | Transition app→CLI (handback) | same coverage class (§1b) | same |
-| Uninstall | `tests/uninstall.rs`: script parity, consent gate, never-recursive, survivors, T19-disable reuse, the schedule-record and record-less-unit refusal (§17) — real `SystemFs` on scratch | the real removal legs + login item (§16c) |
+| Uninstall | `tests/uninstall.rs`: script parity, consent gate, never-recursive, survivors, T19-disable reuse, the schedule-record and record-less-unit refusal (§17), the scheduler step (each engine answer mapped, an `Err` removing nothing, `removeOwn` refusing what the app did not install without calling the engine, `keep`'s refusal, the settings lock held through the step) against a FAKE engine program, the settings leg and its latch, the Linux engine copies — real `SystemFs` on scratch | the real scheduler step against the real engine, the real removal legs + login item (§16c) |
+
+**The uninstall, in order** (`uninstall.rs`'s module header gives each step's reasons).
+`uninstall_preview` makes two engine reads — `status --json` (the state dir and `configPath`) and
+`schedule status --json` (the scheduler's facts; a read that fails or times out is "status
+unreadable", never the all-default view) — plus Rust's own `lstat` look and the login item's state.
+`uninstall_execute(removeEngineState, removeSettings, schedule)` then runs these steps; a missing
+`removeSettings` means `false` and a missing `schedule` means `removeOwn`:
+
+1. **The reads and a first look**, as the preview's. A scheduler is DETECTED when the look sees a
+   record or a unit, or the read says `recordFilePresent` or `registered: true`. Its owner is `app`
+   only when the read succeeded with a readable record owned by `app`.
+2. **The settings lock** (`ConfigSaver`'s), taken when the settings will be removed and held to the
+   end, so a save cannot re-create a file behind that leg.
+3. **The scheduler.** `keep` calls nothing. `removeOwn` answers `ScheduleFailed` ("Couldn't read the
+   background scheduler's status.") when the status read failed, and `ScheduleForeign` for a detected
+   scheduler the app does not own, and otherwise runs `schedule uninstall --invoker app`; `removeAny`
+   runs it with `--take-over`. Exit 0 is `removed`. Exit 1 is `absent` only when the engine printed
+   its line on stdout and step 1's status read succeeded without contradicting it
+   (`recordFilePresent` and `unitPresent` false, `registered` not `true`); any other exit 1 is
+   `ScheduleFailed`. Exit 2 without take-over is `ScheduleForeign`, the in-flight guard is `Busy`,
+   and everything else is `ScheduleFailed` with the engine's stderr. On every `Err` Rust has
+   removed nothing and no later step runs. Rust never runs
+   `launchctl` or `systemctl` itself, and keeps no read timeout on this call: the engine's own 45 s
+   deadline bounds it.
+4. **The login item** (leg 1).
+5. **The gate look**, a fresh `ScheduleSeen::look` with nothing awaited between it and the legs. The
+   report states this look.
+6. **Engine data**, if consented and not refused: refused first by `REFUSED_FOR_KEPT_SCHEDULER`
+   (`keep`, with a scheduler detected by either look), then by the gate look's record
+   (`REFUSED_FOR_SCHEDULE`) or record-less unit (`refused_for_unit`). On Linux the managed engine
+   copies (`~/.local/share/daily-briefing/bin/daily-briefing`, and the same under an absolute
+   `$XDG_DATA_HOME`) are removed here too, only when this step runs and only after their ownership
+   checks; otherwise each one there is reported kept, with why.
+7. **Settings**, if consented and not refused: the same two refusals, then an error when the
+   engine's `configPath` is unknown. In the folder that `configPath` names, each key file a readable
+   config names is removed first, when it is a regular file directly in that folder (compared by
+   identity) and not one of the configs; then `config.json`, then `config.json.bak` (a link loses the
+   link, never its target); then the folder, only if it is now empty. A settings folder that is a
+   link is not entered. Once the `config.json` step completes, a "settings removed" latch makes every
+   later settings write in that app session refuse.
+8. **The app's own files** (leg 2).
+
+**The report** adds three members to the old ones. `schedule`: `outcome` (`removed`, `absent`,
+`kept`, or `notChecked` for `keep` with nothing detected by a check that could not run), `leftover`
+(the FULL paths the gate look still saw, the record and every unit file there in the platform's
+order — on Linux the service and the timer — for any outcome), `leftoverCommands` (the per-path
+command for a leftover unit outside the engine's own unit folder) and `removeSteps` (the engine's,
+from the status read, or `null` when that read failed; the done screen then uses its static per-OS
+copy, which `tests-web` pins equal to the engine's text for the default paths). `settings`: `asked`,
+`folder`, `keyFiles` (full paths, each `removed`, `absent`, `kept` or `failed`, with a reason),
+`keyRefsUnknown`, `removed`, `remaining`, `refused`, `error` and `notes`, Rust-written sentences for
+what the names cannot say — a config that was a link, whether the leg removed it or kept it (it
+stopped at a key file, or the unlink failed) ("<name> was a link to <target>; that file was kept and
+may hold your API key.", or, when the target is gone, "<name> was a link to <target>, which was
+removed as your API key file." or "…, which isn't there."), a removed config that another link still
+holds (links this leg removed itself are counted out, so two configs that were the only two links to
+one file say nothing of the kind), and the `.config.json.save-*` staged copies, which are named and
+never removed. The done screen places a gone-target note with the removals only when its config was
+removed; a kept link's stays under **Still on this machine**. `engineCopies`: one full-path line per
+Linux copy looked at, `[]` on macOS.
+
+**The webview** (`app-uninstall.ts`'s pure helpers, drawn by `UninstallConsent.svelte` and
+`AppSettings.svelte`). The scheduler line is nothing when nothing is detected and the check ran;
+"The background scheduler this app set up is removed too." for the app's own; "Couldn't check for a
+background scheduler (<reason>)." when nothing is on disk and the check could not run; and for any
+other detected scheduler, one lead sentence and a two-option radio group, **Keep it running** first
+and preselected, then **Remove it** (`removeAny`). "Keep it running" clears both boxes, disables
+them and sends them as false. On `ScheduleForeign` the preview is re-read and the radio group is
+always shown. On `ScheduleFailed` the panel shows the message, **Try again**, **Uninstall anyway**
+and **Cancel**. "Uninstall anyway" returns to the consent view in its `keep` form, with its sentence
+in place of the scheduler line (the boxes honoured when nothing was detected, cleared and disabled
+when a scheduler was), and the user then presses the execute button, so nothing is sent before that
+sentence is read. On `Busy` the panel shows the message, **Try again** and **Cancel**; Cancel closes
+the panel and is not a scheduler action. The done screen gives the scheduler's outcome once, then
+what happened to each piece, then **Still on this machine** (a kept or left-over scheduler with its
+manual steps, each of `leftoverCommands` and the app's closing line once; the settings folder when
+it was not asked about, or what of the settings stayed; the Linux copies kept), and the finish last,
+then one control, **Uninstall again…**, disabled while a preview loads or an execute runs. It opens
+the flow IN PLACE of the done screen without clearing the report: Cancel, or a preview that fails
+(its error under the done screen), shows the done screen again, and the report is replaced only when
+the next execute starts. The report and whether an execute is in flight are held by `App.svelte` and
+passed down through `Settings`, so a screen change mid-execute loses neither; when a report ARRIVES,
+App remounts Settings (`{#key}` on a count of arrivals), so the settings form, start-at-login and
+the other panels are read again, and the new mount draws the done screen from the report it is
+handed. After an Uninstall in this session removed `config.json`, Settings' no-config sentence reads
+"Your settings were removed by Uninstall. To set up again, quit and reopen the app, or run
+`daily-briefing init` in a terminal." instead of pointing at Setup: the session's "settings removed"
+latch refuses the wizard's `config_create` too.
 
 ### 16b. Deviations recorded by T25 (B25)
 
@@ -3288,6 +3464,13 @@ Numbered from 157, continuing §15b. §9's retire-in-place convention applies.
      out; the consent label says so up front (`scheduleRecordPresent`). Round 1 kept only
      `daily-briefing` and removed the rest; round 2 replaced that (A-M1). Round 3 extended the
      refusal to a record-less scheduler unit file and added the stale-record way out.*
+     *Amended again (§16a, "The uninstall, in order"): `uninstall_execute` asks the engine to
+     remove the scheduler FIRST, so a record the gate look still refuses on is one the engine left
+     behind or one installed in between. The refusal is said on the done screen, not in the consent
+     label; the stale-record way out is gone, because the engine removes a malformed or dangling
+     record itself; and the script's `$PLIST` lines are gone too, because `scripts/uninstall.sh`
+     also hands the scheduler to the engine. Rust itself still never runs `launchctl` or
+     `systemctl`: the engine's `schedule uninstall` does.*
      **The app's uninstall never touches the launchd domain, and the consented engine list DOES
      include the managed binary.** `scripts/uninstall.sh`'s `$PLIST` lines (unload + rm) are
      `schedule uninstall`'s territory — the Schedule panel's existing flow — so the parity set is
@@ -3377,10 +3560,15 @@ Numbered from 157, continuing §15b. §9's retire-in-place convention applies.
 Beyond §1b, §9, §10f, §11f, §12c, §13g, §14c and §15c, all unchanged:
 
 - **The uninstall-consent REAL leg**: no test removes anything from a real `app_data_dir()`,
-  `app_config_dir()` or the live engine state dir — `tests/uninstall.rs` drives the real
-  `SystemFs` against scratch directories only, and the live state dir
-  (`~/Library/Application Support/daily-briefing`) is on the never-touch list. First real
+  `app_config_dir()`, settings folder, Linux engine copy or the live engine state dir —
+  `tests/uninstall.rs` drives the real `SystemFs` against scratch directories only, and the live
+  state dir (`~/Library/Application Support/daily-briefing`) is on the never-touch list. First real
   execution is T26's clean-VM walkthrough.
+- **The uninstall's scheduler step against the real engine**: every test that reaches
+  `uninstall_execute` runs a FAKE engine program (`EngineClient::with_program`), never the bundled
+  sidecar, so the engine's `schedule uninstall --invoker app` is exercised only as argv and as the
+  fake's answers. Its real effect, a job unregistered by label in a live domain, is VM-gated with
+  the rest of §1b.
 - **The login-item removal**: `uninstall_execute`'s autostart leg reuses T19's plugin
   `disable()`, whose real effect (removing `~/Library/LaunchAgents/Daily Briefing.plist`) is
   VM-gated with the rest of T19 (§12c); every test drives the recording sink.
@@ -3391,7 +3579,7 @@ Beyond §1b, §9, §10f, §11f, §12c, §13g, §14c and §15c, all unchanged:
   (read-only) but never asserted (dev 162); asserting it needs a VM whose domain the test owns.
 - **The uninstall through a packaged webview**: button → consent dialog → report in a real .app
   is T26's dry-run; here the command bodies run over `MockRuntime` IPC
-  (`tests/capability.rs::the_b25_uninstall_commands_are_admitted_and_run_their_own_code`) and
+  (`tests/capability.rs::every_command_body_runs_through_real_ipc_against_a_fake_sidecar`) and
   the wording over `tests-web`.
 - **The compiled-binary run leg**: the suite runs the engine from SOURCE (`bun src/main.ts` —
   the same modules `build-sidecar.sh` compiles); the sandboxed compiled-sidecar legs are
@@ -3459,6 +3647,15 @@ TIGHTENED its watcher rule; both paragraphs below describe the round-2 behaviour
 and *Round 4:* notes where a later round changed what they describe. Line numbers were re-checked
 at the round-4 fix commit; the cap-round block's, and the two paragraphs it corrects, at its own.
 
+*Amended: the uninstall paragraphs below record the seam as these rounds left it, and are history,
+not the contract.* The app's Uninstall asks the engine to remove the scheduler FIRST (§16a, "The
+uninstall, in order"), and its texts were rewritten with that: the consent view says what happens to
+the scheduler in one line, the done screen says each thing once under "Still on this machine", and
+`SCHEDULER_NOTE`, `STALE_RECORD_CLAUSE`, `scheduleBlocks` and `doneNotes`, which the paragraphs below
+cite, no longer exist. The current contract is §11c (the Schedule screen's removal) and §16a
+(Uninstall); the few paragraphs below whose rule a reader would otherwise act on carry their own
+*Amended* note.
+
 **The uninstall removes nothing of the engine's while a schedule record exists** (round 2, A-M1 —
 superseding round 1's M3-verifier-item-6 rule; `uninstall.rs` module header :38-54, round 3's two
 additions :56-71, round 4's one-look paragraph :73-74).
@@ -3505,9 +3702,11 @@ the docs' "(or uninstall the app)" advice led straight into it.
   background schedule is installed; …"). `SCHEDULER_NOTE` names the
   button. The done view (`AppSettings.svelte`) draws `engine data: nothing removed —
   <engineRefused>` in its per-entry list.
-- **A schedule outlives the app — said ticked or not** (round 2, R4). Uninstall never removes the
-  schedule, and its trigger runs the engine copy, not the app, so deleting the app leaves it
-  running. Whenever the PREVIEW the user consented from saw a record (`scheduleRecordPresent`,
+- **A schedule outlives the app — said ticked or not** (round 2, R4). In these rounds Uninstall left
+  the schedule in place, and its trigger runs the engine copy, not the app, so deleting the app left
+  it running. *Amended: Uninstall's scheduler step removes the app's own scheduler, and any other
+  one the user chooses to remove, before every other leg (§16a); a scheduler that stays is listed
+  under "Still on this machine" with the steps to remove it.* Whenever the PREVIEW the user consented from saw a record (`scheduleRecordPresent`,
   captured as `uninstallScheduled` before `uninstallExecute`) — or the leg was refused at execute
   time for a schedule installed after the preview — the done view's closing words
   (`app-uninstall.ts` `doneNotes`, :314) are a WARNING first — *"A background schedule is still
@@ -3658,12 +3857,15 @@ archived briefing with the pre-0.2.0 footer (`— generated locally via`) still 
   engine leg (it fails toward not deleting), but then the Schedule screen draws no removal button and
   `daily-briefing schedule uninstall` exits "Nothing installed" before it unlinks the record
   (`src/schedule/install.ts`, `uninstallSchedule`) — the refusal's way out was a dead end. The rule
-  sentence now ends with the SHARED clause, word for word the one `docs/INSTALL.md` carries: *"If the
-  Schedule screen shows no schedule and `daily-briefing schedule uninstall` reports nothing installed,
-  the record is stale: delete `schedule.json` from the engine's folder, then run Uninstall again."*
-  It is `STALE_RECORD_CLAUSE` (`app-uninstall.ts` :124), appended to `SCHEDULE_RECORD_RULE` (:135),
+  sentence gained a SHARED stale-record clause, word for word the one `docs/INSTALL.md` carried,
+  telling the user to delete `schedule.json` from the engine's folder by hand when neither the
+  Schedule screen nor `daily-briefing schedule uninstall` saw a schedule, then run Uninstall again.
+  It was `STALE_RECORD_CLAUSE` (`app-uninstall.ts` :124), appended to `SCHEDULE_RECORD_RULE` (:135),
   and the tail of Rust's `REFUSED_FOR_SCHEDULE` (`uninstall.rs` :193), so the refusal, the consent
-  label and the done view all carry it. Neither the refusal nor the label says "a schedule is
+  label and the done view all carried it. *Amended: the clause is gone from all of them and from
+  `docs/INSTALL.md`, because the dead end is gone. The engine counts a malformed or dangling record
+  as installed and removes it, and the Schedule screen offers the removal whenever the engine sees
+  the record file, readable or not (§11c).* Neither the refusal nor the label says "a schedule is
   installed" any more: the refusal opens "a background schedule's record (schedule.json) or unit
   file is there, and while that schedule is installed …", the label "A background schedule record
   (schedule.json) is there right now, so ticking this removes nothing". *Round 4 (B4-L6):* the
@@ -3699,10 +3901,14 @@ archived briefing with the pre-0.2.0 footer (`— generated locally via`) still 
 - **The platform words** (B3-L6). The preview and the report carry `os` (`std::env::consts::OS`).
   The consent label claims the engine copy only on macOS, where `managedBinPath` puts it in the state
   folder; on Linux it says the copy is in `~/.local/share/daily-briefing/` by default and is not
-  removed (`engineCopyNote`, :171). `FINISH_LINE` became `finishLine(os)` (:287) — the Trash on
-  macOS, `sudo apt remove daily-briefing` or deleting the `.AppImage` on Linux (`docs/INSTALL.md`'s
-  words). `UNINSTALL_EXPLANATION` (:96), shown before the preview tells the webview its platform,
-  names both.
+  removed (`engineCopyNote`, :171). *Amended: the same consented step removes the Linux copy too,
+  after its ownership checks (§16a, step 6), and on Linux the label names the copy it removes,
+  `~/.local/share/daily-briefing/bin/daily-briefing` (`engineCopyNote`).* `FINISH_LINE` became
+  `finishLine(os)` (:287) — the Trash on macOS, `sudo apt remove daily-briefing` or deleting the
+  `.AppImage` on Linux (`docs/INSTALL.md`'s words). `UNINSTALL_EXPLANATION` (:96), shown before the
+  preview tells the webview its platform, names both. *Amended: it is one sentence about the app's
+  own pieces, and names no platform; how the app itself is removed is the done screen's
+  `finishLine(os)`.*
 - **The refusal line is pinned** (B3-L5): `AppSettings.svelte` :385, `engine data: nothing removed —
   {uninstallReport.engineRefused}`, by source, inside the report list and behind its guard.
 - **The Wizard's save notes are keyed by index** (D3-L3; `Wizard.svelte` :607 and, the same shape,
@@ -3783,7 +3989,10 @@ archived briefing with the pre-0.2.0 footer (`— generated locally via`) still 
   it, and `doneNotes`' unit warning names `UNIT_WAY_OUT` (*cap round:* on Linux the exact command
   for the unit's own directory follows the rule in all three, and an UNKNOWN record no longer gets
   the record-less wording — below). No Schedule-screen button in any of them:
-  `routes/Schedule.svelte` draws `ScheduleUninstall` only under `recordPresent`. The RECORD case is
+  `routes/Schedule.svelte` draws `ScheduleUninstall` only under `recordPresent`. *Amended: it draws
+  it wherever the engine sees a record file, a unit or a registration (§11c); a unit only Rust's
+  look sees, under another `$XDG_CONFIG_HOME`, is still none of those, so this refusal's way out
+  stays the terminal.* The RECORD case is
   unchanged — `SCHEDULE_RECORD_RULE` is still the tail of `REFUSED_FOR_SCHEDULE`, byte for byte, and
   the same rule as `docs/INSTALL.md`'s, whose stale-record clause is word for word the one it ends
   with (*cap round, B5-L2:* this said INSTALL.md's sentence, byte for byte — INSTALL.md words the

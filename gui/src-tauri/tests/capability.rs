@@ -306,6 +306,29 @@ impl daily_briefing_gui_lib::uninstall::UninstallFs for InertUninstallFs {
     fn list_dir(&self, _dir: &std::path::Path) -> std::io::Result<Vec<String>> {
         Ok(Vec::new())
     }
+    // Batch 2 (spec 3.5.4): nothing is there to look at, resolve or read, and nothing is removed.
+    // Because `kind` finds no settings config at all, the settings leg never reaches the one read
+    // it makes OUTSIDE the sink (a config that is a link, read through by
+    // `notifications::read_engine_config_text`), so nothing here reads a real path that way either.
+    fn kind(
+        &self,
+        _path: &std::path::Path,
+    ) -> std::io::Result<daily_briefing_gui_lib::uninstall::Lstat> {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+    fn canonicalize(&self, _path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+    fn read_small(
+        &self,
+        _path: &std::path::Path,
+        _max_bytes: u64,
+    ) -> Result<String, daily_briefing_gui_lib::briefing_files::ReadRefusal> {
+        Err(daily_briefing_gui_lib::briefing_files::ReadRefusal::NotFound)
+    }
+    fn remove_empty_dir(&self, _path: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
 }
 
 /// The capability is scoped to `"windows": ["main"]`, so the label is load-bearing: a webview under
@@ -755,7 +778,9 @@ fn the_granted_commands_are_admitted() {
 /// green. With the client managed as `Engine` state, the fake is injected exactly where the real
 /// sidecar would be and every body runs.
 ///
-/// Sequential in ONE test on purpose — see the module header on the in-flight guard.
+/// Sequential in ONE test on purpose — see the module header on the in-flight guard. That is also
+/// why B25's two uninstall commands are driven here, after the ten engine commands (Batch 2, spec
+/// 3.3.2): `uninstall_execute` now runs `schedule uninstall`, a mutating spawn.
 ///
 /// ⚠ Seen red by the F4 mutation on a disposable copy: replace `engine_schedule_install`'s body
 /// with a constant `Ok(EngineOutcome { … Delivered … })` and the `schedule install` cases fail
@@ -884,6 +909,150 @@ fn every_command_body_runs_through_real_ipc_against_a_fake_sidecar() {
     assert_eq!(
         driven, all,
         "a command in engine::COMMANDS is not driven through IPC here; add a case for it"
+    );
+
+    // ── B25 (T25): the two uninstall commands, admitted by the ACL and running their own code —
+    // against the inert sink and the recording autostart sink, so nothing real can be removed from
+    // here. The bounded-list, consent and scheduler semantics are `tests/uninstall.rs`'s; this is the
+    // IPC seam. ⚠ HERE, IN THE SEQUENTIAL TEST, SINCE BATCH 2 (spec 3.3.2): `uninstall_execute` with
+    // no `schedule` means `removeOwn`, and with nothing detected it runs `schedule uninstall` — a
+    // MUTATING spawn, which takes the in-flight guard (module header).
+
+    // uninstall_preview: admitted; the run-shaped fake answers `status --json` with nothing, so the
+    // engine leg reports its error while the app legs still answer.
+    let _ = std::fs::remove_file(&f.argv_file);
+    let o = attempt(&w, "uninstall_preview", serde_json::json!({}));
+    assert_eq!(
+        o.verdict,
+        Verdict::Admitted,
+        "uninstall_preview was refused by the ACL: {}",
+        o.message
+    );
+    let preview: serde_json::Value = o
+        .body
+        .unwrap_or_else(|| {
+            panic!(
+                "uninstall_preview was admitted but returned Err: {}",
+                o.message
+            )
+        })
+        .deserialize()
+        .expect("an UninstallPreview serialises as JSON");
+    assert_eq!(
+        preview["engineStateDir"],
+        serde_json::Value::Null,
+        "{preview}"
+    );
+    assert!(
+        preview["engineError"].is_string(),
+        "with a fake that prints no status envelope, the engine leg must carry an error: {preview}"
+    );
+    // Batch 2 (spec 3.3.1-3.3.2): the preview's second read, `schedule status --json`, gets the same
+    // run envelope, which parses as an ALL-DEFAULT schedule view — a read that answered, so NOT
+    // "status unreadable", with nothing detected — and no `configPath`, so no settings folder.
+    assert_eq!(preview["scheduleStatusUnreadable"], false, "{preview}");
+    assert_eq!(
+        preview["scheduleRegistered"],
+        serde_json::Value::Null,
+        "{preview}"
+    );
+    assert_eq!(preview["scheduleRecordFilePresent"], false, "{preview}");
+    assert_eq!(
+        preview["settingsFolder"],
+        serde_json::Value::Null,
+        "{preview}"
+    );
+    assert_eq!(
+        preview["autostartEnabled"], false,
+        "the recording sink reports not-enabled: {preview}"
+    );
+    let names: Vec<&str> = preview["appEntries"]
+        .as_array()
+        .expect("appEntries")
+        .iter()
+        .map(|e| e["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        names.contains(&"notify-state.json") && names.contains(&".window-state.json"),
+        "the preview must enumerate the app-owned files: {names:?}"
+    );
+
+    // uninstall_execute without consent, and WITHOUT the two Batch 2 arguments (the webview's call
+    // until M6a): it deserialises with their defaults — `removeSettings` false, `schedule`
+    // `removeOwn`. Admitted; every leg answers `absent` through the inert sink; the engine leg is NOT
+    // attempted (`engineStateRemoved` false, no error). The scheduler step's reads find nothing (the
+    // all-default view), so it asks the engine to remove this app's scheduler — no take-over — and
+    // the fake's exit 0 is outcome `removed`.
+    let _ = std::fs::remove_file(&f.argv_file);
+    let o = attempt(
+        &w,
+        "uninstall_execute",
+        serde_json::json!({ "removeEngineState": false }),
+    );
+    assert_eq!(
+        o.verdict,
+        Verdict::Admitted,
+        "uninstall_execute was refused by the ACL: {}",
+        o.message
+    );
+    let report: serde_json::Value = o
+        .body
+        .unwrap_or_else(|| {
+            panic!(
+                "uninstall_execute was admitted but returned Err: {}",
+                o.message
+            )
+        })
+        .deserialize()
+        .expect("an UninstallReport serialises as JSON");
+    assert_eq!(report["schedule"]["outcome"], "removed", "{report}");
+    // …and a missing `removeSettings` is false (Batch 2 T5.4, spec 3.3.2): the settings leg does not
+    // run, and the report only names the folder that stays — none here, as the fake reports no
+    // `configPath`.
+    assert_eq!(report["settings"]["asked"], false, "{report}");
+    assert_eq!(
+        report["settings"]["folder"],
+        serde_json::Value::Null,
+        "{report}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.argv_file).ok().as_deref(),
+        Some("schedule\nuninstall\n--invoker\napp\n"),
+        "the scheduler step's mutating spawn is the engine's own removal, without take-over"
+    );
+    assert_eq!(report["engineStateRemoved"], false, "{report}");
+    assert_eq!(report["engineError"], serde_json::Value::Null, "{report}");
+    assert_eq!(
+        report["engine"].as_array().map(Vec::len),
+        Some(0),
+        "no consent, no engine leg: {report}"
+    );
+    assert_eq!(report["autostart"]["result"], "absent", "{report}");
+    for entry in report["app"].as_array().expect("app reports") {
+        assert_eq!(entry["outcome"]["result"], "absent", "{entry}");
+    }
+    // Batch 2 (spec 3.3.7): `engineCopies` is always on the report — none on macOS (spec question
+    // SQ5); on Linux each candidate under the scratch home, absent through the inert sink.
+    let copies = report["engineCopies"]
+        .as_array()
+        .unwrap_or_else(|| panic!("engineCopies is always an array: {report}"));
+    for copy in copies {
+        assert_eq!(copy["outcome"], "absent", "{copy}");
+    }
+    #[cfg(target_os = "macos")]
+    assert!(copies.is_empty(), "{report}");
+
+    // And that WAS all of uninstall::COMMANDS.
+    let driven: BTreeSet<&str> = ["uninstall_preview", "uninstall_execute"]
+        .into_iter()
+        .collect();
+    let all: BTreeSet<&str> = daily_briefing_gui_lib::uninstall::COMMANDS
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        driven, all,
+        "a command in uninstall::COMMANDS is not driven through IPC here; add a case for it"
     );
 }
 
@@ -1425,107 +1594,6 @@ fn the_b8_commands_are_admitted_and_run_their_own_code() {
     assert_eq!(
         driven, all,
         "a command in cli_shim::COMMANDS is not driven through IPC here; add a case for it"
-    );
-}
-
-/// B25 (T25): the two uninstall commands are admitted by the ACL and run their own code — against
-/// the inert sink and the recording autostart sink, so nothing real can be removed from here.
-/// The bounded-list and consent semantics are `tests/uninstall.rs`'s; this is the IPC seam.
-#[test]
-fn the_b25_uninstall_commands_are_admitted_and_run_their_own_code() {
-    let f = fixture();
-    let w = main_webview(&f.app);
-
-    // ── uninstall_preview: admitted; the run-shaped fake answers `status --json` with nothing,
-    // so the engine leg reports its error while the app legs still answer.
-    let o = attempt(&w, "uninstall_preview", serde_json::json!({}));
-    assert_eq!(
-        o.verdict,
-        Verdict::Admitted,
-        "uninstall_preview was refused by the ACL: {}",
-        o.message
-    );
-    let preview: serde_json::Value = o
-        .body
-        .unwrap_or_else(|| {
-            panic!(
-                "uninstall_preview was admitted but returned Err: {}",
-                o.message
-            )
-        })
-        .deserialize()
-        .expect("an UninstallPreview serialises as JSON");
-    assert_eq!(
-        preview["engineStateDir"],
-        serde_json::Value::Null,
-        "{preview}"
-    );
-    assert!(
-        preview["engineError"].is_string(),
-        "with a fake that prints no status envelope, the engine leg must carry an error: {preview}"
-    );
-    assert_eq!(
-        preview["autostartEnabled"], false,
-        "the recording sink reports not-enabled: {preview}"
-    );
-    let names: Vec<&str> = preview["appEntries"]
-        .as_array()
-        .expect("appEntries")
-        .iter()
-        .map(|e| e["name"].as_str().unwrap_or_default())
-        .collect();
-    assert!(
-        names.contains(&"notify-state.json") && names.contains(&".window-state.json"),
-        "the preview must enumerate the app-owned files: {names:?}"
-    );
-
-    // ── uninstall_execute without consent: admitted; every leg answers `absent` through the
-    // inert sink; the engine leg is NOT attempted at all (`engineStateRemoved` false, no error —
-    // with consent the same fake would have produced one, as the preview above did).
-    let o = attempt(
-        &w,
-        "uninstall_execute",
-        serde_json::json!({ "removeEngineState": false }),
-    );
-    assert_eq!(
-        o.verdict,
-        Verdict::Admitted,
-        "uninstall_execute was refused by the ACL: {}",
-        o.message
-    );
-    let report: serde_json::Value = o
-        .body
-        .unwrap_or_else(|| {
-            panic!(
-                "uninstall_execute was admitted but returned Err: {}",
-                o.message
-            )
-        })
-        .deserialize()
-        .expect("an UninstallReport serialises as JSON");
-    assert_eq!(report["engineStateRemoved"], false, "{report}");
-    assert_eq!(report["engineError"], serde_json::Value::Null, "{report}");
-    assert_eq!(
-        report["engine"].as_array().map(Vec::len),
-        Some(0),
-        "no consent, no engine leg: {report}"
-    );
-    assert_eq!(report["autostart"]["result"], "absent", "{report}");
-    for entry in report["app"].as_array().expect("app reports") {
-        assert_eq!(entry["outcome"]["result"], "absent", "{entry}");
-    }
-
-    // And that WAS all of uninstall::COMMANDS.
-    let driven: BTreeSet<&str> = ["uninstall_preview", "uninstall_execute"]
-        .into_iter()
-        .collect();
-    let all: BTreeSet<&str> = daily_briefing_gui_lib::uninstall::COMMANDS
-        .iter()
-        .copied()
-        .collect();
-    assert_eq!(
-        driven, all,
-        "a command in uninstall::COMMANDS is not driven through IPC here; add a case for it"
     );
 }
 

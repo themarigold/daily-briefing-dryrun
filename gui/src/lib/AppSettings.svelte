@@ -21,18 +21,31 @@
   import { onMount } from "svelte";
   import { configOfferNotifyAuto, configRead, describeFailure, type SaveOutcome } from "./files";
   import {
+    anywayNote,
     autostartLine,
-    consentLabel,
-    doneNotes,
-    executeLabel,
+    engineDataLine,
+    executeFailure,
+    finishLine,
     outcomeLine,
+    removedList,
+    schedulerBranch,
+    schedulerOutcomeLine,
+    stateAfterFailure,
+    stillOnThisMachine,
     uninstallExecute,
     uninstallPreview,
-    SCHEDULER_NOTE,
+    DEFAULT_SCHEDULER_OPTION,
+    TRY_AGAIN,
+    UNINSTALL_ANYWAY,
     UNINSTALL_EXPLANATION,
+    UNINSTALL_TIME_SENTENCE,
+    type ExecuteArgs,
+    type ExecuteFailure,
+    type SchedulerOption,
     type UninstallPreview,
     type UninstallReport,
   } from "./app-uninstall";
+  import UninstallConsent from "./UninstallConsent.svelte";
   import {
     cliShimInstall,
     cliShimRemove,
@@ -65,8 +78,37 @@
      *  the ask's wording. REQUIRED, with no default, so a mount that forgets it fails
      *  `svelte-check` instead of silently getting one platform's wording. */
     os: Os;
+    /**
+     * M9 round 3: the Uninstall execute's report — the done screen is drawn from it — and whether an execute
+     * is in flight, both held by App (`App.svelte`) and passed down through Settings, so neither is lost when
+     * this panel unmounts. It unmounts in two ways: a screen change mid-execute, and — since M9 round 4, by
+     * design — App's remount of Settings when a report arrives, so the new mount draws the done screen from
+     * the report it is handed. (A consented settings removal's not-configured snapshot no longer opens the
+     * wizard: App stops that route once an execute starts.)
+     *
+     * M9 LOW pass (L5): these four are REQUIRED, with no default, like `os`, so a mount that forgets one fails
+     * `svelte-check` instead of silently showing no done screen.
+     */
+    uninstallReport: UninstallReport | null;
+    uninstallRunning: boolean;
+    /** M9 round 3: an execute is starting — said BEFORE the IPC call (App stops routing to the wizard, and
+     *  since the M9 LOW pass replaces the report it holds: L2). */
+    onuninstallstarted: () => void;
+    /** M9 round 3: the execute ended, with its report, or `null` when it was rejected. */
+    onuninstallended: (report: UninstallReport | null) => void;
   }
-  let { notify, notifyError = "", autostart, autostartError = "", onrefresh, os }: Props = $props();
+  let {
+    notify,
+    notifyError = "",
+    autostart,
+    autostartError = "",
+    onrefresh,
+    os,
+    uninstallReport,
+    uninstallRunning,
+    onuninstallstarted,
+    onuninstallended,
+  }: Props = $props();
 
   let busy = $state(false);
   let failure = $state("");
@@ -162,23 +204,53 @@
 
   /**
    * B25 (T25): the uninstall action. Nothing loads and nothing is removed until the user asks —
-   * the preview (one `status --json` spawn plus stats) runs on the first click, the consent
-   * checkbox defaults OFF, and the engine-data leg happens only with it ticked. The wording is
+   * the preview (two read-only engine spawns, `status --json` and `schedule status --json`, plus
+   * stats) runs on the first click, both consent boxes default OFF, and the engine-data and
+   * settings legs happen only with their box ticked. The consent view is its own component
+   * (`UninstallConsent.svelte`, Batch 2 spec 3.6.2); this panel owns the execute call, its three
+   * error branches (spec 3.3.8) and the done screen (spec 3.6.3). The wording is
    * `./app-uninstall`'s, pure and pinned; what may be removed at all is Rust's.
    */
   let uninstall = $state<UninstallPreview | null>(null);
-  let uninstallReport = $state<UninstallReport | null>(null);
   let uninstallError = $state("");
   let uninstallBusy = $state(false);
-  let consent = $state(false);
+  let removeEngineState = $state(false);
+  let removeSettings = $state(false);
+  let schedulerOption = $state<SchedulerOption>(DEFAULT_SCHEDULER_OPTION);
+  /** The execute call answered `ScheduleForeign`: the radio group always shows (spec 3.3.8). */
+  let foreign = $state(false);
+  /** "Uninstall anyway" was chosen after `ScheduleFailed` (spec 3.3.8). */
+  let anyway = $state(false);
+  /** The last execute call's failure of spec 3.3.8's three kinds; `null` otherwise. */
+  let executeError = $state<ExecuteFailure | null>(null);
+  /** What the last execute call sent — what Try again sends again. */
+  let lastArgs: ExecuteArgs | null = null;
+  /**
+   * M9 LOW pass (L2): the flow "Uninstall again…" opened is drawn IN PLACE of the done screen, over the report
+   * App still holds — set once its preview has landed, cleared by Cancel. So a preview that fails, or a Cancel,
+   * shows the done screen again, its manual steps included; App replaces the report only when the next execute
+   * starts (`onuninstallstarted`). Nothing else writes it: an execute that lands remounts this panel (App's key).
+   */
+  let againOpen = $state(false);
+
+  /** Back to the defaults: both boxes off, "Keep it running" selected, no error branch. */
+  function resetConsent(): void {
+    removeEngineState = false;
+    removeSettings = false;
+    schedulerOption = DEFAULT_SCHEDULER_OPTION;
+    foreign = false;
+    anyway = false;
+    executeError = null;
+    lastArgs = null;
+  }
 
   async function openUninstall(): Promise<void> {
-    if (uninstallBusy) return;
+    if (uninstallBusy || uninstallRunning) return;
     uninstallBusy = true;
     uninstallError = "";
     try {
       uninstall = await uninstallPreview();
-      consent = false;
+      resetConsent();
     } catch (e) {
       uninstall = null;
       uninstallError = describeFailure(e);
@@ -189,24 +261,83 @@
 
   function cancelUninstall(): void {
     uninstall = null;
-    consent = false;
+    resetConsent();
     uninstallError = "";
+    againOpen = false;
   }
 
-  async function runUninstall(): Promise<void> {
-    if (uninstallBusy || uninstall === null) return;
+  /** M9 round 4: "Uninstall again…" on the done screen — the way out its refusals and the app's closing line
+   *  after manual steps name ("run Uninstall again"), which the done screen otherwise offers no control for.
+   *  The flow opens exactly as "Uninstall app…" opens it, and since the M9 LOW pass (L2) without clearing the
+   *  report: the done screen stays, its button disabled, while the preview loads, and gives way to the flow only
+   *  when the preview lands. */
+  async function uninstallAgain(): Promise<void> {
+    if (uninstallBusy || uninstallRunning) return;
+    await openUninstall();
+    againOpen = uninstall !== null;
+  }
+
+  /**
+   * The execute call. Its three Batch 2 rejections are `executeFailure`'s, never `describeFailure`'s
+   * (whose `busy` arm reads another error's shape): on each, Rust removed nothing (spec 3.3.4.3). What
+   * each leaves the screen in is `stateAfterFailure`'s, applied whole (checkpoint M6a F4) — nothing
+   * else here writes those five:
+   *   • `ScheduleForeign` — the preview is re-read and the radio group always shows, Keep selected
+   *     (its boxes cleared); the refusal is itself the detection, so a re-read that fails keeps the
+   *     preview we have.
+   *   • `ScheduleFailed` — the message, Try again and "Uninstall anyway", with what that does.
+   *   • `Busy` — the message and Try again.
+   * M9 round 3: its start is said BEFORE the IPC call and its end the moment it answers (the report, or
+   * `null` for a rejection), so App holds both whatever happens to this panel meanwhile.
+   */
+  async function runUninstall(args: ExecuteArgs): Promise<void> {
+    if (uninstallBusy || uninstallRunning || uninstall === null) return;
     uninstallBusy = true;
     uninstallError = "";
+    executeError = null;
+    lastArgs = args;
+    onuninstallstarted();
     try {
-      uninstallReport = await uninstallExecute(consent);
+      const report = await uninstallExecute(args.removeEngineState, args.removeSettings, args.schedule);
+      onuninstallended(report);
       uninstall = null;
-      consent = false;
+      resetConsent();
       await onrefresh();
     } catch (e) {
-      uninstallError = describeFailure(e);
+      onuninstallended(null);
+      const known = executeFailure(e);
+      if (known === null) {
+        uninstallError = describeFailure(e);
+      } else {
+        const next = stateAfterFailure(known, { removeEngineState, removeSettings, option: schedulerOption, foreign, anyway });
+        removeEngineState = next.removeEngineState;
+        removeSettings = next.removeSettings;
+        schedulerOption = next.option;
+        foreign = next.foreign;
+        anyway = next.anyway;
+        if (next.reread) {
+          try {
+            uninstall = await uninstallPreview();
+          } catch {
+            // Not re-read: the preview we have stands, and `foreign` shows the group either way.
+          }
+        }
+        executeError = known;
+      }
     } finally {
       uninstallBusy = false;
     }
+  }
+
+  function tryAgain(): void {
+    if (lastArgs !== null) void runUninstall(lastArgs);
+  }
+
+  /** "Uninstall anyway": back to the consent view in its keep form, which says what that keeps
+   *  before anything is sent. */
+  function chooseAnyway(): void {
+    anyway = true;
+    executeError = null;
   }
 
   function describeOffer(outcome: SaveOutcome): string {
@@ -368,67 +499,107 @@
 
   <div class="block">
     <h4>Uninstall</h4>
-    {#if uninstallReport !== null}
+    {#if uninstallReport !== null && !againOpen}
+      <!-- The done screen (Batch 2, spec 3.6.3), every line from the REPORT — the execute-time facts,
+           never the preview's: the scheduler's outcome once, then what happened to each piece and
+           what was removed, then "Still on this machine" — only what remains, the scheduler with its
+           steps included — and the finish LAST, so what stays is read before the app is deleted; after
+           it, the one control, "Uninstall again…" (M9 round 4).
+           Every string is `{}`-interpolated, never raw markup: the engine's and Rust's words are text. -->
+      {@const report = uninstallReport}
+      {@const dataLine = engineDataLine(report)}
+      {@const still = stillOnThisMachine(report)}
       <p>Done. What happened to each piece:</p>
       <ul class="muted report">
-        <li>{autostartLine(uninstallReport.autostart)}</li>
-        {#each uninstallReport.app as line (line.name)}
+        <li>{schedulerOutcomeLine(report.schedule.outcome)}</li>
+        <li>{autostartLine(report.autostart, report.os)}</li>
+        {#each report.app as line (line.name)}
           <li>{outcomeLine(line)}</li>
         {/each}
-        {#each uninstallReport.engine as line (line.name)}
+        {#each report.engine as line (line.name)}
           <li>engine: {outcomeLine(line)}</li>
         {/each}
-        {#if uninstallReport.engineStateDir !== null}
+        {#if report.engineStateDir !== null}
           <!-- Round-1 fix M3: the report says WHERE the engine-data leg landed — the execute-time
                `status --json` answer, so the consented target is auditable after the fact. -->
-          <li>engine state directory: {uninstallReport.engineStateDir}</li>
+          <li>engine state directory: {report.engineStateDir}</li>
         {/if}
-        {#if uninstallReport.engineRefused !== null}
-          <!-- Phase E final harden round 2: a schedule record refuses the WHOLE engine leg — the
-               schedule would keep running the engine copy and re-create what was removed — so the
-               one line says nothing was removed and names the way out (`uninstall.rs`). -->
-          <li class="bad">engine data: nothing removed — {uninstallReport.engineRefused}</li>
+        {#if dataLine !== null}
+          <!-- A refused leg removes NOTHING: one line, the refusal verbatim (`uninstall.rs`). -->
+          <li class="bad">{dataLine}</li>
         {/if}
-        {#if uninstallReport.engineError !== null}
-          <li class="bad">engine data: not removed — {uninstallReport.engineError}</li>
-        {/if}
+        {#each removedList(report) as line, i (i)}
+          <li>{line}</li>
+        {/each}
       </ul>
-      <!-- R4: the warning that a schedule outlives the app comes BEFORE the finish line; both are
-           `doneNotes`'s words, from the report's EXECUTE-time schedule facts (round 3, A3-L2), and
-           pinned in `tests-web/coexistence.check.ts`. -->
-      {@const notes = doneNotes(uninstallReport)}
-      {#if notes.warning !== null}
-        <p class="bad">{notes.warning}</p>
+      {#if still.length > 0}
+        <p class="still-head">Still on this machine:</p>
+        <ul class="still">
+          {#each still as line, i (i)}
+            {#if line.kind === "code"}
+              <li><pre>{line.text}</pre></li>
+            {:else}
+              <li>{line.text}</li>
+            {/if}
+          {/each}
+        </ul>
       {/if}
-      <p class="muted">{notes.finish}</p>
+      <p class="muted">{finishLine(report.os)}</p>
+      <div class="row">
+        <button disabled={uninstallBusy || uninstallRunning} onclick={() => void uninstallAgain()}
+          >Uninstall again…</button
+        >
+      </div>
     {:else if uninstall === null}
       <p>{UNINSTALL_EXPLANATION}</p>
+      <!-- M9 round 3: an execute App says is running, that this mount did not start (the screen was left and
+           re-entered mid-run): its Working… state, never a fresh "Uninstall app…" beside it. -->
       <div class="row">
-        <button disabled={uninstallBusy} onclick={() => void openUninstall()}>Uninstall app…</button>
+        <button disabled={uninstallBusy || uninstallRunning} onclick={() => void openUninstall()}
+          >{uninstallRunning ? "Working…" : "Uninstall app…"}</button
+        >
       </div>
-    {:else}
-      <p>{UNINSTALL_EXPLANATION}</p>
-      <p class="muted small">{SCHEDULER_NOTE}</p>
-      <label class="consent">
-        <input type="checkbox" bind:checked={consent} disabled={uninstallBusy} />
-        <span>{consentLabel(uninstall)}</span>
-      </label>
-      {#if uninstall.engineError !== null}
-        <p class="muted small">
-          The engine could not report where its data lives ({uninstall.engineError}) — the
-          engine-data box above will not remove anything until it can.
-        </p>
+      {#if uninstallRunning}
+        <p class="muted small">{UNINSTALL_TIME_SENTENCE}</p>
+      {/if}
+    {:else if executeError !== null && executeError.kind !== "scheduleForeign"}
+      <!-- `ScheduleFailed` or `Busy` (spec 3.3.8): the message verbatim — the engine's stderr, which
+           may carry the manual steps, then the app's closing line once — and `executeFailure`'s
+           buttons: Try again, and for `ScheduleFailed` "Uninstall anyway", with what it does said under
+           it before it is clicked (checkpoint M6a F6) — from the branch the consent view will draw. -->
+      {@const anywayLine = anywayNote(executeError, schedulerBranch(uninstall, foreign), { removeEngineState, removeSettings })}
+      <pre class="bad failure">{executeError.message}</pre>
+      {#if executeError.closing !== null}
+        <p class="muted">{executeError.closing}</p>
       {/if}
       <div class="row">
-        <!-- B6's ScheduleUninstall affordance (round-1 fix M2): the destructive action is marked
-             as one — this button's consented leg can remove the briefing archive. Its words say
-             what clicking WILL do (`executeLabel`, round 3): ticked under a schedule, engine data
-             stays. -->
-        <button class="danger" disabled={uninstallBusy} onclick={() => void runUninstall()}>
-          {executeLabel(consent, uninstall)}
-        </button>
+        {#if executeError.buttons.includes(TRY_AGAIN)}
+          <button disabled={uninstallBusy} onclick={tryAgain}>{TRY_AGAIN}</button>
+        {/if}
+        {#if executeError.buttons.includes(UNINSTALL_ANYWAY)}
+          <button disabled={uninstallBusy} onclick={chooseAnyway}>{UNINSTALL_ANYWAY}</button>
+        {/if}
         <button disabled={uninstallBusy} onclick={cancelUninstall}>Cancel</button>
       </div>
+      {#if anywayLine !== null}
+        <p class="muted small">{anywayLine}</p>
+      {/if}
+    {:else}
+      {#if executeError !== null}
+        <!-- `ScheduleForeign`: what the engine found, verbatim, above the radio group it asks. -->
+        <pre class="bad failure">{executeError.message}</pre>
+      {/if}
+      <UninstallConsent
+        preview={uninstall}
+        {foreign}
+        {anyway}
+        busy={uninstallBusy}
+        bind:removeEngineState
+        bind:removeSettings
+        bind:option={schedulerOption}
+        onexecute={(args) => void runUninstall(args)}
+        oncancel={cancelUninstall}
+      />
     {/if}
     {#if uninstallError !== ""}
       <p class="bad">{uninstallError}</p>
@@ -483,18 +654,30 @@
     margin: 0;
     padding-left: 1.1rem;
   }
-  .report {
+  .report,
+  .still {
     margin: 0 0 0.6rem;
     padding-left: 1.1rem;
   }
-  .consent {
-    display: flex;
-    gap: 0.5rem;
-    align-items: flex-start;
-    margin-bottom: 0.6rem;
+  .still-head {
+    font-weight: 600;
   }
-  .consent input {
-    margin-top: 0.2rem;
+  .still {
+    font-size: 0.85rem;
+    overflow-wrap: anywhere;
+  }
+  .still pre,
+  pre.failure {
+    margin: 0.3rem 0;
+    padding: 0.5rem 0.7rem;
+    border-radius: 0.4rem;
+    border: 1px solid var(--line);
+    overflow-x: auto;
+    font-size: 0.78rem;
+    white-space: pre-wrap;
+  }
+  pre.failure {
+    margin-bottom: 0.6rem;
   }
   .small {
     font-size: 0.8rem;
@@ -519,9 +702,5 @@
   button:disabled {
     opacity: 0.5;
     cursor: default;
-  }
-  button.danger {
-    border-color: var(--danger);
-    color: var(--danger);
   }
 </style>

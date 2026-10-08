@@ -18,9 +18,41 @@
  *
  * `runes: true` matches `svelte.config.js`. A compiler warning fails loudly: a component that
  * compiles with a warning here compiles with the same warning in the build.
+ *
+ * ⚠ AND IT ARMS THE ENGINE'S SCHEDULER REFUSAL (M9 round 3; spec 3.1.3, "The GUI test runner").
+ * The engine's default exec (`src/schedule/install.ts` `defaultExec`) refuses every scheduler change
+ * whenever `process.env.DBA_TEST_UNIT_DIR` is set, and the engine's preload arms it for every engine
+ * test process (`test/fixtures/isolate-state.ts`). This runner reads no `bunfig.toml`, so until now
+ * nothing armed it here, and the import pin in `coexistence.check.ts` was the only guard — a static one,
+ * with gaps each review found another of. So this preload arms it too, the same way: a fresh scratch
+ * directory, set UNCONDITIONALLY (an inherited value is never trusted — the engine fixture's own
+ * lesson), as an accessor that can be neither removed nor pointed elsewhere for the life of the
+ * process. Engine code that reaches this process by ANY route then cannot change a registration.
+ * `coexistence.check.ts` asserts all of it. The backstop covers THIS process, and a child handed an env
+ * that carries the value (`{ ...process.env, … }`); a child spawned with NO env gets bun's startup
+ * environment, without it (measured, bun 1.3.14; `test/fixtures/isolate-state.ts` says the same of the
+ * engine's). That suite's sandbox builds its own env, with its own value. Like the engine fixture's
+ * baselines, the directory is not removed afterwards (`process` "exit" handlers never fire under
+ * `bun test`, `test/preload.ts`): one empty temp directory per run.
  */
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { plugin } from "bun";
 import { compile } from "svelte/compiler";
+
+const UNITS = mkdtempSync(join(tmpdir(), "dba-gui-isolated-units-"));
+Object.defineProperty(process.env, "DBA_TEST_UNIT_DIR", {
+  enumerable: true,
+  configurable: false,
+  get: (): string => UNITS,
+  set(v: unknown) {
+    throw new Error(
+      `DBA_TEST_UNIT_DIR is armed by tests-web/svelte-loader.ts for the whole GUI test process (${UNITS}) ` +
+        `and is never reassigned; got ${JSON.stringify(v)}`,
+    );
+  },
+});
 
 plugin({
   name: "svelte-ssr",

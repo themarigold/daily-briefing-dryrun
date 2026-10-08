@@ -111,8 +111,15 @@ fn schedule() -> ScheduleView {
         experimental: false,
         linger_state: Some("not-applicable".into()),
         last_skip: None,
+        record_file_present: true,
+        registered_reason: None,
+        remove_steps: Some(REMOVE_STEPS.into()),
     }
 }
+
+/// A stand-in for the engine's `removeSteps` (spec 3.1.8): its real framing line, which is all a
+/// fixture needs to be recognisably that text. `derive` carries it verbatim and never reads it.
+const REMOVE_STEPS: &str = "Run these in a terminal (bash or zsh) inside your desktop session.";
 
 fn tick(iso: &str, local_date: &str, count: u64) -> TickLine {
     TickLine {
@@ -1239,10 +1246,20 @@ fn the_wire_shape_is_camel_case_throughout() {
         "engineUpdateAvailable",
         "intervalSec",
         "lingerState",
+        // Batch 2 (spec 3.4.1): the TS `ScheduleState` (`gui/src/lib/state.ts`) reads these three.
+        "recordFilePresent",
+        "registeredReason",
+        "removeSteps",
     ] {
         assert!(
             wire.get(key).is_some(),
             "the wire shape is missing {key}: {wire}"
+        );
+    }
+    for snake in ["record_file_present", "registered_reason", "remove_steps"] {
+        assert!(
+            wire.get(snake).is_none(),
+            "a snake_case field reached the wire: {snake} in {wire}"
         );
     }
     // A skip's reason serialises as the ENGINE's literal string, not as serde's enum wrapper.
@@ -1326,6 +1343,111 @@ fn a_broken_scheduler_says_so_in_the_tray() {
     assert_eq!(
         serde_json::to_value(&state).unwrap()["phase"]["phase"],
         "scheduler-broken"
+    );
+}
+
+/// ⚠ UNKNOWN IS NOT BROKEN, NOW WITH A REASON (Batch 2, spec 3.1.5). A Linux record whose user
+/// manager cannot be reached used to read `registered: false` — SCHEDULER-BROKEN, with Repair —
+/// and the engine now answers `null` with `registeredReason`. With a record present that must not
+/// read as broken: the phase is exactly the one a registered schedule gets from the same inputs,
+/// and the reason and the manual steps reach the state the Schedule screen renders, verbatim.
+#[test]
+fn an_unknown_registration_with_a_record_is_not_broken_and_carries_its_reason() {
+    let unknown = ScheduleView {
+        registered: None,
+        registered_reason: Some("no-user-manager".into()),
+        ..schedule()
+    };
+    let state = derive(&status(), None, Some(&unknown), &at_0910());
+    assert_ne!(state.phase, Phase::SchedulerBroken, "{state:?}");
+    assert_eq!(
+        state.phase,
+        derive(&status(), None, Some(&schedule()), &at_0910()).phase,
+        "an unknown registration must read exactly like a registered one"
+    );
+    assert_eq!(state.registered, None);
+    assert_eq!(state.registered_reason.as_deref(), Some("no-user-manager"));
+    assert_eq!(state.remove_steps.as_deref(), Some(REMOVE_STEPS));
+    assert!(state.record_file_present, "{state:?}");
+    let wire = serde_json::to_value(&state).expect("serialises");
+    assert_eq!(wire["registered"], serde_json::Value::Null, "{wire}");
+    assert_eq!(wire["registeredReason"], "no-user-manager", "{wire}");
+    assert_eq!(wire["removeSteps"], REMOVE_STEPS, "{wire}");
+    assert_eq!(wire["recordFilePresent"], true, "{wire}");
+}
+
+/// `recordFilePresent` is the engine's `lstat` fact, readable or not, and `derive` passes it
+/// through on its own — it is NOT `recordPresent` (spec 3, "three record facts"). A malformed
+/// record reads `recordPresent: false` (the phase stays NOT-SCHEDULED, keyed on the readable
+/// record as before) and `recordFilePresent: true`, which is what the Schedule screen's remove
+/// control will key on (spec 3.4.1). With no schedule envelope at all, all three are unknown.
+#[test]
+fn the_record_file_fact_is_carried_apart_from_the_readable_record() {
+    let malformed = ScheduleView {
+        record_present: false,
+        record_file_present: true,
+        owner: None,
+        ..schedule()
+    };
+    let state = derive(&status(), None, Some(&malformed), &at_0910());
+    assert_eq!(state.phase, Phase::NotScheduled, "{state:?}");
+    assert!(!state.record_present);
+    assert!(state.record_file_present, "{state:?}");
+
+    let none = derive(&status(), None, None, &at_0910());
+    assert!(!none.record_file_present, "{none:?}");
+    assert_eq!(none.registered_reason, None);
+    assert_eq!(none.remove_steps, None);
+}
+
+/// The three keys are read under the ENGINE's spelling. `ScheduleView` is `#[serde(default)]`, so
+/// a misspelt key would not fail to parse — it would silently read as absent, `false` or `null`,
+/// forever. So every key `ScheduleView` reads is required to be a member of the engine's own
+/// `ScheduleStatusReport` type (`src/schedule/status.ts`), and the three Batch 2 keys are parsed
+/// out of a real-shaped envelope.
+#[test]
+fn every_schedule_view_key_is_a_member_of_the_engines_report() {
+    let source = include_str!("../../../src/schedule/status.ts");
+    let start = source
+        .find("export type ScheduleStatusReport = {")
+        .expect("src/schedule/status.ts still declares ScheduleStatusReport");
+    let body = &source[start..];
+    let end = body
+        .find("\n};")
+        .expect("the ScheduleStatusReport type is closed with `};` on its own line");
+    let body = &body[..end];
+    let wire = serde_json::to_value(ScheduleView::default()).expect("serialises");
+    let keys: Vec<&String> = wire.as_object().expect("an object").keys().collect();
+    // prove-it 3b: an empty key list would make the loop below pass vacuously.
+    assert!(keys.len() >= 19, "only {} keys: {keys:?}", keys.len());
+    for key in keys {
+        assert!(
+            body.contains(&format!("\n  {key}:")),
+            "ScheduleView reads `{key}`, which src/schedule/status.ts's ScheduleStatusReport does \
+             not declare — a misspelt key reads as its default forever"
+        );
+    }
+
+    let view: ScheduleView = serde_json::from_value(serde_json::json!({
+        "registered": null,
+        "registeredReason": "timeout",
+        "recordPresent": false,
+        "recordFilePresent": true,
+        "removeSteps": REMOVE_STEPS,
+    }))
+    .expect("the engine's shape parses");
+    assert_eq!(view.registered, None);
+    assert_eq!(view.registered_reason.as_deref(), Some("timeout"));
+    assert!(view.record_file_present);
+    assert_eq!(view.remove_steps.as_deref(), Some(REMOVE_STEPS));
+    // And an older engine, which sends none of them, reads as "not known" rather than failing.
+    assert_eq!(
+        serde_json::from_value::<ScheduleView>(serde_json::json!({ "recordPresent": true }))
+            .expect("an older envelope parses"),
+        ScheduleView {
+            record_present: true,
+            ..ScheduleView::default()
+        }
     );
 }
 

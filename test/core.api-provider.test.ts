@@ -23,6 +23,7 @@ import { renderBriefing, API_NOTICE_TEXTS } from "../src/render";
 import { ProviderError, API_LABEL_ANTHROPIC, type Config, type Provider } from "../src/types";
 import { startFakeApi, okJson, status, type FakeApi, type FakeApiHandler } from "./helpers/fakeApi";
 import { guardNetworkForThisFile } from "./helpers/netGuard";
+import { unstamp } from "./helpers/unstamp";
 import { deriveProbeHosts } from "../src/providers/endpoint";
 import { posturePhrase } from "../src/eval/posture";
 
@@ -406,8 +407,9 @@ describe("T13 — the no-comparability-boundary claim, MEASURED", () => {
         .join("\n")
         .split(provider).join("<PROVIDER>")
         .replace(/\n{3,}/g, "\n\n");
-      expect(strip(renderBriefing(apiRun.struct), apiRun.struct.provider))
-        .toBe(strip(renderBriefing(cliRun.struct), cliRun.struct.provider));
+      // Two runs, so the real-clock `state as of HH:MM` stamp is normalised (see `unstamp`).
+      expect(unstamp(strip(renderBriefing(apiRun.struct), apiRun.struct.provider)))
+        .toBe(unstamp(strip(renderBriefing(cliRun.struct), cliRun.struct.provider)));
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

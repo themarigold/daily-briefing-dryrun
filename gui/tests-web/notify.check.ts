@@ -121,16 +121,20 @@ function status(enabled: boolean | null, extra?: Partial<NotifyStatus>): NotifyS
   };
 }
 
+/** The panel's uninstall props, REQUIRED since the M9 LOW pass (L5): nothing running, no report — the
+ *  panel's first view, which is all these notification and autostart cases are about. */
+const UNINSTALL = { uninstallReport: null, uninstallRunning: false, onuninstallstarted: () => {}, onuninstallended: () => {} };
+
 describe("AppSettings", () => {
   test("never asked: the explained ask with Enable and Not now", () => {
-    const body = html(AppSettings, { notify: status(null), autostart: true, onrefresh: () => {} });
+    const body = html(AppSettings, { ...UNINSTALL, notify: status(null), autostart: true, onrefresh: () => {} });
     expect(body).toContain("Nothing is shown until");
     expect(buttons(body)).toContain("Enable notifications");
     expect(buttons(body)).toContain("Not now");
   });
 
   test("enabled: Turn off, and the who-notifies line", () => {
-    const body = html(AppSettings, { notify: status(true), autostart: true, onrefresh: () => {} });
+    const body = html(AppSettings, { ...UNINSTALL, notify: status(true), autostart: true, onrefresh: () => {} });
     expect(body).toContain("Notifications are on");
     expect(buttons(body)).toContain("Turn off");
     expect(body).toContain("this app is the notifier");
@@ -138,6 +142,7 @@ describe("AppSettings", () => {
 
   test("engine-owns: the panel says the engine is expected to post and this app stays quiet", () => {
     const body = html(AppSettings, {
+      ...UNINSTALL,
       notify: status(true, { engine: { value: "auto", willNotify: true } }),
       autostart: true,
       onrefresh: () => {},
@@ -150,6 +155,7 @@ describe("AppSettings", () => {
 
   test("a suppressed firing is reported, and hostile text in its date stays literal", () => {
     const body = html(AppSettings, {
+      ...UNINSTALL,
       notify: status(false, {
         suppressed: [{ class: "delivered", date: HOSTILE, reason: "disabled" }],
       }),
@@ -164,31 +170,47 @@ describe("AppSettings", () => {
     // B25 round-1 fix F5. What SSR can render is the INITIAL state (no click handler runs —
     // §10f), which is exactly the fact worth pinning first: before the preview loads there is no
     // removal control at all — no consent checkbox, no execute button, only the preview trigger.
-    const body = html(AppSettings, { notify: status(true), autostart: true, onrefresh: () => {} });
+    const body = html(AppSettings, { ...UNINSTALL, notify: status(true), autostart: true, onrefresh: () => {} });
     expect(buttons(body)).toContain("Uninstall app…");
     expect(body).not.toContain('type="checkbox"');
     expect(body).not.toContain("Remove app pieces");
     // The consent branch exists only after a preview lands in component state, which SSR cannot
-    // reach — so the consent facts are SOURCE pins (the coexistence §6 / T9 parse discipline):
+    // reach from here — so the panel's half is SOURCE pins (the coexistence §6 / T9 parse
+    // discipline). Batch 2 (spec 3.6.2) moved the consent view into its own component, which
+    // `coexistence.check.ts` server-renders (the boxes off by default, the radio group's default,
+    // the word budget); the lines this test pinned now live there, and are pinned there.
     const source = readFileSync(new URL("../src/lib/AppSettings.svelte", import.meta.url), "utf8")
       .replace(/\s+/g, " ");
-    // consent starts unchecked, and both open and cancel reset it
-    expect(source).toContain("let consent = $state(false)");
-    // the execute button's label switches with consent — through `executeLabel`, whose three
-    // answers (unticked; ticked; ticked under a schedule, where engine data stays) are pinned in
+    const view = readFileSync(new URL("../src/lib/UninstallConsent.svelte", import.meta.url), "utf8")
+      .replace(/\s+/g, " ");
+    // Both boxes start unchecked — in the panel that holds them and in the view's own defaults — and
+    // both open and cancel reset them.
+    expect(source).toContain("let removeEngineState = $state(false)");
+    expect(source).toContain("let removeSettings = $state(false)");
+    expect(source).toContain(
+      "function resetConsent(): void { removeEngineState = false; removeSettings = false; schedulerOption = DEFAULT_SCHEDULER_OPTION;",
+    );
+    expect(source).toMatch(/uninstall = await uninstallPreview\(\); resetConsent\(\);/);
+    expect(source).toMatch(/function cancelUninstall\(\): void \{ uninstall = null; resetConsent\(\);/);
+    expect(view).toContain("removeEngineState = $bindable(false)");
+    expect(view).toContain("removeSettings = $bindable(false)");
+    // The execute button's label switches with what it sends — through `executeLabel`, whose answers
+    // (nothing ticked; each box; both; a box whose folder is unknown; "Keep it running") are pinned in
     // `coexistence.check.ts` (round 3, A3-L2)…
-    expect(source).toContain("{executeLabel(consent, uninstall)}");
+    expect(view).toContain("{executeLabel(args, preview)}");
     // …and carries the danger affordance (B6's ScheduleUninstall pattern — round-1 fix M2), with
     // the style rule that makes the class an affordance rather than a dead attribute.
-    expect(source).toMatch(/<button class="danger" disabled=\{uninstallBusy\} onclick=\{\(\) => void runUninstall\(\)\}/);
-    expect(source).toContain("button.danger {");
+    expect(view).toMatch(/<button class="danger" disabled=\{busy\} onclick=\{\(\) => onexecute\(args\)\}>/);
+    expect(view).toContain("button.danger {");
+    // The panel hands the view its busy state, so the button is disabled while a call is in flight.
+    expect(source).toContain("busy={uninstallBusy}");
   });
 
   test("the autostart toggle reflects the REAL state it was handed", () => {
-    const on = html(AppSettings, { notify: status(true), autostart: true, onrefresh: () => {} });
+    const on = html(AppSettings, { ...UNINSTALL, notify: status(true), autostart: true, onrefresh: () => {} });
     expect(on).toContain("starts when you log in");
     expect(buttons(on)).toContain("Turn off");
-    const off = html(AppSettings, { notify: status(true), autostart: false, onrefresh: () => {} });
+    const off = html(AppSettings, { ...UNINSTALL, notify: status(true), autostart: false, onrefresh: () => {} });
     expect(off).toContain("does not start at login");
     expect(buttons(off)).toContain("Start at login");
     // The scheduler-keeps-working truth (R1's delegated model) is stated, not implied.
@@ -197,6 +219,7 @@ describe("AppSettings", () => {
 
   test("errors are shown, and a loading state says so", () => {
     const body = html(AppSettings, {
+      ...UNINSTALL,
       notify: null,
       notifyError: "the store could not be read",
       autostart: null,
@@ -260,7 +283,7 @@ describe("v0.2.1 §3.5: the notification ask follows the OS", () => {
     for (const enabled of [null, false] as const) {
       const lead = enabled === null ? "" : "Notifications are off. ";
       const ask = (os: string) =>
-        askParagraph(html(AppSettings, { notify: status(enabled), autostart: true, onrefresh: () => {}, os }));
+        askParagraph(html(AppSettings, { ...UNINSTALL, notify: status(enabled), autostart: true, onrefresh: () => {}, os }));
       for (const os of OFF_MAC) {
         const p = ask(os);
         expect({ enabled, os, p, noMac: noMac(p) }).toEqual({ enabled, os, p: lead + ELSEWHERE, noMac: true });
@@ -325,7 +348,8 @@ describe("v0.2.1 §3.5: the notification ask follows the OS", () => {
     expect(tag(src("routes/Settings.svelte"), "<AppSettings")).toContain("{os}");
     const app = src("App.svelte");
     expect(app).toContain("const os = osFromUserAgent(navigator.userAgent);");
-    for (const open of ["<Schedule", "<Settings ", "<Wizard"]) {
+    // (`<Settings` carries more props since M9 round 3, one per line, so its tag is matched without the space.)
+    for (const open of ["<Schedule", "<Settings", "<Wizard"]) {
       expect({ open, os: tag(app, open).includes("{os}") }).toEqual({ open, os: true });
     }
   });

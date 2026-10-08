@@ -1,0 +1,57 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`near-miss recap inputs produce the frozen struct through generateBriefing: near-miss recap inputs 1`] = `
+"{
+  "date": "2026-10-06",
+  "machineScope": "host",
+  "provider": "fake",
+  "resume": [],
+  "recap": [
+    {
+      "repo": "repo",
+      "text": "Retry loop bounded — evidence: d08ee51 (see log)"
+    },
+    {
+      "repo": "repo",
+      "text": "Config loader reads defaults — evidence: d08ee51 (Sept 4)"
+    },
+    {
+      "repo": "repo",
+      "text": "Cache key normalised — evidence: d08ee51(Oct 4)"
+    },
+    {
+      "repo": "repo",
+      "text": "Two parser fixes landed — evidence: abc1234, def5678 (Oct 5)"
+    },
+    {
+      "repo": "repo",
+      "text": "Join order corrected — evidence: abc(1234) (Oct 5)"
+    },
+    {
+      "repo": "repo",
+      "text": "abc1234 — Fixed the join"
+    },
+    {
+      "repo": "repo",
+      "text": "Readme wording tidied"
+    }
+  ],
+  "suggestions": [],
+  "recapCoverage": {
+    "shown": 0,
+    "total": 2,
+    "notShown": [
+      {
+        "label": "repo",
+        "sha": "d08ee51",
+        "subject": "c-d08ee51"
+      },
+      {
+        "label": "repo",
+        "sha": "abc1234",
+        "subject": "c-abc1234"
+      }
+    ]
+  }
+}"
+`;

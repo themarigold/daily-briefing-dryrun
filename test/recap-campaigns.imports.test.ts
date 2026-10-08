@@ -10,9 +10,9 @@
 // This static walk is the in-suite half. It OVER-approximates (a value-import that names only types
 // still counts), so it can raise a false alarm but not miss a route — and it catches an import that is
 // never used as a value, which the transpiler elides and the runtime guard therefore cannot see (C13).
-// Caveat carried from T1.1's checkpoint: `importClosure`'s comment stripper could misread a regex
-// literal containing `/*` as a comment opener and miss imports after it; no live source does this, and
-// the load guard backstops it.
+// `importClosure` takes its comment ranges from TypeScript's own parser (since 2026-10-05). The
+// hand-rolled stripper before it could misread a regex literal containing `/*` as a comment opener and
+// miss imports after it — the caveat T1.1's checkpoint carried here; the load guard still backstops both.
 import { test, expect } from "bun:test";
 import { resolve } from "node:path";
 import { importClosure } from "./helpers/importClosure";

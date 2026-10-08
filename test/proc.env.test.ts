@@ -6,7 +6,7 @@
 // this `run()` let a child escape it: scripts/audit.ts regenerates a briefing with `bun run
 // src/main.ts run --force` through `run()`, and that child resolved the REAL state and config dirs.
 // isolation.meta.test.ts's scanner 6 judges `run(` calls on the strength of this file.
-import "./fixtures/isolate-state";   // arms the two variables at runtime, from any cwd
+import "./fixtures/isolate-state";   // arms the isolation variables (the two read below among them) at runtime, from any cwd
 import { test, expect } from "bun:test";
 import { run } from "../src/proc";
 

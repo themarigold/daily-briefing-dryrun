@@ -215,23 +215,23 @@ The desktop app is built **around** the command-line tool, not instead of it:
   successful delivery only — never the app, never the installer, never the tray.
 - **One scheduler at a time.** `<state>/schedule.json` records who owns the trigger; the app
   respects a CLI-owned schedule (and offers an explicit take-over rather than replacing it).
-- **The app's uninstall is bounded.** It removes the app's own login item and its own files;
-  the engine's data goes only behind an explicit consent box that names the briefing archive,
-  and the files it may remove there are the same list `bash scripts/uninstall.sh` deletes from
-  the state directory (a test pins the two lists together). Unlike that script it never removes
-  the schedule, so while a background schedule is installed it removes none of the engine's
-  data: remove the schedule first (Schedule screen → **Remove background scheduler…**), or run
-  `daily-briefing schedule uninstall` if you installed it from the terminal, then run Uninstall
-  again. If the Schedule screen shows no schedule and `daily-briefing schedule uninstall` reports
-  nothing installed, the record is stale: delete `schedule.json` from the engine's folder, then run
-  Uninstall again. The engine's folder is the state folder in [Where things live](#where-things-live).
-  A schedule installed before schedule records existed (the scheduler file listed there with no
-  `schedule.json` in the engine's folder: on macOS the `local.daily-briefing` agent, on Linux
-  `daily-briefing.service` or `.timer` under `$XDG_CONFIG_HOME/systemd/user` or
-  `~/.config/systemd/user`) holds the engine's data back the same way: remove it with
-  `daily-briefing schedule uninstall`, then run Uninstall again. On Linux that command looks under
-  `$XDG_CONFIG_HOME/systemd/user` when `XDG_CONFIG_HOME` is set, else under `~/.config/systemd/user`,
-  so run it with the setting the schedule was installed under.
+- **The app's uninstall removes the background scheduler first, and is otherwise bounded.** Its
+  first step asks the engine to remove the background scheduler, the same way
+  `daily-briefing schedule uninstall` does: the engine unregisters the job by its label, and deletes
+  the scheduler's files and its `schedule.json` record only once its own check finds the job gone.
+  A scheduler the app did not set up (one installed from the terminal, or one with no readable
+  record of who set it up) is removed only if you choose **Remove it**. **Keep it running** is the
+  default, and then the engine's data and your settings stay too, because a kept scheduler still
+  runs the engine and needs them. After the scheduler, Uninstall removes the app's own login item
+  and its own files. The engine's data goes only behind an explicit consent box that names the
+  briefing archive, and the files it may remove there are the same list `bash scripts/uninstall.sh`
+  deletes from the state directory (a test pins the two lists together); your settings go only
+  behind a second box. If a scheduler's record or unit file is still there when those two steps
+  run, they remove nothing, and the app says what is left and how to remove it. One scheduler the
+  app cannot remove itself: on Linux, one installed from a terminal with `XDG_CONFIG_HOME` set keeps
+  its `daily-briefing.service` and `.timer` under `$XDG_CONFIG_HOME/systemd/user`, and the engine
+  the app runs looks only under `~/.config/systemd/user`. The app then names the unit file and the
+  command that removes it: `daily-briefing schedule uninstall`, run with that `XDG_CONFIG_HOME`.
 
 The developer-facing contract lives in [docs/gui-seam.md](gui-seam.md) (§16 for
 coexistence and uninstall).
@@ -252,25 +252,50 @@ coexistence and uninstall).
 
 ## Uninstall
 
-Remove the schedule first, then the program, then (if you want) your data.
+Remove the schedule first, then the program, then (if you want) your data. The desktop app's
+Uninstall does the first step itself.
 
-1. **The schedule.** In the app: the Schedule screen's **Remove background scheduler…**. From a
-   terminal: `daily-briefing schedule uninstall`. This removes the system trigger and leaves the
-   engine copy in place.
+1. **The schedule.** In the app: the Schedule screen's **Remove background scheduler…**, or let
+   Uninstall (step 2) remove it. From a terminal: `daily-briefing schedule uninstall`. Either way the
+   engine unregisters the job by its label, checks that it is gone, and only then deletes the
+   scheduler's files and its `schedule.json` record, so it reports "Removed the background
+   scheduler." only once the job is gone. It leaves the engine copy in place. From a terminal it also
+   removes a schedule with no readable record of who set it up, and it refuses one the desktop app set
+   up unless you add `--take-over`. When it cannot finish — the job is still registered, or the check
+   cannot run (over SSH, with no desktop session; on Linux, with your user's systemd manager out of
+   reach) — it deletes nothing more, says why and what, if anything, it removed, and prints the
+   steps to finish by hand
+   ([Removing the background scheduler by hand](TROUBLESHOOTING.md#removing-the-background-scheduler-by-hand)).
 2. **The program.**
-   - **Desktop app (macOS and Linux):** **Settings › This app › Uninstall** removes the app's login item
-     and its own files, and the engine's data only if you tick the box that names it. Uninstall
-     removes none of the engine's data while a background schedule is installed, box ticked or not:
-     remove the schedule first (step 1), then run Uninstall again. If the Schedule screen shows no
-     schedule and `daily-briefing schedule uninstall` reports nothing installed, the record is stale:
-     delete `schedule.json` from the engine's folder, then run Uninstall again. The engine's folder is
-     the state folder in [Where things live](#where-things-live). On macOS and on Linux, a schedule
-     installed before schedule records existed (its scheduler file, with no `schedule.json`) holds the
-     engine's data back the same way; `daily-briefing schedule uninstall` removes it too (see
-     [The desktop app and the command-line tool together](#the-desktop-app-and-the-command-line-tool-together)
-     for where it looks on Linux). Then remove the app itself: on
-     macOS, move Daily Briefing from Applications to the Trash; on Linux, the .deb or AppImage step
-     below.
+   - **Desktop app (macOS and Linux):** **Settings › This app › Uninstall** shows what it will do,
+     then removes, in this order: the background scheduler the app set up; the app's login item; with
+     the first box ticked, the engine's data (your whole briefing archive and its log, and the
+     background engine copy, which on Linux is `~/.local/share/daily-briefing/bin/daily-briefing`);
+     with the second box ticked, your settings (the API key file they name when it sits in the
+     settings folder, then `config.json` and its backup `config.json.bak`, then the folder itself if
+     that leaves it empty); and the app's own files. Both boxes are off by default. It usually takes
+     under a minute, and at most about two.
+     - A scheduler the app did not set up (from the terminal, or with nothing recording who set it
+       up) is removed only if you choose **Remove it**. **Keep it running** is preselected, and keeping
+       it also keeps the engine's data and your settings, which that scheduler still needs.
+     - If the scheduler cannot be removed or checked, Uninstall goes no further and shows the
+       engine's message, which says what, if anything, it removed, with **Try again** and
+       **Uninstall anyway**. **Uninstall anyway** returns to the Uninstall screen with the scheduler
+       kept and says what that keeps; press the Uninstall button there to go ahead. If another
+       engine task is running, it removes nothing and offers **Try again**.
+     - The last screen lists what was removed and, under **Still on this machine**, what stays: a
+       kept scheduler with the steps to remove it yourself, the settings folder when its box was not
+       ticked, and anything that could not be removed.
+
+     Then remove the app itself: on macOS, move Daily Briefing from Applications to the Trash; on
+     Linux, the .deb or AppImage step below.
+   - **The command-line link, if you made one** (**Settings › This app › Command-line tool**):
+     Uninstall does not remove `/usr/local/bin/daily-briefing`, and once the engine copy is gone the
+     link points at nothing. Remove it first with **Remove command-line tool** in the same place; when
+     that needs administrator rights, the app shows the `sudo rm` command to run. If the app is already
+     gone, `ls -l /usr/local/bin/daily-briefing` shows where the link points; when that is the engine
+     copy (in the state folder on macOS, under `~/.local/share/daily-briefing/` on Linux), delete the
+     link with `sudo rm /usr/local/bin/daily-briefing`.
    - **Homebrew:** `brew uninstall daily-briefing`.
    - **The command-line binary:** delete the file you downloaded.
    - **The .deb:** `sudo apt remove daily-briefing`.
@@ -288,20 +313,37 @@ Remove the schedule first, then the program, then (if you want) your data.
 
 ### A source checkout on macOS
 
-Run `bash scripts/uninstall.sh` — it unloads the `launchd` agent and removes the installed
-binary, the log, and the latest-briefing file. When a schedule is recorded, it first asks the installed
-engine to remove its own schedule (`schedule uninstall`). If the desktop app owns that schedule, the
-uninstall **refuses and removes nothing** — the app's schedule runs the very binary it would delete:
-remove the schedule on the app's Schedule screen (**Remove background scheduler…**), then re-run. It
-refuses the same way when a schedule is recorded but the installed binary is missing or not
-executable: remove the schedule first — on the app's Schedule screen if the app owns it, or with
-`daily-briefing schedule uninstall` if you installed it from the terminal — then re-run. If nothing
-is actually scheduled (say, an old engine left the record behind), the record is stale: delete
-`~/Library/Application Support/daily-briefing/schedule.json` and re-run; the message names it.
+Run `bash scripts/uninstall.sh`. It deals with the background scheduler first, and only then
+removes the installed binary, the log, the latest-briefing file and the rest of the engine's files
+in the state folder (the same list as the desktop app's engine-data box). It never unregisters the
+scheduler or deletes its files itself: it asks the installed engine to, and when that cannot be
+done it **stops, having removed nothing itself**.
+
+- **With an engine new enough to remove its own scheduler** (the installed `daily-briefing` is an
+  executable file that contains the text `removeSteps`, and its `schedule status --json` reports
+  `removeSteps`), the script runs that engine's `schedule uninstall`, with or without a schedule
+  record. It carries on when the engine removed the scheduler, or reported nothing installed with
+  nothing on disk saying otherwise. If the desktop app owns the scheduler, it refuses, because the
+  app's scheduler runs the very binary the script would delete: remove it on the app's Schedule
+  screen (**Remove background scheduler…**), then run the script again; if the app is already gone,
+  the message gives the `schedule uninstall --take-over` command to run first. If the engine cannot
+  finish, the script prints the engine's message, which ends with the steps to finish by hand, and
+  stops.
+- **Without one** (the installed engine is missing, not executable, too old, or could not report its
+  status), the script never asks it to remove anything: an older engine's `schedule uninstall` does
+  not check that the job is gone. With a schedule record or the `launchd` agent file on disk, the
+  script stops and prints the steps to remove the scheduler by hand (for a record the desktop app set
+  up, it first points you to the app's Schedule screen). Updating the engine with
+  `scripts/install.sh` also gets you past this, but that re-installs the background schedule and may
+  generate a briefing. With neither on disk, it asks `launchd` once, read-only, whether
+  `local.daily-briefing` is still loaded, and carries on only when `launchd` says it is not.
+
+The script keeps your settings folder, `~/.config/daily-briefing`, and says so: it may hold your API
+key file. Removing it is the desktop app's settings box, or yours by hand (step 3 above).
 
 `bash scripts/uninstall.sh --remove-signing-identity` also deletes the `Daily Briefing (local) Signing`
-identity from your login keychain. It is opt-in, and it refuses (removing nothing) while a schedule
-record exists, because the scheduled engine is signed with that identity.
+identity from your login keychain. It is opt-in, and it refuses while a schedule record still exists,
+because the scheduled engine is signed with that identity.
 
 > **Upgrading from a pre-StartInterval build?** An early build used a repeating `pmset` wake for
 > delivery (since replaced by the interval agent). If you ran that, an orphaned daily wake may still be

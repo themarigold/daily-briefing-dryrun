@@ -21,30 +21,40 @@
 //! called; no briefing is generated and no day is stamped.
 //!
 //! ⚠ **`schedule install` AND `schedule uninstall` ARE NEVER EXECUTED AGAINST THE REAL ENGINE.**
-//! `src/schedule/install.ts` copies a managed engine binary, `codesign`s it, and `launchctl load`s
-//! a plist — `DBA_TEST_UNIT_DIR` redirects where the plist is WRITTEN (`:130`) but the registration
-//! is a real `launchctl` call into the live user domain (`:562`), which no environment variable
-//! redirects. They are covered here by argv construction and by a fake sidecar that reports the
-//! argv it received; executing them is VM-gated per plan line 70. `docs/gui-seam.md` records the
-//! register.
+//! `src/schedule/install.ts` copies a managed engine binary, `codesign`s it (minting a signing
+//! identity with `openssl` and `security` first when it has none), and registers a plist with
+//! `launchctl`; uninstall unregisters it by label. `DBA_TEST_UNIT_DIR` redirects where the plist is
+//! WRITTEN (`unitDir`), and the engine's default exec also REFUSES every scheduler change while
+//! that variable is set: a `launchctl load`, `unload` or `bootout`, or a `systemctl` change, spawns
+//! nothing and comes back as code -2 with `SCHEDULER_CHANGE_REFUSED` (`defaultExec` and
+//! `isRegistrationChange` in `src/schedule/install.ts`, spec 3.1.3). `common::sandbox_env` sets the
+//! variable and `sandboxed` adds it with `with_env` (the client clears its environment, so nothing
+//! ambient carries it), so a sandboxed engine's registration call would be refused rather than
+//! reach the live user domain. That refusal is a backstop, never a licence to execute them: it
+//! blocks only scheduler changes, so the read-only probes (`launchctl print` and `list`) and the
+//! keychain and signing tools would still run for real, and `ensureIdentity`'s fallback
+//! `security import` names no keychain, so it would land in the login keychain. They are covered
+//! here by argv construction and by a fake sidecar that reports the argv it received; executing
+//! them is VM-gated per plan line 70. `docs/gui-seam.md` records the register.
 //!
 //! ## The serialiser, and why it is not a mutex
 //!
 //! `engine::Operation::is_mutating` decides whether an invocation takes the process-global
 //! in-flight guard, and `cargo test` runs the tests in this binary on parallel threads — so two
 //! tests that each spawn a *mutating* operation would contend for that guard and one would fail
-//! with a `Busy` it never asked for. `serialise()` below makes those tests take turns. It is an
-//! atomic with an async back-off rather than a `Mutex` held across the test body precisely because
-//! a lock guard alive across an `.await` is the thing `clippy::await_holding_lock` objects to, and
-//! silencing that lint to build a serialiser would be trading a real warning for a fake one.
+//! with a `Busy` it never asked for. `common::serialise()` makes those tests take turns (it lived
+//! here until Batch 2 moved it to `tests/common` for `tests/uninstall.rs`, whose `uninstall_execute`
+//! now runs `schedule uninstall`). It is an atomic with an async back-off rather than a `Mutex`
+//! held across the test body precisely because a lock guard alive across an `.await` is the thing
+//! `clippy::await_holding_lock` objects to, and silencing that lint to build a serialiser would be
+//! trading a real warning for a fake one.
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use common::{argv_dumper, canned, envelope, sandbox_env, sleeper, ScratchDir};
+use common::{argv_dumper, canned, envelope, sandbox_env, serialise, sleeper, ScratchDir};
 // Used only by the `#[cfg(unix)]` process-group tests at the end of this file, and gated to match.
 // Ungated, these four are `unused_imports` warnings on a non-unix build — and the
 // `ProcessGroupKill` import below is worse than a warning there: the type is itself `#[cfg(unix)]`,
@@ -58,32 +68,6 @@ use daily_briefing_gui_lib::engine::{
     sidecar_path_beside, EngineClient, EngineError, InputRefusal, Invoker, NoProgress, Operation,
     Outcome, ProgressSink, REFUSED_FORMAT_CHARACTERS,
 };
-
-/* ── the serialiser ───────────────────────────────────────────────────────────────────────────── */
-
-static SERIAL: AtomicBool = AtomicBool::new(false);
-
-struct Serial;
-
-impl Drop for Serial {
-    fn drop(&mut self) {
-        SERIAL.store(false, Ordering::Release);
-    }
-}
-
-/// Take the turn for a test that invokes a MUTATING operation. See the module header.
-async fn serialise() -> Serial {
-    for _ in 0..4000 {
-        if SERIAL
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return Serial;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("a mutating-operation test held the serialiser for more than 20s");
-}
 
 /* ── a recording progress sink ────────────────────────────────────────────────────────────────── */
 
@@ -1131,10 +1115,13 @@ async fn a_forced_run_with_a_malformed_config_is_a_config_error() {
 /// reaching the real engine.
 ///
 /// ⚠ VM-GATED, per plan line 70's live-domain register. `DBA_TEST_UNIT_DIR` redirects where the
-/// plist is written (`src/schedule/install.ts:130`) but NOT the `launchctl load` that registers it
-/// (`:562`), and there is no environment override for the live user domain — so executing either
-/// against the real engine on this machine would install or remove a LaunchAgent. The argv is what
-/// this layer owns; the rest is the engine's, and it has its own tests.
+/// plist is written (`unitDir` in `src/schedule/install.ts`), and under it the engine's default
+/// exec refuses the `launchctl load` and `bootout` themselves (code -2, `SCHEDULER_CHANGE_REFUSED`,
+/// spec 3.1.3), so a sandboxed run would not register or remove a LaunchAgent. That refusal is a
+/// backstop, not a reason to execute either here: it covers only scheduler changes, and install
+/// would still copy a managed binary and run `codesign`, `openssl` and `security` for real (and the
+/// fallback `security import` names no keychain, so it would land in the login keychain). The argv
+/// is what this layer owns; the rest is the engine's, and it has its own tests.
 #[tokio::test(flavor = "multi_thread")]
 async fn schedule_mutations_are_argv_only_outside_a_vm() {
     let _turn = serialise().await;

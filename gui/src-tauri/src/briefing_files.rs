@@ -36,7 +36,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::engine::{Engine, EngineClient, EngineOutcome, NoProgress, Operation, Outcome};
-use crate::schedule_state::{StatePaths, StatusView};
+use crate::schedule_state::{ScheduleView, StatePaths, StatusView};
 use crate::shell::ENGINE_READ_TIMEOUT;
 
 /// The largest briefing file the app will read. A briefing is ~8 KB; 1 MiB is two orders of
@@ -331,6 +331,24 @@ pub async fn engine_paths(client: &EngineClient) -> Result<StatePaths, String> {
     let view: StatusView = serde_json::from_value(payload)
         .map_err(|e| format!("`status --json` printed an envelope this app cannot read: {e}"))?;
     Ok(view.paths)
+}
+
+/// Run `schedule status --json` and return the engine's schedule facts — Uninstall's second read
+/// (spec 3.3.1).
+///
+/// ⚠ `Err` IS "STATUS UNREADABLE", AND IT IS NOT AN ALL-DEFAULT VIEW. A read that failed, timed out
+/// or printed an envelope this app cannot parse is an error here, never `ScheduleView::default()`:
+/// the default says "the check ran and reported nothing", and Uninstall's detection (spec 3.3.3)
+/// must be able to tell that from "the check could not be read".
+///
+/// Through the same client and the same 30 s [`ENGINE_READ_TIMEOUT`] as [`engine_paths`], by way of
+/// `access::read_envelope`, which the access panel and the CLI shim already use for this envelope —
+/// so there is one read path for it, not a third copy of the timeout-and-classify step.
+pub async fn engine_schedule_view(client: &EngineClient) -> Result<ScheduleView, String> {
+    let payload = crate::access::read_envelope(client, Operation::ScheduleStatus).await?;
+    serde_json::from_value(payload).map_err(|e| {
+        format!("`schedule status --json` printed an envelope this app cannot read: {e}")
+    })
 }
 
 /// One sentence for an engine read that did not yield a usable envelope — shared by `status --json`

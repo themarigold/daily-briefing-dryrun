@@ -4,16 +4,24 @@
 // uninstall that never knew those files existed.
 import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { archivedBriefingPath } from "../src/marker";
-import { join, dirname, basename } from "node:path";
+import { join, dirname, basename, resolve } from "node:path";
 import { auditFilesToPrune, AUDIT_RETENTION, lastBriefing, LAST_BRIEFING_SCAN_BYTES } from "../src/audit";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 test("T4.7: uninstall removes briefing.log.1, audit-*.md and transcript-health.json", async () => {
-  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-uninst-")));
-  const plist = join(dir, "fake.plist");
+  const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-uninst-")));
+  const dir = join(base, "support");
+  const home = join(base, "home");
+  const stubs = join(base, "bin");
+  const log = join(base, "calls.log");
+  for (const d of [dir, home, stubs]) mkdirSync(d);
+  // Never written (Batch 2, spec 3.6.6): a plist with no usable engine now STOPS the script, a case
+  // test/uninstall.test.ts covers. The path is still passed as DBA_TEST_PLIST, so the script's PLIST can
+  // never resolve to the real LaunchAgents file (test/isolation.meta.test.ts demands both variables).
+  const plist = join(base, "fake.plist");
   const artifacts = [
     "daily-briefing", "wake-schedule.json", "briefing.log", "briefing-latest.md",
     "briefing.log.1", "transcript-health.json", "audit-2026-07-30.md", "audit-2026-07-31.md",
@@ -29,24 +37,67 @@ test("T4.7: uninstall removes briefing.log.1, audit-*.md and transcript-health.j
   const archiveDir = basename(dirname(archivedBriefingPath("2026-08-14")));
   mkdirSync(join(dir, archiveDir), { recursive: true });
   writeFileSync(join(dir, archiveDir, "2026-08-14.md"), "x");
-  writeFileSync(plist, "<plist/>");
+  expect(existsSync(plist)).toBe(false);
   for (const f of artifacts) expect(existsSync(join(dir, f))).toBe(true);   // created, so removal is meaningful
 
-  // Phase E (E10): do-nothing stubs FIRST on PATH for the machine-wide tools uninstall.sh drives by name.
-  // Before this, the run reached the real launchd tool (harmless only because the plist above is
-  // label-less); R10 says a test never reaches it at all. Names by concatenation for the isolation scanner.
-  const stubs = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-uninst-stubs-")));
-  const path = `${stubs}:${process.env.PATH ?? ""}`;
-  for (const name of ["launch" + "ctl", "sec" + "urity", "pmset"]) {
-    writeFileSync(join(stubs, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    expect(Bun.which(name, { PATH: path })).toBe(join(stubs, name));
-  }
-  const proc = Bun.spawn(["bash", "scripts/uninstall.sh"], {
-    cwd: process.cwd(),
-    env: { ...process.env, PATH: path, DBA_TEST_DIR: dir, DBA_TEST_PLIST: plist },
-    stdout: "pipe", stderr: "pipe",
-  });
-  await proc.exited;
+  // The same interlocks as test/uninstall.test.ts (Phase E E10, Checkpoint M7 F2), so the run never reaches
+  // a real machine-wide tool (R10). PATH is the stub directory ALONE: recording stubs for the tools
+  // uninstall.sh drives by name, plus links to the two real utilities it needs (rm, grep). The real tools are
+  // not on PATH at all, so a stub that went missing is "command not found", never the real thing. The env is
+  // explicit (nothing inherited), HOME is scratch, and bash is spawned by absolute path. launchd's stub runs
+  // nothing: it records its argv, answers the read-only verbs (`print`, `list`) "Could not find service"
+  // with exit 113, and refuses every other verb (exit 99). The `daily-briefing` above is not executable, so
+  // with no record and no plist the script makes its one read-only launchd check (spec 3.6.6), and the
+  // not-found answers let the run carry on. Names by concatenation for the isolation scanner.
+  const LAUNCHD = "launch" + "ctl";
+  const KEYCHAIN = "sec" + "urity";
+  const record = (name: string) => `{ printf '%s' "${name}"; for a in "$@"; do printf '\\t%s' "$a"; done; printf '\\n'; } >> "$STUB_LOG"`;
+  writeFileSync(join(stubs, LAUNCHD), [
+    "#!/bin/sh",
+    record(LAUNCHD),
+    'case "$1" in print|list) echo "Could not find service" >&2; exit 113 ;; esac',
+    'echo "stub: refused, not a read-only verb: $*" >&2',
+    "exit 99",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  // Never called without --remove-signing-identity, so it refuses whatever it is sent.
+  writeFileSync(join(stubs, KEYCHAIN), `#!/bin/sh\n${record(KEYCHAIN)}\nexit 99\n`, { mode: 0o755 });
+  writeFileSync(join(stubs, "pmset"), `#!/bin/sh\n${record("pmset")}\nexit 0\n`, { mode: 0o755 });
+  for (const real of ["rm", "grep"]) symlinkSync(Bun.which(real)!, join(stubs, real));
+
+  // prove-it 3b: the refusal is real — a verb other than print/list sent to the stub (by absolute path; it
+  // runs nothing) is recorded and refused, so the "only print and list" check after the run is not vacuous.
+  const probeLog = join(base, "probe.log");
+  expect(readFileSync(join(stubs, LAUNCHD), "utf8")).toContain("stub: refused, not a read-only verb");   // the stub, not a tool
+  const probe = Bun.spawnSync([join(stubs, LAUNCHD), "bootout", "gui/0/probe"], { env: { STUB_LOG: probeLog }, stdout: "pipe", stderr: "pipe" });
+  expect(probe.exitCode).toBe(99);
+  expect(readFileSync(probeLog, "utf8")).toBe(`${LAUNCHD}\tbootout\tgui/0/probe\n`);
+
+  const BASH = Bun.which("bash")!;
+  const SCRIPT = join(resolve(import.meta.dir, ".."), "scripts/uninstall.sh");
+  const env: Record<string, string> = { PATH: stubs, HOME: home, DBA_TEST_DIR: dir, DBA_TEST_PLIST: plist, STUB_LOG: log };
+  // The interlocks, asserted before anything runs: PATH is the stub directory alone, each name resolves to
+  // its stub or link there, and every redirected path is scratch.
+  expect(BASH.startsWith("/")).toBe(true);
+  expect(env.PATH).toBe(stubs);
+  for (const name of [LAUNCHD, KEYCHAIN, "pmset", "rm", "grep"]) expect(Bun.which(name, { PATH: env.PATH })).toBe(join(stubs, name));
+  expect([env.HOME, env.DBA_TEST_DIR, env.DBA_TEST_PLIST].every((p) => p!.startsWith(base + "/"))).toBe(true);
+  const proc = Bun.spawn([BASH, SCRIPT], { cwd: base, env, stdout: "pipe", stderr: "pipe" });
+  const code = await proc.exited;
+  expect(code, await new Response(proc.stderr).text()).toBe(0);
+  // Only the read-only verbs reached launchd's stub — the one check, once each — and nothing reached the
+  // keychain tool.
+  const calls = existsSync(log) ? readFileSync(log, "utf8").trimEnd().split("\n").filter(Boolean).map((l) => l.split("\t")) : [];
+  const launchd = calls.filter((c) => c[0] === LAUNCHD);
+  for (const c of launchd) expect(["print", "list"]).toContain(c[1]!);
+  expect(launchd.map((c) => c[1])).toEqual(["print", "print", "list"]);
+  expect(calls.filter((c) => c[0] === KEYCHAIN)).toEqual([]);
+  // This checks 9 of the script's 16 names and plants no survivor (M9 LOW pass, L17). The same path — no record,
+  // no plist, no new enough engine, the one read-only check answering not found — is decided BYTE FOR BYTE in
+  // test/uninstall.test.ts, against a support dir seeded with every name the desktop app's list removes plus
+  // near misses no list holds: "uninstall.sh: the one-shot read-only check …" › "each reports not found -> it
+  // carries on" and "3.1.5's not-found rule …" (each `left(fx)` = ALL_REMOVED), and the parity cases ›
+  // "ALL_REMOVED and nothingRemoved decide both ways". Its fixture is that file's own, so it is not repeated here.
   const left = readdirSync(dir);
   for (const f of artifacts) expect(left).not.toContain(f);
   expect(left).not.toContain(archiveDir);

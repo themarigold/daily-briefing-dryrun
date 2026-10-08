@@ -57,7 +57,12 @@ function stubBin(): string {
     '    if [ "${STUB_TEST_RC:-0}" != 0 ]; then echo "(fail) a stub test [1.00ms]" >&2; fi; exit "${STUB_TEST_RC:-0}" ;;',
     '  "run test") exit "${STUB_GUI_TEST_RC:-0}" ;;',
     '  "run check") exit "${STUB_GUI_CHECK_RC:-0}" ;;',
+    // STUB_EVAL_RECOVERIES=N: N recap-evidence parse-info lines on stderr first (the eval prints one per
+    // generation that recovered a bullet), which check 6 counts for its report-only note.
     '  "run eval --json")',
+    '    i=0; while [ "$i" -lt "${STUB_EVAL_RECOVERIES:-0}" ]; do',
+    '      echo "parse-info [recap-evidence-pipeless]: 1 of 1 recap bullet(s) recovered (stub)" >&2; i=$((i + 1))',
+    "    done",
     '    cat "$STUB_EVAL_STDOUT"',
     '    echo "[stub] eval diagnostics go to stderr" >&2',
     '    exit "${STUB_EVAL_RC:-0}" ;;',
@@ -167,6 +172,8 @@ function run(fx: Fx, args: string[], env: Record<string, string> = {}, payload: 
 }
 
 const ALL_PASS: Record<string, string> = { "1": "PASS", setup: "PASS", "2": "PASS", "3": "PASS", "4": "PASS", "5": "PASS", "6": "PASS", "7": "PASS", "8": "PASS", "9": "PASS" };
+/** Check 6's report-only count of the eval's `parse-info [recap-evidence-…]` stderr lines, as printed under it. */
+const RECOVERY_NOTE = (n: number) => `      recap evidence recoveries during eval: ${n} line(s) (report only; never changes the verdict)`;
 /** The whole sequence an all-PASS monorepo run makes, in order. */
 const EVERY_CALL = [
   "wt| bun install --frozen-lockfile",
@@ -206,6 +213,9 @@ describe("release-check.sh: the all-PASS run", () => {
     // …and the release worktree is removed afterwards, as docs/RELEASE.md step 4 does.
     expect(r.out).toContain(`worktree remove "${fx.tmp}/dba-release-${V}-${head.slice(0, 12)}"`);
     expect(r.out).toContain(`git push --no-follow-tags origin v${V}`);
+    // Check 6's recovery count, exactly: the stub's default stderr line does not match, so grep -c prints
+    // its one 0 (and exits 1, which the count must absorb without printing a second 0).
+    expect(r.out.split("\n")).toContain(RECOVERY_NOTE(0));
     // The worktree and the whole run directory are gone, and the invoking checkout was never touched.
     expect(git(fx.repo, "worktree", "list", "--porcelain").match(/^worktree /gm)?.length).toBe(1);
     expect(readdirSync(fx.tmp).sort()).toEqual(before);
@@ -259,6 +269,41 @@ describe("release-check.sh: the eval predicate (check 6) over fixture payloads",
       expect(r.out).toContain("release-check: FAIL — 1 check(s) failed");
     });
   }
+
+  // The recovery count is a note, never part of the verdict. Its place is asserted by position inside
+  // check 6's block (between its `[6] ` and the `[7] ` status lines), not as an exact list of the block's
+  // lines: on a FAIL, report also prints the "failing tests:" and "last lines of" tail there.
+  test("recap evidence recoveries on the eval's stderr -> counted in a note under check 6, before its verdict; check 6 still PASS", () => {
+    const r = run(mono(), [V], { STUB_EVAL_RECOVERIES: "3" });
+    expect(r.code).toBe(0);
+    expect(r.status).toEqual(ALL_PASS);
+    const lines = r.out.split("\n");
+    const six = lines.findIndex((l) => l.startsWith("[6] "));
+    const seven = lines.findIndex((l) => l.startsWith("[7] "));
+    const note = lines.indexOf(RECOVERY_NOTE(3));
+    const verdict = lines.indexOf('      pass: true, posture: "full", truncated: false');
+    expect(note).toBeGreaterThan(-1);
+    expect(note).toBeGreaterThan(six);
+    expect(note).toBeLessThan(verdict);
+    expect(verdict).toBeLessThan(seven);
+  }, 60_000);
+
+  // The same inputs as the "exit 1, payload otherwise clean" row above, plus the knob: the count is taken
+  // before check 6's early return, so a failing eval still reports it.
+  test("recap evidence recoveries on a failing eval (exit 1) -> the note still prints, before the exited note; check 6 still FAIL", () => {
+    const r = run(mono(), [V], { STUB_EVAL_RC: "1", STUB_EVAL_RECOVERIES: "2" }, payload({}));
+    expect(r.code).toBe(1);
+    expect(r.status).toEqual({ ...ALL_PASS, "6": "FAIL" });
+    const lines = r.out.split("\n");
+    const six = lines.findIndex((l) => l.startsWith("[6] "));
+    const seven = lines.findIndex((l) => l.startsWith("[7] "));
+    const note = lines.indexOf(RECOVERY_NOTE(2));
+    const exited = lines.findIndex((l) => l.startsWith("      bun run eval --json exited 1;"));
+    expect(note).toBeGreaterThan(-1);
+    expect(note).toBeGreaterThan(six);
+    expect(note).toBeLessThan(exited);
+    expect(exited).toBeLessThan(seven);
+  }, 60_000);
 });
 
 describe("release-check.sh: every check runs, whatever failed before it", () => {

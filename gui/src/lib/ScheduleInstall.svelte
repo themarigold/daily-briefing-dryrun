@@ -35,19 +35,39 @@
     purpose?: string;
     /** `ScheduleState.owner` — who the engine says owns the trigger now. */
     owner?: string | null;
+    /**
+     * Batch 2 (spec 3.4.4): an install attempt is starting — the first one or a take-over, whatever
+     * comes of it. The Schedule screen's last removal line is cleared on it (`App.svelte`), so a line
+     * about an earlier removal never sits beside a new install; and, since M9 round 2, so are the remove
+     * control's failed and in-progress states, and the control is remounted at idle (`removalReset`), so
+     * a failed removal's Try again never repeats against the scheduler this install makes. Unlike
+     * `onfinished`, it carries no side effect of its own.
+     */
+    onstarted?: () => void;
     onfinished?: (outcome: EngineOutcome) => void;
+    /**
+     * M9 round 3: an install attempt's call has RETURNED, whatever came of it — done, failed, the
+     * foreign-owner stage, or a thrown error such as a Busy refusal. Unlike `onfinished` (success only: it
+     * arms the verification loop), this carries no side effect of its own; the Schedule screen uses it to
+     * reset its remove control (`App.svelte`), so a removal refused Busy during the install leaves no Try
+     * again beside the new scheduler.
+     */
+    onended?: () => void;
   }
   let {
     label = "Install / repair scheduler",
     purpose = "install the background scheduler",
     owner = null,
+    onstarted,
     onfinished,
+    onended,
   }: Props = $props();
 
   let stage = $state<Stage>("idle");
   let message = $state("");
 
   async function install(takeOver: boolean): Promise<void> {
+    onstarted?.();
     stage = "running";
     message = "";
     try {
@@ -60,6 +80,8 @@
       // A `busy` refusal means a run or another install is already in flight; nothing was started.
       stage = "failed";
       message = describeFailure(e);
+    } finally {
+      onended?.();
     }
   }
 </script>

@@ -11,6 +11,7 @@ import { parseBriefing, splitRecapEvidence, generateBriefing, countPipelessRecap
 import { runCore } from "../src/core";
 import { renderBriefing } from "../src/render";
 import { buildRepo } from "./fixtures/build-repo";
+import { unstamp } from "./helpers/unstamp";
 import type { Config } from "../src/types";
 import type { ReducedContext, Activity, Provider } from "../src/types";
 import type { Unit } from "../src/subprojects";
@@ -154,6 +155,7 @@ test("runCore logs ONE parse-info line when the fallback fires, none for the pip
   // Log-only: nothing reaches the delivered page — no warning, and the render is byte-identical to the
   // pipe form's, which emits no line at all.
   expect(JSON.stringify(pipeless.struct.warnings ?? [])).not.toContain("parse-info");
-  expect(renderBriefing(pipeless.struct)).toBe(renderBriefing(pipe.struct));
+  // Two runs, so the real-clock `state as of HH:MM` stamp is normalised (see `unstamp`).
+  expect(unstamp(renderBriefing(pipeless.struct))).toBe(unstamp(renderBriefing(pipe.struct)));
   expect(renderBriefing(pipeless.struct)).not.toContain("pipe");
 });

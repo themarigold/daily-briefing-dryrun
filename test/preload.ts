@@ -13,7 +13,8 @@
 import { afterAll, afterEach } from "bun:test";
 // Evaluated here, before any test file, so DAILY_BRIEFING_STATE_DIR and XDG_CONFIG_HOME are isolated from
 // the first test on and are tripwires that cannot be cleared — see the file for the 2026-09-15 live-state
-// write this closes.
+// write this closes. DBA_TEST_UNIT_DIR is armed the same way (Batch 2), which arms the default exec's
+// refusal of scheduler changes in src/schedule/install.ts for every test process.
 import { takeIsolationViolations } from "./fixtures/isolate-state";
 import { removeRegisteredTempDirs } from "./fixtures/temp-dirs";
 import { setGitFlushMsForTests } from "../src/git";
@@ -39,7 +40,7 @@ afterEach(() => {
 });
 
 // After the last test file: delete every temp directory registered with `removeAtRunEnd`
-// (fixtures/temp-dirs.ts owns what may be registered and how it is removed). Deliberately NOT the two
+// (fixtures/temp-dirs.ts owns what may be registered and how it is removed). Deliberately NOT the three
 // `dba-isolated-*` baseline directories from fixtures/isolate-state.ts: they are never registered — the
 // decision recorded there to keep them was not revisited by this hook.
 //

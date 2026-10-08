@@ -11,6 +11,15 @@
 // developer's real `~/Library/Application Support/daily-briefing`, alongside `account-state.json` and
 // `last-run`; for the config, `configPath()` (src/config.ts:51) instead of `~/.config/daily-briefing`.
 //
+// And, since Batch 2 (spec 3.1.3), DBA_TEST_UNIT_DIR, a third per-process temp directory. It is not a
+// fallback location like the other two: it is what ARMS the default exec's refusal in
+// src/schedule/install.ts, so a scheduler change (`launchctl bootout`, `systemctl --user stop`, …) that
+// reaches the default exec in any engine test process spawns nothing and comes back as -2. The refusal
+// reads `process.env` as well as the env the exec was built from, so a test that passes neither `exec`
+// nor `env`, or an env object of its own without the variable, is still refused. Because the launchd
+// and systemd user domains act by uid, not by HOME, no scratch HOME isolates the live job; this does.
+// (It also redirects `unitDir`, whose override it is; the schedule tests pass their own unit dir in `env`.)
+//
 // It OVERRIDES an inherited value, NOT `??=`. The `??=` this started as honoured an INHERITED value, and
 // `src/marker.ts:8-10` documents DAILY_BRIEFING_STATE_DIR as a supported power-user override — so a
 // developer or CI runner who had exported it ran the ENTIRE suite against their real configured state
@@ -77,13 +86,18 @@ function armTripwire(name: string, baseline: string): void {
 
 const STATE_BASELINE = mkdtempSync(join(tmpdir(), "dba-isolated-state-"));
 const CONFIG_BASELINE = mkdtempSync(join(tmpdir(), "dba-isolated-config-"));
+// The third baseline, made the same way and, like the other two, never registered for run-end removal
+// (scanner 5 allows this file's unwrapped mkdtemp calls; see its TMP_SELF_CLEANING entry).
+const UNITS_BASELINE = mkdtempSync(join(tmpdir(), "dba-isolated-units-"));
 armTripwire("DAILY_BRIEFING_STATE_DIR", STATE_BASELINE);
 armTripwire("XDG_CONFIG_HOME", CONFIG_BASELINE);
+armTripwire("DBA_TEST_UNIT_DIR", UNITS_BASELINE);
 
 // The baselines, assigned through the accessors. Plain assignments on purpose: they are also the shape
 // isolation.meta.test.ts's `setsEnv` reads.
 process.env.DAILY_BRIEFING_STATE_DIR = STATE_BASELINE;
 process.env.XDG_CONFIG_HOME = CONFIG_BASELINE;
+process.env.DBA_TEST_UNIT_DIR = UNITS_BASELINE;
 
 /** Every record since the last call, oldest first; the list is emptied. */
 export function takeIsolationViolations(): string[] {

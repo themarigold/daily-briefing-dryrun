@@ -19,18 +19,22 @@
 //     (`import { type A } from "./x"`) STILL COUNTS: the walker over-approximates, so it can raise a
 //     false alarm but never miss a route;
 //   · comments are stripped first, so a commented-out `import("./main")` (`preflight.ts:5`,
-//     `json.ts:48`) is not an edge. The stripper is a small state machine rather than a regex, because
-//     `"**/*.ts"` in a string opens a phantom block comment under a naive `/\/\*[\s\S]*?\*\//` and that
-//     phantom can swallow a later dynamic import — the one direction this walker must not err in.
-//     String, template (with `${…}` nesting) and regex literals are stepped over; the regex-vs-division
-//     call is the usual previous-token heuristic (`(`, `=`, `,`, `:`, `[`, `!`, `&`, `|`, `?`, `{`,
-//     `;`, `}` or `return`/`typeof`/… before the `/` means a regex). A wrong call here is bounded to the
-//     rest of one line or one literal, and imports never share a line with either;
+//     `json.ts:51`) is not an edge. The comment ranges come from TypeScript's own parser (`typescript`,
+//     the package's peer dependency, already read by `test/docs-config.test.ts`), not from a regex or a
+//     scanner of our own. A naive `/\/\*[\s\S]*?\*\//` opens a phantom block comment at `"**/*.ts"` in a
+//     string, and that phantom can swallow a later dynamic import — the one direction this walker must not
+//     err in. The hand-rolled scanner that replaced the regex had to guess regex-vs-division from the
+//     token before each `/`, and review on 2026-10-05 found guesses that went wrong both ways: after `i++`,
+//     `x!`, `if (x)` or `export default`, a misread `/` either kept every later comment or blanked a later
+//     import. The parser decides those the way the compiler does, in the dialect the file's extension
+//     names (`.tsx` as TSX, `.json` as JSON). An extension TypeScript does not know, `.svelte`, is parsed
+//     as TypeScript, markup included, as the scanner did before it; none is reachable from `src/`
+//     (measured 2026-10-05);
 //   · only RELATIVE specifiers (`./`, `../`) are followed. `node:fs`, `bun`, `svelte/compiler` are not
 //     files of this package. A specifier resolves to the first of: the literal path (when it exists as a
 //     file), `<p>.ts`, `<p>.tsx`, `<p>.mts`, `<p>/index.ts`, and a `.js`/`.mjs` spelling to its `.ts`
-//     twin. Whatever resolves is followed and parsed the same way (`.svelte` and `.json` included — a
-//     `<script>` block's imports are still imports; a JSON file simply has none).
+//     twin. Whatever resolves is followed, stripped and scanned the same way (`.svelte` and `.json`
+//     included — a `<script>` block's imports are still imports; a JSON file simply has none).
 //
 // `importClosure(roots, pkgDir)` returns the SORTED, `pkgDir`-relative, POSIX-spelled list of every file
 // reachable from `roots` (roots included), `roots` being `pkgDir`-relative too. Measured at the base this
@@ -41,97 +45,48 @@
 // `test/isolation.meta.test.ts`'s scanners read every `.ts` file there.
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
+import ts from "typescript";
 
-/** Words after which a `/` begins a regex literal rather than a division. */
-const REGEX_AFTER_WORD = new Set(["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await"]);
-/** Punctuation after which a `/` begins a regex literal. `)` and `]` are deliberately absent: `(a + b) / c`. */
-const REGEX_AFTER_PUNCT = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";", "+", "-", "*", "%", "<", ">", "~", "^"]);
+/** Characters `stripComments` never blanks, so a comment spanning lines keeps every line break. */
+const LINE_BREAK = /[\n\r\u2028\u2029]/;
 
-/** Comments blanked out (each comment character becomes a space, so nothing else moves — the walker's
- *  own outputs never cite offsets, but a caller diffing two strippings should see the same shape). */
-export function stripComments(src: string): string {
+/** Comments blanked out (each comment character becomes a space and line breaks stay, so nothing else
+ *  moves — the walker's own outputs never cite offsets, but a caller diffing two strippings, or pinning
+ *  whole lines, should see the same shape). Every comment is trivia next to some token, so asking for the
+ *  ranges around every node and token (the end-of-file token included) finds them. Both calls are needed:
+ *  TypeScript reports a comment on the same line after a token only as that token's TRAILING comment.
+ *  JSDoc is left unparsed (`ParseNone`): parsed, its tags hold nodes (a `{type}`), and the trailing-comment
+ *  scan from such a node's end reads a `//` inside the JSDoc as a line comment that runs past the JSDoc's
+ *  end and blanks code. Kept as text: a `#!` line (not a comment), and comments in the trivia right after a
+ *  merge-conflict marker (TypeScript stops scanning there).
+ *  `fileName` picks the dialect: `.tsx` as TSX, `.json` as JSON, anything TypeScript does not know as TS. */
+export function stripComments(src: string, fileName = "strip.ts"): string {
   const out = src.split("");
-  const n = src.length;
-  let i = 0;
-  /** The last significant (non-space) character before `i`, and the identifier ending there, if any. */
-  const before = (at: number): { ch: string; word: string } => {
-    let j = at - 1;
-    while (j >= 0 && /\s/.test(src[j]!)) j--;
-    if (j < 0) return { ch: "", word: "" };
-    let k = j;
-    while (k >= 0 && /[\w$]/.test(src[k]!)) k--;
-    return { ch: src[j]!, word: src.slice(k + 1, j + 1) };
-  };
-  const blank = (from: number, to: number) => { for (let k = from; k < to; k++) if (out[k] !== "\n") out[k] = " "; };
-  // Template literals nest through `${ … }`: each entry is the brace depth at which the enclosing
-  // template resumes. Code mode is the stack being empty or the top's depth being open.
-  const templates: number[] = [];
-  let braces = 0;
-  while (i < n) {
-    const c = src[i]!, d = src[i + 1];
-    if (c === "/" && d === "/") {                                   // line comment
-      let j = i;
-      while (j < n && src[j] !== "\n") j++;
-      blank(i, j); i = j; continue;
-    }
-    if (c === "/" && d === "*") {                                   // block comment
-      let j = src.indexOf("*/", i + 2);
-      j = j < 0 ? n : j + 2;
-      blank(i, j); i = j; continue;
-    }
-    if (c === '"' || c === "'") {                                   // string literal: step over it
-      let j = i + 1;
-      while (j < n && src[j] !== c && src[j] !== "\n") { if (src[j] === "\\") j++; j++; }
-      i = j + 1; continue;
-    }
-    if (c === "`") {                                                // template literal: step to `${` or the closing tick
-      i = skipTemplate(src, i + 1, templates);
-      continue;
-    }
-    if (templates.length && c === "}" && braces === templates[templates.length - 1]) {
-      templates.pop();                                              // `${ … }` closed: back inside the template text
-      i = skipTemplate(src, i + 1, templates);
-      continue;
-    }
-    if (c === "{") braces++;
-    else if (c === "}") braces--;
-    else if (c === "/") {                                           // regex literal or division
-      const { ch, word } = before(i);
-      const isRegex = ch === "" || REGEX_AFTER_PUNCT.has(ch) || (/[\w$]/.test(ch) && REGEX_AFTER_WORD.has(word));
-      if (isRegex) {
-        let j = i + 1, inClass = false;
-        while (j < n && src[j] !== "\n") {
-          const r = src[j]!;
-          if (r === "\\") { j += 2; continue; }
-          if (inClass) { if (r === "]") inClass = false; }
-          else if (r === "[") inClass = true;
-          else if (r === "/") break;
-          j++;
-        }
-        i = j + 1; continue;
-      }
-    }
-    i++;
+  const file = ts.createSourceFile(fileName, src, { languageVersion: ts.ScriptTarget.Latest, jsDocParsingMode: ts.JSDocParsingMode.ParseNone });
+  const blank = (r: ts.CommentRange) => { for (let k = r.pos; k < r.end; k++) if (!LINE_BREAK.test(out[k]!)) out[k] = " "; };
+  const nodes: ts.Node[] = [];
+  const inJsxText = new Uint8Array(src.length);
+  // A stack rather than recursion: a long `a + b + …` chain nests deep enough to overflow the call stack.
+  const pending: ts.Node[] = [file];
+  for (let node = pending.pop(); node !== undefined; node = pending.pop()) {
+    nodes.push(node);
+    if (node.kind === ts.SyntaxKind.JsxText) inJsxText.fill(1, node.pos, node.end);
+    for (const child of node.getChildren(file)) pending.push(child);
+  }
+  // No scan starts inside JSX text: it is not trivia, but TypeScript's comment scan reads a `//` or `/*` at
+  // its start (`<p>/*</p>`) as a comment that can run on and blank code, and no real comment starts there.
+  // Each position is scanned once per direction: that `a + b + …` chain starts one node per term at the
+  // same offset, and rescanning there would collect the same comments for every node.
+  const leadingDone = new Set<number>(), trailingDone = new Set<number>();
+  for (const { pos, end } of nodes) {
+    if (!inJsxText[pos] && !leadingDone.has(pos)) { leadingDone.add(pos); ts.getLeadingCommentRanges(src, pos)?.forEach(blank); }
+    if (!inJsxText[end] && !trailingDone.has(end)) { trailingDone.add(end); ts.getTrailingCommentRanges(src, end)?.forEach(blank); }
   }
   return out.join("");
-
-  /** From just after a backtick (or a closing `}`), step over template text until its closing tick —
-   *  returning the index after it — or until a `${`, pushing the current brace depth and returning the
-   *  index after the `{` so the expression is read as code. */
-  function skipTemplate(s: string, from: number, stack: number[]): number {
-    let j = from;
-    while (j < s.length) {
-      const t = s[j]!;
-      if (t === "\\") { j += 2; continue; }
-      if (t === "`") return j + 1;
-      if (t === "$" && s[j + 1] === "{") { stack.push(braces); braces++; return j + 2; }
-      j++;
-    }
-    return j;
-  }
 }
 
-/** Every relative specifier this (already comment-stripped) source VALUE-imports, in source order. */
+/** Every relative specifier this (already comment-stripped) source VALUE-imports: static imports, then
+ *  re-exports, then side-effect and dynamic imports, each kind in source order. */
 export function valueImportSpecifiers(stripped: string): string[] {
   const found: string[] = [];
   // `import <clause> from "x"`: default, `* as ns`, `{ … }` — the braces span lines — or default+named.
@@ -172,7 +127,7 @@ export function importClosure(roots: string[], pkgDir: string): string[] {
   }
   while (queue.length) {
     const file = queue.shift()!;
-    const stripped = stripComments(readFileSync(file, "utf8"));
+    const stripped = stripComments(readFileSync(file, "utf8"), file);
     for (const spec of valueImportSpecifiers(stripped)) {
       const target = resolveSpecifier(file, spec);
       if (target !== undefined && !seen.has(target)) { seen.add(target); queue.push(target); }

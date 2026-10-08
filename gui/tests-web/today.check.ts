@@ -72,6 +72,9 @@ function state(phase: Phase, statusLine: string): ScheduleState {
     intervalSec: 600,
     experimental: false,
     lingerState: null,
+    recordFilePresent: true,
+    registeredReason: null,
+    removeSteps: "Run these in a terminal (bash or zsh) inside your desktop session.",
   };
 }
 

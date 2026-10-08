@@ -140,7 +140,7 @@ test("B3: an unusable stateDir FALLS BACK and warns — it must never be fatal",
   // warning (harden.ts "became unusable"). Two `bun test` runs sharing one TMPDIR share this one path too;
   // a private TMPDIR avoids that. Note what does and does not catch its ABSENCE: no assertion here does,
   // so a single-file run stays green without it (measured). Its only detector is the run-end drain
-  // leaving only the two `dba-isolated-*` baselines in TMPDIR across a FULL run — a leak guard, not a suite
+  // leaving only the three `dba-isolated-*` baselines in TMPDIR across a FULL run — a leak guard, not a suite
   // assertion.
   removeAtRunEnd(providerCwdTmpFallback());
   // …and clear it: a leftover from a run killed before the drain would satisfy the assertion below

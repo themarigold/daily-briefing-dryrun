@@ -47,11 +47,13 @@
 //!    replace ([`sweep_stale`]).
 //!
 //! Saves are serialised by [`ConfigSaver`]'s lock, so the Settings screen and the Quit offer cannot
-//! interleave two read-modify-writes.
+//! interleave two read-modify-writes. Once Uninstall's settings leg has removed the settings (Batch
+//! 2, spec 3.5.3), the saver's latch makes all three writes refuse, first thing under that lock,
+//! with [`SETTINGS_REMOVED_BY_UNINSTALL`] — so nothing re-creates them in this app session.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -77,11 +79,29 @@ pub const CANDIDATE_SUBDIR: &str = "config-candidates";
 /// The name prefix of every candidate file (`candidate-<pid>-<seq>.json`).
 pub const CANDIDATE_PREFIX: &str = "candidate-";
 
-/// Managed state: the save lock, and (for tests only) where candidate files go.
+/// Why every settings write refuses once Uninstall has removed the settings (Batch 2, spec 3.5.3
+/// step 6) — [`SaveError::Unsupported`]'s `detail`, which the webview shows verbatim
+/// (`lib/files.ts`, `describeFailure`), so no wire type changes (plan SQ2).
+pub const SETTINGS_REMOVED_BY_UNINSTALL: &str = "Settings were removed by Uninstall.";
+
+/// Managed state: the save lock, the "settings removed" latch, and (for tests only) where
+/// candidate files go.
 #[derive(Default)]
 pub struct ConfigSaver {
     candidate_dir: Option<PathBuf>,
-    lock: tokio::sync::Mutex<()>,
+    /// The save lock: every settings write holds it (`config_save`, `config_offer_notify_auto`,
+    /// `config_create`). `pub(crate)` for `uninstall::uninstall_execute` (Batch 2, spec 3.3.4.2),
+    /// which holds it from before its scheduler step to its end when it will remove the settings,
+    /// so a save cannot re-create a file behind that leg.
+    pub(crate) lock: tokio::sync::Mutex<()>,
+    /// The "settings removed" latch (Batch 2, spec 3.5.3 step 6). Set ONLY by `uninstall_execute`'s
+    /// settings leg, while it holds [`Self::lock`], once that leg's `config.json` step has completed
+    /// (removed, or found absent) — so it is visible to every write that takes the lock after it,
+    /// whether it was queued behind the leg or comes later in this app session. Never cleared: the
+    /// three settings writes then refuse ([`Self::refuse_if_settings_removed`]) and nothing
+    /// re-creates the settings. `uninstall_execute` itself never reads it, so a second Uninstall can
+    /// finish what a first one left.
+    settings_removed: AtomicBool,
 }
 
 impl ConfigSaver {
@@ -90,8 +110,29 @@ impl ConfigSaver {
     pub fn with_candidate_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
             candidate_dir: Some(dir.into()),
-            lock: tokio::sync::Mutex::new(()),
+            ..Self::default()
         }
+    }
+
+    /// Whether Uninstall has removed the settings in this app session (the latch above).
+    pub fn settings_removed(&self) -> bool {
+        self.settings_removed.load(Ordering::SeqCst)
+    }
+
+    /// Set the latch. Called only by `uninstall::uninstall_execute`, with [`Self::lock`] held.
+    pub(crate) fn mark_settings_removed(&self) {
+        self.settings_removed.store(true, Ordering::SeqCst);
+    }
+
+    /// Each settings write's first step once it holds [`Self::lock`]: refuse, with
+    /// [`SETTINGS_REMOVED_BY_UNINSTALL`], once the latch is set — before it reads anything.
+    fn refuse_if_settings_removed(&self) -> Result<(), SaveError> {
+        if self.settings_removed() {
+            return Err(SaveError::Unsupported {
+                detail: SETTINGS_REMOVED_BY_UNINSTALL.into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1048,6 +1089,7 @@ pub async fn config_save<R: Runtime>(
     let client = client_of(&engine)?;
     let dir = candidate_dir(&app, &saver)?;
     let _serialised = saver.lock.lock().await;
+    saver.refuse_if_settings_removed()?;
     let path = locate(client).await?;
     let current = read_existing(&path)?;
     if digest(current.as_bytes()) != base {
@@ -1084,6 +1126,7 @@ pub async fn config_offer_notify_auto<R: Runtime>(
     let client = client_of(&engine)?;
     let dir = candidate_dir(&app, &saver)?;
     let _serialised = saver.lock.lock().await;
+    saver.refuse_if_settings_removed()?;
     let path = locate(client).await?;
     let current = read_existing(&path)?;
     let mut candidate = parse_on_disk(&path, &current)?;
@@ -1157,6 +1200,7 @@ pub async fn config_create<R: Runtime>(
     let client = client_of(&engine)?;
     let dir = candidate_dir(&app, &saver)?;
     let _serialised = saver.lock.lock().await;
+    saver.refuse_if_settings_removed()?;
     let path = locate(client).await?;
     if std::fs::symlink_metadata(&path).is_ok() {
         return Err(SaveError::AlreadyExists {

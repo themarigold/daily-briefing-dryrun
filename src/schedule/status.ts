@@ -10,8 +10,10 @@
 // ⚠ READ-ONLY, and it must stay safe to poll every few seconds. It reuses A1's `statusReport`
 // internals (`parseTickLine`, `statePaths`, `readLastRunDate`, `readLastSkip`) rather than
 // re-deriving them — a second implementation of the tick format or the state paths is exactly the
-// drift `StatePaths`' own docstring exists to prevent. The ONE thing it adds that touches the OS is
-// the registration probe, which goes through the injected exec like everything else in this module.
+// drift `StatePaths`' own docstring exists to prevent. What it adds that touches the OS — the
+// registration check (`probeRegistration`, the ONE check, shared with uninstall) and the Linux linger
+// read — goes through the injected exec like everything else in this module, every exec capped at 5 s
+// so status always answers well inside the app's 30 s read timeout (Batch 2, spec 3.1.5).
 import pkg from "../../package.json";
 import { parseTickLine, statePaths, JSON_SCHEMA_VERSION } from "../json";
 import { stripControl } from "../render";
@@ -20,10 +22,15 @@ import { parseFloor, isPastFloor, DEFAULT_MORNING_TIME } from "../schedule";
 import { loadConfig } from "../config";
 import { DEFAULT_INTERVAL_SEC } from "./units";
 import {
-  readScheduleRecord, schedulePath, unitPaths, primaryUnitPath, kindFor, isRegistered, lingerState,
+  readScheduleRecord, schedulePath, unitPaths, primaryUnitPath, kindFor, lingerState,
+  probeRegistration, pathPresent, manualRemoveSteps,
   resolveScheduleDeps as resolveDeps,
-  type ScheduleDeps, type ScheduleKind, type ScheduleOwner, type LingerState,
+  type ScheduleDeps, type ScheduleKind, type ScheduleOwner, type LingerState, type RegistrationReason,
 } from "./install";
+
+/** The cap on each exec status makes — the three (macOS) or two (Linux) probe commands and the Linux
+ *  linger read — so the whole report stays well inside the app's 30 s engine read timeout (spec 3.1.5). */
+const STATUS_EXEC_TIMEOUT_MS = 5_000;
 
 /**
  * ⚠ THE LAST-TICK TRUST STATE, and why it is three values rather than a number-or-null.
@@ -45,13 +52,18 @@ export type ScheduleStatusReport = {
   engineVersion: string;
   platform: NodeJS.Platform;
 
-  /** Is the trigger registered with the OS right now? `null` when the platform has no scheduler, or
-   *  when the probe could not be run. NOT the same as `recordPresent` — a record without a
-   *  registration is the "somebody deleted my plist" case a Schedule panel must be able to show. */
+  /** Is the trigger registered with the OS right now? `probeRegistration` mapped: present → true,
+   *  gone → false, and `null` whenever the check could not say — a manager out of reach, no desktop
+   *  session, a timeout, a command that could not run, an unsupported platform. `registeredReason` says
+   *  which. NOT the same as `recordPresent` — a record without a registration is the "somebody deleted
+   *  my plist" case a Schedule panel must be able to show. */
   registered: boolean | null;
-  /** Does `<state>/schedule.json` exist and parse? */
+  /** Is `<state>/schedule.json` a READABLE record — a regular file of at most 64 KiB that parses (the
+   *  bounded read, spec 3.1.2)? A symlinked, oversized or malformed record reads false here and true in
+   *  `recordFilePresent`. */
   recordPresent: boolean;
-  /** Does the unit FILE exist on disk? The third leg of the same triangle. */
+  /** Does a unit file exist on disk, by `lstat` (a dangling symlink counts)? The third leg of the same
+   *  triangle. */
   unitPresent: boolean;
 
   owner: ScheduleOwner | null;
@@ -89,6 +101,17 @@ export type ScheduleStatusReport = {
   experimental: boolean;
 
   paths: { schedulePath: string; unitPaths: string[] };
+
+  // ── Batch 2 (spec 3.1.5), appended. Always present; no existing key changed name or type, so
+  // JSON_SCHEMA_VERSION stands. A consumer built against an older engine must treat them as absent.
+  /** Why `registered` is `null` — the check's reason — and `null` whenever `registered` is not. */
+  registeredReason: RegistrationReason | null;
+  /** Is ANYTHING at `<state>/schedule.json`, by `lstat`, readable or not (spec 3, "three record facts")? */
+  recordFilePresent: boolean;
+  /** The manual removal steps for this machine's paths (spec 3.1.8), framing line first and NO closing
+   *  line — each surface adds its own. `null` where launchd and systemd do not apply (Windows and
+   *  unsupported platforms). */
+  removeSteps: string | null;
 };
 
 export type ScheduleStatusDeps = ScheduleDeps & { now?: () => Date };
@@ -113,9 +136,13 @@ export async function scheduleStatusReport(deps: ScheduleStatusDeps = {}): Promi
   const floor = parseFloor(cfg?.morningTime);
 
   const record = await readScheduleRecord();
+  const recordPath = schedulePath();
+  const recordFilePresent = await pathPresent(recordPath);   // beside the read, so both facts are one moment's
   const units = unitPaths(d.platform, d.env, d.home);
   let unitPresent = false;
-  for (const p of units) if (await Bun.file(p).exists().catch(() => false)) { unitPresent = true; break; }
+  for (const p of units) if (await pathPresent(p)) { unitPresent = true; break; }
+  // The ONE registration check, shared with uninstall. It never throws: a thrown exec counts as -2.
+  const check = await probeRegistration(d, { timeoutMs: STATUS_EXEC_TIMEOUT_MS });
 
   const tickText = await Bun.file(sp.tickPath).text().catch(() => null);
   const parsed = tickText === null ? null : parseTickLine(tickText);
@@ -130,7 +157,7 @@ export async function scheduleStatusReport(deps: ScheduleStatusDeps = {}): Promi
     engineVersion: pkg.version,
     platform: d.platform,
 
-    registered: await isRegistered(deps),
+    registered: check.state === "present" ? true : check.state === "gone" ? false : null,
     recordPresent: record !== null,
     unitPresent,
 
@@ -142,7 +169,7 @@ export async function scheduleStatusReport(deps: ScheduleStatusDeps = {}): Promi
     installedAt: record?.installedAt || null,
     installedEngineVersion: record?.engineVersion || null,
 
-    lingerState: await lingerState(d),
+    lingerState: await lingerState(d, { timeoutMs: STATUS_EXEC_TIMEOUT_MS }),
 
     lastTickState,
     lastTick: parsed,
@@ -166,7 +193,13 @@ export async function scheduleStatusReport(deps: ScheduleStatusDeps = {}): Promi
 
     experimental: d.platform === "win32",
 
-    paths: { schedulePath: schedulePath(), unitPaths: units },
+    paths: { schedulePath: recordPath, unitPaths: units },
+
+    registeredReason: check.state === "unknown" ? check.reason : null,
+    recordFilePresent,
+    removeSteps: kind === "launchd" || kind === "systemd"
+      ? manualRemoveSteps(kind, { units, record: recordPath, home: d.home })
+      : null,
   };
 }
 

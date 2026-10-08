@@ -18,11 +18,18 @@ import { render } from "svelte/server";
 // READ-ONLY import of the engine's own advice writer. `protectedPath.ts` imports only `node:os` and
 // `node:path` and has no Bun-only API, so it loads here directly.
 import { warnFor } from "../../src/protectedPath";
+import ForeignOwnerDialog from "../src/lib/ForeignOwnerDialog.svelte";
 import ScheduleAccess from "../src/lib/ScheduleAccess.svelte";
 import ScheduleUninstall from "../src/lib/ScheduleUninstall.svelte";
 import ScheduleVerify from "../src/lib/ScheduleVerify.svelte";
 import { describeAccess, launchActions, type AccessSnapshot, type ProbeResult } from "../src/lib/access";
-import { afterUninstall, uninstallConfirmation } from "../src/lib/uninstall-flow";
+import {
+  afterKeep,
+  afterUninstall,
+  foreignOwnerLead,
+  uninstallConfirmation,
+  uninstallLine,
+} from "../src/lib/uninstall-flow";
 import {
   afterKick,
   afterKickRefusal,
@@ -120,6 +127,9 @@ function scheduleState(extra: Partial<ScheduleState> = {}): ScheduleState {
     intervalSec: 600,
     experimental: false,
     lingerState: "not-applicable",
+    recordFilePresent: true,
+    registeredReason: null,
+    removeSteps: "Run these in a terminal (bash or zsh) inside your desktop session.",
     ...extra,
   };
 }
@@ -668,61 +678,345 @@ describe("verify-flow", () => {
 /* ── T20: the removal ─────────────────────────────────────────────────────────────────────────── */
 
 describe("uninstall-flow", () => {
-  test("the confirmation names the file and the consequence", () => {
-    const c = uninstallConfirmation(scheduleState());
-    expect(c.unitPath).toBe("/Users/x/Library/LaunchAgents/local.daily-briefing.plist");
-    expect(c.body).toContain("/Users/x/Library/LaunchAgents/local.daily-briefing.plist");
+  const PLIST = "/Users/x/Library/LaunchAgents/local.daily-briefing.plist";
+  const TIMER = "/home/x/.config/systemd/user/daily-briefing.timer";
+  // The engine's manual steps open with this line (`src/schedule/install.ts`, `manualRemoveSteps`; the
+  // static copies' pin in `coexistence.check.ts` holds the app's copy of it to the engine's text).
+  const STEPS = [
+    "Run these in a terminal (bash or zsh) inside your desktop session.",
+    "1. Unregister the job:",
+    "   launchctl bootout gui/$(id -u)/local.daily-briefing; launchctl bootout user/$(id -u)/local.daily-briefing",
+    "4. Delete the files:",
+    `   rm -f -- "$HOME"/'Library/LaunchAgents/local.daily-briefing.plist'`,
+  ].join("\n");
+  const CLOSING = "Then press Remove again, or run Uninstall again.";
+  const TODAYS_LEAD = "Something else already owns the background schedule.";
+  const NULL_OWNER_LEAD = "A background scheduler is set up, but nothing records who set it up.";
+  /** `schedule uninstall --invoker app`'s outcome as Rust classifies each exit (`engine.rs`, `classify`). */
+  const removal = (exitCode: number | null, stderr = "", stdout = ""): EngineOutcome =>
+    outcome({
+      operation: "schedule-uninstall",
+      outcome:
+        exitCode === 0
+          ? { kind: "delivered" }
+          : exitCode === 2
+            ? { kind: "configError" }
+            : { kind: "failed", reason: exitCode === 1 ? null : exitCode === null ? "signalled" : `exit-${exitCode}` },
+      exitCode,
+      stdout,
+      stderr,
+    });
+  /** The app's refusal (spec 3.1.1), naming what the engine found. */
+  const refusal = (found: string): EngineOutcome =>
+    removal(2, `This background scheduler wasn't set up by this app (${found}). Removing it needs your go-ahead.\n`);
+  const source = (file: string): Promise<string> =>
+    Bun.file(new URL(`../src/lib/${file}`, import.meta.url)).text();
+
+  test("the confirmation names the unit file it removes, what stops by its label, and the consequence", () => {
+    const c = uninstallConfirmation(scheduleState(), "macos");
+    expect(c.unitPath).toBe(PLIST);
+    expect(c.body).toContain(PLIST);
+    expect(c.body).toContain("unloads the loaded job `local.daily-briefing`");
     expect(c.body).toContain("Nothing will generate a briefing after that");
     expect(c.body).toContain("archive are untouched");
-    expect(c.foreign).toBe(false);
+    // Checkpoint M6b (F5): exactly what the component draws — no `foreign` flag, which nothing read
+    // (the ownership sentence in `body` is what says a second confirmation follows).
+    expect(Object.keys(c).sort()).toEqual(["body", "confirmLabel", "owner", "title", "unitPath"]);
+    // Checkpoint M6a: unregistering is a `bootout` by label, not an unload of whatever the file names.
+    expect(c.body).not.toContain("unloads it from the operating system");
+    const linux = uninstallConfirmation(scheduleState({ unitPath: TIMER }), "linux");
+    expect(linux.body).toContain(TIMER);
+    expect(linux.body).toContain("stops the `daily-briefing` timer and service");
   });
 
-  test("with no unit path it says so rather than naming one this app computed", () => {
-    const c = uninstallConfirmation(scheduleState({ unitPath: null }));
-    expect(c.unitPath).toBeNull();
-    expect(c.body).toContain("did not report a file path");
+  test("with no unit file it names no path — not even the computed one — and says what it stops, per platform (spec 3.4.8)", () => {
+    // `unitPath` is the engine's COMPUTED default when no unit file is there (`status.ts`).
+    const noFile = (unitPath: string | null) => scheduleState({ unitPresent: false, unitPath });
+    const mac = uninstallConfirmation(noFile(PLIST), "macos");
+    expect(mac.unitPath).toBeNull();
+    expect(mac.body).not.toContain(PLIST);
+    expect(mac.body).toContain("This unloads the loaded job `local.daily-briefing`.");
+    const linux = uninstallConfirmation(noFile(TIMER), "linux");
+    expect(linux.unitPath).toBeNull();
+    expect(linux.body).not.toContain(TIMER);
+    expect(linux.body).toContain("This stops the `daily-briefing` timer and service.");
+    // Off launchd and systemd: the plain words, still no path.
+    for (const os of ["windows", "other"] as const) {
+      const other = uninstallConfirmation(noFile("C:\\x\\task.xml"), os);
+      expect(other.body).not.toContain("C:\\x\\task.xml");
+      expect(other.body).toContain("This unregisters the background scheduler from the operating system.");
+    }
+    // No path reported at all: the same.
+    expect(uninstallConfirmation(scheduleState({ unitPath: null }), "macos").unitPath).toBeNull();
+    expect(uninstallConfirmation(scheduleState({ unitPath: null }), "macos").body).toContain(
+      "This unloads the loaded job `local.daily-briefing`.",
+    );
+  });
+
+  test("checkpoint M6b (F3): on macOS it says \"unloads the loaded job\" only when the job may be loaded — registered true or unknown — and \"if it is still loaded\" when the check found none (spec 3.4.8)", () => {
+    const LOADED = "unloads the loaded job `local.daily-briefing`";
+    const IF_LOADED = "unregisters `local.daily-briefing` if it is still loaded";
+    const mac = (extra: Partial<ScheduleState>) => uninstallConfirmation(scheduleState(extra), "macos").body;
+    // Registered, or the check could not say: the spec's own wording, with the file and without.
+    for (const registered of [true, null]) {
+      expect([registered, mac({ registered })]).toEqual([
+        registered,
+        expect.stringContaining(`This removes the background scheduler's trigger file, ${PLIST}, and ${LOADED}.`),
+      ]);
+      expect([registered, mac({ registered, unitPresent: false })]).toEqual([
+        registered,
+        expect.stringContaining(`This ${LOADED}.`),
+      ]);
+      expect([registered, mac({ registered }).includes(IF_LOADED)]).toEqual([registered, false]);
+    }
+    // The check found nothing registered (a record or a unit file with nothing loaded — the
+    // scheduler-broken phase with its unit there): no loaded job is claimed.
+    const withFile = mac({ registered: false });
+    expect(withFile).toContain(`This removes the background scheduler's trigger file, ${PLIST}, and ${IF_LOADED}.`);
+    expect(withFile).not.toContain(LOADED);
+    const noFile = mac({ registered: false, unitPresent: false, recordFilePresent: true });
+    expect(noFile).toContain(`This ${IF_LOADED}.`);
+    expect(noFile).not.toContain(LOADED);
+    expect(noFile).not.toContain(PLIST);
+    // No state read at all (M9 round 2): nothing is known, so no loaded job is claimed — M6b(2)'s form. (A
+    // state whose check could not run, `registered: null`, keeps the spec's wording above.)
+    expect(uninstallConfirmation(null, "macos").body).toContain(`This ${IF_LOADED}.`);
+    expect(uninstallConfirmation(null, "macos").body).not.toContain(LOADED);
+    // Linux and the rest are unchanged by registration: they claim nothing is loaded.
+    for (const registered of [true, false, null]) {
+      expect(uninstallConfirmation(scheduleState({ registered, unitPath: TIMER }), "linux").body).toContain(
+        "and stops the `daily-briefing` timer and service.",
+      );
+      expect(uninstallConfirmation(scheduleState({ registered, unitPresent: false }), "other").body).toContain(
+        "This unregisters the background scheduler from the operating system.",
+      );
+    }
   });
 
   test("a CLI-owned schedule warns that removing it needs a second confirmation", () => {
-    const c = uninstallConfirmation(scheduleState({ owner: "cli", invoker: "cli" }));
-    expect(c.foreign).toBe(true);
+    const c = uninstallConfirmation(scheduleState({ owner: "cli", invoker: "cli" }), "macos");
     expect(c.body).toContain("installed from the command line");
+    expect(c.body).toContain("removing it needs a second confirmation.");
   });
 
-  test("exit 1 is `there was nothing to remove`, keyed on the exit code", () => {
-    // ⚠ `reason` IS NULL HERE — gui-seam §3: the classifier invents no reason string for exit 1, so
-    // a panel keying on `reason` would show an empty error for an ordinary outcome.
-    const stage = afterUninstall(
-      outcome({
-        operation: "schedule-uninstall",
-        outcome: { kind: "failed", reason: null },
-        exitCode: 1,
-      }),
-      false,
-      "app",
+  test("a null owner gets its own wording, never the terminal's (spec 3.4.3)", () => {
+    for (const unitPresent of [true, false]) {
+      const c = uninstallConfirmation(scheduleState({ owner: null, invoker: null, recordPresent: false, unitPresent }), "macos");
+      expect(c.body).toContain("Nothing records who set up this background scheduler.");
+      expect(c.body).not.toContain("command line");
+      // The engine refuses `--invoker app` without a record owned by `app` (spec 3.1.1), so the
+      // take-over question follows here too — and the body says so.
+      expect(c.body).toContain("Removing it needs a second confirmation.");
+    }
+    // This app's own: no ownership sentence at all.
+    const own = uninstallConfirmation(scheduleState(), "macos").body;
+    expect(own).not.toContain("Nothing records who set up");
+    expect(own).not.toContain("second confirmation");
+  });
+
+  test("M9 round 2: with NO state read, the confirmation makes no claim from it — no ownership sentence (owner unknown is not owner absent), no loaded job — and the foreign-owner dialog keeps its default lead", () => {
+    const LOADED = "unloads the loaded job `local.daily-briefing`";
+    // The remove control can be drawn with no state since M9 round 1 (a failed removal, then a refresh that
+    // read nothing). Nothing is known then: an app-owned scheduler would get no second confirmation, so the
+    // body must not promise one, nor say nothing records who set it up.
+    for (const os of ["macos", "linux", "windows", "other"] as const) {
+      const c = uninstallConfirmation(null, os);
+      expect([os, c.body.includes("Nothing records who set up")]).toEqual([os, false]);
+      expect([os, c.body.includes("second confirmation")]).toEqual([os, false]);
+      expect([os, c.body.includes("command line")]).toEqual([os, false]);
+      expect([os, c.body.includes(LOADED)]).toEqual([os, false]);
+      expect([os, c.unitPath, c.owner]).toEqual([os, null, null]);
+    }
+    expect(uninstallConfirmation(null, "macos").body).toBe(
+      "This unregisters `local.daily-briefing` if it is still loaded. Nothing will generate a briefing after that — not on a timer, and not while this app is open — until a scheduler is installed again. Your config, your settings and every briefing already in the archive are untouched.",
     );
-    expect(stage.stage).toBe("done");
-    expect(stage.message).toContain("nothing to remove");
+    // A state that READ no owner still gets its own wording: that is a fact, not an unknown.
+    expect(uninstallConfirmation(scheduleState({ owner: null, invoker: null, recordPresent: false }), "macos").body).toContain(
+      "Nothing records who set up this background scheduler.",
+    );
+
+    // After an exit 2, the dialog with no state is drawn with ForeignOwnerDialog's default lead, never the
+    // null-owner one; with a state whose owner is null, the null-owner lead as before.
+    const dialogLead = (scheduleState: ScheduleState | null): string => {
+      const body = html(ScheduleUninstall, { scheduleState, os: "macos", stage: "foreign-owner" });
+      return /<p class="lead[^"]*">([\s\S]*?)<\/p>/.exec(body)?.[1]?.trim() ?? "";
+    };
+    expect(dialogLead(null)).toBe(TODAYS_LEAD);
+    expect(dialogLead(scheduleState({ owner: null, invoker: null, recordPresent: false }))).toBe(NULL_OWNER_LEAD);
+    expect(dialogLead(scheduleState({ owner: "cli", invoker: "cli" }))).toBe(TODAYS_LEAD);
   });
 
-  test("a foreign owner offers take-over once, and a refused take-over does not loop", () => {
-    const refusal = outcome({
-      operation: "schedule-uninstall",
-      outcome: { kind: "configError" },
-      exitCode: 2,
-      stderr: "schedule: refusing — this schedule is owned by cli",
+  test("exit 1 shows the engine's own stdout line; exit 1 with empty stdout is a crash, shown as failed with its stderr (spec 3.4.7; SQ1)", () => {
+    // ⚠ `reason` IS NULL HERE — gui-seam §3: the classifier invents no reason string for exit 1, so
+    // the key is the exit code.
+    const genuine = afterUninstall(removal(1, "", "Nothing installed by daily-briefing was found.\n"), false);
+    expect(genuine).toEqual({ stage: "done", message: "Nothing installed by daily-briefing was found." });
+    // The engine's words, whatever they are — never the app's old fixed sentence.
+    expect(afterUninstall(removal(1, "", "Some other wording.\n"), false)).toEqual({
+      stage: "done",
+      message: "Some other wording.",
     });
-    expect(afterUninstall(refusal, false, "cli").stage).toBe("foreign-owner");
+    expect(genuine.message).not.toContain("nothing to remove");
+    // A crash before the engine's own try block exits 1 with only stderr (spec §2 point 17).
+    const crash = afterUninstall(removal(1, "TypeError: boom\n    at main (main.ts:1:1)\n", ""), false);
+    // Its stderr verbatim (checkpoint M6b, F1): the trailing line break included.
+    expect(crash).toEqual({ stage: "failed", message: "TypeError: boom\n    at main (main.ts:1:1)\n" });
+    expect(afterUninstall(removal(1, "boom\n", "  \n"), false).stage).toBe("failed");
+    // Nothing on either stream: failed, and the line says so in the app's words.
+    const silent = afterUninstall(removal(1), false);
+    expect(silent).toEqual({ stage: "failed", message: "" });
+    expect(uninstallLine(silent)).toEqual({ kind: "failed", line: "That did not work.", closing: null });
+  });
+
+  test("every exit 2 without take-over is the foreign-owner stage, whatever owner the screen last read — cli, null or a stale app — and carries the engine's stderr (spec 3.4.3; SQ1)", () => {
+    const found = refusal(
+      "a schedule record that can't be read at /Users/x/Library/Application Support/daily-briefing/schedule.json, with no unit file",
+    );
+    const expected = {
+      stage: "foreign-owner",
+      message:
+        "This background scheduler wasn't set up by this app (a schedule record that can't be read at /Users/x/Library/Application Support/daily-briefing/schedule.json, with no unit file). Removing it needs your go-ahead.\n",
+    };
+    expect(afterUninstall(found, false)).toEqual(expected);
+    // The cached owner is not an input: Uninstall has no confirmation gate, so its exit 2 only ever means
+    // "not yours", and the owner the screen last read can be stale. What it still decides is the lead.
+    expect(afterUninstall.length).toBe(2);
+    for (const [owner, lead] of [
+      ["cli", undefined],
+      [null, NULL_OWNER_LEAD],
+      ["app", undefined],
+    ] as const) {
+      expect([owner, afterUninstall(found, false), foreignOwnerLead(owner)]).toEqual([owner, expected, lead]);
+    }
     // Already took over and still refused: a failure, never a second dialog.
-    expect(afterUninstall(refusal, true, "cli").stage).toBe("failed");
-    // Owned by this app: exit 2 is some other refusal, and take-over would answer a question
-    // nobody asked.
-    expect(afterUninstall(refusal, false, "app").stage).toBe("failed");
-    expect(afterUninstall(refusal, false, null).stage).toBe("failed");
+    expect(afterUninstall(found, true)).toEqual({ ...expected, stage: "failed" });
+  });
+
+  test("the component asks with the engine's words, the cached owner's lead, and no owner rule of its own", async () => {
+    const component = await source("ScheduleUninstall.svelte");
+    expect(component).toContain("const next = afterUninstall(outcome, takeOver);");
+    // M9 round 2: with no state read, `undefined` — the dialog's default lead — never the null-owner one.
+    expect(component).toMatch(
+      /<ForeignOwnerDialog\s+\{message\}\s+lead=\{scheduleState === null \? undefined : foreignOwnerLead\(scheduleState\.owner\)\}\s+purpose="remove the background scheduler"/,
+    );
+    // "Keep the existing one" ends the flow with the helper's line.
+    expect(component).toContain("onkeep={() => settle(afterKeep())}");
+  });
+
+  test("the dialog, as the removal draws it: the null-owner lead for a null owner, today's for a cached cli one, the unit path a take-over removes, Keep first (spec 3.4.3)", () => {
+    const dialog = (owner: string | null, found: string): string => {
+      const next = afterUninstall(refusal(found), false);
+      expect(next.stage).toBe("foreign-owner");
+      return html(ForeignOwnerDialog, {
+        message: next.message,
+        lead: foreignOwnerLead(owner),
+        purpose: "remove the background scheduler",
+        onkeep: () => {},
+        ontakeover: () => {},
+      });
+    };
+    // A unit with no record: the dialog names the unit file that taking over removes.
+    const unitOnly = dialog(null, `the unit file ${PLIST}, with no schedule record`);
+    expect(unitOnly).toContain(NULL_OWNER_LEAD);
+    expect(unitOnly).not.toContain(TODAYS_LEAD);
+    expect(unitOnly).toContain(`the unit file ${PLIST}, with no schedule record`);
+    expect(buttons(unitOnly)).toEqual(["Keep the existing one", "Take over and remove the background scheduler"]);
+    // A registration with no files: what the engine found, verbatim.
+    expect(dialog(null, "a loaded job with no files")).toContain("(a loaded job with no files)");
+    // A cached terminal owner keeps today's lead.
+    const cli = dialog("cli", `a schedule record set up from the terminal at /x/schedule.json, and the unit file ${PLIST}`);
+    expect(cli).toContain(TODAYS_LEAD);
+    expect(cli).not.toContain(NULL_OWNER_LEAD);
+    expect(cli).toContain(PLIST);
+    // Engine text stays text.
+    expect(dialog(null, HOSTILE)).not.toContain("<img");
+  });
+
+  test("\"Keep the existing one\" ends with \"Kept — nothing was removed.\" (spec 3.4.5)", () => {
+    expect(afterKeep()).toEqual({ stage: "done", message: "Kept — nothing was removed." });
+    expect(uninstallLine(afterKeep())).toEqual({ kind: "done", line: "Kept — nothing was removed.", closing: null });
+  });
+
+  test("exit 3 shows the engine's stderr verbatim, with Try again; manual steps get the app's closing line once, after them (spec 3.4.6; SQ6)", () => {
+    // Not gone in time: the details, then the steps (spec 3.1.7).
+    const late = [
+      "The background scheduler is still registered after 30 seconds.",
+      "Still on this computer: the registered job local.daily-briefing.",
+      "This attempt removed nothing.",
+      STEPS,
+    ].join("\n");
+    // A stable reason: the steps FIRST, then the details.
+    const stable = [STEPS, "Couldn't check whether a background scheduler is registered (no-gui-session). Nothing was removed."].join("\n");
+    for (const stderr of [late, stable]) {
+      for (const takeOver of [false, true]) {
+        const next = afterUninstall(removal(3, `${stderr}\n`), takeOver);
+        // Verbatim (checkpoint M6b, F1): the engine's closing line break is kept, not trimmed.
+        expect(next).toEqual({ stage: "failed", message: `${stderr}\n` });
+        const line = uninstallLine(next);
+        expect(line).toEqual({ kind: "failed", line: `${stderr}\n`, closing: CLOSING });
+        // Once, and the app's own — never folded into the engine's text.
+        expect(line?.line).not.toContain(CLOSING);
+      }
+    }
+    expect(uninstallLine(afterUninstall(removal(3, `${stable}\n`), false))?.line.startsWith(STEPS.split("\n")[0] ?? "?")).toBe(
+      true,
+    );
+    // An exit 3 that carries no steps gets no closing line.
+    const bare = afterUninstall(removal(3, "schedule uninstall: no scheduler is supported on sunos.\n"), false);
+    expect(uninstallLine(bare)).toEqual({
+      kind: "failed",
+      line: "schedule uninstall: no scheduler is supported on sunos.\n",
+      closing: null,
+    });
+    // A signal death or any other code: failed, with what the engine said.
+    expect(afterUninstall(removal(null, "killed\n"), false)).toEqual({ stage: "failed", message: "killed\n" });
+    expect(afterUninstall(removal(4, "", "only stdout\n"), false)).toEqual({ stage: "failed", message: "only stdout" });
+  });
+
+  test("checkpoint M6b (F1): the engine's stderr reaches the stage and the line byte for byte — leading whitespace and trailing line breaks included (spec 3.4.3, 3.4.6)", () => {
+    const stderr = `  \n\t  The background scheduler is still registered after 30 seconds.\n${STEPS}\n\n`;
+    // Exit 3, with and without take-over, and a crash's exit 1: failed, the string untouched.
+    for (const takeOver of [false, true]) {
+      expect(afterUninstall(removal(3, stderr), takeOver)).toEqual({ stage: "failed", message: stderr });
+      expect(uninstallLine(afterUninstall(removal(3, stderr), takeOver))).toEqual({ kind: "failed", line: stderr, closing: CLOSING });
+    }
+    expect(afterUninstall(removal(1, stderr), false)).toEqual({ stage: "failed", message: stderr });
+    expect(afterUninstall(removal(null, stderr), false)).toEqual({ stage: "failed", message: stderr });
+    // Exit 2: the foreign-owner stage carries it untouched too, and a refused take-over fails with it.
+    const refused = `\n  This background scheduler wasn't set up by this app (a loaded job with no files).\n\n`;
+    expect(afterUninstall(removal(2, refused), false)).toEqual({ stage: "foreign-owner", message: refused });
+    expect(afterUninstall(removal(2, refused), true)).toEqual({ stage: "failed", message: refused });
+    // A stderr of only whitespace said nothing: the fallbacks apply as before — stdout, then the app's word.
+    expect(afterUninstall(removal(3, " \n\n", "only stdout\n"), false)).toEqual({ stage: "failed", message: "only stdout" });
+    expect(uninstallLine(afterUninstall(removal(3, " \n\n"), false))).toEqual({ kind: "failed", line: "That did not work.", closing: null });
+    expect(afterUninstall(removal(1, "\n"), false)).toEqual({ stage: "failed", message: "" });
+  });
+
+  test("a failed attempt offers Try again, which repeats it; nothing else does", async () => {
+    const drawn = (stage: string) => buttons(html(ScheduleUninstall, { scheduleState: scheduleState(), os: "macos", stage }));
+    expect(drawn("failed")).toEqual(["Remove background scheduler…", "Try again"]);
+    for (const stage of ["idle", "done", "foreign-owner"]) {
+      expect(drawn(stage).includes("Try again")).toBe(false);
+    }
+    const component = await source("ScheduleUninstall.svelte");
+    expect(component).toMatch(/onclick=\{\(\) => remove\(lastTakeOver\)\}>Try again<\/button>/);
+    expect(component).toMatch(/async function remove\(takeOver: boolean\): Promise<void> \{[\s\S]*?lastTakeOver = takeOver;/);
+  });
+
+  test("done and failed say so in one line, with the engine's words or the app's own", () => {
+    expect(uninstallLine(afterUninstall(removal(0, "", "Removed the background scheduler.\n"), false))).toEqual({
+      kind: "done",
+      line: "Removed the background scheduler.",
+      closing: null,
+    });
+    expect(uninstallLine({ stage: "done", message: "" })).toEqual({ kind: "done", line: "Removed.", closing: null });
+    for (const stage of ["idle", "running", "foreign-owner"] as const) {
+      expect(uninstallLine({ stage, message: "x" })).toBeNull();
+    }
   });
 
   test("the first control is the confirmation, not the removal", () => {
-    const body = html(ScheduleUninstall, { scheduleState: scheduleState() });
+    const body = html(ScheduleUninstall, { scheduleState: scheduleState(), os: "macos" });
     expect(buttons(body)).toEqual(["Remove background scheduler…"]);
     // The destructive label and the consequence are behind it, not on the screen by default.
     expect(body).not.toContain("Nothing will generate a briefing after that");

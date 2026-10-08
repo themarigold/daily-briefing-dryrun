@@ -6,14 +6,14 @@ import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off 
 // which is the direction that breaks a shipped GUI — and it deliberately does not fail on an added
 // one, because additive is the whole point.
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   scheduleStatusReport, renderScheduleStatus, expectedTicks, type ScheduleStatusReport,
 } from "../src/schedule/status";
-import { writeScheduleRecord } from "../src/schedule/install";
-import { SCHEDULE_LABEL } from "../src/schedule/units";
+import { writeScheduleRecord, manualRemoveSteps } from "../src/schedule/install";
+import { SCHEDULE_LABEL, SYSTEMD_TIMER_NAME } from "../src/schedule/units";
 import { tickPath, markerPath, localDateStr } from "../src/marker";
 import type { Exec } from "../src/schedule/install";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
@@ -37,7 +37,9 @@ beforeEach(() => {
   process.env.XDG_CONFIG_HOME = CFG;
 });
 afterEach(() => {
-  if (prevUnitDir === undefined) delete process.env.DBA_TEST_UNIT_DIR; else process.env.DBA_TEST_UNIT_DIR = prevUnitDir;
+  // Assigned back, never deleted: the preload arms DBA_TEST_UNIT_DIR as a tripwire, so the saved value is
+  // never undefined, and a `delete` would throw on its non-configurable accessor.
+  process.env.DBA_TEST_UNIT_DIR = prevUnitDir;
   if (prevState === undefined) delete process.env.DAILY_BRIEFING_STATE_DIR; else process.env.DAILY_BRIEFING_STATE_DIR = prevState;
   if (prevCfg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prevCfg;
 });
@@ -45,10 +47,15 @@ afterEach(() => {
 const okExec: Exec = async () => ({ code: 0, out: "", err: "" });
 const NOW = () => new Date(2026, 6, 16, 9, 0);   // 09:00 local, past a 07:20 floor
 
+/** `uid: 4242`, fixed, so a probe argv never names the author's real uid's domain; `XDG_DATA_HOME` under
+ *  the scratch HOME, because the env spreads `process.env` (see test/schedule.install.test.ts's `env()`). */
 function deps(extra: Record<string, unknown> = {}) {
   return {
-    exec: okExec, platform: "darwin" as NodeJS.Platform, home: HOME,
-    env: { ...process.env, DBA_TEST_UNIT_DIR: UNITS, DAILY_BRIEFING_STATE_DIR: STATE, USER: "tester" },
+    exec: okExec, platform: "darwin" as NodeJS.Platform, home: HOME, uid: 4242,
+    env: {
+      ...process.env, DBA_TEST_UNIT_DIR: UNITS, DAILY_BRIEFING_STATE_DIR: STATE, USER: "tester",
+      XDG_DATA_HOME: join(HOME, ".local", "share"),
+    },
     now: NOW, say: () => {}, warn: () => {},
     ...extra,
   };
@@ -68,6 +75,8 @@ describe("⚠ the frozen JSON contract", () => {
       "lastDelivery", "lastSkip",
       "morningTime", "isPastFloor", "intervalSec",
       "experimental", "paths",
+      // Batch 2 (spec 3.1.5): appended, each always present; no existing key changed name or type.
+      "registeredReason", "recordFilePresent", "removeSteps",
     ].sort();
     const missing = EXPECTED.filter((k) => !(k in r));
     expect(`missing = ${JSON.stringify(missing)}`).toBe("missing = []");
@@ -103,9 +112,11 @@ describe("the three-legged registration triangle", () => {
     expect(full.binPath).toBe("/managed/daily-briefing");
     expect(full.installedEngineVersion).toBe("0.1.0");
 
-    // A failing probe means NOT registered even with both files present.
+    // Exit 1 from every probe command with nothing on stderr is NOT "not registered" (Batch 2, spec 3.1.5):
+    // a killed command can surface as an ordinary code, so the check cannot say — `null`, with the reason.
     const dead = await scheduleStatusReport(deps({ exec: (async () => ({ code: 1, out: "", err: "" })) as Exec }));
-    expect([dead.recordPresent, dead.unitPresent, dead.registered]).toEqual([true, true, false]);
+    expect([dead.recordPresent, dead.unitPresent, dead.registered]).toEqual([true, true, null]);
+    expect(dead.registeredReason).toBe("unexpected");
   });
 
   test("engine SKEW is visible — the Schedule panel's 'update background engine' prompt keys on it", async () => {
@@ -260,5 +271,164 @@ describe("the human text says 'morning time', never 'floor' (v0.2.1 §3.1)", () 
     const text = renderScheduleStatus(await scheduleStatusReport(deps({ now: () => new Date(2026, 6, 16, 7, 0) })));
     expect(text).toContain("morning time:    07:20 (not yet reached)");
     expect(text).not.toMatch(/floor/i);
+  });
+});
+
+// ── Batch 2 (spec 3.1.5 "Status reuses it"): `registered` comes from the ONE registration check,
+// `probeRegistration`, so status and uninstall can never disagree about it; `unitPresent` and the new
+// `recordFilePresent` are the `lstat` look; `removeSteps` carries the manual steps.
+//
+// ⚠ THESE FAKES ANSWER BY VERB OR DOMAIN, NEVER BY `cmd[0]`, and no literal here names a scheduler tool:
+// isolation.meta.test.ts's scanner 2 exempts only test/schedule.install.test.ts.
+describe("Batch 2: the five changed fields (spec 3.1.5)", () => {
+  type Answer = { code: number; out?: string; err?: string };
+  /** A fake exec answering by verb or domain, recording each call and its timeoutMs. */
+  function byVerb(answer: (cmd: string[]) => Answer) {
+    const calls: string[][] = [];
+    const timeouts: Array<number | undefined> = [];
+    const exec: Exec = async (cmd, opts) => {
+      calls.push(cmd);
+      timeouts.push(opts?.timeoutMs);
+      const a = answer(cmd);
+      return { code: a.code, out: a.out ?? "", err: a.err ?? "" };
+    };
+    return { exec, calls, timeouts };
+  }
+  const NOT_FOUND: Answer = { code: 113, err: `Could not find service "${SCHEDULE_LABEL}" in domain for port` };
+  /** macOS, nothing registered: both prints and the list report service-not-found. */
+  const macGone = (cmd: string[]): Answer => (cmd[1] === "print" || cmd[1] === "list" ? NOT_FOUND : { code: 0 });
+
+  test("registered is the check mapped to true / false / null, and registeredReason is set exactly when it is null", async () => {
+    const present = await scheduleStatusReport(deps({ exec: byVerb(() => ({ code: 0 })).exec }));
+    expect([present.registered, present.registeredReason]).toEqual([true, null]);
+    const gone = await scheduleStatusReport(deps({ exec: byVerb(macGone).exec }));
+    expect([gone.registered, gone.registeredReason]).toEqual([false, null]);
+    // A missing desktop domain (an SSH session) is never "not registered".
+    const noSession = await scheduleStatusReport(deps({
+      exec: byVerb((c) => (c[2]?.startsWith("gui/") ? { code: 113, err: "Could not find domain for port identifier" } : NOT_FOUND)).exec,
+    }));
+    expect([noSession.registered, noSession.registeredReason]).toEqual([null, "no-gui-session"]);
+    expect(renderScheduleStatus(noSession)).toContain("registered:      unknown");
+  });
+
+  test("both prints not found but list gives NO answer → registered: null, never false", async () => {
+    // A not-found from the two prints is not enough on its own: `list` must report not-found too (spec
+    // 3.1.5 step 3). Exit 1 with an empty stderr is no answer (a killed command can surface as an ordinary
+    // code), and a thrown exec counts as -2.
+    const printsNotFound = (list: (cmd: string[]) => Answer) => (cmd: string[]): Answer =>
+      (cmd[1] === "print" ? NOT_FOUND : cmd[1] === "list" ? list(cmd) : { code: 0 });
+    const exitOne = await scheduleStatusReport(deps({ exec: byVerb(printsNotFound(() => ({ code: 1 }))).exec }));
+    expect([exitOne.registered, exitOne.registeredReason]).toEqual([null, "unexpected"]);
+    const thrown = await scheduleStatusReport(deps({
+      exec: byVerb(printsNotFound(() => { throw new Error("list was killed"); })).exec,
+    }));
+    expect([thrown.registered, thrown.registeredReason]).toEqual([null, "spawn"]);
+  });
+
+  test("the probe asks by the exact label with deps' uid", async () => {
+    const f = byVerb(macGone);
+    await scheduleStatusReport(deps({ exec: f.exec }));
+    expect(f.calls.map((c) => c.slice(1).join(" "))).toEqual([
+      `print gui/4242/${SCHEDULE_LABEL}`, `print user/4242/${SCHEDULE_LABEL}`, `list ${SCHEDULE_LABEL}`,
+    ]);
+  });
+
+  test("every probe exec, and the Linux linger exec, is capped at 5 s", async () => {
+    const mac = byVerb(macGone);
+    await scheduleStatusReport(deps({ exec: mac.exec }));
+    expect(mac.timeouts).toEqual([5_000, 5_000, 5_000]);
+
+    const lin = byVerb((c) =>
+      c.includes("show-user") ? { code: 0, out: "Linger=yes\n" }
+        : c.includes("is-active") ? { code: 3, out: "inactive\ninactive\n" }
+          : { code: 1, out: "disabled\n" });
+    const r = await scheduleStatusReport(deps({ platform: "linux", exec: lin.exec }));
+    expect([r.registered, r.lingerState]).toEqual([false, "enabled"]);
+    expect(lin.calls.filter((c) => c.includes("show-user")).length).toBe(1);
+    expect(lin.timeouts).toEqual([5_000, 5_000, 5_000]);
+  });
+
+  test("a THROWN exec gives registered: null with reason spawn — never a crash, on any platform", async () => {
+    const boom: Exec = async () => { throw new Error("no such binary"); };
+    for (const platform of ["darwin", "linux", "win32"]) {
+      const r = await scheduleStatusReport(deps({ platform, exec: boom }));
+      expect(`${platform}: ${r.registered}/${r.registeredReason}`).toBe(`${platform}: null/spawn`);
+    }
+  });
+
+  test("an exec that throws SYNCHRONOUSLY — before it returns a promise — is the same: registered null/spawn, linger unknown, never a crash", async () => {
+    // Non-async on purpose: a `.catch` chained onto the exec's result never sees this throw, so the call itself
+    // must sit inside the try (spec 3.1.4: a thrown exec counts as -2; 3.1.5: it gives null, never a crash).
+    const syncBoom: Exec = () => { throw new Error("boom"); };
+    for (const [platform, linger] of [["darwin", "not-applicable"], ["linux", "unknown"], ["win32", "not-applicable"]]) {
+      const r = await scheduleStatusReport(deps({ platform, exec: syncBoom }));
+      expect(`${platform}: ${r.registered}/${r.registeredReason}/${r.lingerState}`).toBe(`${platform}: null/spawn/${linger}`);
+    }
+  });
+
+  test("registered: null WITH a record — a Linux user manager out of reach is unknown, not 'not registered'", async () => {
+    // This used to read `false`, which the app derives as scheduler-broken and offers Repair for. Unknown
+    // is not broken (spec 3.1.5): the record is still reported, so Remove still shows.
+    await writeScheduleRecord({
+      owner: "app", invoker: "app", kind: "systemd", unitPath: join(UNITS, SYSTEMD_TIMER_NAME),
+      binPath: "/managed/daily-briefing", installedAt: "2026-09-14T00:00:00.000Z", engineVersion: "0.2.1",
+    });
+    const bus = byVerb((c) => (c.includes("show-user") ? { code: 1 } : { code: 1, err: "Failed to connect to bus: No medium found" }));
+    const r = await scheduleStatusReport(deps({ platform: "linux", exec: bus.exec }));
+    expect([r.recordPresent, r.recordFilePresent, r.registered, r.registeredReason]).toEqual([true, true, null, "no-user-manager"]);
+  });
+
+  test("unitPresent is the lstat look: a DANGLING symlink at the unit path counts", async () => {
+    expect((await scheduleStatusReport(deps())).unitPresent).toBe(false);
+    symlinkSync(join(UNITS, "gone-target.plist"), join(UNITS, `${SCHEDULE_LABEL}.plist`));
+    const r = await scheduleStatusReport(deps());
+    expect(r.unitPresent).toBe(true);
+    expect(renderScheduleStatus(r)).not.toContain("no unit file on disk");
+  });
+
+  test("recordFilePresent is the lstat look; recordPresent stays 'a readable record' under the shared bounded read", async () => {
+    const rp = join(STATE, "schedule.json");
+    const look = async () => { const r = await scheduleStatusReport(deps()); return [r.recordPresent, r.recordFilePresent]; };
+    expect(await look()).toEqual([false, false]);
+    writeFileSync(rp, '{"owner":"app","unitPa');                           // malformed
+    expect(await look()).toEqual([false, true]);
+    rmSync(rp);
+    symlinkSync(join(STATE, "nowhere.json"), rp);                         // dangling symlink
+    expect(await look()).toEqual([false, true]);
+    rmSync(rp);
+    const valid = {
+      owner: "app", invoker: "app", kind: "launchd", unitPath: "/u", binPath: "/b",
+      installedAt: "2026-09-14T00:00:00.000Z", engineVersion: "0.2.1",
+    };
+    writeFileSync(join(STATE, "elsewhere.json"), JSON.stringify(valid));
+    symlinkSync(join(STATE, "elsewhere.json"), rp);                       // a symlink, even to a valid record
+    expect(await look()).toEqual([false, true]);
+    rmSync(rp);
+    writeFileSync(rp, JSON.stringify(valid) + " ".repeat(64 * 1024));     // valid JSON, but over 64 KiB
+    expect(await look()).toEqual([false, true]);
+    rmSync(rp);
+    writeFileSync(rp, JSON.stringify(valid));
+    expect(await look()).toEqual([true, true]);
+  });
+
+  test("removeSteps: this machine's manual steps, with no closing line — and null off launchd and systemd", async () => {
+    const mac = await scheduleStatusReport(deps());
+    expect(mac.removeSteps).toBe(manualRemoveSteps("launchd", { units: mac.paths.unitPaths, record: mac.paths.schedulePath, home: HOME }));
+    expect(mac.removeSteps!.split("\n")[0]).toBe("Run these in a terminal (bash or zsh) inside your desktop session.");
+    // These scratch paths lie outside HOME, so each is one single-quoted word.
+    expect(mac.removeSteps).toContain(`'${mac.paths.unitPaths[0]}'`);
+    expect(mac.removeSteps).toContain(`'${mac.paths.schedulePath}'`);
+    expect(mac.removeSteps).not.toContain("Then run");
+    expect(mac.removeSteps).not.toContain("Then press");
+
+    const lin = await scheduleStatusReport(deps({ platform: "linux" }));
+    expect(lin.removeSteps).toBe(manualRemoveSteps("systemd", { units: lin.paths.unitPaths, record: lin.paths.schedulePath, home: HOME }));
+
+    for (const platform of ["win32", "freebsd"]) {
+      const r = await scheduleStatusReport(deps({ platform }));
+      expect(`${platform}: ${JSON.stringify(r.removeSteps)}`).toBe(`${platform}: null`);
+    }
+    // It survives the JSON pipe the app reads it through, null included.
+    expect(JSON.parse(JSON.stringify(mac)).removeSteps).toBe(mac.removeSteps);
   });
 });

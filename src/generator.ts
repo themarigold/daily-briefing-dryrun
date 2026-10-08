@@ -337,23 +337,54 @@ function repoOf(line: string): { repo: string; text: string } {
 // The pipe-less fallback is deliberately narrow: `evidence:` must be preceded by whitespace (or open
 // the line), be the LAST such occurrence, and EVERYTHING after it must be a comma/space-separated list
 // of tokens that could NAME a commit — the `evidenceTokens` split + `bareToken` strip the resolvers
-// use, gated by `sha.ts`'s `isExtractableSha`. So prose like "evidence: the log shows 0a9a30b" is
-// never eaten: "the" cannot name a commit. `isExtractableSha`, not `isShaShaped`, because this is the
-// extraction question ("could this name a real commit?"), not the fabrication one — MEASURED on the
-// 2026-09-02 archive: 2 of its 40 pipe-less bullets cite all-digit abbrevs (`8426643`, `3552221`)
-// that `isShaShaped` rejects, leaving them "not shown". The 7-char floor keeps a year/PR number out.
+// use, gated by `sha.ts`'s `isExtractableSha` — with ONE exception, a trailing date tag (below). So
+// prose like "evidence: the log shows 0a9a30b" is never eaten: "the" cannot name a commit.
+// `isExtractableSha`, not `isShaShaped` (outside the date-tag branch, which is stricter), because
+// this is the extraction question ("could this name a real commit?"), not the fabrication one —
+// MEASURED on the 2026-09-02 archive: 2 of its 40 pipe-less bullets cite all-digit abbrevs
+// (`8426643`, `3552221`) that `isShaShaped` rejects, leaving them "not shown". The 7-char floor keeps
+// a year/PR number out.
+//
+// The date-tag exception (2026-10-06). In a 2026-10-06 `day8-tie` eval capture the model dropped the
+// pipe AND appended the prompt's own date format: `… — evidence: 36c4738 (Oct 5)`. `Oct` and `5`
+// cannot name a commit, so the list test refused the tail and the SHA stayed in the text. So a tail
+// may END in one `DATE_TAG_TAIL` (whitespace, then a three-letter English month and a day in
+// parentheses, case-sensitive, at most one period after it); the rest of the tail, the part before
+// the tag, must then be ONE contiguous hex run of 7–40 characters once `bareToken` alone has stripped
+// its adornments, and must pass `isShaShaped`:
+//   - `bareToken` alone, never `evidenceTokens`: that tokeniser deletes parentheses inside a token, so
+//     it would read `abc(1234)` as `abc1234`, a SHA the model never wrote;
+//   - ONE token, so a good SHA beside a garble cannot pass its own bullet while the dropped garble's
+//     "didn't resolve" warning loosens every other bullet's missing evidence;
+//   - `isShaShaped`, not `isExtractableSha`, because `verifyEvidence` grounding-checks exactly the
+//     `isShaShaped` tokens: an all-digit token would sit in the evidence slot unchecked, so
+//     `4760499 (Oct 4)` stays refused, as before;
+//   - 7 or more characters, the length the prompt prints and the eval's miner reads.
+// The whole ORIGINAL tail is kept verbatim as `evidence`, exactly as the pipe form keeps
+// `| evidence: 36c4738 (Oct 5)`. A tagged tail that fails is refused outright rather than handed to
+// the list test, which could never pass it (a month is under `SHA_RE`'s 4-character floor).
 const PIPE_EVIDENCE = /\s*\|\s*evidence:\s*/i;
 const TRAILING_EVIDENCE = /(?:^|\s)evidence:\s*/gi;
+// No `g` flag (unlike TRAILING_EVIDENCE), so `exec` keeps no `lastIndex` between calls.
+const DATE_TAG_TAIL = /\s+\((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}\)\.?$/;
 
 // The pipe-less fallback alone: the split it would make, or null when the line does not qualify.
 // A CLAIM is required — `- [r] evidence: 0a9a30b` keeps its literal text (the base behaviour) rather
-// than becoming an empty bullet that renders as `[r]  (0a9a30b)` (review round 1, L3).
+// than becoming an empty bullet that renders as `[r]  (0a9a30b)` (review round 1, L3). The claim
+// guard runs before either branch, so `- [r] evidence: d08ee51 (Oct 4)` keeps its literal text too.
+// Then a tail ending in a date tag takes the date-tag branch (above) and every other tail the list
+// test; `countPipelessRecapEvidence` counts both, because both run here.
 function trailingEvidence(t: string): { text: string; evidence: string } | null {
   const last = [...t.matchAll(TRAILING_EVIDENCE)].pop();
   if (!last) return null;
   const claim = t.slice(0, last.index!).trim();
   if (!claim) return null;
   const tail = t.slice(last.index! + last[0].length).trim();
+  const tag = DATE_TAG_TAIL.exec(tail);
+  if (tag) {
+    const sha = bareToken(tail.slice(0, tag.index));
+    return /^[0-9a-fA-F]{7,40}$/.test(sha) && isShaShaped(sha) ? { text: claim, evidence: tail } : null;
+  }
   const toks = evidenceTokens(tail).map(bareToken).filter(Boolean);
   return toks.length && toks.every(isExtractableSha) ? { text: claim, evidence: tail } : null;
 }

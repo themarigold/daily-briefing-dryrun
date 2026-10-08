@@ -11,8 +11,9 @@
    * `config validate` exists to prevent.
    *
    * ⚠ IT EDITS AN EXISTING CONFIG. With no config file it points at the first-run wizard (B8's
-   * `config_create` path — or `daily-briefing init` in a terminal); with one that is not JSON it
-   * says so and changes nothing.
+   * `config_create` path — or `daily-briefing init` in a terminal) — unless an Uninstall removed the
+   * settings in this app session, whose latch refuses that path too (M9 LOW pass, L1); with one that
+   * is not JSON it says so and changes nothing.
    *
    * ⚠ AN UNSAVED EDIT SURVIVES LEAVING THE SCREEN. Switching to another screen unmounts this one;
    * a changed draft (or raw text) is kept in memory (`keepSettings`) and restored on return, with a
@@ -57,6 +58,7 @@
     type NotifyStatus,
   } from "../lib/notify";
   import type { Os } from "../lib/platform";
+  import type { UninstallReport } from "../lib/app-uninstall";
   import SaveReport from "./SaveReport.svelte";
   import SettingsForm from "./SettingsForm.svelte";
 
@@ -65,8 +67,27 @@
      *  panel for the notification ask's wording. REQUIRED, with no default, so a mount that
      *  forgets it fails `svelte-check` instead of silently getting one platform's wording. */
     os: Os;
+    /** M9 round 3: the Uninstall execute's report and in-flight state, held by App so they outlive this
+     *  screen (`App.svelte`), and its start and end — passed straight through to the "This app" panel. M9
+     *  LOW pass (L5): REQUIRED, with no default, like `os`. */
+    uninstallReport: UninstallReport | null;
+    uninstallRunning: boolean;
+    onuninstallstarted: () => void;
+    onuninstallended: (report: UninstallReport | null) => void;
+    /** M9 LOW pass (L1): an Uninstall in this app session removed `config.json` (App latches it for the
+     *  session, as Rust's "settings removed" latch is never cleared), so every settings write — the Setup
+     *  wizard's `config_create` included — is refused until the app restarts, and the no-config sentence says
+     *  what still works instead of pointing at Setup. REQUIRED, with no default. */
+    settingsRemovedByUninstall: boolean;
   }
-  let { os }: Props = $props();
+  let {
+    os,
+    uninstallReport,
+    uninstallRunning,
+    onuninstallstarted,
+    onuninstallended,
+    settingsRemovedByUninstall,
+  }: Props = $props();
 
   /** B7 (T18/T19): the "This app" panel's state — the notification opt-in and the REAL autostart
    *  state (`is_enabled()`, re-fetched after every change; never a cached boolean). */
@@ -280,6 +301,10 @@
     autostartError={appAutostartError}
     onrefresh={loadApp}
     {os}
+    {uninstallReport}
+    {uninstallRunning}
+    {onuninstallstarted}
+    {onuninstallended}
   />
 
   <!-- Phase E (E12): the update panel — the last answer and "Check now". The AUTOMATIC check is the
@@ -306,12 +331,22 @@
       </p>
     {/if}
     {#if !doc.exists}
-      <p>
-        There is no config at this path yet. The Setup wizard creates one (it opens on its own
-        while no config exists — or press Setup in the header); alternatively run
-        <code>daily-briefing init</code> in a terminal. This screen edits an existing config and
-        does not create one.
-      </p>
+      {#if settingsRemovedByUninstall}
+        <!-- M9 LOW pass (L1): the settings were removed by an Uninstall in this session, and its latch refuses
+             every settings write until the app restarts — the wizard's `config_create` too — so Setup is not
+             offered as the way back. -->
+        <p>
+          Your settings were removed by Uninstall. To set up again, quit and reopen the app, or run
+          <code>daily-briefing init</code> in a terminal.
+        </p>
+      {:else}
+        <p>
+          There is no config at this path yet. The Setup wizard creates one (press Setup in the
+          header); alternatively run
+          <code>daily-briefing init</code> in a terminal. This screen edits an existing config and
+          does not create one.
+        </p>
+      {/if}
     {:else if doc.parseError !== null}
       <p class="bad">
         This file could not be read as a JSON object ({doc.parseError}). Fix it in an editor, or restore

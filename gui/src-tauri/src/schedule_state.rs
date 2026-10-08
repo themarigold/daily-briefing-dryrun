@@ -309,6 +309,18 @@ pub struct ScheduleView {
     pub experimental: bool,
     pub linger_state: Option<String>,
     pub last_skip: Option<LastSkip>,
+    // ── Batch 2 (spec 3.1.5, 3.4.1). An older engine sends none of them, so each reads as "not
+    // known" by `default`: `false`, `null`, `null`.
+    /// The engine's `lstat` of `schedule.json`, readable or not — NOT [`Self::record_present`],
+    /// which is a READABLE record (spec 3, "three record facts"). A malformed, symlinked or
+    /// oversized record is `record_present: false` and `record_file_present: true`.
+    pub record_file_present: bool,
+    /// Why [`Self::registered`] is `null` (`"no-user-manager"`, `"no-gui-session"`, `"timeout"`,
+    /// `"spawn"`, `"unexpected"`), and `null` whenever `registered` is not.
+    pub registered_reason: Option<String>,
+    /// The engine's manual removal steps for this machine's paths (spec 3.1.8), with no closing
+    /// line; `null` off launchd and systemd (Windows and unsupported platforms).
+    pub remove_steps: Option<String>,
 }
 
 /// The instant [`derive`] is evaluated at. An operand, so the machine reads no clock.
@@ -462,6 +474,15 @@ pub struct ScheduleState {
     pub experimental: bool,
     /// Linux only; `"disabled"` means the timer silently never fires while logged out.
     pub linger_state: Option<String>,
+    /// [`ScheduleView::record_file_present`]: anything at `schedule.json`, readable or not. The
+    /// phase still keys on [`Self::record_present`]; the Schedule screen's remove control reads
+    /// this too (spec 3.4.1). `false` when the schedule envelope is missing.
+    pub record_file_present: bool,
+    /// [`ScheduleView::registered_reason`]: why [`Self::registered`] is `null`, verbatim.
+    pub registered_reason: Option<String>,
+    /// [`ScheduleView::remove_steps`]: the engine's manual removal steps, verbatim; `null` off
+    /// launchd and systemd, or when the schedule envelope is missing.
+    pub remove_steps: Option<String>,
 }
 
 impl ScheduleState {
@@ -650,6 +671,11 @@ pub fn derive(
         interval_sec: interval,
         experimental: schedule.is_some_and(|s| s.experimental),
         linger_state: schedule.and_then(|s| s.linger_state.clone()),
+        // Straight through. None of the three feeds the phase: "unknown is not broken" stays
+        // `derive_phase`'s step 3, which reads `registered == Some(false)` only.
+        record_file_present: schedule.is_some_and(|s| s.record_file_present),
+        registered_reason: schedule.and_then(|s| s.registered_reason.clone()),
+        remove_steps: schedule.and_then(|s| s.remove_steps.clone()),
     }
 }
 

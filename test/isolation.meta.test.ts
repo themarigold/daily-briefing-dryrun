@@ -29,6 +29,7 @@ import { test, expect } from "bun:test";
 import { Glob } from "bun";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import ts from "typescript";
 
 const TEST_DIR = new URL("./", import.meta.url).pathname;
 /** Sibling surface the walk below also follows into: test files import `../scripts/*` directly
@@ -49,109 +50,69 @@ async function testFiles(): Promise<string[]> {
  *  state (measured), and forcing an allowlist entry for a comment would train the reader to wave entries
  *  through.
  *
- *  This is a small hand-rolled TOKENISER rather than a regex, because both regex attempts failed in the
- *  DANGEROUS direction — silently deleting code, which turns a real offender into a pass:
- *   1. stripping block comments with a regex of their own: `render.legend.test.ts:318` contains the glob
+ *  The comments and regex literals come from TypeScript's own parser (`typescript`, the package's peer
+ *  dependency), because every lighter reading failed in the DANGEROUS direction — silently deleting
+ *  code, which turns a real offender into a pass:
+ *   1. stripping block comments with a regex of their own: `render.legend.test.ts:320` contains the glob
  *      string "packages" followed by a slash-star, which opened a phantom block comment that ran to the
  *      next genuine terminator and swallowed the `DAILY_BRIEFING_STATE_DIR` line the guard looks for.
- *   2. consuming string/template literals first (the previous fix): a REGEX literal is not a string
- *      literal, so `/pkgs\/*\.ts/` — an ordinary workspace-glob regex — reopened exactly the same hole.
- *      Reproduced end-to-end before this rewrite: a file with a real `hardenedProvider({})` call, that
- *      regex above it and a `/** … *\/` block below it, dropped out of the touching set entirely.
- *  A tokeniser has no third case of this kind: every construct that can contain a slash is consumed as
- *  itself.
+ *   2. consuming string/template literals first: a REGEX literal is not a string literal, so
+ *      `/pkgs\/*\.ts/` — an ordinary workspace-glob regex — reopened exactly the same hole.
+ *   3. a hand-rolled tokeniser that guessed regex-vs-division from the previous token: `a! / f() / b`
+ *      read as a regex and deleted the call, and a template nested inside a `${…}` threw it out of step
+ *      (measured 2026-10-05; no live file lost code to either, which kept the guard's verdicts unchanged).
  *
- *  String and template literals are handed back UNCHANGED (scanner 2 reads them; see `literals()`).
- *  Comments AND regex literals become a single space: both are data, never a call — which is also why
- *  `posture.test.ts` (whose `hardenedProvider(` occurrences are regex literals matched against other
- *  files' text) no longer needs a state allowlist entry.
- *
- *  Regex-vs-division is decided from the preceding significant token, the standard heuristic: after
- *  `)` only when that paren closed an `if`/`for`/`while`/`switch`/`catch` condition, after `}`, after an
- *  operator or opener, or after a keyword that cannot be followed by division. Stripping is applied per
- *  FILE and only then joined, so no mis-strip can cross a file boundary. */
+ *  String and template literals are handed back UNCHANGED (scanner 2 reads them; see `literals()`), a
+ *  template's `${…}` code and any comment in it included, template TYPES too. Comments AND regex literals
+ *  become a single space: both are data, never a call — which is also why the regex-literal
+ *  `hardenedProvider(` occurrences in `posture.test.ts` need no state allowlist entry (its one entry
+ *  covers a failure-message template). Comments are asked for around every node and token, leading AND
+ *  trailing: TypeScript reports a comment on the same line after a token only as that token's trailing
+ *  comment. JSDoc is left unparsed: parsed,
+ *  a trailing-comment scan from inside a tag (`{type}`) reads a `//` there as a line comment that runs
+ *  past the JSDoc and deletes the code after it. Stripping is applied per FILE and only then joined, so
+ *  no mis-strip can cross a file boundary. */
 function stripComments(src: string): string {
-  const out: string[] = [];
-  const OPENERS = new Set("(,=:[!&|?{;+-*%~^<>".split(""));
-  const REGEX_OK_AFTER_WORD = /(?:^|[^\w$])(?:return|typeof|instanceof|in|of|new|delete|void|case|do|else|yield|await|throw)$/;
-  const CONTROL_WORD = /(?:^|[^\w$])(?:if|for|while|switch|catch|with)$/;
-  const parens: boolean[] = [];
-  let prev = "";              // last significant (non-whitespace) character kept
-  let word = "";              // identifier run ending at `prev`, for `return /re/`
-  let lastParenControl = false;
-  const keep = (chunk: string): void => {
-    out.push(chunk);
-    for (const ch of chunk) {
-      if (/\s/.test(ch)) continue;
-      if (ch === "(") parens.push(CONTROL_WORD.test(word));
-      else if (ch === ")") lastParenControl = parens.pop() ?? false;
-      prev = ch;
-      word = /[\w$]/.test(ch) ? word + ch : "";
-    }
-  };
-  const regexAllowed = (): boolean => {
-    if (prev === "") return true;
-    if (prev === ")") return lastParenControl;
-    if (prev === "}") return true;
-    if (OPENERS.has(prev)) return true;
-    return REGEX_OK_AFTER_WORD.test(word);
-  };
-
-  let i = 0;
-  const n = src.length;
-  while (i < n) {
-    const c = src[i]!;
-    if (c === "/" && src[i + 1] === "/") {              // line comment
-      while (i < n && src[i] !== "\n") i++;
-      out.push(" ");
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "*") {              // block comment
-      const end = src.indexOf("*/", i + 2);
-      i = end === -1 ? n : end + 2;
-      out.push(" ");
-      continue;
-    }
-    if (c === '"' || c === "'" || c === "`") {          // string / template literal — kept verbatim
-      const start = i;
-      i++;
-      while (i < n) {
-        const d = src[i]!;
-        if (d === "\\") { i += 2; continue; }
-        if (d === c) { i++; break; }
-        if (d === "\n" && c !== "`") break;             // unterminated quote: bail, never eat the file
-        i++;
-      }
-      keep(src.slice(start, i));
-      continue;
-    }
-    if (c === "/" && regexAllowed()) {                  // regex literal — the hole that reopened twice
-      const start = i;
-      let j = i + 1;
-      let inClass = false;
-      let closed = false;
-      while (j < n) {
-        const d = src[j]!;
-        if (d === "\\") { j += 2; continue; }
-        if (d === "\n") break;                          // a regex literal cannot span lines
-        if (d === "[") inClass = true;
-        else if (d === "]") inClass = false;
-        else if (d === "/" && !inClass) { j++; closed = true; break; }
-        j++;
-      }
-      if (closed && j > start + 2) {                    // `//` is a comment, handled above
-        while (j < n && /[dgimsuvy]/.test(src[j]!)) j++;
-        i = j;
-        out.push(" ");
-        prev = "/"; word = "";
-        continue;
-      }
-    }
-    keep(c);
-    i++;
+  let out = "", at = 0;
+  for (const [from, to] of cutRanges(src)) {
+    out += src.slice(at, from) + " ";
+    at = to;
   }
+  return out + src.slice(at);
+}
+
+/** The same cuts as `stripComments`, but every cut character becomes a space instead of each cut becoming
+ *  one, and every `\n` is kept: line N of the result is line N of `src`, stripped in the context of the
+ *  whole file. Scanner 5 reads it line by line; a line parsed on its own is misread (a leading division
+ *  or a block comment's closing `*\/` starts a phantom regex literal that takes the call with it). Only
+ *  `\n` survives: scanner 5 splits on nothing else. */
+function blankComments(src: string): string {
+  const out = src.split("");
+  for (const [from, to] of cutRanges(src)) for (let k = from; k < to; k++) if (out[k] !== "\n") out[k] = " ";
   return out.join("");
 }
+
+/** Start and end of every comment and regex literal in `src`, in source order — see `stripComments`. */
+function cutRanges(src: string): [number, number][] {
+  const file = ts.createSourceFile("strip.ts", src, { languageVersion: ts.ScriptTarget.Latest, jsDocParsingMode: ts.JSDocParsingMode.ParseNone }, false, ts.ScriptKind.TS);
+  const cut = new Map<number, number>();       // start → end
+  // Each position is scanned once per direction: nested nodes share a start, and a comment just before a
+  // long `a + b + …` would otherwise be rescanned once per level.
+  const leadingDone = new Set<number>(), trailingDone = new Set<number>();
+  const pending: ts.Node[] = [file];           // a stack, not recursion: a long `a + b + …` nests deep
+  for (let node = pending.pop(); node !== undefined; node = pending.pop()) {
+    const { pos, end, kind } = node;
+    if (!leadingDone.has(pos)) { leadingDone.add(pos); for (const r of ts.getLeadingCommentRanges(src, pos) ?? []) cut.set(r.pos, r.end); }
+    if (!trailingDone.has(end)) { trailingDone.add(end); for (const r of ts.getTrailingCommentRanges(src, end) ?? []) cut.set(r.pos, r.end); }
+    if (kind === ts.SyntaxKind.TemplateExpression || kind === ts.SyntaxKind.NoSubstitutionTemplateLiteral || kind === ts.SyntaxKind.TemplateLiteralType) continue;   // kept whole
+    if (kind === ts.SyntaxKind.RegularExpressionLiteral) cut.set(node.getStart(file), end);
+    for (const child of node.getChildren(file)) pending.push(child);
+  }
+  return [...cut].sort((a, b) => a[0] - b[0]);
+}
+
+/** Stripped text by source text: every test file re-reads the shared helpers, and parsing is not free. */
+const strippedCache = new Map<string, string>();
 
 /** A test file's own source plus the source of every helper it imports from inside test/ OR scripts/ —
  *  transitively. Both scanners read this union, so "sets the env var via a shared helper", "spawns via a
@@ -170,7 +131,8 @@ function sourceWithHelpers(rel: string): string {
     seen.add(abs);
     let txt: string;
     try { txt = readFileSync(abs, "utf8"); } catch { return; }
-    const stripped = stripComments(txt);
+    const stripped = strippedCache.get(txt) ?? stripComments(txt);
+    strippedCache.set(txt, stripped);
     parts.push(stripped);   // per FILE — see stripComments: a mis-strip must not cross files
     const runtime = stripped.replace(/\bimport\s+type\b[^;\n]*/g, " ");
     for (const m of runtime.matchAll(/(?:from|import)\s*\(?\s*["'](\.[^"']+)["']/g)) {
@@ -200,14 +162,40 @@ test("the comment stripper keeps prose out and code in — including the glob an
   expect(reStripped).toContain("hardenedProvider(");
   expect(reStripped).toContain("DAILY_BRIEFING_STATE_DIR");
   // A regex literal is DATA, so a trigger spelled inside one is not a call (posture.test.ts's shape).
-  expect(stripComments("const t = /hardenedProvider\\(/;")).not.toContain("hardenedProvider(");
+  expect(stripComments("const t = /hardenedProvider(x)?/;")).toBe("const t =  ;");
   // Division must not be mistaken for a regex opener, or real code would be deleted silently.
-  expect(stripComments("const q = (a + b) / c; const r = d / e;\nrunCore();"))
-    .toContain("runCore()");
-  expect(stripComments("if (x) { a = 1; }\nconst z = y / 2;\nstampToday();")).toContain("stampToday()");
+  expect(stripComments("const q = (a + b) / c; const r = d / e;\nrunCore();")).toBe("const q = (a + b) / c; const r = d / e;\nrunCore();");
+  expect(stripComments("if (x) { a = 1; }\nconst z = y / 2;\nstampToday();")).toBe("if (x) { a = 1; }\nconst z = y / 2;\nstampToday();");
   // A comment after code on one line goes; the code and the literal stay.
   expect(stripComments('const u = "https://x/y"; // supportDir( in a trailing comment'))
     .toBe('const u = "https://x/y";  ');
+  // Shapes the hand-rolled tokeniser before the parser got wrong (measured 2026-10-05). A TS non-null `a!`
+  // then `/`: a division, so the call between the slashes is code, not a regex literal's text.
+  expect(stripComments("const x = a! / hardenedProvider() / b;")).toContain("hardenedProvider(");
+  // A template nested inside a `${…}` (release-collect.test.ts's shape): the regex on the next line is
+  // still a regex literal, and still becomes a space.
+  expect(stripComments("for (const l of ls) expect(`${o}: ${n.includes(`(\\`${l}\\`)`)}`).toBe(`${o}: true`);\nexpect(n).toMatch(/supportDir/);"))
+    .not.toContain("supportDir");
+  // A regex after `export default`, and the comment after it.
+  expect(stripComments("export default /`/;\nrunCore();\n// supportDir( in prose")).toBe("export default  ;\nrunCore();\n ");
+  // A `//` inside a JSDoc tag is JSDoc text, not a line comment that runs on past the JSDoc's end.
+  const jsdoc = stripComments("/** @returns {number} // supportDir( in prose */ export const f = () => runCore();");
+  expect(jsdoc).toContain("runCore(");
+  expect(jsdoc).not.toContain("supportDir(");
+  // Exact outputs, each pinning one part of the parser reading. Template literals and template TYPES come
+  // back whole, a comment or a regex inside a `${…}` included:
+  expect(stripComments("const s = `${a /* supportDir( */} ${/runCore\\(/.source}`;")).toBe("const s = `${a /* supportDir( */} ${/runCore\\(/.source}`;");
+  expect(stripComments("type T = `a${ /* supportDir( */ B }`;")).toBe("type T = `a${ /* supportDir( */ B }`;");
+  // a comment mid-statement, which TypeScript reports only as the previous TOKEN's trailing comment:
+  expect(stripComments("const s = /* supportDir( */ `x`;")).toBe("const s =   `x`;");
+  // a comment just before a regex: one space each, the regex cut from its first slash, not its leading trivia:
+  expect(stripComments("const x = /* c */ /supportDir(x)?/.test(s);")).toBe("const x =    .test(s);");
+  // cuts put back together in source order:
+  expect(stripComments("// a\nx();\n// b\ny();\n// c\nz();")).toBe(" \nx();\n \ny();\n \nz();");
+  // TypeScript, not TSX: `<string>x` is a type assertion, so what follows it is a comment, not JSX text.
+  expect(stripComments("const v = <string>x; // supportDir( in prose")).toBe("const v = <string>x;  ");
+  // `blankComments`, scanner 5's view: the same cuts, character for character, line breaks kept.
+  expect(blankComments("a(); // c\n/* x\n y */ b(/re/);")).toBe("a();     \n    \n      b(    );");
 });
 
 // ── scanner 1: state-dir isolation ──────────────────────────────────────────────────────────────────
@@ -461,8 +449,14 @@ test("the trigger table and the set-check discriminate the shapes that slipped t
 
 // ── the disarm scanner ──────────────────────────────────────────────────────────────────────────────
 
-/** The two variables test/fixtures/isolate-state.ts arms: the disarm scanner below watches both for a
- *  clear, and scanner 6 demands both of a child's env. HOME is deliberately absent; see scanner 6's rule. */
+/** Two of the three variables test/fixtures/isolate-state.ts arms: the disarm scanner below watches both
+ *  for a clear, and scanner 6 demands both of a child's env. HOME is deliberately absent; see scanner 6's
+ *  rule. The third, DBA_TEST_UNIT_DIR (Batch 2), is deliberately NOT listed: scanner 6 would then demand
+ *  it of every child engine's env, failing the engine spawns that set only these two (e.g.
+ *  test/dispatch.help-anywhere.test.ts), and the disarm scanner would flag test/schedule.install.test.ts's
+ *  tripwire test, which clears it on purpose. A child engine run with a `schedule` command is covered by
+ *  the batch's own rule instead: it carries DBA_TEST_UNIT_DIR in its env, and only `schedule status` (read-
+ *  only probes) may be spawned for real. The runtime tripwire guards DBA_TEST_UNIT_DIR all the same. */
 const ISOLATING_VARS = ["DAILY_BRIEFING_STATE_DIR", "XDG_CONFIG_HOME"];
 
 /** Which of ISOLATING_VARS a disarm match names. */
@@ -864,7 +858,7 @@ test("any test spawning scripts/uninstall.sh passes BOTH DBA_TEST_DIR and DBA_TE
     spawners.push(f);
     const missing = ["DBA_TEST_DIR", "DBA_TEST_PLIST"].filter((v) => !src.includes(v));
     if (missing.length) {
-      offenders.push(`${f} spawns ${INSTALLER_REDIRECTABLE[0]} without ${missing.join(" and ")} — it would launchctl-unload and delete the REAL installed agent`);
+      offenders.push(`${f} spawns ${INSTALLER_REDIRECTABLE[0]} without ${missing.join(" and ")} — it would judge the REAL installed agent, and could have the real engine boot it out and delete it`);
     }
   }
   // The exerciser exists; if it ever stops existing this guard would pass over an empty set.
@@ -1113,8 +1107,8 @@ test("no test names a REAL unit directory — those writes go through DBA_TEST_U
 //
 // ⚠ WHAT THIS PIN DOES NOT PROVE: that the allowlisted files actually clean up after themselves. That is
 // a claim about their BODIES — an `afterEach`, an `afterAll`, an `rm` in a `finally` — and it was verified
-// by MEASUREMENT during #488 (a full run then left exactly one TMPDIR entry, `dba-isolated-state-*`; since 2026-09-19 it leaves the two
-// `dba-isolated-*` baselines from fixtures/isolate-state.ts), not by
+// by MEASUREMENT during #488 (a full run then left exactly one TMPDIR entry, `dba-isolated-state-*`; since 2026-09-19 it leaves the
+// `dba-isolated-*` baselines from fixtures/isolate-state.ts, two until Batch 2 added `dba-isolated-units-*`, three since), not by
 // this scan, which only reads lines. All the scan pins is that a NEW unwrapped site cannot appear outside
 // the list. If an allowlisted file's cleanup were deleted tomorrow this test would still be green.
 //
@@ -1142,8 +1136,9 @@ async function testSources(): Promise<string[]> {
  *  quantifier greedy changes no verdict (measured: that mutant survives, while dropping the lookahead or
  *  the `/g` turns the table test red). The optional `name.` segments take in a namespace-qualified callee
  *  (`fs.mkdtempSync(`, `fs.promises.mkdtemp(`), so the wrap test below sees the whole of it.
- *  REGEX LITERALS on purpose, here and below: `stripComments` erases regex literals, so the scanner
- *  cannot match its own source (the same reason `posture.test.ts` needs no state entry). */
+ *  REGEX LITERALS on purpose, here and below: `blankComments` erases regex literals, so the scanner
+ *  cannot match its own source (the same reason the regex literals in `posture.test.ts` need no state
+ *  entry). */
 const MKDTEMP_RE = /(?:[\w$]+\s*\.\s*)*\bmkdtemp(?:Sync)?\((?:(?!\bmkdtemp(?:Sync)?\().)*?\btmpdir\(\)/g;
 
 /** A wrap that wraps THIS call: the code before the call must END in the wrap's open paren. The bare
@@ -1161,28 +1156,32 @@ const WRAP_BEFORE_RE = /\bremoveAtRunEnd\(\s*(?:await\s+)?$/;
 const IMPORT_ALIAS_RE = /\b(?:mkdtemp(?:Sync)?|tmpdir)\s+as\s+[\w$]+/;
 
 /** Scanner 5's decision for ONE source line — called by the scan and pinned by its own table test.
- *  `strippedFile` is the comment-stripped text of the whole file the line came from.
- *
- *  The line is matched AFTER `stripComments`, so a trailing `// …` or an inline block comment — even one
- *  that names `tmpdir()` itself — changes nothing. A match counts only if the code from it to the end of
- *  the line also appears in `strippedFile`: `stripComments` collapses a multi-line block comment to one
- *  space, so a line from INSIDE one (which the line-level strip cannot recognise, never having seen the
- *  opening) is absent there and is dropped as prose. A substring test rather than a line index, because
- *  that same collapse means the stripped text does not line up with the source. Measured over the real
- *  corpus, `live()` rejects 0 of 219 matches: it is future-proofing, and the table test's two
- *  block-comment rows are its only live input — which is the reason to keep it, not to simplify it away. */
-function tmpSitesOnLine(line: string, strippedFile: string): { sites: number; unwrapped: number; alias: boolean } {
-  const code = stripComments(line);
-  const live = (at: number): boolean => strippedFile.includes(code.slice(at).trimEnd());
+ *  `code` is that line as `blankComments` leaves it: comments and regex literals blanked in the context of
+ *  the WHOLE FILE, so a trailing `// …` or an inline block comment — even one that names `tmpdir()` itself
+ *  — changes nothing (except between a callee and its `(`, or inside `tmpdir()`: see the scan's list),
+ *  and a line inside a multi-line block comment is blank. Stripping the line on its own
+ *  (the rule before 2026-10-05) needed a substring test against the stripped file to drop such lines, and
+ *  still misread lines a parser cannot read out of context: `n) / 2; <call>; // …` and `*\/ <call>; // …`
+ *  each took the call with a phantom regex literal. */
+function tmpSitesOnLine(code: string): { sites: number; unwrapped: number; alias: boolean } {
   let sites = 0;
   let unwrapped = 0;
   for (const m of code.matchAll(MKDTEMP_RE)) {
-    if (!live(m.index)) continue;
     sites++;
     if (!WRAP_BEFORE_RE.test(code.slice(0, m.index))) unwrapped++;
   }
-  const a = IMPORT_ALIAS_RE.exec(code);
-  return { sites, unwrapped, alias: a !== null && live(a.index) };
+  return { sites, unwrapped, alias: IMPORT_ALIAS_RE.test(code) };
+}
+
+/** Scanner 5's decision for every line of one file, in order, each with its 1-based line number and source
+ *  text: each line read from the whole file's `blankComments`. A CR or a line separator OUTSIDE a cut —
+ *  between tokens, in a string, or in a template, whose `${…}` code and comments are kept verbatim — would
+ *  stop MKDTEMP_RE's `.` as surely as one inside a comment, and the scan splits on `\n` alone, so they read
+ *  as spaces. */
+function tmpSitesByLine(src: string): ({ line: number; text: string } & ReturnType<typeof tmpSitesOnLine>)[] {
+  const text = src.split("\n");
+  return blankComments(src).replace(/[\r\u2028\u2029]/g, " ").split("\n")
+    .map((code, i) => ({ line: i + 1, text: text[i]!, ...tmpSitesOnLine(code) }));
 }
 
 /** Files whose unwrapped sites are NOT leaks because they clean up themselves. Every entry names the
@@ -1198,7 +1197,7 @@ const TMP_SELF_CLEANING: Record<string, string> = {
   "test/core.api-provider.test.ts": "an `afterAll` removes the file-scope `stateDir` (test/core.api-provider.test.ts:67-72) and each of the three per-test dirs (:268, :356, :378) goes in a `finally` (:284-285, :372-373, :405-406).",
   "test/tick-heartbeat.test.ts": "an `afterEach` removes the per-test dir (test/tick-heartbeat.test.ts:14-16).",
   "test/run-lock.test.ts": "both dirs are removed by `env.cleanup()` (test/run-lock.test.ts:55-56), which every test calls from a `finally`.",
-  "test/fixtures/isolate-state.ts": "DELIBERATELY never registered and never removed: its two baselines (`dba-isolated-state-*`, `dba-isolated-config-*`) are the only TMPDIR entries a full run is expected to leave, and the reason is recorded at test/fixtures/isolate-state.ts:21 and test/preload.ts:42-44. Registering them would delete the process-wide state and config dirs mid-drain.",
+  "test/fixtures/isolate-state.ts": "DELIBERATELY never registered and never removed: its three baselines (`dba-isolated-state-*`, `dba-isolated-config-*`, `dba-isolated-units-*`) are the only TMPDIR entries a full run is expected to leave, and the reason is recorded in test/fixtures/isolate-state.ts (\"deliberately NOT removed afterwards\") and test/preload.ts's run-end hook comment. Registering them would delete the process-wide state, config and unit dirs mid-drain.",
 };
 
 /** Files excluded from the scan outright, each with the reason. Distinct from the list above: these are
@@ -1206,6 +1205,28 @@ const TMP_SELF_CLEANING: Record<string, string> = {
 const TMP_SCAN_EXCLUDE: Record<string, string> = {
   "test/fixtures/temp-dirs.probe.ts": "the CHILD-PROCESS probe for the registry itself (see test/fixtures/temp-dirs.test.ts). Its two unwrapped sites are the inputs it then hands to `removeAtRunEnd` to observe what the call RETURNS and whether it throws — wrapping them in place would erase the shape under test. Everything it creates lives under a directory the parent test registered, so the run-end drain still removes it.",
 };
+
+/** Scanner 5 over ONE file: its live sites, its unwrapped sites, and the offenders to report, each named by
+ *  the line it came from. The scan calls it per file and the wiring pin below calls it on a fixture, so a
+ *  version of it that stripped lines alone, or reported a verdict against the wrong line, fails that pin.
+ *  The scan's own loop body — its call into this function and the three lines that add up the results —
+ *  is outside the pin. */
+function tmpScanFile(file: string, raw: string): { sites: number; unwrapped: number; offenders: string[] } {
+  let sites = 0;
+  let unwrapped = 0;
+  const offenders: string[] = [];
+  for (const v of tmpSitesByLine(raw)) {
+    sites += v.sites;
+    // Neither allowlist can excuse an ALIASED import, and that asymmetry is deliberate: both lists
+    // excuse an unwrapped SITE, whereas an alias leaves the scan with no site to excuse at all.
+    if (v.alias) offenders.push(`${file}:${v.line}: an aliased mkdtemp/tmpdir import defeats this scan: ${v.text.trim()}`);
+    if (v.unwrapped === 0) continue;               // no site, or every site on the line wrapped in place
+    unwrapped += v.unwrapped;
+    if (file in TMP_SELF_CLEANING || file in TMP_SCAN_EXCLUDE) continue;
+    offenders.push(`${file}:${v.line}: ${v.text.trim()}`);
+  }
+  return { sites, unwrapped, offenders };
+}
 
 test("every mkdtemp under tmpdir() in test/ is registered for run-end removal", async () => {
   const files = await testSources();
@@ -1237,26 +1258,21 @@ test("every mkdtemp under tmpdir() in test/ is registered for run-end removal", 
     //     • a base that is not a literal `tmpdir()` call on that line: a variable holding its result
     //       (`const T = tmpdir();` then `join(T, …)` inside the call), or any rebinding of either name
     //       other than the aliased import refused below (a destructured `{ tmpdir: td }` is not);
-    //     • a line that strips differently read alone than read in file context — one opening with a
-    //       division operator, or one inside a multi-line template literal — which `live()` then drops as
-    //       prose. Contrived, and nothing here writes it, but it is the one miss `live()` itself creates.
+    //     • anything between `mkdtemp`/`mkdtempSync`/`tmpdir` and its `(` — whitespace, a comment, `?.`,
+    //       `!`, type arguments — or inside `tmpdir()`: MKDTEMP_RE reads the call as this repo writes it;
+    //     • literal text inside the call that spells a wrapped call (`removeAtRunEnd(mkdtempSync(`): the
+    //       strip keeps literal text, so the matcher takes the fake call, wrap and all, for the real one;
+    //     • a call nested in another's arguments (`mkdtempSync((removeAtRunEnd(mkdtempSync(…)), …))`): the
+    //       inner callee stops the outer call's match;
     //   LOUD, so it costs a rewrite and never a leak —
     //     • a wrap split across lines (`removeAtRunEnd(` ending the line above the call);
     //     • a callee qualified by anything but plain `name.` segments (`require("node:fs").…`);
-    //     • a commented-out site whose code, from the call to the end of its line, also appears live in
-    //       the same file — counted as live.
-    const stripped = stripComments(raw);
-    raw.split("\n").forEach((line, i) => {
-      const v = tmpSitesOnLine(line, stripped);
-      sites += v.sites;
-      // Neither allowlist can excuse an ALIASED import, and that asymmetry is deliberate: both lists
-      // excuse an unwrapped SITE, whereas an alias leaves the scan with no site to excuse at all.
-      if (v.alias) offenders.push(`${file}:${i + 1}: an aliased mkdtemp/tmpdir import defeats this scan: ${line.trim()}`);
-      if (v.unwrapped === 0) return;               // no site, or every site on the line wrapped in place
-      unwrapped[file] = (unwrapped[file] ?? 0) + v.unwrapped;
-      if (file in TMP_SELF_CLEANING || file in TMP_SCAN_EXCLUDE) return;
-      offenders.push(`${file}:${i + 1}: ${line.trim()}`);
-    });
+    //     • a call spelled inside a string or template literal, which the strip keeps as text — counted
+    //       (hence the split-token fixtures in the table test below).
+    const found = tmpScanFile(file, raw);
+    sites += found.sites;
+    if (found.unwrapped > 0) unwrapped[file] = found.unwrapped;
+    offenders.push(...found.offenders);
   }
 
   // Non-vacuity: 219 live sites at this commit. Floored well below, unlike the floors above, and the
@@ -1291,7 +1307,7 @@ test("every mkdtemp under tmpdir() in test/ is registered for run-end removal", 
 });
 
 test("scanner 5's per-line rule judges EVERY call on a line, after comments are stripped", () => {
-  // ⚠ Every fixture is assembled from split tokens. Scanner 5 reads THIS file too, and `stripComments`
+  // ⚠ Every fixture is assembled from split tokens. Scanner 5 reads THIS file too, and `blankComments`
   // keeps string literals, so a whole mkdtemp-under-tmpdir call — or an aliased import — written out in
   // a string here would be a live offender of the very scan these rows pin.
   const MK = "mkdtemp" + "Sync";
@@ -1326,10 +1342,70 @@ test("scanner 5's per-line rule judges EVERY call on a line, after comments are 
     // KNOWN MISSES, pinned so they stay deliberate — see the list in the scan above.
     ["KNOWN MISS: base held in a variable", `const d = ${MK}(join(T, "x"));`, noSite],
     ["KNOWN MISS: call split across lines", `const d = ${MK}(`, noSite, `const d = ${MK}(\n  join(${TMP}(), "x"),\n);`],
+    // Lines a parser misreads on their own: each loses the call when the line alone is parsed; read in the
+    // context of their file, they keep it.
+    ["a line opening with a division", `  / ${call("x")}.length;`, offender(1, 1), `const n = 1\n  / ${call("x")}.length;`],
+    ["a line opening with a division that closes on the line", `  / ${call("x")} / 2;`, offender(1, 1),
+      `const n = 1\n  / ${call("x")} / 2;`],
+    ["a closing paren, a division, then a comment", `  n) / 2; const d = ${call("x")}; // scratch`, offender(1, 1),
+      `const m = Math.max(1,\n  n) / 2; const d = ${call("x")}; // scratch`],
+    ["code after the end of a multi-line block comment", ` * end */ const d = ${call("x")};`, offender(1, 1),
+      `/* a\n * end */ const d = ${call("x")};\nconst y = 1;`],
+    ["…with a slash later on the line", ` * end */ const d = ${call("a/b")};`, offender(1, 1),
+      `/* a\n * end */ const d = ${call("a/b")};\nconst y = 1;`],
+    ["…opening an array, with a trailing comment", ` */ const ds = [${call("x")}, // first`, offender(1, 1),
+      `/* a\n */ const ds = [${call("x")}, // first\n  2];`],
+    // A comment inside the call that holds a line separator or a lone carriage return: blanked like the rest
+    // of the comment, so the call still reads as one.
+    ["a comment holding U+2028 inside the call", `const d = ${MK}(/* a\u2028b */ join(${TMP}(), "x"));`, offender(1, 1)],
+    ["a comment holding a lone CR inside the call", `const d = ${MK}(/* a\rb */ join(${TMP}(), "x"));`, offender(1, 1)],
+    ["a comment holding U+2029 inside the call", `const d = ${MK}(/* a\u2029b */ join(${TMP}(), "x"));`, offender(1, 1)],
+    // …and outside any cut: in a template's `${…}` code, which is kept verbatim, comments included; in a
+    // string argument; between tokens, where it must read as a space and not vanish (`1<LS>mkdtemp…`
+    // joined up would lose its word boundary); and on a later line of a CRLF file, so every one is replaced.
+    ["U+2028 in a template's code", "const s = `${" + `${MK}(\u2028join(${TMP}(), "x"))` + "}`;", offender(1, 1)],
+    ["a lone CR in a template's code", "const s = `${" + `${MK}(\rjoin(${TMP}(), "x"))` + "}`;", offender(1, 1)],
+    ["a comment holding U+2028 in a template's code", "const s = `${" + `${MK}(/* a\u2028b */ join(${TMP}(), "x"))` + "}`;", offender(1, 1)],
+    ["U+2029 in a string argument", `const d = ${MK}(join("a\u2029b", ${TMP}(), "x"));`, offender(1, 1)],
+    ["U+2028 right before the callee", `const x = 1\u2028${MK}(join(${TMP}(), "x"));`, offender(1, 1)],
+    ["U+2028 in the call on line 2 of a CRLF file", `const d = ${MK}(join(\u2028${TMP}(), "x"));\r`, offender(1, 1),
+      `const a = 1;\r\nconst d = ${MK}(join(\u2028${TMP}(), "x"));\r\n`],
+    ["KNOWN MISS: a comment between the callee and its paren", `const d = ${MK}/* c */(join(${TMP}(), "x"));`, noSite],
+    ["KNOWN MISS: a comment inside tmpdir()", `const d = ${MK}(join(${TMP}(/* c */), "x"));`, noSite],
+    ["KNOWN MISS: a space inside tmpdir()", `const d = ${MK}(join(${TMP}( ), "x"));`, noSite],
+    ["KNOWN MISS: a comment between tmpdir and its paren", `const d = ${MK}(join(${TMP} /* c */(), "x"));`, noSite],
+    ["KNOWN MISS: literal text that poses as the wrap", `const d = ${MK}(join("removeAtRunEnd(${MK}(".slice(0, 0), ${TMP}(), "x"));`,
+      offender(1, 0)],
   ];
-  const got = Object.fromEntries(rows.map(([name, line, , file]) => [name, tmpSitesOnLine(line, stripComments(file ?? line))]));
+  // Each line is judged the way the scan judges it: as a line of its whole file.
+  const inFile = (line: string, file = line): Verdict => {
+    const at = file.split("\n").indexOf(line);
+    expect(`row line found in its file: ${at >= 0}`).toBe("row line found in its file: true");
+    const { sites, unwrapped, alias } = tmpSitesByLine(file)[at]!;
+    return { sites, unwrapped, alias };
+  };
+  const got = Object.fromEntries(rows.map(([name, line, , file]) => [name, inFile(line, file)]));
   const want = Object.fromEntries(rows.map(([name, , verdict]) => [name, verdict]));
   expect(got).toEqual(want);
+});
+
+test("scanner 5 reads each line in its file's context and names the line it came from", () => {
+  // Split tokens, as in the table above: scanner 5 reads this file too.
+  const MK = "mkdtemp" + "Sync";
+  const TMP = "tmp" + "dir";
+  const raw = [
+    "const m = Math.max(1,",
+    `  n) / 2; const d = ${MK}(join(${TMP}(), "x")); // scratch`,   // read alone, a parser loses this call
+    `import { ${MK} as mk } from "node:fs";`,
+  ].join("\n");
+  expect(tmpScanFile("test/fixture.ts", raw)).toEqual({
+    sites: 1,
+    unwrapped: 1,
+    offenders: [
+      `test/fixture.ts:2: n) / 2; const d = ${MK}(join(${TMP}(), "x")); // scratch`,
+      `test/fixture.ts:3: an aliased mkdtemp/tmpdir import defeats this scan: import { ${MK} as mk } from "node:fs";`,
+    ],
+  });
 });
 
 // ── scanner 6: a child `bun` running an entry point gets the isolated env ───────────────────────────
