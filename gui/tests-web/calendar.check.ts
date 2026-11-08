@@ -19,6 +19,7 @@ import { describe, expect, test } from "bun:test";
 import { afterEach, beforeEach } from "bun:test";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { render } from "svelte/server";
 
 import * as engineContract from "../../src/calendar/render-contract";
@@ -190,7 +191,9 @@ describe("the section mirror reproduces the frozen fixture byte for byte", () =>
   const fixture = readSectionFixture();
 
   test("the fixture is the engine's file, with its five variants", () => {
-    expect(SECTION_FIXTURE_PATH.endsWith("daily_briefing_application/test/fixtures/calendar/rendered-section.txt")).toBe(true);
+    // The engine's own file, located from this test rather than by the monorepo folder name: the public
+    // repo has no `daily_briefing_application/` level, and the old suffix check failed there (v0.3.0 dry run).
+    expect(SECTION_FIXTURE_PATH).toBe(join(import.meta.dir, "..", "..", "test", "fixtures", "calendar", "rendered-section.txt"));
     expect([...fixture.keys()]).toEqual(["full-day", "busy-day", "unavailable", "quiet", "no-sources", "merged"]);
     expect(SECTION_SOURCES.map((s) => s.name)).toEqual(["full-day", "busy-day", "unavailable", "quiet", "no-sources", "merged"]);
   });

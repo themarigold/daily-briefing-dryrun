@@ -45,7 +45,10 @@
 #      so a check that rewrote one would ship a tree that is not the commit being certified. A failed HARD
 #      sweep (or a sweep that could not run) is a FAIL. Its SOFT residual list — anything but its "(none)"
 #      line — is a FAIL unless --soft-ok was passed, and is printed either way.
-#   8. bun install --frozen-lockfile && bunx tsc --noEmit && bun test, INSIDE that export — only when
+#   8. bun install --frozen-lockfile && bunx tsc --noEmit && bun test, INSIDE that export, then in its gui/
+#      bun install --frozen-lockfile && bun run test && bun run check (the GUI suite and svelte-check; added
+#      2026-11-07, user-directed, after a GUI test that assumed the monorepo layout failed the v0.3.0 dry
+#      run that check 8 had passed). Both halves run, and either failing is a FAIL. Only when
 #      export-public.sh itself exited 0. A failed export can leave a populated target whose sweep failed
 #      or never ran, and that tree is never gated as if it were the export.
 #   The exported tree has no scripts/export-public.sh (the export excludes itself), so there 7-8 are
@@ -286,7 +289,10 @@ check_export_gates() {
   # Gated on check 7's outcome, not on the directory: a failed export-public.sh can leave a populated
   # target behind (it writes the tree before its sweeps run), and that tree was never swept clean.
   [ -n "$EXPORT_OK" ] || { note "not run: check 7 produced no export that passed its sweep (export-public.sh failed, or was not run)"; return 1; }
-  ( cd "$EXPORT" && bun install --frozen-lockfile && bunx tsc --noEmit && bun test )
+  local failed=""
+  ( cd "$EXPORT" && bun install --frozen-lockfile && bunx tsc --noEmit && bun test ) || failed="$failed engine"
+  ( cd "$EXPORT/gui" && bun install --frozen-lockfile && bun run test && bun run check ) || failed="$failed gui"
+  if [ -n "$failed" ]; then note "failed inside the export:$failed"; return 1; fi
 }
 check_worktree_unchanged() {
   require_pristine_worktree "a check rewrote them, so the checks above did not test HEAD itself"
@@ -330,6 +336,7 @@ if [ -f "$WD/scripts/export-public.sh" ]; then
   echo "  git -C \"$TOPLEVEL\" worktree add --detach \"$REL\" $HEAD_SHA"
   echo "  bash \"$REL/${PREFIX}scripts/export-public.sh\" \"$OUT\""
   echo "  (cd \"$OUT\" && bun install --frozen-lockfile && bunx tsc --noEmit && bun test)"
+  echo "  (cd \"$OUT/gui\" && bun install --frozen-lockfile && bun run test && bun run check)"
   echo "  git -C \"$TOPLEVEL\" worktree remove \"$REL\""
   echo "  then sync \"$OUT\" into the public repo checkout, commit, check the commit's tree and record its sha"
   echo "  (docs/RELEASE.md, step 5), push it (yes), and tag that sha: git tag v$VERSION <sha>; git push --no-follow-tags origin v$VERSION (yes)"

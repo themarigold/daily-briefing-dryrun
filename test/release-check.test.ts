@@ -54,7 +54,8 @@ function stubBin(): string {
     'if [ "$1" = "-e" ]; then exec "$REAL_BUN" "$@"; fi',
     REC("bun").trimEnd(),
     // Inside the export (check 8) only STUB_EXPORT_GATES_RC decides, so a worktree-side knob never leaks there.
-    'case "$PWD" in */export) exit "${STUB_EXPORT_GATES_RC:-0}" ;; esac',
+    // …and its gui/ by STUB_EXPORT_GUI_RC, falling back to STUB_EXPORT_GATES_RC.
+    'case "$PWD" in */export) exit "${STUB_EXPORT_GATES_RC:-0}" ;; */export/gui) exit "${STUB_EXPORT_GUI_RC:-${STUB_EXPORT_GATES_RC:-0}}" ;; esac',
     'case "$*" in',
     '  "install --frozen-lockfile") exit "${STUB_INSTALL_RC:-0}" ;;',
     // STUB_TEST_READY: say so, then hold the check open for a second (the hangup case signals it there).
@@ -115,7 +116,7 @@ function fixture(layout: "monorepo" | "export" = "monorepo"): Fx {
       "#!/bin/sh",
       REC("export-public").trimEnd(),
       '[ -e "$1" ] && { echo "refusing: $1 exists" >&2; exit 1; }',
-      'mkdir -p "$1" && echo "{}" > "$1/package.json"',
+      'mkdir -p "$1/gui" && echo "{}" > "$1/package.json"',
       'echo "— export complete: $1"',
       'if [ "${STUB_EXPORT_RC:-0}" != 0 ]; then echo "✗ HARD residuals found" >&2; exit "$STUB_EXPORT_RC"; fi',
       'echo "— hard residual sweep: clean"',
@@ -145,6 +146,7 @@ function calls(fx: Fx): string[] {
     const cwd = line.slice(0, i).replace(/\/+$/, "");
     const argv = line.slice(i + 1).trim().replace(/\S*\/export$/, "<export>");
     const where = /\/export$/.test(cwd) ? "export"
+      : /\/export\/gui$/.test(cwd) ? "export/gui"
       : /\/worktree(?:\/proj)?\/gui$/.test(cwd) ? "wt/gui"
       : /\/worktree(?:\/proj)?$/.test(cwd) ? "wt"
       : cwd;
@@ -195,6 +197,9 @@ const EVERY_CALL = [
   "export| bun install --frozen-lockfile",
   "export| bunx tsc --noEmit",
   "export| bun test",
+  "export/gui| bun install --frozen-lockfile",
+  "export/gui| bun run test",
+  "export/gui| bun run check",
 ];
 
 /** One shared monorepo fixture for the cases that do not change it (each run makes and removes its own
@@ -322,8 +327,8 @@ describe("release-check.sh: every check runs, whatever failed before it", () => 
     expect(r.code).toBe(1);
     expect(r.status).toEqual({ ...ALL_PASS, "2": "FAIL", "3": "FAIL", "4": "FAIL", "5": "FAIL", "8": "FAIL" });
     expect(r.out).toContain("release-check: FAIL — 5 check(s) failed");
-    // export| bun install is the one command check 8 reaches before its stub fails the chain.
-    expect(r.calls).toEqual(EVERY_CALL.slice(0, -2));
+    // In each half of check 8, bun install is the one command reached before its stub fails that chain.
+    expect(r.calls).toEqual([...EVERY_CALL.slice(0, -5), "export/gui| bun install --frozen-lockfile"]);
   });
 
   test("a failing GUI suite still runs svelte-check and cargo test", () => {
@@ -331,6 +336,24 @@ describe("release-check.sh: every check runs, whatever failed before it", () => 
     expect(r.status).toEqual({ ...ALL_PASS, "5": "FAIL" });
     expect(r.calls).toEqual(EVERY_CALL);
     expect(r.out).toContain("failed: 'bun run test'");
+  });
+
+  test("a GUI failure inside the export fails check 8 alone, after the export's engine gates passed", () => {
+    // The v0.3.0 dry run: the worktree's GUI suite passed (check 5) and the export's engine suite passed,
+    // while a GUI test that assumed the monorepo layout failed in the public tree.
+    const r = run(mono(), [V], { STUB_EXPORT_GUI_RC: "1" });
+    expect(r.code).toBe(1);
+    expect(r.status).toEqual({ ...ALL_PASS, "8": "FAIL" });
+    expect(r.out).toContain("failed inside the export: gui");
+    expect(r.calls).toEqual([...EVERY_CALL.slice(0, -2)]);
+  });
+
+  test("an engine failure inside the export still runs the export's GUI gates", () => {
+    const r = run(mono(), [V], { STUB_EXPORT_GATES_RC: "1", STUB_EXPORT_GUI_RC: "0" });
+    expect(r.status).toEqual({ ...ALL_PASS, "8": "FAIL" });
+    expect(r.out).toContain("failed inside the export: engine");
+    expect(r.out).not.toContain("failed inside the export: engine gui");
+    expect(r.calls).toEqual([...EVERY_CALL.slice(0, -5), ...EVERY_CALL.slice(-3)]);
   });
 
   test("the GUI gate needs the host sidecar: a failed build-sidecar.sh fails check 5 before cargo", () => {

@@ -163,6 +163,7 @@ REL="/private/tmp/dba-release-$V"; OUT="/private/tmp/dba-export-$V"
 git worktree add --detach "$REL" "$SHA"
 bash "$REL/$(git rev-parse --show-prefix)scripts/export-public.sh" "$OUT"
 (cd "$OUT" && bun install --frozen-lockfile && bunx tsc --noEmit && bun test)
+(cd "$OUT/gui" && bun install --frozen-lockfile && bun run test && bun run check)
 git worktree remove "$REL"
 ```
 
