@@ -249,7 +249,7 @@ describe("T7 — the owned-vs-laddered split", () => {
     // clearMark line would never be reached and the test would pass for the wrong reason. An expired
     // mark is selectable, which is exactly the state clearMark exists to tidy up.
     const past = new Date(Date.now() - 3 * 3600e3);
-    await recordLimit(DEFAULT_LABEL, past, new Date(Date.now() - 4 * 3600e3), { isProbe: false, stateDir });
+    await recordLimit(DEFAULT_LABEL, past, new Date(Date.now() - 4 * 3600e3), { reason: "usage", isProbe: false, stateDir });
     expect((await loadAccountState(stateDir)).accounts[DEFAULT_LABEL]).toBeDefined();
 
     const ok = await serve(anthropicOk);
@@ -429,4 +429,63 @@ describe("T13 — the no-comparability-boundary claim, MEASURED", () => {
     const surface = `${JSON.stringify(r.struct)}\n${renderBriefing(r.struct)}\n${r.promptText}\n${r.rawText}`;
     expect(surface.includes(SENTINEL)).toBe(false);
   });
+});
+
+// ── final harden r3: a provider failure never persists calendar text ─────────────────────────────────
+
+describe("final harden r3 — a provider error from a calendar-carrying attempt is a fixed diagnostic", () => {
+  const CAL_SNTL = "SNTLATTENDEE-Zed-agenda-0001";
+  const calendar = async () => ({
+    struct: { events: [], sources: [{ id: "work", kind: "link" as const, status: "ok" as const }], incomplete: false },
+    promptBlocks: { locked: `TODAY'S CALENDAR\n- 10:00 Planning with ${CAL_SNTL}`, unlocked: `TODAY'S CALENDAR\n- 10:00 Planning with ${CAL_SNTL}` },
+    skipOffline: false,
+  });
+  /** An endpoint that rejects the request and ECHOES the part of the prompt holding the sentinel (or its start, when
+   *  there is none) — the shape the fix exists for: the echo lands inside the 600-character diagnostic. */
+  const echoing = (status: number) => (req: { bodyText: string }) => {
+    const at = req.bodyText.indexOf(CAL_SNTL);
+    const echo = at >= 0 ? req.bodyText.slice(at, at + 80) : `ECHO-MARKER ${req.bodyText.slice(0, 40)}`;
+    return new Response(JSON.stringify({ error: { message: `rejected prompt near: ${echo}` } }), { status, headers: { "content-type": "application/json" } });
+  };
+
+  test("an HTTP 400 that echoes the prompt: the message names the kind and status, never the body", async () => {
+    const s = await serve(echoing(400));
+    const cfg = { ...apiCfg(s.origin), calendar: { enabled: true, links: [{ id: "work", urlEnv: "UNUSED_CAL_URL" }] } } as Config;
+    let caught: unknown;
+    try { await runCore(cfg, { ...deps, provider: buildProvider(cfg.provider).provider, calendar }); } catch (e) { caught = e; }
+    expect(s.requests.length).toBeGreaterThanOrEqual(1);
+    expect(s.requests[0]!.bodyText).toContain(CAL_SNTL);         // the request really carried the calendar block
+    expect(caught).toBeInstanceOf(ProviderError);
+    const e = caught as ProviderError;
+    expect(e.message).not.toContain(CAL_SNTL);
+    expect(e.message).not.toContain("rejected prompt");
+    expect(e.message).toContain("HTTP 400");
+    expect(e.message).toContain(`(${e.code}, HTTP 400)`);
+    expect(JSON.stringify(e.warnings ?? [])).not.toContain(CAL_SNTL);
+  });
+
+  test("no calendar block: the message keeps today's body diagnostic", async () => {
+    const s = await serve(echoing(400));
+    const cfg = apiCfg(s.origin);
+    let caught: unknown;
+    try { await runCore(cfg, { ...deps, provider: buildProvider(cfg.provider).provider }); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(ProviderError);
+    expect((caught as ProviderError).message).toContain("HTTP 400 — ");
+    expect((caught as ProviderError).message).toContain("ECHO-MARKER");
+  });
+});
+
+// PR 1 final review round 4, M1 (requirement 9), kept by round 5 M1: four headers origin/main's lenient `Date.parse`
+// read as near dates. On the walls' reading (origin's, round 5) each is a short wait — retried, nothing marked.
+test("round 4 M1: a single anthropic entry's 429 with a present but non-RFC retry-after is retried, never marked", async () => {
+  const now = Date.now();
+  for (const header of [new Date(now + 30e3).toUTCString().replace("GMT", "+0000"), new Date(now + 30e3).toUTCString().replace("GMT", "UTC"),
+    new Date(now + 30e3).toISOString(), "1.5"]) {
+    const s = await serve(status(429, { error: { type: "rate_limit_error", message: "slow down" } }, { "retry-after": header }));
+    const e = await runCore(apiCfg(s.origin), { ...deps, retryDelaysMs: [1] }).then(() => undefined, (x) => x as ProviderError);
+    expect(`${header}: ${e?.code}`).toBe(`${header}: nonzero-exit`);
+    expect(`${header}: ${s.requests.length}`).toBe(`${header}: 2`);              // the try and the schedule's retry
+    expect(`${header}: ${Object.keys((await loadAccountState(stateDir)).accounts).length}`).toBe(`${header}: 0`);
+    await rm(accountStatePath(stateDir), { force: true });
+  }
 });

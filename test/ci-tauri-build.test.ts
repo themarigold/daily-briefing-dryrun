@@ -7,11 +7,16 @@
 // environment from nothing (PATH, HOME, the stubs, the case's own variables), so an APPLE_* variable that
 // happens to be set on the machine running the suite can never leak into a case, or into a real build.
 import "./fixtures/isolate-state";
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, setDefaultTimeout } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
+
+// Nothing here asserts wall time, and bun's 5 s default was failing tests of several runs under load. The shared stubs
+// below remove most of that wait, but each stub's first exec still costs up to 1.8 s (measured at load 6-9).
+// Bun scopes this default to the file (measured, 1.3.14).
+setDefaultTimeout(60_000);
 
 const ROOT = resolve(import.meta.dir, "..");
 const SCRIPT = join(ROOT, "gui", "scripts", "ci-tauri-build.sh");
@@ -48,29 +53,46 @@ interface Run {
   runnerTemp: string;
 }
 
-function run(args: string[], os: "Darwin" | "Linux", extra: Record<string, string> = {}, stubExit = 0): Run {
-  const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-ci-tauri-")));
-  const bin = join(base, "bin");
-  const home = join(base, "home");
-  const runnerTemp = join(base, "runner-temp");
-  for (const d of [bin, home, runnerTemp]) mkdirSync(d, { recursive: true });
-  writeFileSync(join(bin, "uname"), `#!/bin/sh\necho ${os}\n`, { mode: 0o755 });
-  const rec = join(base, "rec");
-  const stub = join(base, "tauri-stub");
+/** The PATH and Tauri stubs, written ONCE per file and shared by every run (as release-check.test.ts does): on
+ *  macOS the first exec of a freshly written executable is the slow part of a run (median 0.7 s at load 6-9, against
+ *  4 ms for the second). Writing them per run took this file from 3 s to 13 s on an idle machine, and one test to 18 s
+ *  under load. A run's own record path and exit come by environment. */
+let sharedStubs: { uname: Record<"Darwin" | "Linux", string>; tauri: string } | undefined;
+function stubs(): NonNullable<typeof sharedStubs> {
+  if (sharedStubs) return sharedStubs;
+  const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-ci-tauri-stubs-")));
+  const uname = { Darwin: join(base, "Darwin"), Linux: join(base, "Linux") };
+  for (const [os, dir] of Object.entries(uname)) {
+    mkdirSync(dir);
+    writeFileSync(join(dir, "uname"), `#!/bin/sh\necho ${os}\n`, { mode: 0o755 });
+  }
+  const tauri = join(base, "tauri-stub");
   writeFileSync(
-    stub,
+    tauri,
     "#!/bin/sh\n" +
-      `env > "${rec}.env"\n` +
-      `printf '%s\\n' "$@" > "${rec}.argv"\n` +
-      `if [ -n "\${APPLE_API_KEY_PATH:-}" ]; then cat "$APPLE_API_KEY_PATH" > "${rec}.key"; fi\n` +
-      `exit ${stubExit}\n`,
+      'env > "$STUB_REC.env"\n' +
+      `printf '%s\\n' "$@" > "$STUB_REC.argv"\n` +
+      'if [ -n "${APPLE_API_KEY_PATH:-}" ]; then cat "$APPLE_API_KEY_PATH" > "$STUB_REC.key"; fi\n' +
+      'exit "$STUB_EXIT"\n',
     { mode: 0o755 },
   );
+  return (sharedStubs = { uname, tauri });
+}
+
+function run(args: string[], os: "Darwin" | "Linux", extra: Record<string, string> = {}, stubExit = 0): Run {
+  const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-ci-tauri-")));
+  const home = join(base, "home");
+  const runnerTemp = join(base, "runner-temp");
+  for (const d of [home, runnerTemp]) mkdirSync(d, { recursive: true });
+  const rec = join(base, "rec");
+  const { uname, tauri } = stubs();
   const env: Record<string, string> = {
-    PATH: `${bin}:/usr/bin:/bin`,
+    PATH: `${uname[os]}:/usr/bin:/bin`,
     HOME: home,
-    TAURI_CMD: stub,
+    TAURI_CMD: tauri,
     RUNNER_TEMP: runnerTemp,
+    STUB_REC: rec,
+    STUB_EXIT: String(stubExit),
     ...extra,
   };
   const r = Bun.spawnSync(["bash", SCRIPT, ...args], { env, stdout: "pipe", stderr: "pipe" });

@@ -38,6 +38,7 @@ export type SkipReason =
   | "provider-fail"
   | "parse-empty"
   | "marker-fail"
+  | "write-fail"
   | "crashed"
   | (string & Record<never, never>);
 
@@ -57,6 +58,10 @@ export interface LastSkip {
   localDate: string;
   reason: SkipReason;
   detail: string | null;
+  /** The engine's `allOutOfUsage` (spec r9 §5, requirement 11): `true` on a `limited` skip where
+   *  EVERY provider is out of usage — the once-a-day out-of-usage notice (Rust decides it). The
+   *  Rust `LastSkip` always serialises it; an older engine's record reads as `false`. */
+  allOutOfUsage: boolean;
 }
 
 /**
@@ -89,7 +94,10 @@ export type Phase =
 export interface ScheduleState {
   phase: Phase;
   /** The one-line status. The tray shows exactly this, and so does the Schedule screen's badge —
-   *  render it, never a mapping of your own from `phase` (or a skip token) to words. */
+   *  render it, never a mapping of your own from `phase` (or a skip token) to words. The one
+   *  exception is the Schedule screen's BODY for a skipped phase: it says the skip reason in plain
+   *  words through `runResultSentence` (`lib/run-result.ts`, wave 2 polish §6). The badge is still
+   *  this line, unmapped. */
   statusLine: string;
   /** The floor IN FORCE (`HH:MM`). For an invalid configured value this is the default the engine
    *  uses, and `floorWarning` says so. */
@@ -128,6 +136,16 @@ export interface ScheduleState {
   /** The engine's manual removal steps for this machine, as text with no closing line — each
    *  surface adds its own. `null` off launchd and systemd, or when the schedule envelope is missing. */
   removeSteps: string | null;
+  /** Provider fallback (P3-M6-T2): the scheduled binary's version as it answers NOW (the engine's
+   *  `scheduledEngineVersion`, gui-seam §2) — `null` when there is no record or the read failed.
+   *  ⚠ NOT `installedEngineVersion`, the install-time record, which goes stale once the binary is
+   *  replaced in place. The older-engine warning shows THIS one. */
+  scheduledEngineVersion: string | null;
+  /** The older-background-engine warning (spec §6), decided in Rust (`older_engine_warning`): two or
+   *  more VALID entries in the provider list, and a scheduled engine older than the first engine
+   *  with same-run switching. For BOTH owners — but a CLI-owned schedule's remedy is text
+   *  (`olderEngineRemedy`, `install-flow.ts`), never this app's install. */
+  olderEngineWarning: boolean;
 }
 
 /** The `state:changed` payload, and what `state_snapshot` returns. */

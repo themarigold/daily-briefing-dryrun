@@ -50,9 +50,8 @@ fn main() {
     }
 }
 
-/// The command list, duplicated from `engine::COMMANDS` + `shell::COMMANDS` +
-/// `briefing_files::COMMANDS` + `config_save::COMMANDS` (in that order — see `commands.rs`'s
-/// `all_commands`) because a build script cannot import its own crate.
+/// The command list, duplicated from every module's `COMMANDS` (in `commands.rs`'s `all_commands`
+/// order) because a build script cannot import its own crate.
 /// `tests/capability.rs` asserts the two agree, so the duplication cannot drift silently — which is
 /// the only reason it is tolerable.
 fn daily_briefing_gui_commands() -> &'static [&'static str] {
@@ -61,7 +60,6 @@ fn daily_briefing_gui_commands() -> &'static [&'static str] {
         "engine_doctor",
         "engine_run",
         "engine_run_to_file",
-        "engine_config_validate",
         "engine_schedule_install",
         "engine_schedule_uninstall",
         "engine_schedule_status",
@@ -71,6 +69,27 @@ fn daily_briefing_gui_commands() -> &'static [&'static str] {
         // Phase E (E12): `update --check --json`, the Settings screen's "Check now". NOT mutating —
         // its one write is the engine's own update-check record — and it takes no operand.
         "engine_update_check",
+        // v0.3.0 (plan M8): the four calendar operations, none with an operand. `status` and `list`
+        // are reads (30 s bound), `test` reads every source now (not mutating; 75 s), and
+        // `connect_mac` is MUTATING — it installs and re-signs the helper copy and raises the
+        // Calendar permission dialog (150 s); off macOS it refuses before any spawn.
+        "engine_calendar_status",
+        "engine_calendar_list",
+        "engine_calendar_test",
+        "engine_calendar_connect_mac",
+        // Provider fallback PR 3 (P3-M1-T1): five of the seven `provider` operations, every one
+        // MUTATING (the in-flight guard holds it) and bounded (15-19 s). `key_set` takes the key,
+        // which reaches the engine on STDIN only; `key_migrate` an index; `key_delete` a key id;
+        // `reset` an index or a label (the label on STDIN, never argv); `key_scrub_backup` holds
+        // the settings save lock across the call. `provider test` has NO command — it takes a file
+        // path, and only the candidate-staging command reaches it. `key delete-all` has none either
+        // since PR 3 final r1 (uninstall runs it Rust-side), nor does `config validate --file`
+        // (the webview's copy returned every literal `apiKey`; see `engine::COMMANDS`).
+        "engine_provider_key_set",
+        "engine_provider_key_migrate",
+        "engine_provider_key_delete",
+        "engine_provider_key_scrub_backup",
+        "engine_provider_reset",
         // T11's shell commands. Not `engine_*`: they spawn nothing — they read the app's own
         // window and state. The capability names them one at a time all the same, because the
         // grant is per command name and "may raise the window" is not "may quit the app".
@@ -91,6 +110,12 @@ fn daily_briefing_gui_commands() -> &'static [&'static str] {
         // that already holds the name is ever replaced), engine-validated, no key and no
         // transcripts block accepted. Closes §10e's open design point (deviation 42).
         "config_create",
+        // Provider fallback PR 3 (P3-M1-T2): the candidate check — the Providers screen's "Check" and
+        // "Test", and the ONLY route to `provider test --file`. JSON text and a closed mode in, never
+        // a path: it stages the candidate itself (0600, `provider-check-…`, removed on every outcome)
+        // and runs `config validate --file` or `provider test --file --index` over it. Writes nothing
+        // to the real config; a Test is MUTATING (the in-flight guard), a validate is not.
+        "provider_candidate_check",
         // B6 (T17): the folder-access flow. Four grants rather than one, because "may read one
         // protected folder from this process" (the macOS prompt trigger), "may reveal the managed
         // engine copy in Finder" and "may open a System Settings pane" are three different powers
@@ -127,5 +152,58 @@ fn daily_briefing_gui_commands() -> &'static [&'static str] {
         // the fixed bundle identifier.
         "autostart_set_enabled",
         "autostart_wizard_default",
+        // v0.3.0 (plan M8): a calendar LINK's Rust side. Three grants because "write a secret link
+        // file", "remove a link (file + config entry)" and "replace the `calendar` config block" are
+        // three powers. The link write takes an id (grammar-checked, `macos` reserved) and the URL
+        // (minimal check; never echoed, never logged) and writes only
+        // `<state>/calendar/links/<id>.url` — 0600 in a 0700 folder, atomic, no symlink followed —
+        // under the engine-reported state dir; the remove takes the id alone; the block save takes
+        // JSON text through the one config-write path. None takes a path.
+        "calendar_link_write",
+        "calendar_link_remove",
+        "calendar_config_save",
+        // Provider fallback PR 3 (P3-M4-T3): the Rust-owned pending-reset store behind Replace. Each
+        // takes a label and the NEW key id (`k-` + 12 lowercase hex), never a path: `add` records a
+        // `pre-save` reset and runs `provider reset` (the label on STDIN); `flush` moves it to
+        // `post-save` after the save and resets again; `drop` discards an unsaved replacement — it
+        // deletes the new key only when the saved config (the engine's `config validate` rows)
+        // references it nowhere. All three are MUTATING through the engine ops they run.
+        "provider_pending_reset_add",
+        "provider_pending_reset_flush",
+        "provider_pending_reset_drop",
+        // The briefing redesign (A-M1): the app-preference store. `get` reads and `set` changes the
+        // first name (used only in the greeting; validated Rust-side) and the slides switch in the
+        // app's own `app-prefs.json` (0600). No path, no spawn, nothing sent to the engine.
+        "app_prefs_get",
+        "app_prefs_set",
+        // The briefing redesign's B1 (wave 2): the live git check. A READ, gated in Rust (window
+        // visibility, the current slide, a stat of each repo's git metadata, one in flight); its
+        // validated request reaches the engine's `repos status --json` on STDIN, never argv. No path.
+        "repos_status",
+        // The briefing redesign, wave 2 (C-M3-T9): today's calendar details, read live and never
+        // saved. Four grants, four powers: `open` asks for a read (gated in Rust on the window's
+        // visibility, the current slide, the reason and one read in flight; the reply carries no
+        // URL); `get` returns one event's people and notes from Rust's map by handle (reads
+        // nothing); `join` opens that event's meeting link by handle after Rust's own validation
+        // (the webview never names a URL; ask-first hosts need `confirmed`); `app_open` launches
+        // the Calendar app by bundle id, taking nothing from any event. None takes a path.
+        "calendar_details_open",
+        "calendar_details_get",
+        "calendar_join",
+        "calendar_app_open",
+        // The briefing redesign's B2 (wave 3): opening things from the deck. Five grants, five powers, none taking a URL, a
+        // path or a command: `open_github` opens one held GitHub target by handle (the GitHub links switch on, the target
+        // re-judged in Rust); `copy_push_command` copies the push command of held branches by handle, its text built in Rust
+        // and never returned; `editor_list` reads the installed editors and the project inventory; `editor_open` launches a
+        // named closed-enum editor on one held folder by handle; `editor_choice_set` remembers a project's editor by its
+        // stable key. The last three are macOS only.
+        "open_github",
+        "copy_push_command",
+        "editor_list",
+        "editor_open",
+        "editor_choice_set",
+        // The briefing redesign's A2 (A2-M4-T13): the one read of the stored AI summary. It takes two
+        // 64-hex identities, never a path; `status --json` is its only spawn; it writes nothing.
+        "read_latest_summary",
     ]
 }

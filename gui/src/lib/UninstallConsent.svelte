@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * Batch 2 (spec 3.3.8, 3.6.2) — the Uninstall action's CONSENT VIEW: what the user sees and answers
-   * between the preview and the execute call. `AppSettings.svelte` owns the call, its errors and the
+   * between the preview and the execute call. `settings/UninstallPanel.svelte` owns the call, its errors and the
    * done screen; this component only draws the preview it is given and hands back what the Uninstall
    * button will send ({@link executeArgs}, or {@link uninstallAnyway}'s after a failed scheduler step).
    *

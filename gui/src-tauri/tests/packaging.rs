@@ -134,6 +134,27 @@ fn the_platform_conf_files_carry_exactly_the_recorded_keys() {
     }
 }
 
+/// v0.3.0 (calendar W3, plan M11; spec r4 §4.1 "Shipping"): the Mac Calendar Reader ships inside the app's
+/// `Contents/Resources`, where the engine (the sidecar, in `Contents/MacOS`) finds it
+/// (`src/calendar/reader.ts` `shippedReaderCandidates`). Built universal by `reader/build.sh` in its own
+/// step before every macOS `tauri build` (each release leg's "Calendar Reader" step, and
+/// verify-dist-local.sh's build step) — NOT as a `build.*` hook here: platform siblings stay bundle-only
+/// (capability.rs, §15b dev 156). The files source is relative to src-tauri/.
+#[test]
+fn the_calendar_reader_is_shipped_in_resources() {
+    let c = conf("tauri.macos.conf.json");
+    let files = c["bundle"]["macOS"]["files"].as_object().expect("bundle.macOS.files is an object");
+    assert_eq!(files.len(), 1, "exactly one shipped extra file");
+    assert_eq!(
+        files["Resources/Daily Briefing Calendar Reader.app"].as_str(),
+        Some("../../reader/build/Daily Briefing Calendar Reader.app")
+    );
+    // The source path resolves to the folder reader/build.sh writes by default.
+    let script = std::fs::read_to_string(src_tauri("../../reader/build.sh")).expect("reader/build.sh");
+    assert!(script.contains("OUT=\"${1:-$HERE/build}\""), "reader/build.sh's default output moved");
+    assert!(script.contains("NAME=\"Daily Briefing Calendar Reader\""), "reader/build.sh's bundle name moved");
+}
+
 #[test]
 fn the_per_platform_targets_are_the_recorded_ones() {
     let expect = [
@@ -239,7 +260,7 @@ fn the_signing_parameters_are_present_and_empty() {
     };
     assert_eq!(
         mac_keys,
-        vec!["dmg", "entitlements", "hardenedRuntime", "signingIdentity"],
+        vec!["dmg", "entitlements", "files", "hardenedRuntime", "signingIdentity"],
         "bundle.macOS keys drifted off §15a's recorded set"
     );
     assert!(
@@ -611,6 +632,8 @@ fn the_size_budget_file_is_schema_valid_and_carries_the_appendix_ceilings() {
         ("deb-x86_64-unknown-linux-gnu", Some(80_000_000)),
         ("appimage-x86_64-unknown-linux-gnu", Some(160_000_000)),
         ("nsis-x86_64-pc-windows-msvc", Some(70_000_000)),
+        // v0.3.0 (calendar W3, plan M11): the universal Calendar Reader shipped in the DMG's Resources.
+        ("reader-universal-apple-darwin", Some(2_000_000)),
     ];
     let mut got: Vec<&String> = artifacts.keys().collect();
     got.sort();

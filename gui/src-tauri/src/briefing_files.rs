@@ -33,6 +33,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tauri::State;
 
 use crate::engine::{Engine, EngineClient, EngineOutcome, NoProgress, Operation, Outcome};
@@ -256,6 +257,181 @@ fn read_capped(path: &Path, cap: u64, single_link: bool) -> Result<String, ReadR
     String::from_utf8(bytes).map_err(|_| ReadRefusal::NotUtf8)
 }
 
+/* ── the latest page's canonical v1 identity ────────────────────────────────────────────────── */
+
+/// Decimal fields are strings so canonical formatting never loses integer precision.
+pub struct PageVersionFields<'a> {
+    pub platform: &'a str,
+    pub volume: &'a str,
+    pub file_id: &'a str,
+    pub size: &'a str,
+    pub mtime_ns: &'a str,
+    pub ctime_ns: &'a str,
+}
+
+/// The same seven fields and final LF as `src/summary/page-version.ts`.
+pub fn canonical_page_version(fields: &PageVersionFields<'_>) -> Option<String> {
+    let unsigned = |value: &str| {
+        value == "0"
+            || (value
+                .as_bytes()
+                .first()
+                .is_some_and(|b| matches!(b, b'1'..=b'9'))
+                && value.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let signed = |value: &str| {
+        unsigned(value)
+            || value
+                .strip_prefix('-')
+                .is_some_and(|v| v != "0" && unsigned(v))
+    };
+    let file_id_ok = match fields.platform {
+        "unix" => unsigned(fields.file_id),
+        "windows" => {
+            fields.file_id.len() == 32
+                && fields
+                    .file_id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+        }
+        _ => false,
+    };
+    if !file_id_ok
+        || !unsigned(fields.volume)
+        || !unsigned(fields.size)
+        || !signed(fields.mtime_ns)
+        || !signed(fields.ctime_ns)
+    {
+        return None;
+    }
+    Some(format!(
+        "summary-page-v1\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        fields.platform,
+        fields.volume,
+        fields.file_id,
+        fields.size,
+        fields.mtime_ns,
+        fields.ctime_ns,
+    ))
+}
+
+pub fn page_version_for(fields: &PageVersionFields<'_>) -> Option<String> {
+    canonical_page_version(fields)
+        .map(|canonical| format!("{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+/// FILE_ID_128 in array-byte order, including leading zero bytes; never GUID order.
+pub fn windows_file_id(bytes: &[u8]) -> Option<String> {
+    (bytes.len() == 16).then(|| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Native FILETIME ticks (100 ns) in exact wide arithmetic, up to the unsigned 64-bit boundary.
+pub fn windows_ticks_to_unix_ns(ticks: u64) -> String {
+    ((i128::from(ticks) - 116_444_736_000_000_000) * 100).to_string()
+}
+
+#[cfg(unix)]
+fn metadata_page_version(meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    page_version_for(&PageVersionFields {
+        platform: "unix",
+        volume: &meta.dev().to_string(),
+        file_id: &meta.ino().to_string(),
+        size: &meta.len().to_string(),
+        mtime_ns: &(i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()))
+            .to_string(),
+        ctime_ns: &(i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()))
+            .to_string(),
+    })
+}
+
+// Open question 3 (a): without a reliable native identity, summaries are unavailable.
+#[cfg(not(unix))]
+fn metadata_page_version(_meta: &std::fs::Metadata) -> Option<String> {
+    None
+}
+
+/// The page version `before` gives, only if the read stayed on that one unchanged file: every
+/// byte `before` promised was read, the opened file still matches it, and the path still names it.
+pub fn stable_page_version(
+    before: &std::fs::Metadata,
+    read_len: u64,
+    after: Option<&std::fs::Metadata>,
+    current: Option<&std::fs::Metadata>,
+) -> Option<String> {
+    let version = metadata_page_version(before)?;
+    let same_file = |meta: Option<&std::fs::Metadata>| {
+        meta.is_some_and(|m| {
+            m.is_file() && metadata_page_version(m).as_deref() == Some(version.as_str())
+        })
+    };
+    (read_len == before.len() && same_file(after) && same_file(current)).then_some(version)
+}
+
+/// Read the page once; an unstable identity leaves the ordinary page usable without a summary.
+/// `read_capped` stays unchanged because config saves and archived reads share it.
+fn read_latest_capped(path: &Path) -> Result<(String, Option<(String, String)>), ReadRefusal> {
+    let file = open_no_follow(path)?;
+    let before = file
+        .metadata()
+        .map_err(|e| ReadRefusal::Io(e.to_string()))?;
+    if !before.is_file() {
+        return Err(ReadRefusal::NotAFile);
+    }
+    if before.len() > MAX_BRIEFING_BYTES {
+        return Err(ReadRefusal::TooLarge {
+            bytes: before.len(),
+        });
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&file)
+        .take(MAX_BRIEFING_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| ReadRefusal::Io(e.to_string()))?;
+    if bytes.len() as u64 > MAX_BRIEFING_BYTES {
+        return Err(ReadRefusal::TooLarge {
+            bytes: MAX_BRIEFING_BYTES + 1,
+        });
+    }
+    let after = file.metadata().ok();
+    let current = std::fs::symlink_metadata(path).ok();
+    let identity = stable_page_version(
+        &before,
+        bytes.len() as u64,
+        after.as_ref(),
+        current.as_ref(),
+    )
+    .map(|version| (format!("{:x}", Sha256::digest(&bytes)), version));
+    let text = String::from_utf8(bytes).map_err(|_| ReadRefusal::NotUtf8)?;
+    Ok((text, identity))
+}
+
+/// Latest-page read with identity from that same descriptor, never a second page read.
+pub fn read_latest_briefing_at(path: &Path) -> Result<BriefingFile, BriefingError> {
+    match read_latest_capped(path) {
+        Ok((text, identity)) => {
+            let (page_hash, page_version) = match identity {
+                Some((hash, version)) => (Some(hash), Some(version)),
+                None => (None, None),
+            };
+            Ok(BriefingFile {
+                path: path.display().to_string(),
+                bytes: text.len() as u64,
+                text,
+                page_hash,
+                page_version,
+            })
+        }
+        Err(ReadRefusal::NotFound) => Err(BriefingError::NotFound {
+            path: path.display().to_string(),
+        }),
+        Err(refusal) => Err(BriefingError::Unreadable {
+            path: path.display().to_string(),
+            detail: refusal.describe(path, MAX_BRIEFING_BYTES),
+        }),
+    }
+}
+
 /* ── what the webview receives ────────────────────────────────────────────────────────────────── */
 
 /// One briefing file, as text.
@@ -268,6 +444,11 @@ pub struct BriefingFile {
     /// (`src/render.ts`, `stripControl`). The webview renders it through the escape-first renderer.
     pub text: String,
     pub bytes: u64,
+    /// Latest-page identity only; History's wire result remains unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_version: Option<String>,
 }
 
 /// Why a read failed. Tagged by `kind`, like `EngineError`.
@@ -291,6 +472,8 @@ pub fn read_briefing_at(path: &Path) -> Result<BriefingFile, BriefingError> {
             path: path.display().to_string(),
             bytes: text.len() as u64,
             text,
+            page_hash: None,
+            page_version: None,
         }),
         Err(ReadRefusal::NotFound) => Err(BriefingError::NotFound {
             path: path.display().to_string(),
@@ -412,7 +595,7 @@ pub async fn read_latest_briefing(
         paths.latest_briefing_path.as_ref(),
     )
     .map_err(|detail| BriefingError::Engine { detail })?;
-    match read_briefing_at(&path) {
+    match read_latest_briefing_at(&path) {
         Ok(file) => Ok(Some(file)),
         Err(BriefingError::NotFound { .. }) => Ok(None),
         Err(e) => Err(e),

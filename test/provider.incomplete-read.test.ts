@@ -240,7 +240,8 @@ test("a TRUNCATED stdout is returned rather than discarded — the fail-open, on
   // Without this pin the fail-open is indistinguishable from an oversight, and a future "make it match
   // runGit" change would look like a consistency fix.
   const out = await bounded(sh("printf 'HALF A BRIEF'; sleep 3 &", { flushMs: 150 }).generate("x"));
-  expect(out).toBe("HALF A BRIEF");
+  // Without EOF or whitespace the last token could be a credential prefix, so it is withheld.
+  expect(out).toBe("HALF A ");
 });
 
 test("the readers are abandoned on the TIMEOUT path too, not only after a clean exit", async () => {

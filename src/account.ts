@@ -8,6 +8,7 @@
 //     discipline below has exactly one place it can be broken.
 import { join } from "node:path";
 import { supportDir } from "./marker";
+import { writePrivateAtomic } from "./strictFile";
 
 /** A mark is ALWAYS a real instant — never null. An "unknown expiry" sentinel would have to mean either
  *  "never retry" or "retry immediately", and each reading breaks a requirement: never-retry benches an
@@ -15,7 +16,24 @@ import { supportDir } from "./marker";
  *  reached and the whole feature silently does nothing while appearing to work.
  *  `isProbe` distinguishes a PARSED reset from a probe deadline (a parse failure, or a non-limit failure
  *  on a non-first account). The skip message may only claim "resets at…" for a parsed one. */
-export type AccountMark = { limitedUntil: string; isProbe: boolean };
+export type AccountMark = { limitedUntil: string; isProbe: boolean; reason?: MarkReason };
+
+/** An hour-class mark's reason (provider fallback, spec r9 §5): the failure that benched the entry for an
+ *  hour. `earlier-failure` is the reported reason for a mark with no recorded cause — a legacy probe mark (an
+ *  older engine's non-limit failure on a non-first account wrote one with no reason). */
+export const HOUR_MARK_REASONS = ["auth", "key-unavailable", "not-installed", "not-found", "unusable-answer", "cli-failure", "earlier-failure"] as const;
+export type HourMarkReason = typeof HOUR_MARK_REASONS[number];
+/** Why an entry is benched. `usage` is the only non-hour reason. */
+export type MarkReason = "usage" | HourMarkReason;
+/** Derived from `HOUR_MARK_REASONS`, the one list (a test checks it covers every hour-class row of src/failover.ts). */
+const MARK_REASONS: ReadonlySet<string> = new Set<string>(["usage", ...HOUR_MARK_REASONS]);
+
+/** A mark's reason as the walk reads it. A mark with no `reason` (written by an older engine, which rewrites
+ *  the whole file and drops the field) keeps the legacy reading: `isProbe:false` is usage, `isProbe:true` the
+ *  hour class, reported `earlier-failure` (spec r9 §5 "Marks", including its accepted one-time residual). */
+export function markReason(mark: AccountMark): MarkReason {
+  return mark.reason ?? (mark.isProbe ? "earlier-failure" : "usage");
+}
 
 /** `lastLimit` is the outage CAUSE, and per the spec the cause is the TRIGGER for reporting: a gap alone
  *  fires on a closed laptop over a weekend. Duration comes from `last-run` (durable, written on a
@@ -108,7 +126,9 @@ export async function loadAccountState(stateDir?: string): Promise<AccountState>
     const until = Date.parse(m.limitedUntil);
     if (!Number.isFinite(until)) continue;               // nonsense date ⇒ dropped
     if (until - nowMs > MAX_MARK_MS) continue;           // far future ⇒ DISCARDED (see resolveAccount)
-    accounts[label] = { limitedUntil: m.limitedUntil, isProbe: m.isProbe === true };
+    // `reason` is carried only when it is one this engine knows; anything else falls back to the legacy reading.
+    const reason = typeof m.reason === "string" && MARK_REASONS.has(m.reason) ? { reason: m.reason as MarkReason } : {};
+    accounts[label] = { limitedUntil: m.limitedUntil, isProbe: m.isProbe === true, ...reason };
   }
   const ll = r.lastLimit as Record<string, unknown> | undefined;
   const lastLimit = ll && typeof ll.label === "string" && typeof ll.at === "string"
@@ -121,13 +141,10 @@ export async function loadAccountState(stateDir?: string): Promise<AccountState>
  *  costs one wasted provider call and is re-recorded by the next limit; a torn read would poison every
  *  subsequent run. Bounded and self-correcting beats consistent-but-fragile here. */
 async function writeAccountState(state: AccountState, stateDir?: string): Promise<void> {
-  const path = accountStatePath(stateDir);
-  // Unique PER CALL, not per process: two concurrent writers sharing one temp name meant the first
-  // rename moved it away and the second failed ENOENT. Caught by the concurrency test.
-  const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
-  await Bun.write(tmp, JSON.stringify(state, null, 2));
-  const { rename } = await import("node:fs/promises");
-  await rename(tmp, path);
+  // The one shared private, atomic writer (PR 1 final review round 1, M9): a unique temp per call (two concurrent
+  // writers sharing one name raced the rename — caught by the concurrency test), created 0600 whatever the umask
+  // (it was `Bun.write`, the umask's 0644), renamed over the record; no temp left behind; a failure is thrown.
+  await writePrivateAtomic(accountStatePath(stateDir), JSON.stringify(state, null, 2));
 }
 
 /** Clamp at WRITE (the read path discards instead — see loadAccountState). */
@@ -141,43 +158,82 @@ export function clampUntil(until: Date, now: Date): string {
   return new Date(Math.min(t, max)).toISOString();
 }
 
-/** Record a limit. `report: false` for a non-limit probe mark (a broken login) — it marks the account but
- *  writes NO `lastLimit`, so a developer- or auth-caused event is never reported to the user as a usage
- *  limit outage. Read-modify-write: marking one account must not erase the other's mark. */
+/** Record a limit. The `reason` is REQUIRED (provider fallback, P1-M5-T1), so no call site can write a mark whose
+ *  class has to be guessed later: the usage call site passes `"usage"` — also for an unparsed wall, which is
+ *  written with `isProbe: true` and must still read as usage, not as an hour mark item 1 would ignore.
+ *  `report: false` for a non-limit mark — it marks the account but writes NO `lastLimit`, so a developer- or
+ *  auth-caused event is never reported to the user as a usage limit outage. Read-modify-write: marking one
+ *  account must not erase the other's mark. NON-FATAL: a failed write is swallowed (the state is advisory). */
 export async function recordLimit(
-  label: string, until: Date, now: Date, opts: { isProbe?: boolean; report?: boolean; stateDir?: string } = {},
-): Promise<void> {
-  const state = await loadAccountState(opts.stateDir);
-  state.accounts[label] = { limitedUntil: clampUntil(until, now), isProbe: opts.isProbe === true };
-  if (opts.report !== false) state.lastLimit = { label, at: now.toISOString() };
-  await writeAccountState(state, opts.stateDir);
+  label: string, until: Date, now: Date, opts: { reason: MarkReason; isProbe?: boolean; report?: boolean; stateDir?: string },
+): Promise<boolean> {
+  try {
+    const state = await loadAccountState(opts.stateDir);
+    state.accounts[label] = markFor(until, now, opts);
+    if (opts.report !== false) state.lastLimit = { label, at: now.toISOString() };
+    await writeAccountState(state, opts.stateDir);
+    return true;
+  } catch { return false; /* a lost mark costs one wasted provider call; a throw here would cost the run */ }
+}
+
+/** The mark `recordLimit` writes, for a caller that must reason about it even when the write failed. */
+export function markFor(until: Date, now: Date, opts: { reason: MarkReason; isProbe?: boolean }): AccountMark {
+  return { limitedUntil: clampUntil(until, now), isProbe: opts.isProbe === true, reason: opts.reason };
+}
+
+/**
+ * Bench a NON-first entry for an hour after a failure of class `reason` (provider fallback, P1-M5-T1). Never the
+ * current item 1 (`item1Label`): returns false and writes nothing. Writes no `lastLimit` — a failure is not a
+ * usage wall. Non-fatal, like `recordLimit`.
+ */
+export async function recordHourMark(
+  label: string, reason: HourMarkReason, now: Date, opts: { item1Label: string; stateDir?: string },
+): Promise<boolean> {
+  if (label === opts.item1Label) return false;   // never bench item 1 on a failure (account.ts's standing rule)
+  return recordLimit(label, new Date(now.getTime() + PROBE_MS), now, { reason, isProbe: true, report: false, stateDir: opts.stateDir });
 }
 
 /** A success clears ONLY the succeeding account's mark. Clearing broadly would erase the primary's mark
  *  the moment the fallback succeeds, so the next tick retries the primary and stickiness is silently
  *  gone. Usually a no-op; it exists for the case where it is not. */
 export async function clearMark(label: string, stateDir?: string): Promise<void> {
-  const state = await loadAccountState(stateDir);
-  if (!(label in state.accounts)) return;
-  delete state.accounts[label];
-  await writeAccountState(state, stateDir);
+  try { await removeMark(label, { stateDir }); } catch { /* non-fatal (P1-M5-T1): a mark left behind expires on its own */ }
 }
 
-/** §4a — a NON-limit failure under an account that is not the first entry.
- *
- *  Scoped by POSITION, never by the word "default": on a two-entry config every account is
- *  "non-default", so a label-based rule would mark the PRIMARY on an ordinary wake-before-wifi
- *  `nonzero-exit` — the most common transient failure this codebase has, and the one the whole
- *  `failFastMs` ladder exists for. The first entry is only ever marked by a real limit.
- *
- *  Writes NO `lastLimit`: an auth failure is not a usage wall, and recording it as one would later
- *  report a broken fallback login to the user as a usage-limit outage. */
-export async function recordAuthProbe(
-  label: string, accounts: readonly AccountSpec[] | undefined, now: Date, stateDir?: string,
-): Promise<boolean> {
-  if (effectiveAccounts(accounts)[0]?.label === label) return false;   // never bench the primary on a blip
-  await recordLimit(label, new Date(now.getTime() + PROBE_MS), now, { isProbe: true, report: false, stateDir });
+/**
+ * Remove `label`'s mark — only when `only` (if given) accepts it — and say whether one was removed (provider fallback,
+ * P2-M1-T2: `provider reset` and a passing `provider test`). Read-modify-write like every writer here; the CALLER holds
+ * the run lock (spec r9 §5 "One writer at a time"). Unlike `clearMark` it THROWS on a failed write, so an operation the
+ * user asked for can report that it did not happen. Nothing is written when there is nothing to remove.
+ */
+export async function removeMark(label: string, opts: { stateDir?: string; only?: (mark: AccountMark) => boolean } = {}): Promise<boolean> {
+  const state = await loadAccountState(opts.stateDir);
+  const mark = state.accounts[label];
+  if (mark === undefined || (opts.only !== undefined && !opts.only(mark))) return false;
+  delete state.accounts[label];
+  await writeAccountState(state, opts.stateDir);
   return true;
+}
+
+/** The walk's view of the marks (provider fallback, spec r9 §4–§5). PURE. Splits `entries` into the ones a mark
+ *  does not bench (input order kept) and the `skipped-by-mark` ones with their reason and expiry. An hour-class
+ *  mark on the CURRENT item 1 is ignored here — it stays in the file — so moving an entry to the top makes it run;
+ *  a usage mark still applies to item 1. Active means `resolveAccount`'s rule (unexpired, parseable, in bounds).
+ *  `resolveAccount` and `resolveForScript` do not use this: the audit judge keeps today's reading. */
+export function markFilter<E extends { label: string }>(
+  entries: readonly E[], state: AccountState, now: Date, item1Label: string,
+): { eligible: E[]; skipped: { entry: E; reason: MarkReason; until: string }[] } {
+  const t = now.getTime();
+  const eligible: E[] = [];
+  const skipped: { entry: E; reason: MarkReason; until: string }[] = [];
+  for (const entry of entries) {
+    const mark = state.accounts[entry.label];
+    if (!mark || !isMarkActive(mark, t)) { eligible.push(entry); continue; }
+    const reason = markReason(mark);
+    if (reason !== "usage" && entry.label === item1Label) { eligible.push(entry); continue; }
+    skipped.push({ entry, reason, until: mark.limitedUntil });
+  }
+  return { eligible, skipped };
 }
 
 /** Cleared after a successful DELIVERY, unconditionally — not only when an outage line was rendered.

@@ -1,0 +1,311 @@
+{
+  "_comment": "Plan §0, B2 final round 4. Each case's `facts` are what real git leaves behind for that flow: test/repos.reach.test.ts builds the flow, compares the engine's facts with them, runs `expect.command` for real and runs a plain `git push` to confirm what is a destination. tests/actions.rs mints from the same literal. `expect` is what the local branch `feat` may open, and `copy` is its refusal or, with `command`, what follows `git -C <repo> push`. When a pushRemote or pushDefault selects another remote, a branch's upstream is not its destination, whatever its name: the same-name-at-tip rule decides the links, on the selected remote. With no such selection, an upstream of the branch's own name is its destination, and one named differently is only when `pushesToUpstream` holds. Otherwise that upstream is only where the branch started: the same-name-at-tip rule decides the links, and Copy names the branch's own name with no -u. With two or more remotes and no selection, such a branch's Copy names `origin` when that is one of them, and otherwise has no remote to name and refuses `ambiguous`.",
+  "cases": {
+    "never pushed, started from the default": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "main", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "new branch still at the default's tip": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "main", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": true }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "pushed without -u": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "main", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "pushed without -u, then a local commit": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "main", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": false }, { "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "started from origin/develop, never pushed": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "develop", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "develop", "atTip": false }, { "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "started from origin/develop, pushed": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "develop", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "develop", "atTip": false }, { "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, upstream/main with pushRemote origin": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "main", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, upstream/main with pushRemote origin, never pushed": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "main", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, upstream/main with no selection, never pushed": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "main", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, push.default current, upstream/main with no selection, never pushed": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "main", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "two remotes, neither origin, upstream/main with no selection, never pushed": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "fork", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "main", "pushRemote": null },
+        "remoteBranches": [{ "remote": "fork", "name": "main", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": "ambiguous", "command": null }
+    },
+    "fork, upstream/develop with pushRemote origin": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "develop", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "develop", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, upstream's default unknown": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": null }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "main", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "default unknown, never pushed": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": null }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "main", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "default unknown, pushed without -u": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": null }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "main", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "upstream set to topic, git's own push.default": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "topic", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "origin", "name": "topic", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "upstream set to topic, git's own push.default, default unknown": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": null }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "topic", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "origin", "name": "topic", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "real rename, push.default upstream": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": true,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "topic", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "origin", "name": "topic", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/topic", "compare": "https://github.com/org/repo/compare/main...topic", "copy": "name-mismatch", "command": null }
+    },
+    "real rename, push.default tracking": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": true,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "topic", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "origin", "name": "topic", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/topic", "compare": "https://github.com/org/repo/compare/main...topic", "copy": "name-mismatch", "command": null }
+    },
+    "real rename, push.default upstream, default unknown": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": true,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": null }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "topic", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "origin", "name": "topic", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/topic", "compare": null, "copy": "name-mismatch", "command": null }
+    },
+    "real rename, push.default upstream, pushRemote names the upstream's remote": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": true,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "topic", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "origin", "name": "topic", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/topic", "compare": "https://github.com/org/repo/compare/main...topic", "copy": "name-mismatch", "command": null }
+    },
+    "fork, push.default upstream, pushRemote selects another remote": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": true,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "develop", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "develop", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, push.default upstream, pushDefault selects another remote": {
+      "facts": {
+        "pushDefault": "origin", "pushesToUpstream": true,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "develop", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "develop", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "same-named upstream behind the local tip": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "feat", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": false }, { "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "same-named upstream behind the local tip, pushRemote names its remote": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "feat", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": false }, { "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "same-named upstream behind the local tip, pushDefault names its remote": {
+      "facts": {
+        "pushDefault": "origin", "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "origin", "upstreamBranch": "feat", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": false }, { "remote": "origin", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, same-named upstream/feat with pushRemote origin, never pushed": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "feat", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "feat", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, same-named upstream/feat with pushRemote origin, never pushed, still at its tip": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "feat", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": true }, { "remote": "upstream", "name": "feat", "atTip": true }, { "remote": "upstream", "name": "main", "atTip": true }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, same-named upstream/feat with pushRemote origin, pushed": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "feat", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "feat", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, same-named upstream/feat with pushRemote origin, both at its tip": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "feat", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": true }, { "remote": "upstream", "name": "feat", "atTip": true }, { "remote": "upstream", "name": "main", "atTip": true }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, same-named upstream/feat with pushDefault origin, never pushed, still at its tip": {
+      "facts": {
+        "pushDefault": "origin", "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "feat", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": true }, { "remote": "upstream", "name": "feat", "atTip": true }, { "remote": "upstream", "name": "main", "atTip": true }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, same-named upstream/feat with pushDefault origin, pushed": {
+      "facts": {
+        "pushDefault": "origin", "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "feat", "pushRemote": null },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "feat", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, push.default upstream, same-named upstream/feat with pushRemote origin": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": true,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "feat", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "feat", "atTip": true }, { "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "feat", "atTip": false }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": "https://github.com/org/repo/tree/feat", "compare": "https://github.com/org/repo/compare/main...feat", "copy": null, "command": "-- 'origin' 'feat'" }
+    },
+    "fork, upstream/develop with pushRemote origin, feat only on upstream": {
+      "facts": {
+        "pushDefault": null, "pushesToUpstream": false,
+        "remotes": [{ "name": "origin", "owner": "org", "defaultBranch": "main" }, { "name": "upstream", "owner": "acme", "defaultBranch": "main" }],
+        "branch": { "upstreamRemote": "upstream", "upstreamBranch": "develop", "pushRemote": "origin" },
+        "remoteBranches": [{ "remote": "origin", "name": "main", "atTip": false }, { "remote": "upstream", "name": "develop", "atTip": false }, { "remote": "upstream", "name": "feat", "atTip": true }, { "remote": "upstream", "name": "main", "atTip": false }]
+      },
+      "expect": { "branch": null, "compare": null, "copy": null, "command": "-- 'origin' 'feat'" }
+    }
+  }
+}

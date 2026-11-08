@@ -11,12 +11,14 @@ argv plus stdout.
 
 | Need | Invocation |
 | --- | --- |
-| "brief me now" | `<bin> run --force` |
+| "brief me now" (still once a day — the app's Run now) | `<bin> run --now` |
+| "regenerate today's" | `<bin> run --force` |
 | structured outcome of a run | `<bin> run --json` (stdout) or `--json-out <name>` (a file **beside the stdout envelope**, not instead of it) |
 | engine state | `<bin> status --json` |
 | health check | `<bin> doctor --json` |
 | validate a config about to be written | `<bin> config validate --json --file <path>` |
 | **scheduling** | `<bin> schedule install\|uninstall\|status\|verify` |
+| keys, entry reset, Test (provider fallback PR 2) | `<bin> provider key …\|reset\|test … --json` — §1d |
 
 ⚠ **A subcommand must come FIRST.** `<bin> --json status` is REFUSED (exit 2), not treated as
 `status`. It used to route to `run` and discard the token, so a Schedule panel polling every few
@@ -49,14 +51,20 @@ dependency of the shell crate and the capability grants no `shell:*` permission.
 | --- | --- |
 | `engine_status` | `status --json` |
 | `engine_doctor` | `doctor --json` |
-| `engine_run` | `run --json [--force]` |
-| `engine_run_to_file` | `run --json [--force] --json-out <name>` — `<name>` is a bare `.json` filename, resolved by the engine under its state directory (§1) |
-| `engine_config_validate` | `config validate --json --file <path>` |
+| `engine_run` | `run --json [--force] [--now]` |
+| `engine_run_to_file` | `run --json [--force] [--now] --json-out <name>` — `<name>` is a bare `.json` filename, resolved by the engine under its state directory (§1) |
 | `engine_schedule_install` | `schedule install --invoker app [--take-over]` |
 | `engine_schedule_uninstall` | `schedule uninstall --invoker app [--take-over]` |
 | `engine_schedule_status` | `schedule status --json` |
 | `engine_schedule_verify` | `schedule verify --json` — B6/T20; **mutating** (§11) |
 | `engine_update_check` | `update --check --json` — Phase E (E12); **not** mutating, so never blocked by a run in flight (below) |
+
+⚠ **`engine_config_validate` (`config validate --json --file <path>`) was in this table until PR 3 final round 1
+dropped it.** It returned the engine's report verbatim — `normalized` with every literal `apiKey` — for any absolute
+file the webview named, the real `config.json` included, which undercut PR 3's redaction; no app code called it.
+`Operation::ConfigValidate` stays, built only Rust-side over a file Rust staged or owns (the settings guard,
+`provider_candidate_check` §1e, uninstall's kept-schedule check), and `tests/capability.rs`'s
+`the_dropped_config_validate_and_key_delete_all_commands_are_refused` pins the refusal.
 
 Slice 5's shell adds three more (T10/T11/T14). They spawn nothing of their own; `state_snapshot` is
 the only one that reaches the engine, and it does so through the same `EngineClient`:
@@ -115,17 +123,137 @@ either:
 | `autostart_set_enabled` | takes one boolean. ON: the autostart plugin's `enable()`, then — macOS — `AssociatedBundleIdentifiers` = the bundle id added to the plist it wrote (`autostart::brand_launch_agent`). OFF: its `disable()`. Records that a login-item choice was made. The Settings toggle and the wizard's Finish |
 | `autostart_wizard_default` | READS the login-item record and `is_enabled()`: the wizard's pre-tick (ON for a fresh install, else the real state). Enables nothing |
 
-⚠ **The pinned spellings, as of B8: SEVEN module `COMMANDS` lists concatenated into one, compared
-against four external spellings.** `engine::COMMANDS`, `shell::COMMANDS`,
+The briefing redesign (A-M1) adds two more: the app-preference store, `src/app_prefs.rs`. Neither
+takes a path, spawns anything or sends anything to the engine; the first name is used only in the
+greeting:
+
+| Command | Argument | What it does | Answers |
+| --- | --- | --- | --- |
+| `app_prefs_get` | none | READS `<app_data_dir>/app-prefs.json`; a missing, corrupt, oversized or symlinked file reads as the defaults, field by field | `{firstName?, slides, githubLinks, editorChoices, revision}` (`firstName` absent = unset; `slides` and `githubLinks` default to `true`; `editorChoices` maps a project key to an editor token or `"ask"`, defaults to `{}`, and an invalid entry drops alone; a project with no entry was never chosen; `revision` = the store's successful writes this session, read under its mutex) |
+| `app_prefs_set` | `{patch: {firstName?, slides?, githubLinks?}}` (one named argument; an unknown field is refused, `editorChoices` among them: only `editor_choice_set` writes those) | validates the name first (trimmed; empty unsets it; at most 40 Unicode scalar values; no control or `Bidi_Control` character, and no U+2028 / U+2029 line or paragraph separator; at least one character that is neither `White_Space` nor `Default_Ignorable_Code_Point`), then one read-modify-write under the store's mutex: a new 0600 temp file (`app-prefs.json.tmp-<pid>-<seq>`), renamed over the store. An empty patch writes nothing. Every write, `editor_choice_set`'s too, first measures the whole serialized file against 16 KiB (`MAX_PREFS_BYTES`, the size a read will take): over it, the write is refused before the temp file, with the old file and the revision unchanged | the values now stored with the revision (bumped under the mutex by a write that landed; the webview keeps the answer with the highest revision), or `{kind: "invalidInput", field: "firstName", reason}` (the sentence the Settings row shows; nothing written), `{kind: "preferences-full"}` (mapped to a fixed sentence by the webview; nothing written) or `{kind: "store", detail}` (`detail` can name paths, so the GitHub links switch shows a fixed sentence instead) |
+
+Uninstall's app leg removes `app-prefs.json` and its `app-prefs.json.tmp-*` siblings (§16a, step 8),
+with the store CLOSED around it like the pending-reset store (`AppPrefs::close_for_uninstall`): the
+app stays open on Settings after Uninstall, so every later `app_prefs_set` in the session answers
+`{kind: "store"}` ("This app's files were removed by Uninstall, …") and writes nothing; `app_prefs_get`
+still answers.
+
+The briefing redesign's B1 (wave 2) adds one more, the live git check, `src/repos.rs`. Today's drivers
+ask; Rust gates the ask (the main window's visibility, the deck's current slide, the reason, one check
+in flight, a stat of each repo's git metadata) and runs the engine only when the gate says so:
+
+| Command | Argument | What it does | Answers |
+| --- | --- | --- | --- |
+| `repos_status` | `{request: {labels: [{key, tokens}], branches: [{key, name}], pageDate, reason, current}}` (one named argument; an unknown member is refused; `reason` is `first`, `focus` or `minute`; `current` a `SlideId` or `null`) | validates the request (at most 64 labels and 64 branch entries; each key at most 80 Unicode scalar values, `""` admitted, no control or refused format character; tokens 1-40 ASCII hex, at most 512 per label and 4 096 in all; branch names at most 255 UTF-8 bytes, no control or format character; `pageDate` a real `YYYY-MM-DD`), then gates it (`repos::decide`: no current slide or a hidden window → nothing runs; no held result for this request → a full check, whatever the reason (so, with nothing held for the page, after a failed check a full check runs every minute until one succeeds); `first`/`focus` → a full check; `minute` → a full check only after a stat change (a repo with more than 2 000 entries under `refs/` counts as changed every minute), with a `first` still owed (one asked while the window was hidden), on the one ungated ask a rejected run record arms, or to retry a repo the last check answered `unknown` (after 1, 2, 4, then 5 minutes while it keeps timing out or running out of budget, every 5 minutes for any other reason, until every repo answers); else on the launchpad the "Not committed" status runs every minute (that status alone), else nothing; the stat work may take 5 s, `STAT_LIMIT`, before the ask fails). A check is `Operation::ReposStatus`: `repos status --json`, the request (with the scope the gate chose) **written to STDIN, never argv**; a READ, so no in-flight guard (its own one-in-flight latch, one `first`/`focus` waiter that re-samples the window after the wait); bounded at 30 s (`ENGINE_READ_TIMEOUT`; the engine's own budget is 25 s). Writes nothing anywhere | the engine's reply with its engine-only `repos` (stat targets, the only paths) removed and every member the reply types do not declare dropped (`repos::REPLY_KEYS`), plus `{gate: "ran" \| "held" \| "noResult", heldAt (Rust's clock, epoch seconds, when that check was decided), uncommittedAt, unknownRepos: [repoKey]}`; or those four alone with `gate: "noResult"`; or `{kind: "invalidInput", field, reason}` (nothing ran), or `{kind: "spawn", detail}` with one fixed sentence for every other failure: a failed or malformed run, the 30 s bound, and stat work past `STAT_LIMIT` (the engine's stderr never crosses) |
+
+The briefing redesign's wave 2 (C, plan C-M3-T9) adds four: today's calendar details, read live and
+held in Rust memory only, `src/calendar_details.rs`. None takes a path or a URL; every request is
+`deny_unknown_fields` (the webview cannot pass a URL), and no reply carries one:
+
+| Command | Argument | What it does | Answers |
+| --- | --- | --- | --- |
+| `calendar_details_open` | `{request: {reason, current}}`: `reason` one of `became-current`, `focus`, `timer`; `current` the deck's slide id or `null` | waits for any read in flight, then samples the window (`live_gate`) and Rust's clock and decides (`decide`): another slide reads nothing; a hidden or minimised window is refused (nothing owed); with no held read of today and the current config generation, every reason reads; `became-current` reads again only when a remembered command link holds no URL; a `timer` inside 295 s answers the held read. A read runs `calendar details --json` (`--skip-commands` on every `focus` and `timer` read; `--skip-mac` on a timed read while the Mac source's last status is `denied` or `not-granted`) through the SEALED path (`EngineClient::invoke_sealed`): the remembered URLs go on STDIN from a zeroing buffer, stdout is parsed inside Rust (never an `EngineOutcome`), stderr reduced to a fixed code; bounded at 45 s | `{gate: "none"}`, `{refused: "hidden" \| "calendar-off"}`, `{failed: <fixed code>}`, or `{gate: "held" \| "read", readAt, readerOutdated, events: [{handle, title, location, rowText, time, status, ended, linkState, joinHost, serviceName?, needsConfirm, fromMac}], sources: [{id, kind, status?, reason?, skipped, last}]}`; an engine error (`timeout`, `spawn`, `sidecarUnresolved`) as the usual `EngineError` |
+| `calendar_details_get` | `{request: {handle}}` | one event's people and notes from the in-memory map; reads nothing; checks the handle's read, day and config generation (the config re-read) | `{people: [{name, organiser}] \| null, notes, otherNotes?: [{title: string\|null, notes}]}` (`otherNotes` is present only on a key-c merged event and omitted otherwise; `notes` is the core view's notes only; `people` is `null` when the read could not keep the event's details, shown as "Details not available"; `[]` is "Just you") or `{refused: "stale"}` |
+| `calendar_join` | `{request: {handle, confirmed}}` | the held Join candidate, re-validated with the `url` crate (https; no backslash anywhere in the raw string; no userinfo; no port written, checked on the raw string; the host lowercased, in punycode, and equal to the held Join host the list showed, else `invalid-link`), opened by Rust through `access::OpenSink` (the opener's free function); a host outside the known meeting services needs `confirmed` | `{opened: true}`, `{ask: host, serviceName?}`, `{refused: "stale" \| "several" \| "no-link" \| "invalid-link"}`, `{failed: "opener"}` — never the URL, never the opener's text |
+| `calendar_app_open` | none | macOS only (`engine::mac_only`): `/usr/bin/open -b com.apple.iCal ical://date/<now, UTC>?method=show`, so Calendar lands on today; the URL is built from Rust's clock alone, taking nothing from any event | `null`, or `unsupported` off macOS |
+
+**Hub items 3 and 4, recorded here.** Item 3 (Join): a link is opened only by Rust, from the map, by
+handle; a known meeting host opens directly, any other https host from the event's URL field or
+location, and the five notes-list services, ask first ("Open this link on {host}?" / "Open this
+{service} link on {host}?"), and `confirmed: true` is the webview's assertion — acceptable because
+the URL is chosen in Rust and never named by the webview. Item 4 (Open in Calendar): the Calendar
+app by bundle id, nothing from the event. **What Rust holds** (memory only, never written, logged or
+sent to the webview): the event map (purged at the day change, on a config change and by a read
+that does not answer), the remembered command-link URLs (`LinkUrl`; exactly what the last answered
+read returned; dropped on a dead link, an own-entry change or removal, and at quit; unchanged by a
+refusal, a held reply or a read that does not answer) and each source's last status. The handback
+buffer is wiped on drop through the same volatile loop as `KeySecret` (`engine::wipe_bytes`);
+best effort, as `KeySecret`'s is: each `LinkUrl`'s `String`, earlier allocations freed as the engine's
+stdout/stderr buffers grow, stderr's temporary reader/line/text buffers, serde's parse strings and the kernel's
+pipe buffers are not reached. `SealedDetails::collect` wipes the final stdout/stderr buffers only
+on normal collection. On timeout the reader futures are dropped, and on a `child.wait()` error
+the shared spawn body returns before collection: their stdout/stderr buffers drop **unwiped** in
+both cases. The handback's `SecretBytes` still wipes on drop on those paths.
+
+The briefing redesign's wave 3 (B2, plan B2-M6-T16) adds five: GitHub links and the copied push command in
+`src/actions.rs`, Open in editor in `src/editor.rs`. None takes a URL, path, branch or command; every request is
+`deny_unknown_fields`, and no reply carries one. The handles ride on `repos_status`'s `all`-scope reply as its `actions`
+member, `[{repoKey, cardKind, cardId, handles: [{handle, target, row, sha, project, label}]}]`; an `all` reply always has
+it, `[]` when nothing was minted. A handle is looked up in Rust's held map and never parsed:
+
+| Command | Argument | What it does | Answers |
+| --- | --- | --- | --- |
+| `open_github` | `{request: {handle}}` | reads the GitHub links switch from the app prefs, re-checks B2's stat inputs (`ReposLive::check_before_sink`), then resolves the handle, judges the held target against the private facts held with it, builds the address with the `url` crate from parsed owner and repo (`github_url`) and opens it through `access::OpenSink` | `{opened: true}`, `{refused: "stale" \| "links-off" \| "unknown-repo" \| "not-pushed" \| "invalid-target" \| "ambiguous" \| "host"}` or `{failed: "opener"}`; never the URL or the opener's text |
+| `copy_push_command` | `{request: {handles}}` (at most 32) | the same re-check, then every branch of the copy is judged before the clipboard is touched; a branch pushes to its `pushRemote`, `pushDefault`, its upstream's remote when that is its real destination or the sole remote, and otherwise to `origin` when that is one of several known remotes; Rust builds and quotes the text, joined with ` && ` and no trailing newline, and writes it through `ClipboardSink`. A push card or the launchpad tile whose branch refuses at the mint, or whose list is over the limit, holds no copy handles, so it draws no button; a change since the mint clears the handles and answers `stale`, and the click's own judgement is a backstop | `{copied: true}`, `{copiedToOrigin: true}` (at least one command's remote is `origin` by that last rule; the webview shows "Copied. Pushes to origin."), `{refused: "stale" \| "unknown-repo" \| "unsafe-name" \| "no-remote" \| "ambiguous" \| "name-mismatch" \| "transport"}` (the first match, in that order for each branch) or `{failed: "clipboard"}`; never the text or a remote's name |
+| `editor_list` | `{request: {handle?}}` | macOS only. Reads the current config through `config_save::config_read` (no new engine operation), merges its repos with the engine's held project roots and the stored choices, and asks LaunchServices which supported bundles are installed (`EditorDetector`; nothing is opened). With a held editor handle it also reads that folder's `.vscode` and `.idea` markers | `{editors: [{editor, label}], projects: [{project, label, choice, availability}], discoveryConfigured, preselect?}` (`project` an opaque key or `null`; `choice` an editor, `"ask"` or `null`, never chosen; `availability` `ready` or `not-checked`; `preselect` only when the ask named a handle, `null` with nothing installed), `{refused: "unsupported" \| "stale"}` or `{failed: "detection"}`; missing config lists no projects, unusable config is the failure. Never a folder |
+| `editor_open` | `{request: {handle, editor}}` | macOS only. The same re-check, then the held folder and an installed bundle of the named editor (the closed `EditorId` list; no caller-supplied bundle id), then the disk is read again (the held file identities, containment, and that the checkout still holds the branch), then `/usr/bin/open -b <bundle> <folder>` through `EditorSink`, no shell | `{opened: true}`, `{refused: "unsupported" \| "stale" \| "no-editor" \| "invalid-folder"}` or `{failed: "editor"}`; never a folder |
+| `editor_choice_set` | `{request: {project, editor}}` (`editor` an `EditorId` token or `"ask"`, never `null`) | macOS only. A key is known when it is in the inventory `editor_list {}` would give now, or already stored; a B2 generation bump alone does not stale it. Writes through `app_prefs_set`'s store: the same read-modify-write, revision and 16 KiB bound | `{saved: true, revision}`, `{refused: "unsupported" \| "stale" \| "unknown-editor" \| "preferences-full"}` or `{failed: "preferences"}` |
+
+**Hub items 1 and 2 and the clipboard, recorded here** (scoped changes to deviation 39's no-href / no-opener rule, §10g;
+the no-reveal ruling, deviations 40 and 82, stands: nothing here reveals a file in Finder). Item 1 (GitHub): an address is
+opened only by Rust, by handle, for pushed work. The engine parses raw `remote.<name>.url`; Rust gets parsed owner/repo and
+verdicts, never a raw or effective URL, and re-checks https, github.com, empty userinfo and no query or fragment on what it
+builds. Item 2 (an installed editor, macOS only): a closed bundle-id list, on the engine-validated checkout where the branch
+is checked out, then its contained sub-project folder. The clipboard: text is written only from Rust.
+`tauri-plugin-clipboard-manager` is registered with nothing granted (`the_webview_cannot_reach_the_clipboard_plugin`), so
+`copy_push_command` is the one way there, and the webview has no clipboard or opener grant. Copied text adds no hardening
+flags: hooks, `core.sshCommand` and other repo config still apply when the user runs it.
+
+**What Rust holds for B2** (memory only, never written, logged or sent to the webview): the engine's top-level `actionFacts`
+member, stripped from the `repos status` reply before `sanitize_reply` (the real repo path, per-remote owner/repo and
+transport verdicts, upstreams, reachability, default branches, PR evidence, checkout paths, sub-project roots, stat inputs),
+and the targets minted from it, per handle (`RepoFacts`, `HeldTargets`, `ReposState`). A full check replaces both. The
+handles go at the one invalidation, `ReposState::clear_actions`, which bumps the generation, drops the held targets and sets the
+held document's `actions` to `[]` before any next reply: on a new page, a change or an unreadable input among B2's stat inputs
+(config files and the used worktrees' metadata), a replacing full check, or a repo becoming unknown. The facts survive that:
+Settings' project rows read them with no handle (`held_inventory`), so they go only when a full check replaces them, or at
+quit, with no wipe. An `uncommitted`-scope update mints nothing and keeps both. No URL string enters the member, and no name in a shape the credential matcher recognises (B2 `:21`, `:23`); a secret in a shape it does not know is not detected. A `branch.<n>.remote` or `.pushremote` that is only not a remote name, such as a URL, leaves the branch's entry with `remoteFactsUnknown: true` and its remote facts null: the editor stays, Branch and Compare have no link, and Copy refuses `ambiguous`. A credential-shaped one leaves no entry. On disk, B2
+adds only the switch and project key → editor token to `app-prefs.json`, so no new app file or uninstall row (§16a). A project
+key is the engine's opaque hash, never built in Rust.
+
+**What B2 does NOT execute, and what is therefore UNRUN.** Beyond §10f's standing notes (no test runs a real webview), no
+suite runs these three, because every test manages a recording sink (plan §0.6):
+
+- `SystemClipboard`: no test writes to the real clipboard, through the registered plugin or otherwise. The copied bytes are
+  pinned at the recording sink.
+- `SystemEditorDetector`: no test asks LaunchServices. `NSWorkspace`'s answer for each bundle id, and whether a real install
+  reads as installed, is unobserved.
+- `SystemEditorSink`: no test spawns `/usr/bin/open`. The argv is pinned at the recording launcher; that macOS opens the folder
+  in that editor, and that a failed launch exits non-zero, is not observed.
+
+In the webview, a key press, focus returning from the chooser and a chooser staying open across a re-mint run in no test:
+they are pinned at source level (`deck-render.check.ts`) over `editorFlow` and `actionRuns`, which are driven directly. All of
+it is what the author's after-merge check exists for (wave-3 plan §7), with the real opener's destinations.
+
+The briefing redesign's A2 (plan A2-M4-T13) adds one read of the stored AI summary, `src/summary.rs`.
+It takes no path, writes nothing and adds no `Operation`:
+
+| Command | Argument | What it does | Answers |
+| --- | --- | --- | --- |
+| `read_latest_summary` | `{request: {pageHash, pageVersion}}`: each 64 lowercase hexadecimal digits, from `read_latest_briefing`'s reply; an unknown member is refused | checks the operands before anything else; `status --json` supplies the paths and the sidecar's date (`lastRunDate`, the delivery marker's, never the clock); re-checks the latest page's identity; reads only `<briefingsDir>/<date>.<pageHash>.<pageVersion>.summary.json` (capped at 64 KiB, no symlink); revalidates every stored point and sentence in Rust, checks keys by syntax only, and refuses a failing record whole. Card membership is the webview's | `{state: "ready", pageHash, pageVersion, revision, projects: [{key, points}], goodMorningSentence, warnings}` or `{state: "pending" \| "unavailable", warnings}`, `warnings` being fixed codes. Ordinary absence, including an engine client that failed at startup, is `{state: "unavailable", warnings: []}`. A bad operand is the error `{kind: "invalidOperand"}` |
+
+The identity and revision fields it relies on: `read_latest_briefing`'s `BriefingFile` also carries
+`pageHash` and `pageVersion` (the latest page only; `read_archived_briefing` omits both, and on Windows
+both are absent, so there is no summary read), and `status --json` carries `latestSummaryRevision` (`{pageHash, pageVersion, revision, state}`, omitted
+while summaries are off or no record exists) and `aiSummaryStatus` (`{enabled, warnings}`, fixed codes;
+absent reads as off). Both status members are read leniently in `schedule_state::StatusView`, so a
+malformed one reads as absent or off and never fails the envelope. Neither is in `RunEnvelope`.
+
+⚠ **The pinned spellings: SEVENTEEN module `COMMANDS` lists concatenated into one (seven as of B8),
+compared against four external spellings.** `engine::COMMANDS`, `shell::COMMANDS`,
 `briefing_files::COMMANDS`, `config_save::COMMANDS` (which B8 grows by `config_create`),
-`access::COMMANDS` (B6), `notifications::COMMANDS` (B7) and `cli_shim::COMMANDS` (B8) each own the
-names their module defines;
+`access::COMMANDS` (B6), `notifications::COMMANDS` (B7), `cli_shim::COMMANDS` (B8),
+`uninstall::COMMANDS`, `autostart::COMMANDS`, `calendar::COMMANDS`, `pending_resets::COMMANDS`,
+`app_prefs::COMMANDS`, `repos::COMMANDS`, `calendar_details::COMMANDS` (wave 2, C), `actions::COMMANDS` and
+`editor::COMMANDS` (wave 3, B2) and `summary::COMMANDS` (A2) each own the names their module defines (`src/commands.rs`'s `all_commands`, in that order);
 `daily_briefing_gui_lib::all_commands()` is the ordered concatenation, and that is what
 `capabilities/default.json`, `build.rs`'s list, `generate_handler!` and the TS invoke scan
 (`tests-web/history.check.ts`, set-equality since the B7 fix round) are pinned against
 (`the_capability_grants_exactly_the_app_commands`). The handler parse takes an **enumerated module
 allowlist** (`["engine::", "shell::", "briefing_files::", "config_save::", "access::",
-"notifications::", "cli_shim::"]` — `tests/capability.rs`, grown one module per slice on purpose), not a
+"notifications::", "cli_shim::", "uninstall::", "autostart::", "calendar::", "pending_resets::",
+"app_prefs::", "repos::", "calendar_details::", "actions::", "editor::", "summary::"]`, one per module in `all_commands` — `tests/capability.rs`'s `COMMAND_MODULES`, grown one
+module per slice on purpose), not a
 wildcard: the easy loosening — strip everything before `::` — would let a command from any module
 into the handler unnoticed.
 
@@ -159,14 +287,17 @@ is a field on it) — and at most one of them may be in flight in the app proces
 trigger, so launchd runs the engine and a briefing can be generated and the day stamped (§11). A second one does **not queue**: it is refused
 immediately with `{ kind: "busy", running: "<the operation already running>" }`, because a second
 briefing generation must not be *delayed* into happening. `engine_status`, `engine_doctor`,
-`engine_config_validate`, `engine_schedule_status` and — the tenth command, added in Phase E (E12) —
-`engine_update_check` (`update --check --json`) are **never** blocked by it — a panel that
+`engine_schedule_status` and — added in Phase E (E12) — `engine_update_check` (`update --check --json`) are
+**never** blocked by it (`engine_config_validate` was a fifth until PR 3 final r1 dropped it; the Rust-side
+`config validate` of the candidate check is likewise not guarded) — a panel that
 stopped refreshing while a run was in flight would go quiet exactly when it has the most to show,
 and "Check now" works while a run is in flight.
 The guard is **in-process only**: a `daily-briefing run` started in a terminal is outside it, and
 the engine's own `run.lock` is what covers that. The partition is pinned literally by
 `the_in_flight_guard_covers_exactly_the_state_changing_operations`, so adding a mutating operation
 without adding it to the guard fails a test.
+With AI summaries on, a run returns up to 30 s after its envelope, and Run now stays running until then: `run()`
+awaits the summary after delivery (`src/main.ts`), and the guard is held until the process ends.
 
 **The `EngineError` union, in full.** Every command rejects with exactly one of four shapes
 (`gui/src/lib/engine.ts`; the tag is `kind`):
@@ -181,7 +312,10 @@ without adding it to the guard fails a test.
 An engine that RAN and failed is not an error at this seam — it is an `EngineOutcome` whose
 `outcome.kind` is `failed` or `configError`, with the exit code and the engine's stderr.
 
-**What the two operands accept.** `--file` (`engine_config_validate`): an **absolute** path; U+0020
+**What the two path operands accept.** (PR 3 adds two more operands, `--index` and `--id`, validated in Rust as
+`ProviderIndex` and `KeyId`, with the reset label and the pasted key: §1d has their engine side, §1e what the app's
+commands accept and how they refuse.) `--file` (since PR 3 final r1 never webview-supplied: only a file Rust staged or
+owns reaches it, through the same validator): an **absolute** path; U+0020
 is admitted and so are dot-leading segments (`~/.config/daily-briefing/config.json` and
 `~/Library/Application Support/…` are the paths that matter); refused are `.`/`..` segments, NUL,
 control characters, non-space whitespace, and Unicode **format** characters (123 of the category's
@@ -200,10 +334,15 @@ One surface the app deliberately does not carry: **`init`**. It has no command a
 validated `config_create` path (§13), rather than spawning the engine's do-not-clobber writer,
 because `init`'s template cannot carry the wizard's choices (its discovery roots would be the APP
 process's cwd, its provider only what `--provider` can spell, no floor, no repos selection) and a
-post-init edit would be the two-write shape the write-once rule forbids. `calendar` is in plan
-R1's forward list and is **not in the engine**, so the enum — which is exhaustive over the
+post-init edit would be the two-write shape the write-once rule forbids. `calendar` was in plan
+R1's forward list and **not in the engine**, so the enum — which is exhaustive over the
 operations the app may perform, i.e. the engine surface minus `init` and `help`, each excluded
-deliberately (§1c deviation 4) — has no variant for it either. (`update --check` was on that
+deliberately (§1c deviation 4) — had no variant for it either. **AMENDED IN v0.3.0 (calendar
+connection, plan M8):** the engine gains `calendar status|list|test|connect mac --json` (W1's M5)
+and the enum the four matching operations (`engine_calendar_*`) in the same release; the engine's
+`calendar add-link` / `remove-link` stay out of the enum because they read the URL on stdin, which
+the app's spawns never provide — the app writes the managed link file itself (`src/calendar.rs`,
+three `calendar_*` commands; `capabilities/README.md` has the bounds). (`update --check` was on that
 list too until Phase E M4 added it to the engine; it is now `engine_update_check`, above.)
 
 ⚠ **`schedule verify` WAS on that list until B6, and the reason it left is not that R1 changed.**
@@ -232,6 +371,8 @@ does not have to reconstruct it from a commit message:
    carry the wizard's choices — §13d's rejected alternative — and :165's reasoning is unchanged).
    **AMENDED IN PHASE E M4:** `update --check` is now in the engine (`KNOWN_COMMANDS` gained
    `update`) and has a typed command, `engine_update_check` (§1a); `calendar` is still dropped.
+   **AMENDED IN v0.3.0 (plan M8):** `calendar` now has four typed commands
+   (`engine_calendar_status|list|test|connect_mac`), shipped with the engine's subcommands.
    **AMENDED IN B6:** this entry read "minus `init`, `help` and
    `schedule verify`" until T20 added `Operation::ScheduleVerify`; the kickstart is still
    engine-side and the new operation re-issues it (§11, deviation 76).
@@ -281,6 +422,386 @@ run lock, the repo walk and the provider; the forced one exits 2 for the same re
 `config.json` that does not parse exits 2 with `skipReason: "config-error"` from the same catch,
 forced or not. No provider is configured or loadable, so none can be called.
 
+⚠ **The briefing redesign's git detail (B1, wave 2) adds, additively:** one state file,
+`<state>/run-record.json` (`runRecordPath()`, `src/runRecord.ts`): the morning run's record for the app's live git
+check — the page's date, the repo list, the window start, the page labels (`{repo, root}`), every window commit
+(`{sha, label, repo}`) and `recapCoverage`'s `missing` list. Written by `run` right after `briefing-latest.md`
+(fail-open, 0600, temp file and rename; nothing printed) and read by the live check only for its own page's date.
+Like the provider-fallback files below it is **not** in `paths`; `engineOwnedPaths()` lists it for the `--json-out`
+guard and the uninstall parity test, and `ENGINE_STATE_REMOVALS` removes it.
+
+⚠ **Provider fallback (PR 1) adds, all additively:**
+- two state files, `<state>/provider-status.json` (the per-provider status record) and `<state>/last-failure.json`
+  (the day's unresolved failure, kept until a delivery), and the app-owned key folder `<state>/keys/`. They are
+  **not** in `paths` (`statePaths()` is the `run --json` envelope's `paths`, pinned byte for byte by the calendar-off
+  goldens); `engineOwnedPaths()` (`src/json.ts`) lists them for the `--json-out` guard and the uninstall parity test,
+  and `ENGINE_STATE_REMOVALS` removes the two files (the key folder is the key leg's);
+- `status --json` → `lastFailure` (`{localDate, reason, detail}` or `null`) and `providers` (one row per entry of
+  the combined list and per dropped entry: `index`, `source`, `fallbackIndex`, `label`, `kind`, `status` — the
+  `rowStatus` object — and `until` / `failingSince`; PR 2 adds **`revision`**, the entry's `entryRevision` (32 hex,
+  non-secret: a truncated SHA-256 of the entry's settings), on every resolved entry's row and absent on an
+  `invalid` row, which has no entry — the value `key migrate` answers, and the one an outcome is recorded against, so
+  the app compares it rather than computing one). ⚠ **`label` is display text and may be masked** (a key, a
+  calendar link or a control character in a label shows as `[redacted label]`), so two rows can read the same and a
+  `duplicate-label` dropped row reads its twin's label: **join rows to config entries by `index`**, the 0-based
+  position in the combined list as written (item 1's logins, then `fallbacks`, each dropped entry in its place — the
+  numbering `--index` uses). `source` is `"provider"` (item 1's logins) or `"fallback"`; `fallbackIndex` is the
+  entry's index in `fallbacks`, absent for item 1 and for a whole-list drop (`fallbacks` not an array). ⚠ **One
+  exception: a structurally broken `provider.accounts`** (the config warning ending "— account failover disabled",
+  e.g. two logins with one label). The engine then runs item 1 as ONE implicit entry, so the rows show ONE
+  `"provider"` row (index 0) while the written list has N logins, and every later `index` is shifted from the written
+  position (`--index`, PR 2, refuses such a config — spec §4). While that warning is present the app must not join
+  rows by `index`: show the engine's rows as they are (and `config validate --json`'s `providers`, PR 2, is then `[]`
+  — §1d's Test timeouts — so no Test bound can be joined to a wrong entry either);
+- `status --json` → `lastSkip.allOutOfUsage: true` on a `limited` skip where every provider is out of usage; its
+  `detail`'s first line is then the notification body and the second the old `limitedSkipMessage` line;
+- `doctor --json` → `providers` (the same `index` / `source` / `fallbackIndex` and display `label`, each entry's key
+  source, resolved read-only, and its mark). A config whose only
+  errors are dropped fallbacks is `degraded`, not `blocked` — the run still delivers from item 1;
+- the briefing's `notices` (struct) and the `ℹ︎ ` lines above its title (file); `run --json`'s `limited` gains
+  `allOutOfUsage`, and `exhausted` is always `true`.
+
+### 1d. The `provider` command — the app's key and Test API (provider fallback PR 2)
+
+⚠ **Provider fallback (PR 2) adds the `provider` command — the app's whole key and Test API** (`src/providerCli.ts`
+is the source of truth; this section is checked against it). It is an ordinary engine command the app spawns (§1),
+not a VM-gated leg: its own sub-heading, so it is not read as part of §1b. Seven verbs, each REQUIRING `--json` exactly once
+(there is no human-readable form):
+
+```
+daily-briefing provider key set --json                          (the key on stdin)
+daily-briefing provider key migrate --index <n> --json
+daily-briefing provider key delete --id <keyId> --json
+daily-briefing provider key delete-all --json
+daily-briefing provider key scrub-backup --json
+daily-briefing provider reset (--index <n> | --label-stdin) --json   (--label-stdin: {"label": "…"} on stdin)
+daily-briefing provider test --file <candidate.json> --index <n> --json
+```
+
+**The answer is one JSON line on stdout.** Success: `{"schemaVersion": 1, "ok": true, …}`, exit 0. Refusal:
+`{"schemaVersion": 1, "ok": false, "code", "error", …}`, where `error` is `"<verb>: <message>"` (`<verb>` is
+`(no verb)` or `(unknown verb)` when argv names none of the seven — the token is never echoed), the same message on
+stderr as `provider <verb>: <message>` (control characters stripped), and the exit code follows `code`. ⚠ **No JSON
+line on stdout means the engine CRASHED** (an uncaught error exits 1 with only a stderr line): treat it as a crash,
+never as a refusal, and **never infer `code` from the exit status** — exit 1 is both `write-failed` and a crash, and
+exit 2 both `usage` and `config`; switch on the JSON's `code` (and `reason`) only.
+
+| `code` | exit | meaning |
+| --- | --- | --- |
+| `usage` | 2 | the argv or the stdin payload is malformed: no verb, an unknown verb, `--json` missing or twice, an unknown or repeated flag, a flag with no value, a required flag missing (`key migrate`'s `--index`, `key delete`'s `--id`, `test`'s `--file` and `--index`), `reset` given both or neither of `--index` and `--label-stdin`, an `--index` that is not 1 to 6 decimal digits, a bad `--id`, a TTY stdin, a stdin that could not be read, a stdin payload too large, late or not the expected shape, `key set`'s key outside the key rule |
+| `config` | 2 | the saved config (or `test`'s candidate) is missing, not JSON or not valid; `--index` does not resolve (below); `--label-stdin`'s label is unknown or names a dropped entry; `key migrate`'s entry holds nothing it can move (its literal outside the key rule carries `reason: "invalid-key"`); `test`'s tested entry holds a literal `apiKey` whose trimmed value contains whitespace or a control character (`reason: "invalid-key"`, P3-M4-T4 — nothing probed or recorded); `key scrub-backup` cannot read `.bak` as one, or it changed meanwhile (`reason: "changed"` — retry); a read of `key migrate`, `key scrub-backup`, `reset` (the saved config) or `test` (the candidate) timed out (with `reason: "timeout"` — retry) |
+| `lock-held` | 3 | a briefing holds the run lock — retry later (`reset` only; `test` never refuses for it) |
+| `write-failed` | 1 | the state file, the key store, or (`key scrub-backup`) the settings backup could not be written |
+
+No message ever echoes a label, a flag's value, a key or a config value — only flag names, counts and fixed text,
+plus one path: a missing saved config is "no config at `<config path>` — …", which names the config file's location
+(`key migrate`, `reset` and `key scrub-backup`; `test` names no path) — so the app words refusals by `code` and
+`reason`, never by parsing `error`. **`--index` is the 0-based position in
+the combined list as written** (item 1's logins, then `fallbacks`), the same numbering as `status --json`'s
+`providers[].index`; it is refused (`config`) when any entry would be dropped at run time, when `provider.accounts`
+is structurally broken (the "— account failover disabled" warning: the engine would count item 1's logins as one),
+and when out of range. A label never travels in argv: `reset --label-stdin` reads `{"label": "<non-empty string>"}`
+(that one member only, at most 64 KiB) from stdin.
+
+**The key verbs.** A key is accepted only after trimming, as 8 to 512 characters of `A-Z a-z 0-9 . _ ~ + / = -`.
+- `key set` reads the key on stdin (at most 4 KiB; a TTY is refused; stdin must END within 1 s — write the key, then
+  close it). Success: `{ok: true, keyId: "k-<12 hex>", apiKeyCommand: [...]}` on macOS (the login Keychain, service
+  `daily-briefing.app-key`) or `{ok: true, keyId, apiKeyFile: "<state>/keys/k-<12 hex>.key"}` elsewhere. The
+  reference is what the app saves into the entry; the key is never printed. Exactly (`src/keyStore.ts`
+  `appKeyCommand` / `keyFilePath`): on macOS `apiKeyCommand` is
+  `["/usr/bin/security", "find-generic-password", "-s", "daily-briefing.app-key", "-a", "<keyId>", "-w", "<home>/Library/Keychains/login.keychain-db"]`
+  — the keychain operand absolute, from the user's home folder, never `~`; elsewhere `apiKeyFile` is
+  `<state>/keys/<keyId>.key`, `<state>` the engine's state folder as the engine resolves it (`src/marker.ts`
+  `stateDirFor`: absolute, unless `DAILY_BRIEFING_STATE_DIR` or `XDG_STATE_HOME` is set to a relative path, which is
+  used as given). A key id is `k-` and 12 LOWERCASE hex
+  digits; save both values exactly as answered.
+- `key migrate --index <n>` stores entry n's legacy literal `apiKey` from the SAVED config the same way and answers
+  the same shape **plus `revision`** (the entry's `entryRevision` — the same value as that entry's `status --json` row
+  `providers[n].revision`, in the PR 1 list above): before saving the reference, compare it with the `revision` of the row
+  the app shows for that `index`, and on a mismatch `key delete` the new id. It
+  writes nothing to the config, holds no run lock, and refuses (`config`) a CLI entry, an entry with no literal
+  `apiKey`, a plain-`http:` non-loopback endpoint, a literal outside the key rule (`reason: "invalid-key"`), and a
+  saved config that could not be read in time (`reason: "timeout"`, as `key scrub-backup`'s: retry; every other
+  `config` refusal of `key migrate` carries no `reason` — fix the config).
+- `key delete --id <keyId>`: `{ok: true, deleted: true | false}`. `true`: it removed that key — off macOS the file
+  `<keyId>.key`, or a temp file of that id (`.<keyId>.<pid>.<seq>.tmp`) whose writer process is gone, or both (a
+  failed set's stuck temp holds the key too); `false`: it removed nothing — no key file, and no temp of a gone writer.
+  A temp file whose writer is still running (a `key set` in flight) is never removed and is not counted; nor is one
+  whose pid has since been REUSED by another process, which reads as alive — so `false` is not proof that no temp of
+  that id is left (the next `key set`'s dead-pid sweep, or `key delete-all`, removes it once that pid is gone). A gone
+  writer's temp that cannot be removed is `write-failed`, `reason: "failed"`, never `deleted: false`. So is a `keys/`
+  folder that cannot be LISTED (e.g. mode 0300): the key file is still removed by name, but its temps cannot be looked
+  for, so the answer fails closed — `failed` even though the key may be gone; a retry answers the same until the
+  folder is listable again.
+- `key delete-all`: `{ok: true, deleted: <count>}` — every app-owned key (the app's uninstall leg). Off macOS it
+  removes every app-shaped file in `<state>/keys/` — each `k-<12 hex>.key` (counted in `deleted`) and each
+  `.<keyId>.<pid>.<seq>.tmp` temp file, whatever its pid (a temp holds a key too) — and then the `keys/` folder itself
+  when nothing else is in it. A file there that is not the app's is never touched: it stays, with the folder, and the
+  answer adds **`kept: <count>`** (absent when zero). A symlinked `keys/` is refused (`keys-folder`), never followed
+  or removed.
+- A key store refusal is `write-failed` with **`reason`**, the store's own: `keychain-refused`, `refused`, `timeout`,
+  `add-failed`, `readback-failed`, `readback-mismatch`, `failed`, `cap`, and the file store's `unsupported-platform`
+  (win32), `keys-folder`, `write-failed`, `collision`. `timeout` is the same on both platforms; word it per platform —
+  macOS "unlock your keychain, then retry", elsewhere "the key folder did not answer in time — retry". A key outside
+  the key rule (`key set`) or a bad `--id` (`key delete`) is `usage` with `reason` `invalid-key` / `invalid-id`, whether
+  the command or the store refused it. A failed `key set` / `key migrate` also carries **`cleanup`** (`deleted` /
+  `not-found` / `failed` / `timeout`: what removing the half-stored key did) when there was something to remove, and
+  **`keyId`** when what it stored is unconfirmed: a cleanup of `failed` or `timeout`, or ANY cleanup after a
+  `reason: "timeout"` — a timed-out store call may still land after its cleanup looked (a Keychain add cut short while
+  the item was being written), so `not-found` then is not proof. Retry `key delete --id <keyId>` with it; it is not a
+  secret. ⚠ One exception, off macOS: when the id's file name turned out to be TAKEN (another key's) and the temp file
+  then could not be removed, the answer is `cleanup: "failed"` with **no `keyId`** — a `key delete` with that id would
+  remove the other key. Nothing then names what is left (a temp file of this, by then exited, process); the dead-pid
+  sweep of the next `key set` / `key migrate`, and `key delete-all`, remove it. So `cleanup: "failed"` without
+  `keyId` means: nothing to retry. The same holds for a **`reason: "timeout"`** answer off macOS: when the id's name
+  was found to hold another key — by link(2), by the store's look at the name the moment the id was issued (awaited
+  within the cleanup budget), or by the cleanup — it carries no `keyId` (whatever its `cleanup`). Residuals, each
+  needing a random 48-bit id to collide with an existing app key (accepted): off macOS, a look at the name that did not
+  answer within the cleanup budget (a stalled key folder) leaves the id in the answer, as before — nothing showed
+  another key there, and the retry is what removes this set's own — and so does another writer creating that same
+  id's file after the look; on macOS, a Keychain add that timed out never answered, so whether its fresh id already
+  named an item is unknowable — the cleanup deletes that id and the answer names it. Every Keychain child is killed (and reaped) before the engine answers, so none
+  outlives the call. `key delete-all`'s refusal carries **`deleted`**, which on a timeout is a lower bound.
+- `key scrub-backup` removes from `<config>.bak` every literal key the saved config no longer holds:
+  `{ok: true, removed: <count>}`, plus **`otherCopies: true`** when the rewritten `.bak` had another hard link, which
+  still holds the literal. The app's scrub command first sweeps its own crashed saves' staged copies under the save lock
+  (`engine_provider_key_scrub_backup`, `config_save::sweep_stale`; P3-M4 checkpoint), so an `otherCopies: true` the app
+  sees is a link it did not make or could not remove, and the app tells the user to find and delete it. No `.bak`, or nothing to
+  remove: `removed: 0`, nothing written. A removed literal with no other key source in its entry becomes
+  `apiKeyEnv: "DAILY_BRIEFING_KEY_MOVED"`, a variable nothing sets, so a restored `.bak` gives a named
+  `key-unavailable` skip: show such an entry as "key moved — add a key", not as an environment-variable source. Its
+  reads timing out is `config` with **`reason: "timeout"`** (retry); "changed while it was read / scrubbed — retry" is
+  `config` with **`reason: "changed"`** (retry; P3-M4 checkpoint). Any other `config` refusal is not retried.
+
+**`reset (--index <n> | --label-stdin)`** clears that entry's marks under the run lock: `{ok: true, cleared: true |
+false}`; `lock-held` while a briefing runs; `write-failed` when the marks file cannot be written. `--label-stdin`'s
+stdin must END within 1 s (`usage` otherwise), and the saved config must be read within 5 s of the start (`config`,
+`reason: "timeout"` — retry); nothing is locked or written after either.
+
+**`test --file <candidate.json> --index <n>`** builds entry n of the CANDIDATE (a file the app stages, the
+`config validate --file` pattern), probes it unlocked, then records the outcome under the run lock. A Test that
+fails is still `ok: true`, exit 0:
+`{ok: true, passed: boolean, reason?: <FailoverReason>, at: "<ISO instant>", recorded: boolean, notRecorded?: "lock-held" | "write-failed"}`.
+`reason` (on a failure) is a classifier reason — `usage`, `rate-limited`, `auth`, `key-unavailable`, `not-installed`,
+`not-found`, `prompt-too-long`, `rejected-request`, `unreachable`, `empty-answer`, `unusable-answer`, `cli-failure`,
+`insecure-endpoint` — never provider text. `recorded: false` comes with `notRecorded`: `lock-held` ("not saved — a
+briefing was running") or `write-failed` ("not saved — the status file could not be written"). An app-owned key over
+plain `http:` to a non-loopback host fails with `insecure-endpoint` before the key is read or anything is sent.
+**A tested entry whose literal `apiKey`, trimmed, still contains whitespace or a control character is refused**
+(`config`, `reason: "invalid-key"`, exit 2) before the probe, whatever other source the entry has: nothing is probed,
+sent or recorded (P3-M4-T4, revised at PR 3 final r1). The app never holds a literal key, so such a Test could only
+carry the settings guard's redaction placeholder, which always has spaces; a real key never does. The engine decides
+by that shape and never names the placeholder. This is deliberately NOT the key store's rule (8 to 512 characters of
+`A-Z a-z 0-9 . _ ~ + / = -`, which `key set` and `key migrate` refuse with the same `reason`): a short or odd-charset
+literal the run accepts — Ollama's documented dummy `apiKey: "ollama"`, say — is tested as before, though `key migrate`
+would refuse to move it. Defence in depth: the app already disables Test on an entry holding a literal (spec §6) until
+the key is moved or removed. The
+candidate's read and the post-probe read of the SAVED config share one 0.5 s bound: a candidate that cannot be read
+within it is `config` with `reason: "timeout"` (retry), nothing probed; a saved config not read in what is left is
+judged as an unreadable one (the run lock's staleness taken conservatively), never an error.
+
+**App-side timeouts** (spec §6: the engine's worst case + 5 s): `key set` and `key migrate` **19 s**; `key delete-all`
+**16 s**; `key delete`, `key scrub-backup` and `reset` **15 s**; `test` **80 s** for a remote or CLI entry and the
+entry's EFFECTIVE `timeoutMs` **+ 17 s** for a loopback one (300 000 ms, an API entry's default, when the entry sets
+none — a fallback does not inherit `provider.timeoutMs`; [CONFIG.md](CONFIG.md)). The engine caps a loopback Test's probe at 30 min − 17 s
+(`PROBE_LOOPBACK_MAX_TIMEOUT_MS`, from `APP_LOOPBACK_TEST_CAP_MS` = 30 min), so the app's 30-minute cap must stay
+equal to `APP_LOOPBACK_TEST_CAP_MS`. **"Loopback"** is exactly the engine's `isLoopbackHost`
+(`src/providers/endpoint.ts`) on an API entry's endpoint host, case-insensitively: `localhost`, any `*.localhost`
+name, the whole `127.0.0.0/8` block (`127.0.1.1` included) and `::1`. Nothing else is — not `0.0.0.0`, not a LAN
+address, not a name that resolves to 127.0.0.1 — an API entry with no `baseUrl` is the provider's own remote
+endpoint, and every CLI entry is remote. **The app does not re-implement this:** `config validate --json` on the
+staged candidate answers **`providers: [{index, testTimeoutMs}]`** (appended, always present; `[]` when the
+candidate does not validate far enough to resolve its list, and when its `provider.accounts` is structurally broken —
+the "— account failover disabled" warning: the engine's indexes are then not the written list's, and `test --index`
+refuses such a candidate anyway) — one row per entry the combined list resolves, `index` the `--index` numbering (a
+dropped entry keeps its place and has no row), `testTimeoutMs` exactly the bound above in integer milliseconds (80 000,
+or the effective `timeoutMs` capped at `PROBE_LOOPBACK_MAX_TIMEOUT_MS`, + 17 000, a fractional one rounded up), no
+label and no endpoint. Use that row's value as the Test's timeout — the app's `Operation::ProviderTest` carries it as
+`test_timeout_ms`, which is **always the entry's validate-row `testTimeoutMs`, for every entry kind** (remote and CLI
+rows are 80 000; the app never decides "loopback" itself and adds nothing to it), clamped to between 17 s (the engine's
+smallest possible row: a loopback entry with a tiny `timeoutMs`) and the 30-minute cap. **Which app key each entry references** (PR 3, P3-M1-T0,
+appended, optional): a row also carries **`appOwnedKey: true`** when the entry's key is one the app stores, decided by
+the engine's own rule (`isAppOwnedKey` — the WIDE one: the Keychain tool reached through `PATH` or another spelling,
+`-s<service>` joined, a `..` alias or a hard link to a file in `<state>/keys/`, ids and the service matched
+case-insensitively; and fail-closed when the engine's look into `<state>/keys/` could not complete), and
+**`appKeyId`** beside it — the app key id (`k-` + 12 lowercase hex, the store's own form, lowercased whatever the
+reference's case) that entry's references name, when one id can be named — EVERY reference counts (an app-owned
+`apiKeyCommand` and an app-owned `apiKeyFile` beside it), not only the one the key ladder would read. `appOwnedKey`
+comes WITHOUT `appKeyId` when none can: a reference naming the service but no id (`-s daily-briefing.app-key` alone),
+two different ids in the entry, a file in `keys/` not named `<id>.key`, or that incomplete look — treat that entry as
+possibly referencing ANY app key. A key command names an id **only** when its argv is exactly the one the app writes:
+`<bin> find-generic-password -s daily-briefing.app-key -a <id> -w <keychain>` — eight elements, those words in that
+order, the id at the sixth (any case, reported lowercase), with any spelling of the binary and an absolute keychain
+path (one starting with `/`, as the app always writes). The tool gets that argv as a vector, so no shell reads it; and
+the keychain must be absolute because `security`'s option parsing reads on past `-w`, so a dash-led eighth element
+would be a further option, such as a second `-a`. **Every other app-owned key command names no id** and gives
+`appOwnedKey` with no `appKeyId`: a shell wrapper (`sh -c '…'`, `eval`, `… | tr -d '\n'`), `env security …`, a joined
+flag (`-a<id>`, `-s<service>`), another flag order, a missing or relative keychain or an extra element, a second `-a`
+(also one hidden in the keychain's place: `-ak-…`), and a key file read by a command (`cat …/<id>.key`; an
+`apiKeyFile` is the file rule's, unaffected). The engine reads no shell text for an id at all (P3-M1-T1 checkpoint;
+narrowed in PR 3 final r4 and r5; since the second post-cap fix of PR 3 final, after three shell readers leaked in
+turn, the exact argv only). **The cost, accepted:** while an entry holds such a command — one the user wrapped by hand
+— the app cannot tell which key it reads, so every delete that asks whether a key is unreferenced (Settings' Remove)
+keeps every app key; an Uninstall removes them. The rows are judged under a
+**2 s total deadline** (`KEY_OWNERSHIP_REPORT_DEADLINE_MS`, on the engine's async filesystem shell, so a user's own
+`apiKeyFile` on a stalled mount cannot hold a save's 30 s bound): a row not decided in time is `appOwnedKey: true` with
+no `appKeyId` — fail closed; the rest of the report is unaffected.
+Both are absent for a key the app does not own (the user's own `apiKeyCommand` / `apiKeyFile`, an `apiKeyEnv`, a
+literal) and for a CLI entry; the rows stay `[]` under a broken `provider.accounts`. No key byte, path or argv is ever
+echoed. **The app does not match reference shapes itself:** P3's `entries_referencing_key` (does any entry reference
+this id?) and the uninstall refusal (does a kept schedule's config reference app-owned keys?) both read these fields
+through `config validate --json --file <that config>`. `config validate` also gains an ERROR (validate-only) for an
+app-owned key over a non-loopback `http:` endpoint, on the entry's `…api.baseUrl` field.
+**Whether each entry is loopback** (PR 3, P3-M4-T1 follow-up, appended, always present on a row): **`loopback: boolean`**
+— the engine's own decision, the very one `testTimeoutMs` above is computed from (`ListEntry.isLoopback`:
+`isLoopbackHost` on an API entry's endpoint host, as defined above). `false` for every CLI entry and for an API entry
+with no `baseUrl` (the provider's own remote endpoint, or none). The rows stay `[]` under a broken `provider.accounts`,
+as before. The app's one-time network-check prompt (Settings) reads it: it asks only when an ADDED entry's row says
+`loopback: false`, so the app never decides "loopback" itself.
+**Whether each entry needs a key at all** (follow-up 4, 2026-10-19, always present on a row): **`keyOptional: boolean`**
+— `true` only for an `openai-compatible` entry whose endpoint host is loopback (Ollama, LM Studio, a local vLLM): the
+engine's ONE no-key rule, `keyOptional` in `src/providers/endpoint.ts`, which the key ladder's `localNoKey`
+(`src/apiKey.ts`), the transport's missing-key refusal (`src/providers/openaiCompatible.ts`) and doctor's anomaly also
+call. `false` for every other kind (an `anthropic` entry at a loopback host included), for a remote endpoint, for an
+API entry with no `baseUrl`, and for every CLI entry. Settings' **Add a provider…** reads it: with no key pasted, an entry
+is added keyless only when its keyless candidate's row says `keyOptional: true`, so the app decides neither the kind
+nor the host; any other keyless API add is refused (an OpenAI-compatible entry with no address is first asked for
+one, an Anthropic one for its key — a presence check of the form's input, the kind choosing only the wording). The `loopback` and `keyOptional` fields are never sent back: the Test mode copies exactly
+`index` and `testTimeoutMs` (§1e).
+**Whether each entry's key was moved out** (PR 3, P3-M4-T2 checkpoint, appended, always present on a row):
+**`keyMoved: boolean`** — `true` when the resolved entry's api block has `apiKeyEnv` equal to `key scrub-backup`'s
+sentinel, `DAILY_BRIEFING_KEY_MOVED` (above; its one definition is `KEY_MOVED_ENV`, `src/providerCli.ts`). `false` for
+every CLI entry and for every other key source (another `apiKeyEnv`, `apiKeyFile`, `apiKeyCommand`, a literal). The
+rows stay `[]` under a broken `provider.accounts`, as before. The app's "key moved — add a key" row status reads it from
+the SAVED config's rows, so the app never names the sentinel itself; an entry with no row says nothing of the kind.
+It is never sent back (§1e).
+
+### 1e. The app's provider commands — what the webview calls (provider fallback PR 3, P3-M1)
+
+§1d is the ENGINE's `provider` command. This is the app side of it: the Tauri commands the webview invokes, their
+wire shapes, and what Rust does between the webview and the engine. The typed wrappers are in `gui/src/lib/engine.ts`
+(`providerKeySet` … `providerCandidateCheck`); `gui/tests-web/provider-ops.check.ts` pins their command names and
+argument names against the Rust source, and the TypeScript `CheckError` / `CheckOutcome` / `EngineError` unions
+against the Rust enums' serde variants and fields.
+
+**Six commands for the seven verbs.** Five run one verb each (`gui/src-tauri/src/engine.rs`); `provider test` has no
+command of its own — it takes a candidate FILE, so the webview reaches it only through `provider_candidate_check`
+(`gui/src-tauri/src/config_save.rs`), which stages that file itself; and `key delete-all` has none since PR 3 final
+round 1 — `engine_provider_key_delete_all` let one IPC call delete every app key, around uninstall's kept-schedule
+refusal and consent, and no app code called it, so only uninstall's key leg runs `Operation::KeyDeleteAll`, Rust-side
+behind both (§16a). No command here takes a path.
+
+| command | webview arguments | engine argv | engine stdin | bound |
+| --- | --- | --- | --- | --- |
+| `engine_provider_key_set` | `{key}` | `provider key set --json` | the key | 19 s |
+| `engine_provider_key_migrate` | `{index}` | `provider key migrate --index <n> --json` | none | 19 s |
+| `engine_provider_key_delete` | `{id}` | `provider key delete --id <keyId> --json` | none | 15 s |
+| `engine_provider_key_scrub_backup` | none | `provider key scrub-backup --json` | none | 15 s |
+| `engine_provider_reset` | `{index}` or `{label}` | `provider reset --index <n> --json`, or `provider reset --label-stdin --json` | `{"label": "…"}` for a label | 15 s |
+| `provider_candidate_check` | `{text, mode}` | `config validate --json --file <staged>`, or `provider test --file <staged> --index <n> --json` | none | 30 s (validate); the row's `testTimeoutMs`, clamped (test) |
+
+- **All five `engine_provider_*` commands are MUTATING:** the in-flight guard holds them, so beside a run, a schedule
+  change or another provider operation they are refused `{kind: "busy"}`, not queued. Past its bound an operation's
+  process group is killed and the call rejects `{kind: "timeout", operation, seconds}` (`operation` is
+  `provider-key-set`, `provider-key-migrate`, `provider-key-delete`, `provider-key-scrub-backup`, `provider-reset` or
+  `provider-test`; uninstall's own `delete-all` times out as `provider-key-delete-all`, §16a). The bounds are §1d's app-side timeouts.
+- **They resolve with an `EngineOutcome` whose `payload` is the engine's one JSON line** (§1d) — switch on its `ok`,
+  `code` and `reason`, never on `outcome` or `exitCode`. A `null` payload means the engine printed no JSON line: it
+  crashed.
+- **Operands are refused in Rust before any spawn**, as `{kind: "invalidInput", field, reason}` naming the argument
+  and never echoing its value. `field` is the argument's name — `"index"`, `"id"`, `"label"` or `"key"` — and the
+  refusals are: `field: "index"` for an index above 999 999 (the validator `provider_index`); `field: "id"` for an id
+  that is not `k-` and 12 lowercase hex digits (`key_id`); `field: "label"` for a label that is empty, holds a NUL, or
+  whose `{"label": …}` payload is over the engine's 64 KiB (`label`; whitespace is the engine's to judge);
+  `field: "key"` for a key that is empty or over the engine's 4 KiB (`KeySecret`; the key rule itself is the
+  engine's — `code: "usage"`, `reason: "invalid-key"`), and also, from the spawn path, for a key-taking operation
+  given no key (`reason: "is required for this operation"`) or a key given to an operation that reads none
+  (`reason: "is not an input of <operation>"`). `engine_provider_reset` given both or
+  neither of `index` and `label` is `{kind: "invalidInput", field: "index/label", reason: "exactly one of the two is
+  required"}`; the wrapper refuses that shape itself, with the same object, before any IPC (a `null` counts as absent,
+  as Rust's `Option` reads it). An argument Rust cannot deserialise at all (a negative or fractional `index`, a `mode`
+  with an extra field) is rejected by Tauri with its own error STRING, not one of these objects.
+- **`engine_provider_key_scrub_backup` holds the settings save lock (`ConfigSaver`) across the engine call**, taken
+  before the in-flight guard, so a settings save started meanwhile waits for it and no save rewrites `.bak` between
+  the scrub's read and its write.
+
+**The key and the reset label travel on STDIN, never argv.** Every engine spawn's stdin is `/dev/null` except two:
+`key set`, whose stdin is the key, and `reset` by label, whose stdin is `{"label": "<label>"}` (argv carries only
+`--label-stdin`: a label is user text, `--help` is a legal one, and the engine reads `-h`/`--help`/`-v`/`--version`
+anywhere in argv). Rust writes the bytes and then CLOSES the pipe (the engine requires stdin to end within 1 s). The
+key is never part of the `Operation` Rust builds (a separate secret with no `Debug`, `Clone` or `Serialize`, its
+bytes overwritten when dropped), never in argv or the environment (the spawn clears it), never in an error or log
+line; the webview wrapper passes it as the call's one argument and does not log it, wrap it in an error, or keep it.
+An operation is refused before a spawn if it would carry both a key and a label.
+
+**`provider_candidate_check(text, mode)`** — validate or Test a CANDIDATE config without saving it:
+
+- `text` is the candidate's JSON text. `mode` is `"validate"`, or `{"test": {"index": <n>, "testTimeoutMs": <ms>}}`
+  — closed: an unknown mode or any other field is refused by deserialisation, before anything runs. `testTimeoutMs`
+  is that entry's `config validate` row value (§1d), passed UNCHANGED for every entry kind (`testModeFor(row)` in
+  `engine.ts` copies exactly `index` and `testTimeoutMs`); Rust adds nothing and clamps it to between 17 s and the
+  30-minute cap.
+- It answers, tagged by `kind`:
+  - `{kind: "validated", report}` — `config validate --json`'s report verbatim (`valid`, `errors`, `warnings`,
+    `normalized`, `providers` with `testTimeoutMs`, `loopback`, `keyOptional`, `keyMoved`, `appOwnedKey`, `appKeyId`). An invalid candidate is
+    `valid: false`, not an error.
+  - `{kind: "tested", answer, boundMs}` — `provider test --json`'s line verbatim (a pass or a failure, both `ok: true`,
+    or the engine's refusal, `ok: false` with `code`), and the bound Rust applied in milliseconds.
+  - `{kind: "invalid", errors, warnings}` — refused before anything was staged, in both modes: the candidate's
+    `calendar` block holds a link address, the save path's own answer; or (PR 3 final r1) a key slot — an `apiKey` of
+    any ASCII case, at any depth — holds any non-`null` literal other than the redaction placeholder: one note, field
+    `apiKey`, fixed text that names neither the value nor where it sits (`CHECK_LITERAL_KEY_ERROR`,
+    `literal_key_errors` in `config_save.rs`). The save path refuses such a literal too; the check refuses it so it
+    never reaches the candidate folder. When both hold, the calendar note is the answer.
+- It rejects, tagged by `kind`: `notJson {detail}` (not a JSON object), `tooLarge {bytes, limit}` (over the save
+  path's 1 MiB, refused before it is parsed), `candidateDir {detail}` (the candidate folder is unusable),
+  `invalidInput {field, reason}` (a Test `index` Rust refuses — nothing staged), `busy {running}` (a Test while
+  another mutating operation runs — refused, not queued; its staged file removed), `timeout {operation, seconds}`
+  (the engine did not answer within the bound and was stopped), `engine {detail}` (the engine could not be run,
+  crashed, or gave no usable JSON reply — or, before anything is staged or the engine asked, Uninstall removed the
+  settings in this app session: `detail` is `Settings were removed by Uninstall.`, a save's own words). Nothing is ever
+  written to the real config.
+- The candidate is staged as a private 0600 file in the 0700 candidate folder under its own `provider-check-` prefix
+  (the save path's sweep never matches it; its own sweep removes only a dead writer's files), and removed on every
+  outcome. The first step under the settings save lock is the settings-removed latch. The lock is held only around that
+  latch, the sweep and the write — never across the engine call, so a
+  save made while a Test runs is not blocked by it. A validate is not mutating: it takes no in-flight slot and can run
+  while a Test runs.
+- ⚠ A literal key's placeholder (what `config_read` shows in place of the value at every `apiKey` slot) is staged as
+  it is — and it is the ONLY literal ever staged (any other is the `invalid` answer above); the check sees the
+  placeholder text, not the stored key. Only the save restores it (§10e, step 5 of the save pipeline).
+
+**The Test's process.** Every engine spawn on unix is the leader of a process group of its own. A Test's group is
+SIGKILLed when the call RETURNS, not only on a timeout — a CLI Test's backgrounded grandchild can outlive the engine
+(measured at the P2-M4 checkpoint) — while every other operation keeps what it deliberately backgrounded.
+
+**Replace's pending-reset store** (PR 3, P3-M4-T3; `gui/src-tauri/src/pending_resets.rs`, the wrappers
+`providerPendingResetAdd` / `Flush` / `Drop` in `gui/src/lib/engine.ts`). Replacing an entry's key brackets the save
+with two `provider reset --label-stdin`s (spec §6 steps 1–4); between them Rust keeps a record
+`{label, phase: "pre-save" | "post-save" | "discard", newKeyId}` in the APP's `<app_data_dir>/pending-resets.json`
+(0600; not an engine path), keyed by `(label, newKeyId)`, every read-modify-write under one mutex.
+
+| command | webview arguments | what it does | answers (`kind`) |
+| --- | --- | --- | --- |
+| `provider_pending_reset_add` | `{label, newKeyId}` | writes a `pre-save` record, then the pre-save `provider reset` (the engine resolves the label against the SAVED config) | `reset` (save now; the record stays), `retry` (`lock-held`, or the app's `busy` — call again in 15 s), `refused {code, reason, detail}` (record dropped) |
+| `provider_pending_reset_flush` | `{label, newKeyId}` | after the save landed: `post-save`, then the post-save reset | `reset` (record cleared), `retry` (Rust's task retries it), `discarding`, `refused {…}` (record dropped) |
+| `provider_pending_reset_drop` | `{label, newKeyId}` | Discard / cancel an unsaved replacement, under the settings save lock | `promoted` (the saved entry under this label already uses the key — nothing deleted), `deleted`, `deletePending` (`key delete` refused `busy`: the task retries it), `kept {why: "otherLabel" \| "unverified"}`, `deleteFailed {detail}` |
+
+They reject `{kind: "invalidInput", field: "label" | "newKeyId", reason}` before anything is written or spawned, or
+`{kind: "store" | "engine", detail}`. **"References the key" is the engine's**: `config validate` over the saved bytes,
+each row's `appKeyId` / `appOwnedKey` (§1d), joined to labels by position through the settings guard's own enumeration
+(`gui/src-tauri/src/key_refs.rs`); a key is deleted only when every written entry has a row and none names the id or
+may read any app key, and the config is valid — a missing or unreadable config keeps it. A Rust task runs once at start
+and every 15 s: it resets `post-save` records (`lock-held` / `busy` retried, any other refusal drops the record),
+re-checks and finishes `discard` records, and resolves a `pre-save` record a PREVIOUS run left (referenced under its
+label → promoted and reset; only under another → dropped, key kept; nowhere → key deleted). The editor's own `pre-save`
+record is left to the editor. Lock order: the settings save lock, then the store's mutex; the mutex is never held
+across an engine call. **Uninstall closes the store** (P3-M6-T4, §16a step 8): its app-files leg removes
+`pending-resets.json` and its `pending-resets.json.tmp-*` temp files with the mutex held and a latch set, and every
+later write in the session rejects `{kind: "store"}`, so the retry task cannot re-create the file; a key a record
+still held stays in the store unless the settings box was ticked and the key leg is not refused (§16a step 9), when
+the key leg's `delete-all` removes it.
+
 ## 2. `schedule status --json` is the scheduling API, and it is FROZEN ADDITIVE-ONLY
 
 `ScheduleStatusReport` (`src/schedule/status.ts`) is the whole of it. **Only new, optional fields may
@@ -300,9 +821,35 @@ Fields a panel will want first:
   counts.
 - `removeSteps` — the manual removal steps for this machine's paths, as text with no closing line
   (each surface adds its own); `null` off launchd and systemd.
+- `registeredHint` — `"login-items-off"` on macOS when the unit file is on disk and the check says
+  gone (the item is probably switched off in System Settings › General › Login Items &
+  Extensions); `null` otherwise and on every other platform. Appended 2026-10-11, always present. The
+  wording is the engine's `LOGIN_ITEMS_OFF_HINT` (`src/schedule/units.ts`); the app reads this field
+  from the raw `Snapshot.schedule` envelope (`gui/src/lib/login-items.ts`), not through
+  `ScheduleState`, and shows that sentence as text — no allowed opener reaches the Login Items pane.
 - `owner` — `"cli"` or `"app"`. See §3.
 - `installedEngineVersion` vs `engineVersion` — **engine/app skew**. This is what the "update
   background engine" prompt keys on.
+- `scheduledEngineVersion` — *provider fallback PR 2 (P2-M5-T3), appended, always present.* The
+  scheduled binary's version as it answers NOW: the first line of `<binPath> --version`, through the
+  status module's injected exec, capped at the same 5 s as every status exec, read only when it is a bare
+  semver (`0.2.1`, `0.3.0-rc.1`). `installedEngineVersion` is the install-time RECORD, stale once the
+  binary is replaced in place; the app's older-background-engine warning (spec §6, P3) reads this one.
+  `null` — never a crash — when there is no record or no `binPath`, when `binPath` is not absolute
+  (nothing is run: a relative or bare path would resolve against the status caller's cwd or `PATH`), or
+  when the read fails: could not run, a non-zero exit, a timeout, or output that is not a bare version.
+  Records carry `binPath` only from 2026-09-14, after `--version` became real (2026-07-17), so the binary an
+  install recorded answers `--version`. An accepted residual, and NOT a harmless one: a binary REPLACED IN PLACE by a
+  pre-2026-07-15 build reads `--version` as `run`, so asking it starts a REAL briefing — a provider call that may be
+  billed. That run is capped at the same 5 s and its direct child killed, but a grandchild it started (the provider
+  CLI's own children) can survive the kill, and the field is `null`.
+  *(P3-M6-T2)* The app's `ScheduleState` carries it straight through as `scheduledEngineVersion` and adds
+  `olderEngineWarning`: true, for either owner, when `status --json` `providers` has two or more VALID rows (a
+  dropped row, `kind: "invalid"`, does not count) and this version is older (semver) than the lower of
+  `FIRST_SAME_RUN_SWITCHING_VERSION` (`gui/src-tauri/src/schedule_state.rs`, `0.3.0`, the first release containing
+  same-run switching) and the app's own version.
+  An unknown or unreadable version warns nothing. Only an app-owned schedule is offered the app's "Update background
+  engine" install; any other owner gets text.
 - `lingerState` — Linux only; `"disabled"` means the timer will silently never fire while logged out.
 - `ticksToday` vs `ticksExpectedSinceFloor` — the day-34 diagnostic. A healthy count with a late
   briefing means the *gate* is the defect; a count near 1 means the trigger is not firing.
@@ -427,10 +974,13 @@ parser accepts falls the same fail-open way.
 
 - **PATH and `caffeinate` are the APP's job on an app spawn (T9).** A GUI app launched from Finder
   or as a login item gets a minimal environment, not the user's shell PATH, so the sidecar would
-  fail to find `claude`/`codex`; and the plist wraps the binary in `/usr/bin/caffeinate -i`
-  (`src/schedule/units.ts`) so a 30-120s provider call is not interrupted by idle sleep. The app
+  fail to find `claude`/`codex`; and a scheduled run holds idle sleep off so a 30-120s provider call
+  is not interrupted — since 2026-10-11 by the engine itself, not by the plist: the plist starts
+  `[<bin>, run]` directly (a `caffeinate` wrapper made Background Activity list the job as
+  "caffeinate") and sets `DAILY_BRIEFING_KEEP_AWAKE=1`, on which `dispatch run` starts
+  `/usr/bin/caffeinate -i -w <its pid>` (`src/schedule/units.ts`, `src/keep-awake.ts`). The app
   reproduces both on **every** spawn, not only scheduled ones (plan R1: "PATH parity + caffeinate on
-  app spawns"). ⚠ The PATH's one definition is `installSchedule`'s `pathEnv:`
+  app spawns"), and does not set that variable, so an app spawn gets one caffeinate, the app's. ⚠ The PATH's one definition is `installSchedule`'s `pathEnv:`
   (`src/schedule/install.ts`) — **not** `scripts/install.sh`, which no longer sets one: A2 deleted
   the checked-in plist template and moved unit generation into the binary.
   `gui/src-tauri/tests/engine_env.rs` parses that line at test time and compares it to the Rust
@@ -825,7 +1375,11 @@ interface ScheduleState {
   it carries no side effect of its own), and
   `onfinished(outcome: EngineOutcome)`, called only when `afterInstall` resolves the attempt to
   `done` (`armsVerify` — B7's F2; a failed or foreign-owner attempt does not fire it, nor does an IPC
-  rejection). It owns no route and no layout beyond its own controls. ⚠ **The first attempt never
+  rejection). *Design 2026-10-31 r6 §3:* an optional `onbusy(busy: boolean)`, called from an effect on
+  every stage change with `install-flow.ts`'s pure `installBusy(stage)` — true while the stage is
+  `running` or `foreign-owner` (the call in flight, or the dialog open and unanswered), false otherwise,
+  including the return to idle after Keep. The wizard holds its Back, Finish and "Finish setup later"
+  on it (§13a); the Schedule screen passes nothing. It owns no route and no layout beyond its own controls. ⚠ **The first attempt never
   takes over**: its button always calls `engine_schedule_install` with `takeOver: false`; only the
   foreign-owner dialog's second button retries with `takeOver: true`. The Schedule screen shows ONE
   install/repair control: on `scheduler-broken` its "Repair background scheduler" replaces the
@@ -874,17 +1428,45 @@ interface ScheduleState {
   an attempt without take-over.
 - **`gui/src/lib/ScheduleVerify.svelte`** (B6) — props `evidence` (`{ skipIso, delivered }` from the
   pushed `Snapshot`), `trigger` (a counter the parent bumps after an install) and `onfinished`. The
-  loop's rules are pure (`lib/verify-flow.ts`).
+  loop's rules are pure (`lib/verify-flow.ts`). *Design 2026-10-31 r6 §4,* two optional props the
+  Schedule screen does not pass:
+  - `suspended` (default `false`) — the panel is mounted but hidden (the wizard behind another tab,
+    which passes `suspended={!shown}`). Arming and evidence are separate pure helpers in
+    `verify-flow.ts`. `armDecision(trigger, seen, suspended)` answers `"none"` when `trigger <= seen`,
+    `"defer"` while suspended and `"arm"` otherwise, and the trigger effect advances `seenTrigger` ONLY
+    on `"arm"` — so a trigger that lands while hidden arms once on show, and the loop is never
+    `verifying` without a call in flight. `evidenceStep(loop, evidence, suspended)` wraps `onEvidence`:
+    the transitions always apply and its `state` is `onEvidence`'s own object (the component's fixed
+    point), but while suspended the kick is `null`. ⚠ **Nothing is held**: the evidence effect reads
+    `suspended`, so it re-runs on show and the evidence at show decides again. A suppressed kick comes
+    back only when that evidence still makes one due — on an unchanged state (retrying evidence, say)
+    `onEvidence` returns the same kick again; a delivery that arrived while hidden has already moved the
+    loop to `watching`, so no kick is due (a held one would have overwritten that, or fired twice into
+    `refused`).
+  - `onbusy(busy: boolean)` — true while a `scheduleVerify()` call is in flight: the CALL's lifetime,
+    an in-flight counter around each call (`try`/`finally`), emitted only when `count > 0` changes —
+    not the stage, since a delivery can settle the loop in `watching` before the call returns. The
+    wizard holds Back, Finish and "Finish setup later" on it (§13a).
 - **`gui/src/routes/Wizard.svelte`** (B8, T16) — the first-run wizard, §13. Props `scheduleState`
-  (⚠ not `state` — deviation 91's rune conflict), `evidence`, `notifyAsk` / `notifyAskError` /
+  (⚠ not `state` — deviation 91's rune conflict), `os` (required, no default), `shown` (*design
+  2026-10-31 r6 §4:* REQUIRED, no default, like `os` — App passes `route === "wizard"`; while false
+  the calendar step's body is not drawn and the verification loop is suspended, §13a), `evidence`,
+  `notifyAsk` / `notifyAskError` /
   `onnotifychoice` (the SAME record and copy as the Schedule screen's ask — dev 107), `oncancel`
-  (steps 1–5: leaves with NOTHING written) and `onfinished`. It HOSTS `ScheduleAccess` (its step
+  (steps 1–5, "Set up later": leaves with NOTHING written) and `onfinished` (Finish, and since design
+  2026-10-31 D3 "Finish setup later", which calls `onfinished()` alone — no `finish()`, so nothing is
+  installed and the login-item plan is not applied). App's `onfinished` clears `wizardOpen`, routes
+  to Today **only if `route === "wizard"`** (a Finish that completes while setup is hidden behind
+  another tab leaves the user where they went), and still runs `refresh()` and
+  `refreshAccess(false)`. It HOSTS `ScheduleAccess` (its step
   4) and `ScheduleInstall` + `ScheduleVerify` (its step 6) — the same flow components, not forks —
   and its rules are pure (`lib/wizard.ts`). Entry: App.svelte routes to it ONCE per session on the
   first snapshot whose phase is `not-configured` (:1180's state) — but not once an Uninstall execute
   has started (Batch 2, M9 round 3: from that start on, the session never routes to it on its own, so a
-  consented settings removal does not take the done screen away); a `Setup` nav button shows while
-  that phase holds. `Route` gained `"wizard"`; `NavigateTarget` did not (deviation 54's rule).
+  consented settings removal does not take the done screen away). A `Setup` nav button shows while
+  `wizardTabShown(route, phase, wizardOpen)` (`lib/wizard.ts`) holds: setup is the route, OR setup is
+  open behind another tab (`wizardOpen`, design 2026-10-31 D3, §13a), OR the phase is
+  `not-configured` (the pre-D3 rule, kept). `Route` gained `"wizard"`; `NavigateTarget` did not (deviation 54's rule).
 
 ## 9. Deviations recorded by T10/T11/T14 (B4)
 
@@ -1139,7 +1721,14 @@ session rather than trusting that sentence.
 
 ### 10b. Today (T12)
 
-`routes/Today.svelte` gathers; `lib/today.ts` decides; `routes/TodayView.svelte` draws.
+`routes/Today.svelte` gathers; `lib/today.ts` decides; `routes/TodayView.svelte` draws. Since the
+briefing redesign (A) Today renders `lib/deck/DeckOrClassic.svelte`: the deck (`lib/deck.ts`, a pure
+model over the same `Block[]`) or, with the slides switch off, a page the deck cannot map, or "Full
+briefing", this same `TodayView`. Run now, its result line and Details are `lib/RunControls.svelte`,
+shared by `TodayView` and the deck's Good morning slide. The result line goes when a new briefing arrives (`RunLine`, `lib/run-result.ts`).
+`TodayView` draws Run now's hint beside the
+button (the default); Good morning passes `hint="info"` and draws it in the note of an "i" button,
+in one row with its status badge (user-directed 2026-10-22).
 
 - **Which renderer.** Under R1 the morning briefing is delivered by launchd, so the app normally
   holds no envelope for it and Today renders `briefing-latest.md` through the escape-first renderer.
@@ -1176,8 +1765,64 @@ session rather than trusting that sentence.
   against the local date — a label on the document, not a schedule phase). The badge is
   `ScheduleState.statusLine` coloured by `lib/tone.ts`, moved there from `Schedule.svelte` so the
   two screens cannot colour one state two ways.
-- **Run Now** is `engine_run` with `force: false`, as in B4. Only `engine:progress` lines whose
+- **Run Now** is `engine_run` with `now: true` and `force: false` — `run --json --now` (design 2026-10-24): the engine
+  lifts its morning-time floor for it and keeps the once-a-day guard, so it runs whenever it is clicked and answers
+  `already-ran` once today's briefing exists. Only `engine:progress` lines whose
   operation is `run` are shown, verbatim; a `busy` refusal names the operation already running.
+- **The AI summary (the briefing redesign's A2).** App owns one `summaryStatusDriver` (`lib/summary-status.ts`), the
+  ordered status read every summary decision waits on, and Today owns one `summaryReader` (`lib/summary-reader.ts`)
+  per mount, the only caller of `read_latest_summary`. They read on mount, on window focus, on a `state:changed` whose
+  summary fields differ from both the last event and the last read, and after a landed Settings save. There is no
+  minute tick (A2 :78's was dropped, plan R5-M3): before the morning time a `state:changed` arrives every minute, and
+  each read costs engine processes. A read keeps the last state until it answers, then updates in place, so a focus
+  never hides a showing summary; an external off edit shows until that read answers. Only a Settings save publishes
+  `known: false` synchronously, and its new generation drops any older enabled reply, so that reply cannot restore
+  text. The driver also keeps the last accepted payload per App, keyed by page identity and revision, so a return to
+  Today shows it at once when App's state is known-on with the same key, then re-reads in place. A save's hide still
+  wins, a read answering off forgets the payload, and an external off edit shows until that read answers. The payload
+  read waits for the ordered answer, so a stale known-on at mount reads no payload: a superseded read settles only when
+  the newest one does, and a mount whose read fails shows only what App kept, if anything, until a later read answers.
+  A failed status read keeps the last state and the text and issues no payload read: that read asks status itself, so
+  the same failure would answer as ordinary absence and clear the text. A failed read goes to App's own
+  `summaryStatusError`, which History and Schedule draw. While it is set, App reads again on window focus away from
+  Today (whose reader has its own focus read) and on entering either route, never on a tick. The driver's next good
+  read clears it, and so does any `state:changed` or snapshot App reads for itself whose `status` is not null, since
+  that proves status reads again.
+- **The live git detail (the briefing redesign's B1, wave 2).** Today drives `repos_status` (§1a's table)
+  through `lib/git-live.ts`: one keyed effect on the page key asks `first`, the minute tick `minute`, window focus
+  `focus`, and a slide becoming current sends a `first` still owed; at most one ask is outstanding and one queued
+  (the stronger reason kept), an answer for an older page is dropped, and an IPC error keeps the last answer,
+  marked not current. What it holds goes to `deckView` as `gitDetail` (with the OS, read once with
+  `osFromUserAgent`), and `lib/git-detail.ts`, a pure model, turns it into the slides' `git` view. The slides only
+  draw that view: What you did's window title, live PR count and rows (`lib/deck/GitRows.svelte`, each row a closed
+  native `<details>` that Open all never reaches), Where you left off's live branch words and "N files not
+  committed" tag, Suggested's unnumbered "Push your work" cards before its `<ol>`, the launchpad's tiles
+  (`lib/deck/GitTile.svelte`, chosen at the deck's clock) and mood line, and Good morning's "only on this Mac"
+  line. No component calls a command or reads the reply itself. Before the first answer, and for a card whose
+  repo the check could not answer, A's views stay as they were; "on this Mac" reads "on this computer" off macOS
+  (`hereWords`). The seeded states the screenshot pass draws are `tests-web/probes/b1-states.ts` (fixtures only).
+- **The live calendar (briefing redesign C, wave-2 plan C-M4, C-M5).** Today owns the calendar driver
+  (`lib/calendar-live.ts`, one per mount), the only caller of `calendar_details_open` (§1a's table):
+  `became-current` only on `DeckOrClassic`'s `onmove` onto the calendar slide or the launchpad from
+  neither, `focus` and a 5-minute `timer` while either is current, every ask gated on today's page with
+  a calendar section, judged on the live deck when it is sent. The deck draws what the driver holds
+  through `deckView`'s `live` field (`lib/calendar-detail.ts`, pure): the calendar slide
+  (`lib/deck/CalendarSlide.svelte`: the subtitle, one line per failure, the page's status rows before a
+  read and after a whole-read failure, the all-day strip, the next-meeting bar, the timeline, the page's
+  "+N more" line), the meeting card (`MeetingCard.svelte`), and the launchpad's and Good morning's
+  meeting tiles, which follow the live events once a read has answered (`tileEvents`). With no live
+  view (an older page) the slide draws A's rows.
+  - **Who calls what.** `calendar_details_get`: only the card, by handle, when it shows a live event; its
+    people and notes are held only while the card is open and dropped at the event's end and at the day
+    change. `calendar_join`: only `JoinButton.svelte` (on the card, the bar and the tile), unconfirmed
+    first; `confirmed: true` only from the ask-first question's "Yes" (`AskFirst.svelte`); "No" sends
+    nothing. `calendar_app_open`: only the card's Open in Calendar, hidden when `calendar status` lists
+    no `macos` source and, after a read, for an event with no Mac copy.
+  - **A stale handle** (`{refused: "stale"}` from either) reaches the driver through a Svelte context,
+    `CALENDAR_STALE`, set once by Today (`staleContext(cal, () => deck)`), never a prop; the driver
+    answers it with one `focus` ask on the live deck. With no context (a test render) nothing happens.
+  - Every calendar string (titles, places, names, notes, the Join host) is a text node; no component
+    builds a link, and no reply carries one.
 
 ### 10c. The renderers (T12, T13)
 
@@ -1214,6 +1859,16 @@ session rather than trusting that sentence.
   rule in the next bullet) — so collapsed only level-1 lines show, and expanding a campaign shows its
   level-2 lines with each absorbed group still collapsed. No `open` attribute is written at either
   level. A two-level page has no `nested2` line, so its rows are exactly what they were.
+- **The calendar section** (v0.3.0, plan M9; spec r4 §7). `lib/calendar-contract.ts` mirrors the
+  engine's `src/calendar/render-contract.ts` (heading, `CALENDAR_LINE_PREFIX` = `   ◦ `,
+  `isCalendarHeading`, the fixed status sentences — deep-equal pinned by `tests-web/calendar.check.ts`).
+  `lib/briefing-struct.ts` renders `struct.calendar` after "Today so far" and before "Suggested next",
+  checked byte for byte against M0's FROZEN fixture (`test/fixtures/calendar/rendered-section.txt`,
+  read from the engine's test folder; times in the local zone, so the check runs in UTC). The file
+  view is SECTION-BOUNDED, the audit's rule: from a line matching `isCalendarHeading` (with or without
+  ` (incomplete)`) to the next `▶ ` heading, a `   ◦ ` line is a `calendar` block — plain text, no
+  inline forms, since its words are event titles other people wrote. Outside that section the prefix
+  means nothing, so a page without the section classifies exactly as before.
 - **Rows are keyed by index AND header** (`lib/briefing-rows.ts`'s `rowKey`; fix round, MED-1).
   `open` is DOM state Svelte does not reset on a reused element, and Today swaps briefings inside
   the same `BriefingView` (Run Now replaces `latest`; `TodayView.svelte` keeps the view), so an
@@ -1259,9 +1914,28 @@ only for a list the engine actually reported empty. A briefing the user has open
 5. `transcripts` must equal what is on disk as JSON VALUES (key order and `50.0` vs `50` are not
    changes — the form's JavaScript round trip rewrites the latter; `config_save::json_eq`: two
    numbers it calls equal are equal doubles; it is exact for integers that fit in 64 bits, and past
-   that range serde_json reads a double on both sides, as JavaScript does) and a literal
-   `provider.api.apiKey` may be kept or removed but not set or
-   changed (the webview only ever sees the placeholder);
+   that range serde_json reads a double on both sides, as JavaScript does) and a literal key — the
+   value at ANY `apiKey` slot, at any spelling and depth: item 1's `provider.api.apiKey`, each
+   `fallbacks[i].api.apiKey`, anywhere else (P3-M2-T1) — may be kept or removed but not set or
+   changed (the webview only ever sees the placeholder). A kept key goes back at the SAME JSON
+   pointer only while the entry owning it has the same resolved label on both sides (item 1:
+   its first login's label beside a CLI `accounts` list, else `provider.label`, else
+   `"default"`), that label belongs to no other entry of the combined list on either side, and
+   the entry's `api.kind` and endpoint ORIGIN (scheme, host, port; no `baseUrl` = the kind's
+   default) are unchanged — a model or path change is not a move. Anything else is
+   `apiKeyChanged`, so a key never moves to another entry or another endpoint. Then (P3-M2-T2,
+   `config_save::refuse_new_or_changed_literals`) every literal left in the candidate — any value
+   but `null` at any `apiKey` slot, any ASCII case, any depth — must be exactly what the file holds
+   at the SAME pointer; a new one (a fallback gaining `apiKey`, a case variant such as `APIKEY`
+   beside a placeholder, a stored key copied to another pointer) or a changed one (another value,
+   another type, `""`) is `apiKeyChanged` before anything is validated or written. A literal sent
+   back VERBATIM (the stored value itself, not the placeholder) is bound like a restored one
+   (checkpoint P3-M2): the entry owning its pointer must have the same resolved label on both
+   sides, and the same `api.kind` and endpoint origin — a stored key cannot follow a rename or a
+   new `baseUrl` by being sent as itself. The unique-label check is NOT applied to a verbatim
+   literal, so the Quit offer and calendar saves, which rebuild the candidate from the parsed file,
+   keep working over a hand-written config whose labels collide. Removing a
+   literal (absent, or `null`) is allowed, and an unrelated edit beside a stored literal saves;
 6. a candidate that re-serialises to what is on disk is a no-op (nothing validated, nothing written);
    one that re-serialises past the size cap is `tooLarge`;
 7. the candidate is written to `<app_data_dir>/config-candidates/candidate-<pid>-<seq>.json` (0600,
@@ -1296,7 +1970,9 @@ backup from its target. A `.bak` swapped for a directory by another program betw
 the swap is not covered (the window is the swap itself).
 
 Modes: the config keeps its mode, tightened to owner-only when the candidate OR the file on disk has
-`provider.api` (as `initConfig` does for an API config); `.bak` gets `current & new`, never wider
+an `api` block — item 1's `provider.api` or any `fallbacks[i].api` (P3-M2-T2,
+`config_save::holds_api_block`; as `initConfig` does for an API config) — or the file holds a
+literal key anywhere; `.bak` gets `current & new`, never wider
 than the new file (round 1, M4: a 0644 API config used to leave a world-readable `.bak` holding the
 literal key). Saves are serialised by a lock in `ConfigSaver` — the Settings save and the Quit offer
 share it, and `tests/config_save.rs` pins that two never validate at once.
@@ -1321,8 +1997,10 @@ deviation 48.
 `read_latest_briefing {}`, `read_archived_briefing { date }` — nothing else is read from the body.
 
 - `ConfigDocument { path, exists, text, base, parseError, apiKeyRedacted }` — `text` is the file
-  re-serialised in the save format with a stored key replaced by the literal placeholder
-  `(a literal API key is stored in config.json; Daily Briefing never displays it)`; `text` and
+  re-serialised in the save format with the value at every `apiKey` slot (any spelling, any depth,
+  any type but `null`) replaced by the literal placeholder
+  `(a literal API key is stored in config.json; Daily Briefing never displays it)`, and
+  `apiKeyRedacted` says whether any was; `text` and
   `parseError` are `null` when there is no file, `text` is `null` when it is not JSON; `base` is
   `null` only when there is no file.
 - `SaveOutcome` (tagged `kind`): `saved { path, backupPath, warnings }`,
@@ -1353,12 +2031,16 @@ construction. §13 records the design, the alternatives rejected, and why the fi
 `init` operation) lost.
 
 **The wizard's key step (T16) is constrained by what exists.** `config_save` refuses to SET a
-literal `provider.api.apiKey` (deviation 45); `init` has no `--api-key` flag; and `apiKeyEnv` cannot
+literal key at any pointer (deviation 45; P3-M2-T2); `init` has no `--api-key` flag; and `apiKeyEnv` cannot
 resolve from the app or from launchd (§6). So a wizard that wants a native key must write it to a
 file and point `apiKeyFile` at it, point `apiKeyCommand` at a keychain helper, or come with a new
-create path that is designed to carry a key. **B8 chose the references** (deviation 129): the
-wizard collects an `apiKeyFile` path or an `apiKeyCommand` argv and never the key value, and
-`config_create` refuses a literal key outright — the third option was rejected, §13.
+create path that is designed to carry a key. **B8 chose the references** (deviation 129), and
+the third option stays rejected (§13): `config_create` refuses a literal key outright. **The
+wizard's API path now defaults to paste (P3-M6-T3):** the key goes to `provider key set` on stdin
+(§1d — never argv, never a config text), and the config receives only the answered reference
+(`apiKeyCommand` on macOS, `apiKeyFile` elsewhere); an `apiKeyFile` path or an `apiKeyCommand` argv
+of the user's own stays under Advanced. `config_create` still refuses a literal `apiKey` at any
+spelling.
 
 **Which file.** The path is whatever `status --json` reports, and the app does not forward
 `XDG_CONFIG_HOME` to the engine (`engine::FORWARDED_ENV`) — nor does launchd — so the app, and the
@@ -1367,8 +2049,9 @@ scheduled run, edit and read `$HOME/.config/daily-briefing/config.json` (`src/co
 terminal. Settings shows the path it edits; deviation 64.
 
 **The Settings screen** (`routes/Settings.svelte`, `SettingsForm.svelte`, `SaveReport.svelte`,
-`lib/settings-model.ts`): a form over every `Config` field except `transcripts`, and a raw-JSON
-tab; both send JSON text to `config_save`. The form edits the PARSED file in place, so unknown keys
+`lib/settings-model.ts`; since redesign D a sidebar of seven pages, `lib/settings/`): a form over
+every `Config` field except `transcripts`, spread over the pages, and a JSON editor on Advanced
+("Edit settings as JSON"); both send JSON text to `config_save`. The form edits the PARSED file in place, so unknown keys
 and key order survive, and list-of-object fields are rebuilt by matching existing entries. Help
 text is quoted from the engine (`src/types.ts`, `src/config.ts`, `src/harden.ts`), each quote
 checked verbatim against those files by a test. Errors and warnings are reported in separate
@@ -1377,7 +2060,7 @@ blocks. Round 1:
 - the save decision is a pure function (`formSubmission`): a LIVE field error blocks (errors on a
   hidden or disabled field do not, and toggling a list to the engine default clears its error); a
   draft equal to the loaded document as JSON values is `unchanged` with no IPC at all; otherwise
-  the whole draft is sent (`rawFromDraft`, which is also what the raw tab shows);
+  the whole draft is sent (`rawFromDraft`, which is also what the JSON editor shows);
 - `provider.timeoutMs` is its own section, shown for CLI and API providers alike;
 - ⚠ the `provider.argv` field says that `init` refuses `--tools` / `--settings` and that a save from
   this screen does not check for them (deviation 62; round 2 dropped its "unless `provider.harden`
@@ -1491,6 +2174,16 @@ Numbered from 37, continuing §9.
     replaces it with a placeholder, `config_save` restores it when the placeholder comes back,
     refuses any other value (the engine has no `--api-key` flag for the same reason), and allows
     removal. A save of an API config tightens the file to owner-only, as `initConfig` does.
+    *Provider fallback (PR 1):* ⚠ these guarantees cover **item 1 only** (`provider.api.apiKey`): `config_save`'s
+    redact and restore read that one path, so at PR 1 a hand-written literal `fallbacks[i].api.apiKey` reaches the
+    webview in cleartext and a Settings save can write one. `fallbacks` entries get the same guarantees in PR 3
+    (spec §6, P3-M2). *P3-M2-T1:* redaction now covers every `apiKey` slot, and a kept key is restored only at its
+    own pointer, under the same unshared label, at the same kind and endpoint origin (§10e step 5). *P3-M2-T2:* a
+    literal that is new or changed at ANY pointer is refused (one kept verbatim is bound to its owner's label, kind
+    and endpoint origin like a restored one, §10e step 5), and a save is owner-only when any `api` block exists
+    (item 1's or a fallback's) on either side. The combined list is item 1's logins, then `fallbacks`, each resolving its own key. An APP-OWNED key (a file under `<state>/keys/`, or the app's
+    Keychain service) is never sent over plain `http:` to a non-loopback endpoint: the run refuses that entry before
+    reading the key and moves on (`insecure-endpoint`).
 46. **JSON syntax is checked in Rust before the engine is asked**, because re-serialising needs a
     parse. Config SEMANTICS remain the engine's alone (`config validate`).
 47. **The "config mtime guard" (R1) is a content digest.** A base token from `config_read` must
@@ -1545,7 +2238,13 @@ Numbered from 37, continuing §9.
     path refuses a change from either tab.
 58. **The four appendix snapshot states are bun `toMatchSnapshot` files over server-rendered
     markup** (`tests-web/__snapshots__/today.check.ts.snap`), which include Svelte's scoped-style
-    class hashes — a CSS change to `TodayView.svelte` needs `bun test --update-snapshots`.
+    class hashes. Svelte 5 derives each hash from the component's file path relative to the
+    compiler's `rootDir` (the working directory unless set), not from its CSS, and adds the class
+    only to elements some selector of the component can match (measured 2026-10-22, svelte 5.57.0).
+    So editing the declarations of selectors that already match keeps the snapshots; adding or
+    removing a selector's match (a new rule can put the class on a previously unstyled element), a
+    markup change, a rename, or running the suite from another directory changes them, and needs
+    `bun test --update-snapshots`.
 59. **The not-today's-briefing label compares the briefing's own title date with the local date in
     the webview.** It labels the document; it is not a schedule phase, and the badge beside it is
     still Rust's `statusLine`.
@@ -1586,7 +2285,8 @@ Numbered from 37, continuing §9.
     a terminal that exports it. Settings shows the path it edits; §10e.
 65. **`.bak` is never wider than the new config, and a save that touches an API config leaves both
     owner-only** (round 1, M4) — `.bak` mode is `current & new`; the new mode is tightened when the
-    candidate OR the file on disk has `provider.api`. `initConfig`'s rule covers the candidate only.
+    candidate OR the file on disk has an `api` block (`provider.api` or, since P3-M2-T2, any
+    `fallbacks[i].api`) or the file holds a literal key. `initConfig`'s rule covers the candidate only.
 66. **Settings shows the `apiKeyEnv` field** although it cannot resolve from the app or launchd (§6):
     it is a valid engine key a terminal run resolves, and removing it from the form would hide a
     value the user has. Its note says it will not be found by the app or the scheduler.
@@ -1630,8 +2330,8 @@ Numbered from 37, continuing §9.
       every archived day read (one `status --json` spawn per read today, §10a), so it wants a
       batched read command designed for it rather than a loop over this one.
     - **Today's Regenerate** ([S-TODAY]: "only when already delivered today; confirms …") —
-      deferred. It is NOT covered by Run Now: Today's Run Now is `run --json` WITHOUT `--force`
-      (`TodayView.svelte`, `App.svelte` passes `force: false`), which does nothing once today's
+      deferred. It is NOT covered by Run Now: Today's Run Now is `run --json --now` WITHOUT `--force`
+      (`lib/RunControls.svelte`, `App.svelte` passes `now: true` and never `force`), which does nothing once today's
       briefing exists. `engine_run` already accepts `force`; what is missing is the button, its
       only-when-delivered gate and the provider-call confirmation.
     - **Today's Copy markdown** — deferred: it needs a clipboard path (no clipboard plugin or grant
@@ -2030,22 +2730,53 @@ also passes through `notifications::on_snapshot`, whose pure transition machine
   the click route is Today. ⚠ The baseline moves ONLY at absorption and at a delivered firing —
   the delivering tick's briefing write and its stamp land in TWO batches (§8's measured rates), so
   a baseline that tracked every snapshot would erase the change before the flip arrived.
-- **FAILED** (`provider-fail`, `parse-empty`, `marker-fail`, `crashed`) and **BLOCKED**
+- **FAILED** (`provider-fail`, `parse-empty`, `marker-fail`, `write-fail`, `crashed`) and **BLOCKED**
   (`blocked`) fire from TODAY's `Phase::Skipped` evidence, once per class per day (a failing
   morning rewrites `last-skip.json` every tick — 144 banners is what the per-day key prevents).
   The FAILED body is the engine's literal error line (the skip `detail`'s first line — no
   app-side redaction; the engine redacts its own diagnostics since PR #496 — but control-stripped
   and capped: §5's boundary is not redaction). Click route for both: the Schedule screen
   (deviation 106).
+- **OUT-OF-USAGE** (provider fallback, spec r9 §5, requirement 11) fires for a `limited` skip
+  whose record carries the engine's `allOutOfUsage: true` — every provider is out of usage, so no
+  briefing can arrive until a limit resets. Title "No briefing yet today"; the body is the skip
+  `detail`'s first line (the engine's `outOfUsageLine`, which names a reset time only when it
+  parsed one; with no usable line the app shows that line's no-time form, pinned against
+  `src/failover.ts`); click route: Today. A withheld one reads as out of usage in Settings
+  (`suppressedLine`), never as a failed run. The mixed state (out of usage plus paused after
+  failures) is the engine's FAILED skip and notifies as FAILED — a separate dedupe slot, so one
+  day can carry one of each.
 - **NEVER for a legitimate skip.** The whole engine vocabulary is enumerated
   (`notifications::skip_notify_class`, an exhaustive match; table-tested against `SKIP_REASONS`,
   which is itself pinned to `src/json.ts`): `already-ran`, `below-floor`, `offline`, `darkwake`,
-  `concurrent`, `limited`, `no-config` and `config-error` are silence, each with its reason in
-  the match's own docs; an UNKNOWN reason is silence (the additive rule — deviation 108 records
-  the reasoning per member).
-- **The first observation is ABSORBED, never fired**: a briefing already delivered (or a failure
-  already recorded) when the app opens is state, not an event. Absorption is also why the dedupe
-  needs no persistence across restarts. The one knowing cost: an app started between the briefing
+  `concurrent`, a plain `limited` (no `allOutOfUsage` — every older engine's `limited`, which
+  includes the "the next tick uses another account" case), `no-config` and `config-error` are
+  silence, each with its reason in the match's own docs; an UNKNOWN reason is silence (the
+  additive rule — deviation 108 records the reasoning per member).
+- **Once a day, across restarts: `<app_data_dir>/notified-dates.json`** (P3-M5-T2). The dedupe
+  map — per class, the local date it last fired for — is loaded when the first snapshot arrives
+  and written whole at EVERY firing, before the gates, so a firing withheld because notifications
+  are off or never asked is persisted too. A date absorbed at start-up is in the in-memory map
+  and reaches the file only when a firing (the primer's own included) writes the map. A persisted date blocks that
+  class for that date whatever happened in between (a quiet `offline` skip overwriting the
+  record, a restart) — unless it was discarded as a future date. At priming (the first snapshot
+  with a status), a persisted date LATER than the app's local today is discarded
+  (treated as absent: dates only increase in normal running, so a future one means the clock or
+  time zone moved backwards; with no local date nothing is discarded); then the later of the
+  persisted and the absorbed date wins per class. Accepted consequence: a discarded date can be
+  announced again if the clock comes round to it after a restart. A missing,
+  garbage or unwritable file is the in-memory dedupe, never an error. Accepted one-time residual:
+  the first launch of an app with this file has none yet, so a FAILED the previous version
+  already announced that day can fire once more. (Uninstall's `APP_DATA_FILES` names the file since
+  P3-M6-T4, §16a step 8.)
+- **The first observation is ABSORBED, never fired**: a briefing already delivered (or a block
+  already recorded) when the app opens is state, not an event. ⚠ **Except FAILED and
+  OUT-OF-USAGE for TODAY's local date** (requirement 11): the first observed record for today
+  with no persisted firing fires — at the primer, or once a shadowed phase surfaces — so opening
+  the app late cannot miss the day's failure or all-out state. An earlier day's record is
+  absorbed, and DELIVERED and BLOCKED keep today's absorption. "Today" is the app's clock at the
+  snapshot (`schedule_state::now_local`, the watcher's own); with no local date nothing escapes.
+  The one knowing cost: an app started between the briefing
   write and the stamp absorbs the new mtime and stays silent for that delivery — the letter of
   "observed BOTH halves". ⚠ **Only a STRUCTURALLY REAL status payload can prime, and priming
   absorbs the RAW evidence** (round-1 HIGH + round-2 MED, both fixed): the watcher deliberately
@@ -2173,7 +2904,7 @@ Numbered from 105, continuing §11e. §9's retire-in-place convention applies.
      first plugin grants in the capability, and exactly its shipped allow-set
      (`capabilities/README.md`). Real state via `is_enabled()` per render, never cached. The OFF
      path offers engine `notify: "auto"` through the existing offer command and wording
-     (`AppSettings.svelte`; the Quit dialog's rule).
+     (`AppSettings.svelte`, now `settings/AppGeneralControls.svelte`; the Quit dialog's rule).
 116. **The autostart label is `Daily Briefing` — `package_info().name`, i.e. the productName —
      and cannot collide with `local.daily-briefing`.** The plugin's default `app_name` feeds
      `auto-launch`, which uses it as the plist `Label` AND file name; `tests/autostart.rs`'s
@@ -2189,6 +2920,11 @@ Numbered from 105, continuing §11e. §9's retire-in-place convention applies.
      `Daily Briefing.plist` above can no longer go silently stale —
      `the_product_name_the_register_hardcodes_is_pinned` (tests/autostart.rs) fails on any
      `productName` change and names this entry as one of the places that must move with it.
+     *Amended for the briefing redesign (A-M1):* the app-owned records now also include
+     `notified-dates.json` and `pending-resets.json` (provider fallback PR 3, P3-M6-T4) and
+     `app-prefs.json` (the first name and the slides switch), with the two stores' temp files
+     (`pending-resets.json.tmp-*`, `app-prefs.json.tmp-*`); `uninstall.rs`'s `APP_DATA_FILES` and
+     `APP_DATA_GLOBS` are the list, pinned by literal name in `tests/uninstall.rs`.
 
 The entries from 118 are the B7 fix round's (round-1 review findings, resolved and recorded):
 
@@ -2342,7 +3078,7 @@ be read — the first shape turned a failed read into an OFF that Finish applied
 removal. A touched box is applied as the user set it. So the wizard's "nothing is installed until you confirm at the last step" holds for
 the login item. A user who leaves the wizard without pressing Finish, or who configured the engine
 from a terminal and never sees the wizard, gets no login item until they turn it on under
-**Settings › This app**.
+**Settings › General › This app**.
 
 **The record.** `<app_data_dir>/autostart-state.json` keeps its one key, `defaulted`; its meaning
 widens to "a login-item choice has been applied in this app" (B7's one-shot on an existing
@@ -2407,7 +3143,7 @@ stat) still reads ON — the Settings toggle and a wizard re-run would then show
 
 ## 13. The first-run wizard, the first-config path and the CLI shim (T16 + dev 63, B8)
 
-### 13a. The wizard: six steps, one write
+### 13a. The wizard: six steps (plan R1's; seven or eight on screen today), one write
 
 `gui/src/routes/Wizard.svelte` over the pure `gui/src/lib/wizard.ts`; entry is the existing
 `not-configured` state (§8a's Wizard contract). The six steps are plan R1's: welcome (local-first,
@@ -2421,6 +3157,10 @@ kickstart IS the verification, no second run path exists — then the notificati
 same command and copy, then `doctor --json`'s provider verdict and any per-repo note it carries —
 today only the partial-clone one, since the Phase E final harden (§17) — and, since Phase E M5b, the
 "Start Daily Briefing at login" choice, pre-ticked and applied only when Finish is pressed, §12d).
+Since then two steps were added without changing R1's numbering in the code comments (`lib/wizard.ts`
+keeps it on purpose, `STEP_ORDER`'s note): Phase E's update-check consent (E12, "new versions",
+after the access step) and v0.3.0's calendar step (after the save gate, before delivery) — eight in
+`STEP_ORDER`, the access step conditional. What the SCREEN numbers is below.
 
 **The one write.** Steps 1–5 build a DRAFT in webview memory; `lib/wizard.ts` performs no IPC at
 all (pinned by source scan), and the single write happens at the step-5 → step-6 gate:
@@ -2430,7 +3170,9 @@ NOTHING — `cancelWritesNothing`, pinned and mutation-checked.
 
 **Re-run = pre-populate + edit, never clobber** (R1 delta-verify H) — **scoped in round 1 to the
 two re-entry shapes that are actually REACHABLE**, because R1 rules the wizard FIRST-RUN ONLY
-(entry exists only at the `not-configured` phase; the Setup button is gated on the same phase,
+(entry exists only at the `not-configured` phase; the Setup button is gated on the same phase —
+since design 2026-10-31 D3 it also shows while a session's setup is still open behind another tab,
+which is the SAME mounted instance keeping its place, not a re-entry (below) —
 and the Schedule & Access panel remains the flow component for existing-config users — no general
 re-entry point exists or should be added): **(1) a pre-existing config found at first launch**
 (the `onMount` `config_read` seeds the draft), and **(2) the mid-wizard recovery** — a config
@@ -2449,9 +3191,114 @@ answers `unchanged` (pinned byte-for-byte against the FULL fixture AND a local-p
 round 1, deviation 134 as amended). Three do-not-clobber layers
 in `providerValue`: a KEPT CLI provider is returned as-is (a customised `argv` such as
 `["-p","--model","sonnet"]` survives), a changed provider rebuilds only wizard-owned keys (with
-unowned `api` keys — `baseUrl`, `maxTokens`, `apiKeyEnv` — riding through; a rebuild that changed
+unowned `api` keys — `maxTokens`, `apiKeyEnv`, and `baseUrl` only on an Anthropic re-run of an
+`anthropic` block (P3-M2-T2: from another kind the native-key path drops it, so a local LAN URL is
+never kept under the new key) — riding through; a rebuild that changed
 no VALUE keeps the existing object, order included), and a stored literal
 key's PLACEHOLDER is carried so the edit path keeps the key.
+
+**Setup's numbering, narrow Back and keeping your place (design 2026-10-31 r6, D1–D3).** Every rule
+below is a pure helper with a table test (`tests-web/wizard-steps.check.ts`, `wizard-nav.check.ts`,
+`wizard-resume.check.ts`); the component wiring is pinned by exact-call source pins, since the suite
+renders on the server only and no effect runs in it. The one-write contract above is unchanged:
+nothing here saves, and Back never crosses the save.
+
+- **Step numbers count only the steps that show (D1).** `lib/wizard.ts`'s `stepNumber(step, ctx)`,
+  `stepTotal(ctx)` and `stepHeading(step, ctx)` over `ctx = { os, accessKnown, accessInScope }`;
+  `stepHeading` ("Step N of M — title", or `null` for a step that will not show) is the ONLY source
+  of the titles, and the header renders it — the template spells no step number (pinned, and
+  `naming.check.ts` scans the models' strings and the template text of Setup, Settings, Today and
+  every component they import for `/step\s+\d/i` outside `stepHeading`, and for "Optional step"). The folder-access step never counts on Linux or Windows
+  (always 7 steps there); on macOS and an unknown OS (which may be a Mac) it counts while
+  `accessKnown` is false — so the total reads 8 until "Continue" from step 3 has run the access
+  check — and then only if `accessInScope`. `accessKnown` is set in both branches of
+  `continueFromRepos` and never cleared (a recovery re-seed keeps it, like `accessInScope`), so the
+  total can change only at that Continue. The calendar step is numbered: "your calendar (optional)",
+  never "Optional step". The welcome copy's "only if you say yes in step N" interpolates
+  `stepNumber("updates", ctx)`. While the access check runs, Back on step 3 is disabled, and
+  `continueFromRepos` routes only if the wizard is still on step 3 when the snapshot lands.
+- **Narrow Back and the nav row (D2).** One pure `wizardNav(step, s)` decides Back, "Set up
+  later", "Finish setup later" and Finish's install/verify gate (`back`, `setUpLater`,
+  `finishLater` with `shown`/`disabled`, and `finish.disabled`), and the template reads it;
+  Continue and "Create / Save configuration & continue" keep their inline conditions in
+  `Wizard.svelte`. Up to the save gate (`cancelWritesNothing`): "Set up later" (waits while
+  saving) and Back from step 2 on (waits for a key step or a save, and on step 3 for the access
+  check). The calendar step has NO Back; its existing "Your configuration was created / saved / is
+  unchanged at …" line gains "You can change these settings in Settings after setup." On delivery,
+  Back goes to the calendar step only, never past the save, and is disabled while the install is
+  busy (`ScheduleInstall`'s `onbusy`), once an install has armed the check (`verifyTrigger > 0`, so
+  the verify loop never remounts and re-kicks), while a check is in flight (`ScheduleVerify`'s
+  `onbusy`) and while Finish runs. Finish shares the install/verify gate (plus its own `finishing`
+  and the login-plan wait), since leaving through it unmounts the same components mid-call; it is
+  NOT held after an install, nor for a pending retry, which has no timer.
+- **"Finish setup later" (D3).** On the calendar and delivery steps. `finishLater()` calls
+  `onfinished()` and nothing else: no `finish()`, so nothing is installed and the login-item plan is
+  NOT applied; the config was already saved, once. It waits for the install, a check in flight and
+  Finish, and on the calendar step also for a calendar flow or calendar write (`calendarBusy`),
+  which leaving would unmount mid-flow. Under the delivery step's nav row: "You can install
+  background delivery any time from the Schedule screen." (the Setup tab hides once setup ends).
+  **Accepted asymmetry:** on the calendar step the generic Continue (`calendarHold`, from
+  `wizardCalendarStep`'s `continueBlocked`) waits for a running calendar flow, but not for a
+  calendar write in flight once the step has entered (only a pending entry, `entryWaiting`, waits
+  those out, through `calendarEntryAction`), while "Finish setup later" waits for both
+  (`calendarBusy`). Continue's rule predates this design (PB-M7-T1) and is unchanged by it;
+  recorded here, not changed.
+- **Keeping your place (D3).** `App.svelte` sets `wizardOpen` from an effect whenever
+  `route === "wizard"`, and clears it in exactly three places: `onfinished` (Finish, "Finish setup
+  later"), `oncancel` ("Set up later", before the save only) and `onuninstallstarted`. `<Wizard>` is
+  mounted on `wizardOpen || route === "wizard"` (the route term covers the first render, before the
+  effect has run), once, inside `.screen` and OUTSIDE the route chain, in a wrapper with
+  `hidden={route !== "wizard"}` and no author `display` rule — another tab hides it instead of
+  unmounting it. The route chain keeps an empty `{:else if route === "wizard"}` arm, because it ends
+  in a bare `{:else}` that renders Settings. The Setup tab follows `wizardTabShown` (§8a). Inside,
+  the required `shown` prop (`route === "wizard"`) drives what a hidden wizard must not do:
+  - **The calendar step's body is `{#if shown}`** — never drawn while hidden, so there are never two
+    `CalendarSettings` instances (duplicate ids, radio names), and any answer given on Today or in
+    Settings meanwhile is read on return. Unmounting `CalendarQuestion` runs `leaveWizard()`, so a
+    wizard result or a held "Try again" is dropped on a tab switch mid-step, and `CalendarSettings`'
+    local state goes too (accepted, r5). When the step (re-)enters is decided by
+    `calendarEntryPending`, set at exactly three moments — the first entry (the save), setup shown
+    again while on the step, and Back from delivery — and nowhere else, so a flow started by the
+    step's own question never re-enters it. `calendar-question.ts`'s pure
+    `calendarEntryAction({ pending, running, writesInFlight })` answers `"none"` (not pending),
+    `"wait"` (a flow of either origin runs, or a calendar write is in flight — Settings' included) or
+    `"enter"` (the effect clears the flag and, on macOS and Linux, runs the entry read); `wizardCalendarStep` takes
+    `entryWaiting: calendarEntryPending`, so the first render after a show or a Back is already the
+    checking line with Continue held, never the previous entry's view. That holds for a show because
+    the show detector is the wizard's one `$effect.pre`, which runs before the DOM update (final harden
+    r1): a plain `$effect` set the flag one flush late, so `{#if shown}` first drew the previous entry's
+    view, mounting `CalendarQuestion` / `CalendarSettings` for a flush (a `refresh()` read, and a
+    `leaveWizard()` on their destroy). Back and the save set the flag in their own handlers. **Accepted gap:** a Settings →
+    Calendar edit between its read and its save at the very moment of switching back (recorded, not
+    handled).
+  - **The delivery step's verify loop is `suspended={!shown}`** (`ScheduleVerify`'s `armDecision` /
+    `evidenceStep`, §8a): a trigger that lands while hidden arms once on show; a due kick is
+    suppressed, never held. Other steps keep their state and do no background work.
+  - **Focus.** The header's step line is the target (the `<h2>` never changes): it sits in
+    `{#key step}`, has `tabindex="-1"`, and uses `lib/ui/a11y.ts`'s `focusHeading` with the pure
+    `focusStepLine(firstMount, shown)` (`shown && !firstMount`). A step change remounts it, so it
+    focuses on every step; showing setup again flips the argument false → true on the same node.
+    `firstMount` holds until the first step change or the first hide, so opening the app on setup, or
+    the auto-offer, does not pull focus.
+  - **The login-item default is read again on each show while the box is untouched** (final harden
+    r1). Settings › This app can turn the login item on or off while setup is hidden, so the mount-time
+    read can go stale, and an untouched box would let Finish re-apply it — re-creating a login item the
+    user just removed. The show detector calls `readLoginItemDefault()` when
+    `loginDefaultRereads(loginChoice)` (`lib/wizard.ts`: only an untouched box, `choice === null`): the
+    default goes back to `pending` — Finish waits and the box shows the checking note — and a sequence
+    counter (`loginReads`) discards a reply from an earlier read. A touched box is never re-read.
+    **Accepted gap:** a show-time re-read answered while Settings' `autostart_set_enabled` is still in
+    flight can return the OLD value — that command changes the login item and only then writes the
+    record (on success), all under `lock_changes`, while `autostart_wizard_default` reads the record
+    and the live state without taking that lock (`gui/src-tauri/src/autostart.rs`). An untouched-box
+    Finish would then re-apply the old value. The window is one login-item change long (sub-second
+    expected, not measured) — the same class as the calendar step's accepted gap above (recorded, not
+    handled).
+  - Unmount-only behaviour (`onDestroy` → `releaseIfUnused("leave")`) now runs when setup really
+    ends, not on a tab switch. Before the save, outside edits made while setup is hidden still meet
+    the existing guards (`conflict` → re-seed and acknowledgement; `alreadyExists`).
+  - A `finish()` that completes while setup is hidden closes it without moving the user
+    (`onfinished`'s route guard, §8a).
 
 ### 13b. The provider step's three paths (R1)
 
@@ -2467,12 +3314,13 @@ key's PLACEHOLDER is carried so the edit path keeps the key.
   same `which` mechanism `initConfig` uses, at the first moment it can actually run.
 - **(b) a native Anthropic key** — `provider.api` kind `anthropic`, model prefilled
   `claude-sonnet-5` and EXPLICITLY confirmed (the Continue button blocks until the checkbox or an
-  edit). **The key is collected BY REFERENCE ONLY** (deviation 129): an `apiKeyFile` path or an
-  `apiKeyCommand` argv, per §10e's constraint paragraph — the app never ASKS FOR, SETS or ECHOES
-  a key value (round 1's honest wording: a user can paste one into the key-command textarea, as
-  into any textarea; the app never requests one, never stores one, and the engine never echoes
-  one), and `config_create` refuses a literal `apiKey` outright — at any spelling or position
-  (§13d).
+  edit). **The config receives the key BY REFERENCE ONLY** (deviation 129, §10e's constraint
+  paragraph). Since P3-M6-T3 the path defaults to paste: the key goes from a password field to
+  `provider key set` on stdin, and the config receives only the answered reference
+  (`apiKeyCommand` on macOS, `apiKeyFile` elsewhere); an `apiKeyFile` path or an `apiKeyCommand`
+  argv of the user's own stays under Advanced. The key value is never written to a config,
+  shown or echoed, and `config_create` still refuses a literal `apiKey` outright — at any
+  spelling or position (§13d).
   `networkProbeHosts` is deliberately OMITTED on this path (deviation 130): absent, the run
   derives probe hosts from the endpoint (`initConfig`'s own note), where copying the engine's
   explicit-write behaviour would need a drift-prone webview port of `deriveProbeHosts`.
@@ -2519,7 +3367,8 @@ scan for any object key spelled `apiKey`, anywhere in the document**
 shapes through (`provider.api.apikey` created at 0600; a top-level `apiKey` and
 `provider.accounts[].apiKey` created at 0644, world-readable) and the engine's validator is NOT
 a second line of defence; `apiKeyFile`/`apiKeyCommand` stay legal. **The mode rule is unchanged
-and now guaranteed-safe**: 0600 exactly when the candidate carries `provider.api`, 0644 (absolute,
+and now guaranteed-safe**: 0600 exactly when the candidate carries an `api` block (`provider.api`, or
+since P3-M2-T2 any `fallbacks[i].api` — `config_save::holds_api_block`), 0644 (absolute,
 not umask-filtered) otherwise — safe because post-refusal no literal key can exist ANYWHERE in a
 created document, so none can reach a world-readable file. Any `transcripts` block refused
 (the human gate: on a create the only unchanged value is absence). The write is
@@ -2528,8 +3377,8 @@ in one call**, so `EEXIST` is the do-not-clobber answer (`alreadyExists`) for a 
 `daily-briefing init` wrote mid-wizard, a dotfiles symlink, anything; a link-less filesystem
 falls back to `create_new` (still exclusive, no longer atomic — the same accepted residual as
 deviation 68's rename fallback); the parent directory is created (a first run has no
-`~/.config/daily-briefing/`). Mode 0600 when the candidate carries `provider.api` (initConfig's
-rule), 0644 otherwise (guaranteed key-free by the scan above). The wizard answers `alreadyExists`
+`~/.config/daily-briefing/`). Mode 0600 when the candidate carries an `api` block, item 1's or a
+fallback's (initConfig's rule, widened in P3-M2-T2), 0644 otherwise (guaranteed key-free by the scan above). The wizard answers `alreadyExists`
 by RE-READING, RE-SEEDING the draft from what is really there, and switching to the base-token
 edit behind an explicit acknowledgement (§13a's recovery shape, round 1 — deviation 136).
 
@@ -2616,7 +3465,16 @@ Numbered from 126, continuing §12b. §9's retire-in-place convention applies.
      literal key can exist in the webview, in IPC, on a command line or in a log; `config_create`
      refuses one outright, and the STOP condition in the B8 brief was therefore not triggered —
      the engine's surface DOES accept a key without violating the constraint (`apiKeyFile` /
-     `apiKeyCommand`, dev 45's "only app-settable sources").
+     `apiKeyCommand`, dev 45's "only app-settable sources"). *Provider fallback (PR 1):* the reference rule holds per
+     `fallbacks` entry too, and the engine resolves each entry's key only when the walk reaches that entry, scoped to
+     its attempt — never into `process.env` or a later entry's spawn. *Provider fallback (PR 3):* the config still
+     holds a key only by reference (the `apiKeyCommand` or `apiKeyFile` the engine's `key set` answers), but the
+     "no literal key in the webview or in IPC" sentence above no longer holds for the pasted key: it exists in a webview
+     password field (the wizard's, or the Providers list's Add or Replace key) until it is handed over — the field is
+     cleared as it is — and as the one argument of one IPC call to Rust (`engine_provider_key_set`), where it becomes a
+     `KeySecret` (no `Debug`, `Clone` or `Serialize`; its bytes zeroed when dropped) and is written to the engine's
+     stdin, which is then closed — never argv or the environment (the spawn clears it), a log line, an error, or a
+     config. See §1e ("The key and the reset label travel on STDIN") and §13b.
 130. **Path (b) omits `networkProbeHosts` where `initConfig` writes the derived hosts
      explicitly.** Absent, the run derives them from the endpoint at load (the engine's own
      documented behaviour); writing them would need a webview copy of `deriveProbeHosts`, a
@@ -2733,7 +3591,13 @@ Numbered from 126, continuing §12b. §9's retire-in-place convention applies.
      Bounded meanwhile: the wizard's create (B8's surface) refuses at any spelling, and the
      edit path's owner-only mode rule fires whenever either side carries `/provider/api` —
      the residual is a hand-added apiKey-named key OUTSIDE any api block keeping a 0644 file.
-     Follow-up: an introduced-by-this-edit scan in `save_value`.
+     Follow-up: an introduced-by-this-edit scan in `save_value`. *Provider fallback P3-M2-T1:*
+     superseded in part — `redact` and `restore_api_key` now cover every `apiKey` slot, bound to
+     the owning entry's unshared label and endpoint (§10e step 5). *P3-M2-T2:* closed —
+     `refuse_new_or_changed_literals` is that introduced-by-this-edit scan (positional: a literal
+     must be what the file holds at the same pointer, so a pre-existing key round-trips and a new
+     or changed one is refused), and a literal anywhere in the file makes the save owner-only, so
+     the 0644 residual is gone.
 145. **A `config_read` failure DURING the alreadyExists/conflict recovery leaves the PRIOR
      `recovered`/`recoverAck` state in place** (round 2, V-6/GE1; measured SAFE). The inner
      catch reports the failure without re-seeding — but the stale draft's second save still
@@ -3346,7 +4210,7 @@ tempdirs: HOME + XDG_CONFIG_HOME + DAILY_BRIEFING_STATE_DIR + DBA_TEST_UNIT_DIR,
 | Both installed, GUI delegating | owner `"cli"` record + FULL app presence: byte-identical, corpus, audit all hold | the delegated watcher against a real tick |
 | Transition CLI→app (take-over) | engine's foreign-owner exit-2 + `--take-over` argv covered by the engine's own tests and `tests/capability.rs`'s IPC legs (§1b) | the real `launchctl` swap (plan line 70's live-domain register) |
 | Transition app→CLI (handback) | same coverage class (§1b) | same |
-| Uninstall | `tests/uninstall.rs`: script parity, consent gate, never-recursive, survivors, T19-disable reuse, the schedule-record and record-less-unit refusal (§17), the scheduler step (each engine answer mapped, an `Err` removing nothing, `removeOwn` refusing what the app did not install without calling the engine, `keep`'s refusal, the settings lock held through the step) against a FAKE engine program, the settings leg and its latch, the Linux engine copies — real `SystemFs` on scratch | the real scheduler step against the real engine, the real removal legs + login item (§16c) |
+| Uninstall | `tests/uninstall.rs`: script parity, consent gate, never-recursive, survivors, T19-disable reuse, the schedule-record and record-less-unit refusal (§17), the scheduler step (each engine answer mapped, an `Err` removing nothing, `removeOwn` refusing what the app did not install without calling the engine, `keep`'s refusal, the settings lock held through the step) against a FAKE engine program, the settings leg and its latch, the Linux engine copies, the key leg (`delete-all` only behind the settings box, the kept-schedule refusal from scripted `config validate` rows, held while `config.json` or `config.json.bak` is left) and the pending-reset store closed around the app-files leg — real `SystemFs` on scratch | the real scheduler step against the real engine, the real removal legs + login item (§16c) |
 
 **The uninstall, in order** (`uninstall.rs`'s module header gives each step's reasons).
 `uninstall_preview` makes two engine reads — `status --json` (the state dir and `configPath`) and
@@ -3359,7 +4223,7 @@ unreadable", never the all-default view) — plus Rust's own `lstat` look and th
    record or a unit, or the read says `recordFilePresent` or `registered: true`. Its owner is `app`
    only when the read succeeded with a readable record owned by `app`.
 2. **The settings lock** (`ConfigSaver`'s), taken when the settings will be removed and held to the
-   end, so a save cannot re-create a file behind that leg.
+   end, so a save cannot re-create a file behind that leg (and held across the key leg, step 9).
 3. **The scheduler.** `keep` calls nothing. `removeOwn` answers `ScheduleFailed` ("Couldn't read the
    background scheduler's status.") when the status read failed, and `ScheduleForeign` for a detected
    scheduler the app does not own, and otherwise runs `schedule uninstall --invoker app`; `removeAny`
@@ -3371,6 +4235,24 @@ unreadable", never the all-default view) — plus Rust's own `lstat` look and th
    removed nothing and no later step runs. Rust never runs
    `launchctl` or `systemctl` itself, and keeps no read timeout on this call: the engine's own 45 s
    deadline bounds it.
+   - **3b. The kept schedule's keys** (provider fallback PR 3, P3-M6-T4). With the settings box ticked
+     and `keep` sent with no scheduler detected — "Uninstall anyway" in its nothing-detected form, so
+     a scheduler nobody could see may still run — Rust asks whether that schedule's config uses keys
+     the app stored, by the ENGINE's answer: the saved config read as the pending-reset store reads it
+     (`config_save::read_saved_with_report`: `status --json` locates it, `config validate --json
+     --file` over the same bytes) and its `providers` rows' `appOwnedKey` / `appKeyId` (§1d), joined
+     to the written entries by `key_refs.rs` (`any_app_key_referenced`). Rust matches no reference
+     shape and resolves no list. Only a config the engine calls valid, whose rows cover every entry
+     and name no app key, lets the key leg run; a row naming an id, a row `appOwnedKey` with no id,
+     rows that miss an entry, an invalid or unreadable config and a validate that fails each refuse
+     it (`KEYS_KEPT_FOR_SCHEDULE` / `KEYS_KEPT_UNVERIFIED`). No config at all is no reference: a
+     scheduled run stops at `no-config` and reads no key. Read here, under the settings lock, before
+     the gate look. Step 9 applies this refusal only while that config is still there: once step 7's
+     `config.json` step completes (removed, or found absent) AND `config.json.bak` is not there either
+     (removed by step 7, or never there — looked at after step 7), no scheduled run can read a key, and
+     `delete-all` runs; a settings leg that stopped at a key file, could not remove `config.json`, or
+     left `config.json.bak` behind keeps the refusal (checkpoint P3-M6; the backup since PR 3 final r1:
+     it holds the same settings, and a hand restore of it would read the keys `delete-all` removes).
 4. **The login item** (leg 1).
 5. **The gate look**, a fresh `ScheduleSeen::look` with nothing awaited between it and the legs. The
    report states this look.
@@ -3382,12 +4264,33 @@ unreadable", never the all-default view) — plus Rust's own `lstat` look and th
    checks; otherwise each one there is reported kept, with why.
 7. **Settings**, if consented and not refused: the same two refusals, then an error when the
    engine's `configPath` is unknown. In the folder that `configPath` names, each key file a readable
-   config names is removed first, when it is a regular file directly in that folder (compared by
+   config names — every entry's `api.apiKeyFile`, item 1's and each fallback's (P3-M6-T4; through the
+   list enumeration `key_refs.rs` shares; any `apiKeyFile`, the user's own included) — is removed first, when it is a regular file directly in that folder (compared by
    identity) and not one of the configs; then `config.json`, then `config.json.bak` (a link loses the
    link, never its target); then the folder, only if it is now empty. A settings folder that is a
    link is not entered. Once the `config.json` step completes, a "settings removed" latch makes every
    later settings write in that app session refuse.
-8. **The app's own files** (leg 2).
+8. **The app's own files** (leg 2): `APP_DATA_FILES` — the three records, plus `notified-dates.json`
+   (the notify dedupe dates) and `pending-resets.json` (Replace's store) since P3-M6-T4, and
+   `app-prefs.json` (the first name and the slides switch) since the briefing redesign's A-M1 —
+   `APP_DATA_GLOBS` (`pending-resets.json.tmp-*` and `app-prefs.json.tmp-*`, each store's temp files
+   a crash between its write and its rename leaves, holding labels or the first name), the
+   candidate folder and the window-state file. The
+   pending-reset store is CLOSED around this leg (`PendingResets::close_for_uninstall`): its mutex is
+   held while the file and its temp siblings go, and a latch refuses every later write in the
+   session ("This app's files were removed by Uninstall, …"), so its 15 s retry task, or a Replace,
+   cannot re-create the file (P3-M4-T3's known race). The app-preference store is closed the same
+   way (`AppPrefs::close_for_uninstall`, A-M1): the app stays open on Settings, so without it a
+   first-name save on blur would write `app-prefs.json` back.
+9. **The key leg** (P3-M6-T4, spec r9 §6 "Uninstall"), behind the SETTINGS box — the existing
+   consent; there is no third box — and last, because its engine call is the one await after the
+   gate look: `provider key delete-all --json` (§1d, 16 s, the in-flight guard), which removes the
+   `daily-briefing.app-key` Keychain items on macOS and `<state>/keys/` elsewhere. Rust never removes
+   a key or `keys/` itself, and the engine-data leg never touches `keys/`. Refused, without asking the
+   engine, by the settings step's own refusal (the same text), then when the engine's `configPath` is
+   unknown (`KEYS_KEPT_SETTINGS_UNKNOWN`), then by step 3b while step 7 left `config.json` or
+   `config.json.bak` in place.
+   The answer is read from the JSON's `ok` only; a failure is reported, never thrown.
 
 **The report** adds three members to the old ones. `schedule`: `outcome` (`removed`, `absent`,
 `kept`, or `notChecked` for `keep` with nothing detected by a check that could not run), `leftover`
@@ -3403,13 +4306,21 @@ stopped at a key file, or the unlink failed) ("<name> was a link to <target>; th
 may hold your API key.", or, when the target is gone, "<name> was a link to <target>, which was
 removed as your API key file." or "…, which isn't there."), a removed config that another link still
 holds (links this leg removed itself are counted out, so two configs that were the only two links to
-one file say nothing of the kind), and the `.config.json.save-*` staged copies, which are named and
-never removed. The done screen places a gone-target note with the removals only when its config was
+one file say nothing of the kind), and the staged copies — a killed save's `.config.json.save-*` and a
+crashed `key scrub-backup`'s `.config.json.bak.scrub-*` (the engine's prefix, pinned against
+`src/providerCli.ts`), either of which may hold a key — which are named and never removed. The done screen places a gone-target note with the removals only when its config was
 removed; a kept link's stays under **Still on this machine**. `engineCopies`: one full-path line per
-Linux copy looked at, `[]` on macOS.
+Linux copy looked at, `[]` on macOS. Since P3-M6-T4, `keys` too, always present: `asked` (the
+settings box), `deleted` (the engine's count — on a failure a lower bound — or `null`), `kept` (files
+in `keys/` that are not the app's, left with the folder), `refused` and `error`. The done screen lists
+"API keys this app stored removed (<n>)" (or that none was left) under **Removed**, and a refusal ("…:
+kept, for the same reason as the settings." when it is the settings step's own), a failure and a kept
+key folder under **Still on this machine**. The settings box's label is "Also remove my settings (in
+<folder>) and API keys." — no longer than before, for spec 3.6.2's 100-word budget; "API keys" covers
+the key files the settings name and the keys the app stored.
 
 **The webview** (`app-uninstall.ts`'s pure helpers, drawn by `UninstallConsent.svelte` and
-`AppSettings.svelte`). The scheduler line is nothing when nothing is detected and the check ran;
+`settings/UninstallPanel.svelte`, Settings → About & uninstall). The scheduler line is nothing when nothing is detected and the check ran;
 "The background scheduler this app set up is removed too." for the app's own; "Couldn't check for a
 background scheduler (<reason>)." when nothing is on disk and the check could not run; and for any
 other detected scheduler, one lead sentence and a two-option radio group, **Keep it running** first
@@ -3434,7 +4345,7 @@ the other panels are read again, and the new mount draws the done screen from th
 handed. After an Uninstall in this session removed `config.json`, Settings' no-config sentence reads
 "Your settings were removed by Uninstall. To set up again, quit and reopen the app, or run
 `daily-briefing init` in a terminal." instead of pointing at Setup: the session's "settings removed"
-latch refuses the wizard's `config_create` too.
+latch refuses the wizard's `config_create` too, and every candidate check (`provider_candidate_check`, §1e).
 
 ### 16b. Deviations recorded by T25 (B25)
 
@@ -3457,7 +4368,10 @@ Numbered from 157, continuing §15b. §9's retire-in-place convention applies.
      `src/lib.rs:122-124`, measured): the two coincide on macOS and DIVERGE on Linux
      (`~/.config/<id>` vs `~/.local/share/<id>`), so `uninstall.rs` carries TWO directories and
      the single-dir shape the appendix implies would strand the window-state file on exactly the
-     platform where nobody would look.
+     platform where nobody would look. *Amended for the briefing redesign (A-M1):* the simulated
+     presence (`tests-web/coexistence.check.ts`'s hand copy of `APP_DATA_FILES`) also lays down
+     `notified-dates.json`, `pending-resets.json` and `app-prefs.json`, the records added since;
+     nothing checks that copy against Rust, so a new record is added to both by hand.
 159. *Amended in the Phase E final harden (§17): while `<state>/schedule.json` exists the consented
      leg removes NOTHING of the engine's — the trigger that record describes runs the engine copy
      and would re-create what was removed — and reports ONE refusal (`engineRefused`) naming the way
@@ -3700,7 +4614,7 @@ the docs' "(or uninstall the app)" advice led straight into it.
   claim is made on macOS only — `scripts/uninstall.sh` is a macOS source-checkout script — and
   elsewhere the label keeps only the qualification ("None of the engine's data is removed while a
   background schedule is installed; …"). `SCHEDULER_NOTE` names the
-  button. The done view (`AppSettings.svelte`) draws `engine data: nothing removed —
+  button. The done view (`AppSettings.svelte` (now `settings/UninstallPanel.svelte`)) draws `engine data: nothing removed —
   <engineRefused>` in its per-entry list.
 - **A schedule outlives the app — said ticked or not** (round 2, R4). In these rounds Uninstall left
   the schedule in place, and its trigger runs the engine copy, not the app, so deleting the app left
@@ -3895,9 +4809,9 @@ archived briefing with the pre-0.2.0 footer (`— generated locally via`) still 
   `scheduleUnitFile` (:556, :559). `doneNotes(report)` (:314) warns
   from those — a schedule removed between preview and execute no longer warns, and an unknown state
   dir gets a HEDGED warning ("The engine could not say whether a background schedule is installed")
-  rather than none. `AppSettings.svelte` no longer carries `uninstallScheduled`. The ticked button no
+  rather than none. `AppSettings.svelte` (now `settings/UninstallPanel.svelte`) no longer carries `uninstallScheduled`. The ticked button no
   longer promises engine data under a schedule: `executeLabel` (:240) says "Remove app pieces (engine
-  data stays while a schedule is there)" (`AppSettings.svelte` :423).
+  data stays while a schedule is there)" (`AppSettings.svelte` :423, now `settings/UninstallPanel.svelte`).
 - **The platform words** (B3-L6). The preview and the report carry `os` (`std::env::consts::OS`).
   The consent label claims the engine copy only on macOS, where `managedBinPath` puts it in the state
   folder; on Linux it says the copy is in `~/.local/share/daily-briefing/` by default and is not
@@ -3909,7 +4823,7 @@ archived briefing with the pre-0.2.0 footer (`— generated locally via`) still 
   preview tells the webview its platform, names both. *Amended: it is one sentence about the app's
   own pieces, and names no platform; how the app itself is removed is the done screen's
   `finishLine(os)`.*
-- **The refusal line is pinned** (B3-L5): `AppSettings.svelte` :385, `engine data: nothing removed —
+- **The refusal line is pinned** (B3-L5): `AppSettings.svelte` :385 (now `settings/UninstallPanel.svelte`), `engine data: nothing removed —
   {uninstallReport.engineRefused}`, by source, inside the report list and behind its guard.
 - **The Wizard's save notes are keyed by index** (D3-L3; `Wizard.svelte` :607 and, the same shape,
   `saveErrors` :736): the engine redacts every note (`src/json.ts`, `redactNote`), two different
@@ -4041,7 +4955,7 @@ archived briefing with the pre-0.2.0 footer (`— generated locally via`) still 
   `unitUninstallCommand` (`app-uninstall.ts` :176) is the same rule and its `unitCommandNote` (:185)
   the same sentence, its `UNIT_DIR_CLAUSE` (:161) held to Rust's word for word by the source parse;
   the consent label's two unit branches (:244-259) and `doneNotes` (:380) add it only where they name
-  the unit. Text only: `{}`-interpolated as before, never `{@html}` (`AppSettings.svelte` unchanged).
+  the unit. Text only: `{}`-interpolated as before, never `{@html}` (`AppSettings.svelte` (now `settings/UninstallPanel.svelte`) unchanged).
 - **An unknown record is not "no record"** (A5-L1 = B5-L1, a round-4 regression). The preview's
   `scheduleRecordPresent` is `false` when the engine could not name its state dir (`engineError` set;
   the field's doc says so now, :35), and the report's is `null` then; round 4's unit wording read both

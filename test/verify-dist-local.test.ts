@@ -55,7 +55,7 @@ function gitProbe(cwd: string, ...args: string[]): { code: number; out: string; 
 const LOG = (who: string) => `printf '%s\\n' "${who} $*" >> "$STUB_LOG"`;
 
 /** The stubs, written once per file (a freshly written executable's first exec is slow on macOS). */
-let shared: { bin: string; tauri: string; signer: string } | undefined;
+let shared: { bin: string; tauri: string; signer: string; reader: string } | undefined;
 function stubs() {
   if (shared) return shared;
   const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-verify-dist-stubs-")));
@@ -167,7 +167,10 @@ function stubs() {
     "esac",
     "exit 99",
   ]);
-  return (shared = { bin, tauri, signer });
+  // v0.3.0 calendar (M11): the Calendar Reader build step (reader/build.sh is macOS-only); records itself.
+  const reader = join(dir, "reader-build-stub");
+  sh(reader, [`printf 'reader-build\\n' >> "$STUB_LOG"`, "exit 0"]);
+  return (shared = { bin, tauri, signer, reader });
 }
 
 interface Fx { base: string; repo: string; tmp: string; rec: string; log: string }
@@ -227,6 +230,7 @@ function run(env: Record<string, string> = {}, args: string[] = [], setup?: (fx:
       HOME: join(fx.base, "home"),
       REAL_BUN: process.execPath,
       TAURI_CMD: s.tauri,
+      READER_BUILD_CMD: s.reader,
       CODESIGN_CMD: s.signer,
       VERIFY_DIST_TMPDIR: fx.tmp,
       STUB_LOG: fx.log,
@@ -291,6 +295,12 @@ function frozenCliBuilds(): string[] {
   }
   return out.map((c) => c.replaceAll('"', "").replace("--outfile dist/", "--outfile <dist>/"));
 }
+
+/** A case's per-test timeout, per call of run() it makes (bun's default is 5 000 ms). Measured 2026-10-17,
+ *  this file run alone: a run that gets past the refusals took 1.5-4.4 s at load average ~15, up to 9.6 s
+ *  at ~19 (where 19 of 66 cases crossed the default) and up to 12 s at ~22. The refusal-only cases (at most
+ *  1.4 s at ~19-26) keep the default, except the five-refusal loop, which gets one. */
+const FULL_RUN_MS = 30_000;
 
 describe("verify-dist-local.sh: the all-PASS run", () => {
   const r = run();
@@ -400,13 +410,25 @@ describe("verify-dist-local.sh: the local `tauri build` rule", () => {
     expect(env.CI).toBe("true");
     expect("TAURI_BUNDLER_DMG_IGNORE_CI" in env).toBe(false);
     expect(called(r, "tauri")).toEqual(["tauri build"]);
+    // v0.3.0 calendar (M11): the Calendar Reader is built once, before the bundle that ships it.
+    expect(called(r, "reader-build")).toEqual(["reader-build"]);
+    expect(r.calls.indexOf("reader-build")).toBeLessThan(r.calls.indexOf("tauri build"));
     expect(read(join(r.fx.rec, "tauri.cwd")).trim()).toEndWith("/repo/gui");
     // …and the key never reaches the two test steps.
     expect(called(r, "bun-test-env")).toEqual(["bun-test-env ANTHROPIC_API_KEY=<unset>", "bun-test-env ANTHROPIC_API_KEY=<unset>"]);
-  });
+  }, FULL_RUN_MS);
 });
 
 describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
+  test("a failed Calendar Reader build fails the build step and tauri never runs (no stale reader ships)", () => {
+    const failing = join(stubs().bin, "..", "reader-build-fails");
+    writeFileSync(failing, `#!/bin/sh\nprintf 'reader-build\\n' >> "$STUB_LOG"\nexit 3\n`, { mode: 0o755 });
+    const r = run({ READER_BUILD_CMD: failing });
+    expect(r.status["4"]).toBe("FAIL");
+    expect(called(r, "reader-build")).toEqual(["reader-build"]);
+    expect(called(r, "tauri")).toEqual([]);
+  }, FULL_RUN_MS);
+
   test("a failed tauri build fails every step that needs its outputs; collect, the tests and the tracked check still run", () => {
     const r = run({ STUB_TAURI_RC: "1" });
     expectEngineDiscipline(r);
@@ -419,7 +441,7 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(called(r, "hdiutil")).toEqual([]);   // no staged DMG: nothing was attached
     expect(r.out).toContain("verify-dist-local: FAIL — 6 step(s) failed");
     expect(r.out).toContain("run directory kept:");
-  });
+  }, FULL_RUN_MS);
 
   test("a failing drift guard → exit 1, and the site test after it still runs", () => {
     const r = run({ STUB_DRIFT_RC: "1" });
@@ -428,14 +450,14 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(r.status).toEqual({ ...ALL_PASS, "10": "FAIL" });
     expect(called(r, "bun test")).toEqual(["bun test test/docs-config.test.ts", "bun test test/site.test.ts"]);
     expect(markers(r.fx)["macos-arm64.status"]).toBe("built\n");
-  });
+  }, FULL_RUN_MS);
 
   test("a failing site test → exit 1", () => {
     const r = run({ STUB_SITE_RC: "1" });
     expectEngineDiscipline(r);
     expect(r.code).toBe(1);
     expect(r.status).toEqual({ ...ALL_PASS, "11": "FAIL" });
-  });
+  }, FULL_RUN_MS);
 
   test("a size-gate failure after a good build marks the leg size-rejected, and collect refuses it", () => {
     const r = run({ STUB_SIZE_RC: "1" });
@@ -443,7 +465,7 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(r.code).toBe(1);
     expect(r.status).toEqual({ ...ALL_PASS, "6": "FAIL", "9": "FAIL" });
     expect(markers(r.fx)["macos-arm64.status"]).toBe("size-rejected\n");
-  });
+  }, FULL_RUN_MS);
 
   test("a linker-only signature fails the hardened-runtime step, and the DMG stays out of the dist", () => {
     const r = run({ STUB_FLAGS: "flags=0x20002(adhoc,linker-signed)" });
@@ -454,7 +476,7 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(r.out).not.toContain("lack runtime");
     expectCliOnlyRefused(r);
     expect(read(join(r.fx.rec, "collect.dist"))).not.toContain(".dmg");
-  });
+  }, FULL_RUN_MS);
 
   test("a signature without the hardened runtime fails the hardened-runtime step, and the DMG stays out of the dist", () => {
     const r = run({ STUB_FLAGS: "flags=0x2(adhoc)" });
@@ -464,7 +486,7 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(r.out).toContain("flags (adhoc) lack runtime");
     expectCliOnlyRefused(r);
     expect(read(join(r.fx.rec, "collect.dist"))).not.toContain(".dmg");
-  });
+  }, FULL_RUN_MS);
 
   test("a sidecar answering the wrong version fails the DMG leg", () => {
     const r = run({ STUB_SIDECAR_VERSION: "0.0.1" });
@@ -474,14 +496,14 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(r.out).toContain("printed '0.0.1', expected '9.8.7'");
     expectCliOnlyRefused(r);
     expect(called(r, "hdiutil detach")).toHaveLength(1);
-  });
+  }, FULL_RUN_MS);
 
   test("an x86_64 sidecar fails the DMG leg", () => {
     const r = run({ STUB_ARCH: "x86_64" });
     expectEngineDiscipline(r);
     expect(r.code).toBe(1);
     expect(r.status["7"]).toBe("FAIL");
-  });
+  }, FULL_RUN_MS);
 
   test("a failed cross-compile fails the CLI step, and collect fails on the missing CLI floor", () => {
     const r = run({ STUB_CLI_RC: "1" });
@@ -491,21 +513,21 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(r.status["8"]).toBe("FAIL");   // no bare sidecar to sign
     expect(r.status["9"]).toBe("FAIL");
     expect(r.status["10"]).toBe("PASS");
-  });
+  }, FULL_RUN_MS);
 
   test("a version mismatch across the carriers fails step 2 only", () => {
     const r = run({ STUB_VERSIONS_RC: "1" });
     expectEngineDiscipline(r);
     expect(r.code).toBe(1);
     expect(r.status).toEqual({ ...ALL_PASS, "2": "FAIL" });
-  });
+  }, FULL_RUN_MS);
 
   test("a non-macOS host fails step 1, and every later step still runs", () => {
     const r = run({ STUB_OS: "Linux" });
     expectEngineDiscipline(r);
     expect(r.code).toBe(1);
     expect(r.status).toEqual({ ...ALL_PASS, "1": "FAIL" });
-  });
+  }, FULL_RUN_MS);
 
   test("a build that rewrites a tracked file fails the last step", () => {
     const r = run({ STUB_TAURI_REWRITES_LOCK: "1" });
@@ -513,7 +535,7 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(r.code).toBe(1);
     expect(r.status).toEqual({ ...ALL_PASS, "12": "FAIL" });
     expect(r.out).toContain("gui/src-tauri/Cargo.lock");
-  });
+  }, FULL_RUN_MS);
 
   test("a git diff that fails after the run fails the last step — two failed snapshots are not equal digests", () => {
     const r = run({ STUB_TAURI_BREAKS_GIT: "1" });
@@ -521,7 +543,7 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(r.code).toBe(1);
     expect(r.status).toEqual({ ...ALL_PASS, "12": "FAIL" });
     expect(r.out).toContain("the after-run snapshot (git diff HEAD) failed");
-  });
+  }, FULL_RUN_MS);
 
   test("a darwin-arm64 CLI build without its exec bit fails the CLI step, naming it", () => {
     const r = run({ STUB_CLI_NOEXEC: "1" });
@@ -530,7 +552,7 @@ describe("verify-dist-local.sh: a FAIL never stops the later steps", () => {
     expect(r.status["3"]).toBe("FAIL");
     expect(r.out).toContain("daily-briefing-darwin-arm64 is missing or not executable, so its --version was not run");
     expect(r.status["8"]).toBe("FAIL");   // its scratch copy cannot run either
-  });
+  }, FULL_RUN_MS);
 });
 
 describe("verify-dist-local.sh: the hardened-runtime step judges each signature property", () => {
@@ -557,7 +579,7 @@ describe("verify-dist-local.sh: the hardened-runtime step judges each signature 
       expect(r.status).toEqual({ ...ALL_PASS, "8": "FAIL", "9": "FAIL" });
       expect(r.out).toContain(why);
       expectCliOnlyRefused(r);
-    });
+    }, FULL_RUN_MS);
   }
 });
 
@@ -572,7 +594,7 @@ describe("verify-dist-local.sh: the image is detached whenever an attach was att
     expect(hd[0]!).toStartWith("hdiutil attach ");
     expect(hd.slice(1)).toEqual(["hdiutil detach <mnt> -force"]);
     expect(r.err).not.toContain("could not detach");
-  });
+  }, FULL_RUN_MS);
 
   test("a failed trap detach is reported only when hdiutil info still names the mount point", () => {
     const quiet = run({ STUB_ATTACH_RC: "1", STUB_DETACH_RC: "1" });
@@ -583,7 +605,7 @@ describe("verify-dist-local.sh: the image is detached whenever an attach was att
     expectEngineDiscipline(loud);
     expect(loud.err).toContain("could not detach");
     expect(loud.err).toContain("/mnt");
-  });
+  }, 2 * FULL_RUN_MS);
 });
 
 describe("verify-dist-local.sh: where the run directory may live", () => {
@@ -620,7 +642,7 @@ describe("verify-dist-local.sh: where the run directory may live", () => {
     expectEngineDiscipline(r);
     expect(`${r.code}\n${r.out}${r.err}`).toStartWith("0\n");
     expect(r.status).toEqual(ALL_PASS);
-  });
+  }, FULL_RUN_MS);
   test("VERIFY_DIST_TMPDIR = the repo's dist/ is refused before anything runs", () => {
     refused(run({}, [], (f) => ({ VERIFY_DIST_TMPDIR: join(f.repo, "dist") })));
   });
@@ -679,7 +701,7 @@ describe("verify-dist-local.sh: where the run directory may live", () => {
     expectEngineDiscipline(r);
     expect(`${r.code}\n${r.out}${r.err}`).toStartWith("0\n");
     expect(r.status).toEqual(ALL_PASS);
-  });
+  }, FULL_RUN_MS);
   // The trees are git's own record (`git worktree list`), not inferred from the git directory's name
   // (round 3, G3-2): every one is refused, the primary's view of its linked worktrees included.
   test("…and so is a LINKED worktree's dist/ when the script runs from the primary checkout", () => {
@@ -721,7 +743,7 @@ describe("verify-dist-local.sh: where the run directory may live", () => {
     expectEngineDiscipline(passed);
     expect(`${passed.code}\n${passed.out}${passed.err}`).toStartWith("0\n");
     expect(passed.status).toEqual(ALL_PASS);
-  });
+  }, 2 * FULL_RUN_MS);
   test("…while from a linked worktree of it the run is refused: its primary checkout cannot be located", () => {
     const r = run({}, [], (f) => {
       git(f.repo, "init", "-q", "--separate-git-dir", join(f.base, "repo.gitdir"));
@@ -750,7 +772,7 @@ describe("verify-dist-local.sh: where the run directory may live", () => {
     expectEngineDiscipline(passed);
     expect(`${passed.code}\n${passed.out}${passed.err}`).toStartWith("0\n");
     expect(passed.status).toEqual(ALL_PASS);
-  });
+  }, 2 * FULL_RUN_MS);
   // A BARE repository named `.git` has no working tree: its parent directory is nobody's checkout, and the
   // record and the parent-side probe both pass it. Until 2026-10-02 this case expected the whole run to
   // pass there; by the user's decision that day (any `.git` entry in the parent or above it refuses, a bare
@@ -784,7 +806,7 @@ describe("verify-dist-local.sh: where the run directory may live", () => {
     }, fromWt);
     refused(sibling);
     expect(sibling.err).toContain(`inside the working tree ${realpathSync(join(sibling.fx.base, "hub-wt2"))} (another worktree of this repository`);
-  });
+  }, 3 * FULL_RUN_MS);
   // Round 5 (D5-M1): the trees git's record cannot show are caught from the PARENT's side — git, asked
   // from the parent, names this repository's common git directory. (1) A separate git directory literally
   // named `.git` (<D>/.git): git lists <D> as the primary entry and nothing about the real checkout
@@ -807,7 +829,7 @@ describe("verify-dist-local.sh: where the run directory may live", () => {
     expectEngineDiscipline(passed);
     expect(`${passed.code}\n${passed.out}${passed.err}`).toStartWith("0\n");
     expect(passed.status).toEqual(ALL_PASS);
-  });
+  }, 2 * FULL_RUN_MS);
   // (2) A linked worktree moved without `git worktree repair`: git records it where it no longer is
   // (`prunable`), so the record judge skips it — but it still exists, and still points at this repository.
   test("a linked worktree moved without repair: a parent inside it is refused", () => {
@@ -870,7 +892,9 @@ describe("verify-dist-local.sh: where the run directory may live", () => {
     expect(read(join(moved, ".git"))).toStartWith("gitdir: ");
     const probe = gitProbe(join(moved, "dist"), "rev-parse", "--is-inside-work-tree");
     expect(probe.code).not.toBe(0);
-    expect(probe.err).toContain("not a git repository");
+    // git 2.55 says "not a git repository"; 2.56 (the CI runner from 2026-10-29) says "gitfile does not
+    // point to a valid repository". Either one is git finding no repository from the parent.
+    expect(probe.err).toMatch(/not a git repository|gitfile does not point to a valid repository/);
     refusedUnderGit(r, join(moved, "dist"), join(moved, ".git"));
   });
   test("C-2: an unrelated repository initialised inside a moved, unrepaired worktree is refused (discovery stops at it)", () => {
@@ -929,7 +953,7 @@ describe("verify-dist-local.sh: where the run directory may live", () => {
     expectEngineDiscipline(r);
     expect(`${r.code}\n${r.out}${r.err}`).toStartWith("0\n");
     expect(r.status).toEqual(ALL_PASS);
-  });
+  }, FULL_RUN_MS);
   // …while a parent in a working tree whose git directory git cannot name is refused, like the other lookups.
   test("a parent inside a working tree whose git directory git cannot name is refused", () => {
     const r = run({}, [], (f) => {
@@ -994,7 +1018,7 @@ describe("verify-dist-local.sh: where the run directory may live", () => {
       expect(r.calls).toEqual([]);
       expect(readdirSync(join(r.fx.base, "linked", "dist"))).toEqual([]);   // no run directory was made
     }
-  });
+  }, FULL_RUN_MS);
   // …and so does a copy that is not a git checkout at all: there is no repository to name, and step 12
   // could never pass there anyway (it needs `git diff HEAD`), so it is refused before anything runs.
   test("a project that is not a git checkout is refused before anything runs", () => {
@@ -1024,7 +1048,7 @@ describe("verify-dist-local.sh: the tracked-file snapshot", () => {
     expect(r.code).toBe(1);
     expect(r.status).toEqual({ ...ALL_PASS, "12": "FAIL" });
     expect(r.out).toContain("the before-run snapshot (git diff HEAD) failed");
-  });
+  }, FULL_RUN_MS);
 });
 
 describe("verify-dist-local.sh: an all-PASS run whose run directory cannot be removed", () => {
@@ -1038,7 +1062,7 @@ describe("verify-dist-local.sh: an all-PASS run whose run directory cannot be re
     } finally {
       for (const d of readdirSync(r.fx.tmp)) chmodSync(join(r.fx.tmp, d, "locked"), 0o755);
     }
-  });
+  }, FULL_RUN_MS);
 });
 
 describe("verify-dist-local.sh: arguments and the never-open rule", () => {

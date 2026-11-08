@@ -14,8 +14,84 @@
   --on-accent: #fbfaf8;
   --danger: #a3341f;
 
+  /* Step 0, the shared look (hub spec "The look, for every screen"). Every token below has a dark
+     value in the block further down, and `gui/tests-web/look.check.ts` measures their contrast in
+     both themes: text 4.5:1, outlines 3:1, against --tile and --bg (and tag words on their fill). */
+
+  /* The neutral tile (S1): white, a hairline border, a soft shadow. Card surfaces use --panel. */
+  --tile: #ffffff;
+  --tile-border: #e4dfd8;
+  --tile-shadow: 0 1px 2px rgba(28, 26, 23, 0.06), 0 1px 1px rgba(28, 26, 23, 0.04);
+
+  /* States. live: orange — a meeting 5 minutes or less away (its label text), and one in progress
+     (outline and pulsing dot). done: green, briefly, for something just finished. wait: amber.
+     Each is also readable as text (4.5:1) on --tile and on --bg only; NOT on --panel (in light mode
+     done and wait fall below 4.5:1 there), so a Card draws no state-coloured text. */
+  --state-live: #c2410c;
+  --state-done: #15803d;
+  --state-wait: #a16207;
+
+  /* Status tags: merged PR purple, branch blue, main grey, local work amber (the hub's "work only on
+     this Mac", drawn as a dashed outline; its word is the platform-neutral "not pushed", since the
+     app also ships for Windows and Linux). The tag always says its word too; colour is never the
+     only signal. Each
+     --tag-* is the colour of the tag's word (text, 4.5:1) and outline; --tag-*-bg is its fill
+     (tag-colors.html, scheme 1). Local work has no fill: --tag-local-bg is transparent. */
+  --tag-merged: #5a3fb0;
+  --tag-branch: #2a5a9a;
+  --tag-main: #5d5750;
+  --tag-local: #8a5a12;
+  --tag-merged-bg: #ece6fb;
+  --tag-branch-bg: #e3eefb;
+  --tag-main-bg: #ebe8e3;
+  --tag-local-bg: transparent;
+
+  /* The sunrise gradient on Good morning, the one gradient fill. --fg and --muted text stay 4.5:1 on
+     every stop, and at least 4.55:1 everywhere BETWEEN adjacent stops (an sRGB blend dips below
+     both ends): stops 2 and 3 are the mockups' #f6d2c4 / #e7def6, lightened toward white at the
+     S0-M1 checkpoint and again here for the blend, hue kept, because the blend between the earlier
+     stops reached only about 4.49:1 for --muted. */
+  --sunrise-1: #fde7c8;
+  --sunrise-2: #fedfd3;
+  --sunrise-3: #eae2f8;
+
+  /* The neutral colour of inactive controls (slide dots, chevrons): 3:1 against --tile, --bg and
+     --panel in both themes (hub "Accessibility"; the mockups' #d8d2ca dot is 1.3:1, a mockup defect).
+     NOT 3:1 on the sunrise stops (2.97:1 on --sunrise-2 and 2.98:1 on --sunrise-3 in light mode):
+     keep controls off the sunrise gradient, or give them their own surface. */
+  --control: #8a837c;
+
+  /* Motion for CSS (hub "Motion"): the same durations as lib/ui/motion.ts, and 0 under reduced
+     motion (the block below), so a CSS transition follows the setting live. */
+  --glide-ms: 380ms;
+  --open-ms: 220ms;
+
   color-scheme: light dark;
 }
+
+/* The project palette: 12 fixed slots (`lib/project-color.ts` picks the slot number), plus the
+   neutral pill of the deck's "Other" card. A component draws `class="pc-{slot}"` and never builds a
+   colour from engine text (`paletteClass` in `lib/project-color.ts` gives the class name). Each
+   class only SETS two custom properties and paints nothing, so it can sit on any element (A's `▸`
+   markers on a list) without tinting it: --pc-bg is the pill's tint and --pc-fg its text, and
+   `Pill` paints itself from them; A's commit bars and markers draw in --pc-fg (non-text, 3:1
+   against --bg, --tile, --panel and the sunrise stops, both themes, look.check.ts). The dark
+   values are in the block below, which must stay AFTER these rules so it wins the cascade.
+   Slots 0-3 and pc-other are the approved mockups' colours; slots 4-11 are spaced so every
+   background pair involving one of them is at least 0.035 apart in OKLab, in both themes. */
+.pc-0 { --pc-bg: #d6ebe7; --pc-fg: #1d5c52; }
+.pc-1 { --pc-bg: #e6defa; --pc-fg: #4b3591; }
+.pc-2 { --pc-bg: #f7e3c6; --pc-fg: #7a4a0e; }
+.pc-3 { --pc-bg: #dcefd6; --pc-fg: #2f6125; }
+.pc-4 { --pc-bg: #c7dbea; --pc-fg: #1b567b; }
+.pc-5 { --pc-bg: #fedade; --pc-fg: #8d3d4c; }
+.pc-6 { --pc-bg: #f9d3c3; --pc-fg: #854020; }
+.pc-7 { --pc-bg: #bae9f3; --pc-fg: #0c606d; }
+.pc-8 { --pc-bg: #f5d1eb; --pc-fg: #7b3c6e; }
+.pc-9 { --pc-bg: #e1e1b9; --pc-fg: #5b5804; }
+.pc-10 { --pc-bg: #c8d6ff; --pc-fg: #3d4d8c; }
+.pc-11 { --pc-bg: #c4e8d3; --pc-fg: #425c4e; }
+.pc-other { --pc-bg: #ebe8e3; --pc-fg: #4a4540; }
 
 @media (prefers-color-scheme: dark) {
   :root {
@@ -27,6 +103,50 @@
     --accent: #d68b3a;
     --on-accent: #17151a;
     --danger: #e08b78;
+
+    --tile: #201d25;
+    --tile-border: #322d36;
+    --tile-shadow: none;
+
+    --state-live: #fb923c;
+    --state-done: #4ade80;
+    --state-wait: #e0b06a;
+
+    --tag-merged: #c9b8ff;
+    --tag-branch: #9cc4f0;
+    --tag-main: #c2bbb3;
+    --tag-local: #e0b06a;
+    --tag-merged-bg: #3a2f5e;
+    --tag-branch-bg: #23384f;
+    --tag-main-bg: #34303a;
+    --tag-local-bg: transparent;
+
+    --sunrise-1: #3b2618;
+    --sunrise-2: #2e1d2c;
+    --sunrise-3: #1d1f38;
+
+    --control: #7d766f;
+  }
+
+  .pc-0 { --pc-bg: #1f3e39; --pc-fg: #8fd3c5; }
+  .pc-1 { --pc-bg: #33295a; --pc-fg: #c6b5f5; }
+  .pc-2 { --pc-bg: #4a3418; --pc-fg: #f0c48a; }
+  .pc-3 { --pc-bg: #263f22; --pc-fg: #a6d79a; }
+  .pc-4 { --pc-bg: #183f56; --pc-fg: #75c8fc; }
+  .pc-5 { --pc-bg: #4d272d; --pc-fg: #fba0ad; }
+  .pc-6 { --pc-bg: #482818; --pc-fg: #f8a780; }
+  .pc-7 { --pc-bg: #003942; --pc-fg: #59d0e7; }
+  .pc-8 { --pc-bg: #462a41; --pc-fg: #e9a3dc; }
+  .pc-9 { --pc-bg: #38360e; --pc-fg: #c6c36b; }
+  .pc-10 { --pc-bg: #2a3452; --pc-fg: #a4bbff; }
+  .pc-11 { --pc-bg: #0d3926; --pc-fg: #79d4a7; }
+  .pc-other { --pc-bg: #34303a; --pc-fg: #c2bbb3; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --glide-ms: 0ms;
+    --open-ms: 0ms;
   }
 }
 
@@ -49,4 +169,53 @@ body {
 code,
 pre {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* A small-caps label with tabular numbers (hub "The look": "Small-caps labels with tabular numbers";
+   the mockups' `.k` labels). In --muted, not the mockups' --faint, which is below 4.5:1. */
+.caps {
+  font-size: 0.8rem;
+  font-variant-caps: all-small-caps;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+/* Visually hidden, still read by a screen reader (the standard rules): for text that only a screen
+   reader needs, such as a heading's extra context. ⚠ Svelte drops the leading space of an element's
+   static text, so `<span class="sr-only"> commits</span>` after a number renders "commits" and a
+   screen reader hears "12commits": write the text as an expression, `{" commits"}`. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* An opt-in control look, by class only (never a bare `button` selector, so no existing screen
+   changes): the focus ring and the disabled look of `lib/ui/ActionButton.svelte`, the same
+   declarations (look.check.ts compares them). D's and A's local navigation buttons (sidebar
+   entries, slide arrows and dots) add `class="ctl"`. The ring's --accent is ≥ 3:1 on --tile,
+   --panel and --bg in both themes.
+   The class is doubled (`.ctl.ctl`, specificity 0,3,0) because this file comes before every
+   component's CSS in the bundle. It outranks a plain local one-class rule (`.chev { … }`, scoped
+   to `.chev.svelte-x`, 0,2,0). It TIES with a local class plus a pseudo-class or attribute
+   selector (`.chev:hover`, `.chev:focus-visible`, `.chev[aria-current]`, all 0,3,0 once scoped),
+   and the local rule then wins by order. So a local rule that sets any property the disabled look
+   sets writes `:hover:not(:disabled)` (and the like), and a `.ctl` button does not restyle
+   `:focus-visible` locally. */
+.ctl.ctl:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.ctl.ctl:disabled {
+  background: var(--tile);
+  color: var(--muted);
+  border-color: var(--line);
+  cursor: default;
 }

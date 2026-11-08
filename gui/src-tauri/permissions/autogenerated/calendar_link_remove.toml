@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-calendar-link-remove"
+description = "Enables the calendar_link_remove command without any pre-configured scope."
+commands.allow = ["calendar_link_remove"]
+
+[[permission]]
+identifier = "deny-calendar-link-remove"
+description = "Denies the calendar_link_remove command without any pre-configured scope."
+commands.deny = ["calendar_link_remove"]

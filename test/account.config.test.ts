@@ -8,7 +8,7 @@ import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveAccounts } from "../src/config";
-import { recordAuthProbe, loadAccountState, DEFAULT_LABEL } from "../src/account";
+import { recordHourMark, loadAccountState, DEFAULT_LABEL } from "../src/account";
 
 const HOME = "/home/u";
 const noEnv = {} as Record<string, string | undefined>;
@@ -84,12 +84,12 @@ describe("resolveAccounts", () => {
   });
 });
 
+// Through `recordHourMark` since P1-M7-T1 retired `recordAuthProbe`: the walk passes the combined list's item 1.
 describe("§4a — a non-limit failure on a fallback", () => {
-  const two = [{ label: "primary" }, { label: "fallback", configDir: "/x" }];
 
   test("marks the FALLBACK for an hour, with no lastLimit", async () => {
     const d = await mkdtemp(join(tmpdir(), "acct-4a-"));
-    expect(await recordAuthProbe("fallback", two, NOW, d)).toBe(true);
+    expect(await recordHourMark("fallback", "auth", NOW, { item1Label: "primary", stateDir: d })).toBe(true);
     const st = await loadAccountState(d);
     expect(st.accounts.fallback?.isProbe).toBe(true);
     expect(st.lastLimit).toBeUndefined();      // an auth failure is not a usage wall
@@ -100,14 +100,14 @@ describe("§4a — a non-limit failure on a fallback", () => {
   // ordinary wake-before-wifi nonzero-exit — the most common transient failure this codebase has.
   test("does NOT mark the first entry", async () => {
     const d = await mkdtemp(join(tmpdir(), "acct-4a-"));
-    expect(await recordAuthProbe("primary", two, NOW, d)).toBe(false);
+    expect(await recordHourMark("primary", "auth", NOW, { item1Label: "primary", stateDir: d })).toBe(false);
     expect((await loadAccountState(d)).accounts.primary).toBeUndefined();
     await rm(d, { recursive: true, force: true });
   });
 
   test("does NOT mark the synthesised default on a single-account machine", async () => {
     const d = await mkdtemp(join(tmpdir(), "acct-4a-"));
-    expect(await recordAuthProbe(DEFAULT_LABEL, undefined, NOW, d)).toBe(false);
+    expect(await recordHourMark(DEFAULT_LABEL, "auth", NOW, { item1Label: DEFAULT_LABEL, stateDir: d })).toBe(false);
     await rm(d, { recursive: true, force: true });
   });
 });

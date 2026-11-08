@@ -119,6 +119,10 @@ All 10 tests spawn real subprocesses (`git`, a fake provider CLI) or drive the f
   That is the blanket timeout raise this chase was explicitly forbidden to perform: it would hide the
   next *real* hang behind a 30 s wait, and the failures it suppresses are a property of the machine
   the suite happens to be running on.
+  *Updated 2026-11-05 (user decision): still no run-wide bound, but a file or test that has failed on the 5 s default
+  under measurement may carry its own longer bound, when nothing in it asserts wall time. A run under
+  `bun test --timeout 3000` on that tree had no timeouts, so no run-wide bound was needed; real hangs elsewhere still
+  fail at 5 s. Only `--timeout` sets a run-wide bound on bun 1.3.14 (a preload reaches the first file only).*
 - **Read a red suite on a loaded machine accordingly.** If the failures are all
   `timed out after 5000ms` and the durations cluster at 5000–5300 ms, check the load average before
   reaching for `git bisect`. Re-run on a quiet machine; that is the cheap discriminator **for this

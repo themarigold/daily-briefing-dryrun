@@ -12,8 +12,8 @@ import { join } from "node:path";
 import {
   scheduleStatusReport, renderScheduleStatus, expectedTicks, type ScheduleStatusReport,
 } from "../src/schedule/status";
-import { writeScheduleRecord, manualRemoveSteps } from "../src/schedule/install";
-import { SCHEDULE_LABEL, SYSTEMD_TIMER_NAME } from "../src/schedule/units";
+import { writeScheduleRecord, manualRemoveSteps, execResultOf } from "../src/schedule/install";
+import { SCHEDULE_LABEL, SYSTEMD_TIMER_NAME, LOGIN_ITEMS_OFF_HINT } from "../src/schedule/units";
 import { tickPath, markerPath, localDateStr } from "../src/marker";
 import type { Exec } from "../src/schedule/install";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
@@ -77,6 +77,10 @@ describe("⚠ the frozen JSON contract", () => {
       "experimental", "paths",
       // Batch 2 (spec 3.1.5): appended, each always present; no existing key changed name or type.
       "registeredReason", "recordFilePresent", "removeSteps",
+      // spec 2026-10-11 (login-items-off): appended, always present.
+      "registeredHint",
+      // provider-fallback P2-M5-T3: appended, always present.
+      "scheduledEngineVersion",
     ].sort();
     const missing = EXPECTED.filter((k) => !(k in r));
     expect(`missing = ${JSON.stringify(missing)}`).toBe("missing = []");
@@ -311,6 +315,36 @@ describe("Batch 2: the five changed fields (spec 3.1.5)", () => {
     expect(renderScheduleStatus(noSession)).toContain("registered:      unknown");
   });
 
+  // spec 2026-10-11 (login-items-off): the plist on disk and launchd finding no job is what an item
+  // switched off in Login Items looks like (measured on macOS 26.6.2). Only that combination sets the hint.
+  test("registeredHint: login-items-off exactly when darwin, a unit file on disk and the check says gone", async () => {
+    const plist = join(UNITS, `${SCHEDULE_LABEL}.plist`);
+    const noUnit = await scheduleStatusReport(deps({ exec: byVerb(macGone).exec }));
+    expect([noUnit.registered, noUnit.registeredHint]).toEqual([false, null]);
+    expect(renderScheduleStatus(noUnit)).not.toContain(LOGIN_ITEMS_OFF_HINT);
+
+    writeFileSync(plist, "<plist/>");
+    const off = await scheduleStatusReport(deps({ exec: byVerb(macGone).exec }));
+    expect([off.registered, off.unitPresent, off.registeredHint]).toEqual([false, true, "login-items-off"]);
+    expect(JSON.parse(JSON.stringify(off)).registeredHint).toBe("login-items-off");
+    const text = renderScheduleStatus(off).split("\n");
+    expect(text[text.findIndex((l) => l.startsWith("registered:")) + 1]).toBe(`  ⚠ ${LOGIN_ITEMS_OFF_HINT}`);
+
+    const present = await scheduleStatusReport(deps({ exec: byVerb(() => ({ code: 0 })).exec }));
+    expect([present.registered, present.registeredHint]).toEqual([true, null]);
+    const unknown = await scheduleStatusReport(deps({
+      exec: byVerb((c) => (c[2]?.startsWith("gui/") ? { code: 113, err: "Could not find domain for port identifier" } : NOT_FOUND)).exec,
+    }));
+    expect([unknown.registered, unknown.registeredHint]).toEqual([null, null]);
+    expect(renderScheduleStatus(unknown)).not.toContain(LOGIN_ITEMS_OFF_HINT);
+
+    // Linux, with its units on disk and the check saying gone: never the hint, which names a macOS setting.
+    const lin = byVerb((c) => (c[2] === "is-active" ? { code: 3, out: "inactive\ninactive\n" } : c[2] === "is-enabled" ? { code: 1, out: "disabled\n" } : { code: 0 }));
+    for (const p of (await scheduleStatusReport(deps({ platform: "linux", exec: lin.exec }))).paths.unitPaths) writeFileSync(p, "unit\n");
+    const linux = await scheduleStatusReport(deps({ platform: "linux", exec: lin.exec }));
+    expect([linux.registered, linux.unitPresent, linux.registeredHint]).toEqual([false, true, null]);
+  });
+
   test("both prints not found but list gives NO answer → registered: null, never false", async () => {
     // A not-found from the two prints is not enough on its own: `list` must report not-found too (spec
     // 3.1.5 step 3). Exit 1 with an empty stderr is no answer (a killed command can surface as an ordinary
@@ -430,5 +464,99 @@ describe("Batch 2: the five changed fields (spec 3.1.5)", () => {
     }
     // It survives the JSON pipe the app reads it through, null included.
     expect(JSON.parse(JSON.stringify(mac)).removeSteps).toBe(mac.removeSteps);
+  });
+});
+
+// provider-fallback P2-M5-T3 (spec r9 §6): the scheduled engine's version MEASURED from `<binPath> --version`, because
+// the install-time record (`installedEngineVersion`) can be stale — a binary replaced in place keeps its record. Through
+// the injected exec like every other status exec, capped at the same 5 s; absent or failing reads null, never a crash.
+describe("scheduledEngineVersion (P2-M5-T3)", () => {
+  const BIN = "/managed/daily-briefing";
+  const record = (engineVersion = "0.1.0") => writeScheduleRecord({
+    owner: "cli", invoker: "cli", kind: "launchd", unitPath: join(UNITS, `${SCHEDULE_LABEL}.plist`),
+    binPath: BIN, installedAt: "2026-09-14T00:00:00.000Z", engineVersion,
+  });
+  /** Answers `<BIN> --version` with `version`, every probe with 0; records each call and its timeout. */
+  function versionExec(version: (opts?: { timeoutMs?: number }) => Promise<{ code: number; out: string; err: string }>) {
+    const calls: { cmd: string[]; timeoutMs?: number }[] = [];
+    const exec: Exec = async (cmd, opts) => {
+      calls.push({ cmd, timeoutMs: opts?.timeoutMs });
+      return cmd[0] === BIN ? version(opts) : { code: 0, out: "", err: "" };
+    };
+    return { exec, calls };
+  }
+  const ok = (out: string) => async () => ({ code: 0, out, err: "" });
+
+  test("the version from `<binPath> --version`, through the injected exec, capped at 5 s — measured, not the record", async () => {
+    await record("0.1.0");
+    const f = versionExec(ok("0.2.1\n"));
+    const r = await scheduleStatusReport(deps({ exec: f.exec }));
+    expect(r.scheduledEngineVersion).toBe("0.2.1");
+    expect(r.installedEngineVersion).toBe("0.1.0");          // the record stays what it says
+    expect(f.calls.filter((c) => c.cmd[0] === BIN)).toEqual([{ cmd: [BIN, "--version"], timeoutMs: 5_000 }]);
+    expect(JSON.parse(JSON.stringify(r)).scheduledEngineVersion).toBe("0.2.1");
+    // A pre-release spelling, and CRLF output, read as written.
+    expect((await scheduleStatusReport(deps({ exec: versionExec(ok("0.3.0-rc.1\r\n")).exec }))).scheduledEngineVersion).toBe("0.3.0-rc.1");
+  });
+
+  test("no record, or a record with no binPath: null, and nothing is run", async () => {
+    const none = versionExec(ok("0.2.1\n"));
+    expect((await scheduleStatusReport(deps({ exec: none.exec }))).scheduledEngineVersion).toBeNull();
+    expect(none.calls.filter((c) => c.cmd.includes("--version"))).toEqual([]);
+    writeFileSync(join(STATE, "schedule.json"), JSON.stringify({
+      owner: "cli", invoker: "cli", kind: "launchd", unitPath: "/u", binPath: "", installedAt: "2026-09-14T00:00:00.000Z", engineVersion: "0.1.0",
+    }));
+    const empty = versionExec(ok("0.2.1\n"));
+    const r = await scheduleStatusReport(deps({ exec: empty.exec }));
+    expect([r.recordPresent, r.scheduledEngineVersion]).toEqual([true, null]);
+    expect(empty.calls.filter((c) => c.cmd.includes("--version"))).toEqual([]);
+  });
+
+  test("a failing read is null, never a crash: non-zero exit, could not run, thrown (async or sync), not a version", async () => {
+    await record();
+    const cases: [string, Exec][] = [
+      ["exit 1", versionExec(async () => ({ code: 1, out: "0.2.1\n", err: "" })).exec],
+      ["could not run (-2)", versionExec(async () => ({ code: -2, out: "", err: "ENOENT" })).exec],
+      ["thrown", versionExec(async () => { throw new Error("no such binary"); }).exec],
+      ["thrown synchronously", ((cmd: string[]) => { if (cmd[0] === BIN) throw new Error("boom"); return Promise.resolve({ code: 0, out: "", err: "" }); }) as Exec],
+      ["empty output", versionExec(ok("")).exec],
+      ["not a version", versionExec(ok("Usage: daily-briefing [options]\n")).exec],
+      ["a version with trailing words", versionExec(ok("0.2.1 (built today)\n")).exec],
+      ["an escape sequence", versionExec(ok("\u001b[2J0.2.1\n")).exec],
+    ];
+    for (const [name, exec] of cases) {
+      const r = await scheduleStatusReport(deps({ exec }));
+      expect(`${name}: ${JSON.stringify(r.scheduledEngineVersion)}`).toBe(`${name}: null`);
+      expect(`${name}: ${r.recordPresent}`).toBe(`${name}: true`);
+    }
+  });
+
+  test("a HUNG binary is cut at the bound and reads null: proc.run's timed-out result, through the production mapping", async () => {
+    // The default exec hands `timeoutMs` to proc.run, whose SIGKILL ceiling ends a hung child and reports
+    // `timedOut` — which `execResultOf` maps to -1. Even output the child printed before it hung is not read.
+    // P2-M5-T4 checkpoint LOW 4: the fake is otherwise a COMPLETE, exit-0 read of a good version, so `timedOut` ALONE
+    // must make it null — and it is set only when the call carried the 5 s bound, so a call without it reads "0.2.1".
+    await record();
+    const f = versionExec((opts) => execResultOf(Promise.resolve({
+      out: "0.2.1\n", err: "", code: 0, complete: true, spawned: true, signal: null, timedOut: opts?.timeoutMs === 5_000,
+    } as never)));
+    const r = await scheduleStatusReport(deps({ exec: f.exec }));
+    expect(f.calls.filter((c) => c.cmd[0] === BIN).map((c) => c.timeoutMs)).toEqual([5_000]);
+    expect(r.scheduledEngineVersion).toBeNull();
+  });
+
+  // P2-M5-T4 checkpoint LOW 3: only an ABSOLUTE binPath is run. A relative or bare one would resolve against the
+  // status caller's cwd or PATH — a binary nobody scheduled — so it reads null and nothing is executed.
+  test("a relative or bare binPath: null, and nothing is run", async () => {
+    for (const binPath of ["daily-briefing", "./daily-briefing", "bin/daily-briefing", "../managed/daily-briefing"]) {
+      writeFileSync(join(STATE, "schedule.json"), JSON.stringify({
+        owner: "cli", invoker: "cli", kind: "launchd", unitPath: "/u", binPath, installedAt: "2026-09-14T00:00:00.000Z", engineVersion: "0.1.0",
+      }));
+      const calls: string[][] = [];
+      const exec: Exec = async (cmd) => { calls.push(cmd); return cmd.includes("--version") ? { code: 0, out: "0.2.1\n", err: "" } : { code: 0, out: "", err: "" }; };
+      const r = await scheduleStatusReport(deps({ exec }));
+      expect(`${binPath}: ${r.binPath} ${JSON.stringify(r.scheduledEngineVersion)}`).toBe(`${binPath}: ${binPath} null`);
+      expect(`${binPath}: ${JSON.stringify(calls.filter((c) => c.includes("--version") || c[0] === binPath))}`).toBe(`${binPath}: []`);
+    }
   });
 });

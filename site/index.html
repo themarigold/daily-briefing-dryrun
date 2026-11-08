@@ -34,7 +34,7 @@
         Windows. No account, no server: it runs on your machine.
       </p>
       <p class="actions">
-        <a class="button primary" href="https://github.com/themarigold/daily-briefing/releases/latest">Download the latest release</a>
+        <a class="button primary" href="https://github.com/norn-app/daily-briefing/releases/latest">Download the latest release</a>
         <a class="button" href="#sample">See a sample</a>
       </p>
     </section>
@@ -73,24 +73,22 @@
           <h3>macOS app</h3>
           <p>A <code>.dmg</code> for Apple silicon or Intel. The app is not notarized, so the first open needs
             <strong>Open Anyway</strong> in System Settings.</p>
-          <a class="button primary" href="https://github.com/themarigold/daily-briefing/releases/latest">macOS download</a>
+          <a class="button primary" href="https://github.com/norn-app/daily-briefing/releases/latest">macOS download</a>
         </div>
         <div class="card">
           <h3>Linux app</h3>
           <p>An AppImage, or a <code>.deb</code> for Debian and Ubuntu (x86_64).</p>
-          <a class="button primary" href="https://github.com/themarigold/daily-briefing/releases/latest">Linux download</a>
+          <a class="button primary" href="https://github.com/norn-app/daily-briefing/releases/latest">Linux download</a>
         </div>
         <div class="card">
           <h3>Command line</h3>
-          <p>With <a href="https://brew.sh">Homebrew</a>:</p>
-          <pre class="cmd">brew install themarigold/tap/daily-briefing</pre>
-          <p>or a single binary for macOS, Linux or Windows (experimental).</p>
-          <a class="button" href="https://github.com/themarigold/daily-briefing/releases/latest">Binaries</a>
+          <p>A single binary for macOS, Linux or Windows (experimental).</p>
+          <a class="button" href="https://github.com/norn-app/daily-briefing/releases/latest">Binaries</a>
         </div>
       </div>
       <p>
         Step-by-step instructions, including the macOS first-open steps, are in the
-        <a href="https://github.com/themarigold/daily-briefing/blob/main/docs/INSTALL.md">install guide</a>.
+        <a href="https://github.com/norn-app/daily-briefing/blob/main/docs/INSTALL.md">install guide</a>.
         You also need git and an AI to write the briefing: an installed AI coding tool such as
         <code>claude</code>, an API key, or a local model.
       </p>
@@ -100,7 +98,7 @@
       <h2>Privacy</h2>
       <p>
         daily-briefing is local-first and has no telemetry of its own: no analytics, no usage or crash
-        reporting, no account, and no server of its own. It reaches the network in five places, and no
+        reporting, no account, and no server of its own. It reaches the network in seven places, and no
         others. The AI provider you choose: the prompt, built from your commit subjects, short hashes and dates, the
         names of changed and uncommitted files, repository and branch names, and stash messages, goes to
         that provider under its terms, through the AI tool you configure
@@ -108,12 +106,44 @@
         (<code>provider.api</code>), which is encrypted only if that endpoint is <code>https://</code> (a
         plain <code>http://</code> endpoint that is not on your own machine sends the prompt and your API
         key unencrypted). Point it at a local model and the prompt never leaves your machine.
+        The calendar links you add, only if you turn the calendar on: each run sends one HTTPS GET per private
+        calendar link you added, to that link's own host, following at most three redirects and only within the
+        same domain. The desktop app's live read fetches every link the same way each time it reads: when you
+        move onto the calendar slide or the last slide and, while either is shown, when the window regains focus,
+        when you turn the calendar on, when a meeting card or Join button finds the last read out of date, and
+        every five minutes. Nothing about you or your repositories is sent; the link's address itself is the secret
+        that lets the host answer.
+        AI summaries are off unless you turn them on. With them on, a delivered briefing on a day that is
+        not quiet makes a second AI call, if the page has at least one project card. Generating the same
+        day's briefing again can make another when it is delivered. It goes to the same provider entry
+        that wrote the briefing, with one try and no fallback. If it is your key source, your
+        <code>apiKeyCommand</code> runs again for this call. An attempt is locked when it cannot act on
+        what it reads. Every attempt leaves out the computer's name, the page's warning and notice lines and
+        the line that names the provider.
+        A locked attempt gets the saved page. An unlocked attempt after an unlocked
+        morning gets the saved page with the calendar section's body replaced by schedule shape: times, busy
+        blocks and attendee counts, with no event title, location or attendee names. The calendar section also
+        carries today's date, the current time and your time zone and, when a calendar source could not be read
+        fully, that source's id, which can hold a name, as in <code>work-alice</code>. An unlocked attempt after a locked morning makes no
+        call. If you turned <code>transcripts</code> on, the call includes the page's <code>— you wrote</code>
+        quotes from your sessions, up to 600 characters each. No call is made when AI summaries are off or on
+        a quiet day. No live details are added. The result shows only on the desktop app's slides. The call is
+        still made with the slides off or with no desktop app, because the engine cannot read that app
+        setting. The result is stored at
+        <code>&lt;state&gt;/briefings/&lt;date&gt;.&lt;hash&gt;.&lt;version&gt;.summary.json</code>. It stays
+        after you turn AI summaries off, and other dates' files are not pruned; it goes with the briefing
+        archive when Uninstall removes the engine's data. A locked attempt's text may name a meeting. AI
+        summaries are not available on Windows yet. No summary call is made on Windows.
         A connectivity check before it generates, and, on macOS, each time the desktop app opens: a TCP connection
         to the hosts in <code>networkProbeHosts</code> (by default 1.1.1.1 and 8.8.8.8, or your API
         endpoint), opened and closed with no data sent, which you can turn off.
         GitHub, only if you turn on the update check or ask for one: a single anonymous request to
         <code>api.github.com</code> for the latest release, carrying the version number, and after the
-        first answer GitHub's own cache tag, and nothing about you or your code. Your repository's own
+        first answer GitHub's own cache tag, and nothing about you or your code. GitHub again, when you
+        press an Open on GitHub button in the desktop app (Open PR, Open branch, Compare or a commit's arrow): your
+        browser opens that page, so the owner,
+        repository and branch names in its address, and its PR number or commit ID, go to
+        <code>github.com</code> through your browser; the GitHub links switch turns these off. Your repository's own
         remote, only in a partial clone (one made with <code>--filter</code>, or by
         <code>scalar clone</code>): the tool never runs
         <code>git fetch</code>, <code>pull</code> or
@@ -128,20 +158,20 @@
         <code>bun.report</code>. The desktop app and the macOS schedule turn this off; for a run you start
         from a terminal, or the experimental Windows schedule, set <code>DO_NOT_TRACK=1</code> to turn it
         off.
-        <a href="https://github.com/themarigold/daily-briefing#privacy">The full privacy notes</a>
+        <a href="https://github.com/norn-app/daily-briefing#privacy">The full privacy notes</a>
       </p>
     </section>
 
     <section class="wrap" id="links">
       <h2>Links</h2>
       <ul class="links">
-        <li><a href="https://github.com/themarigold/daily-briefing">Source code on GitHub</a></li>
-        <li><a href="https://github.com/themarigold/daily-briefing/releases/latest">Latest release</a></li>
-        <li><a href="https://github.com/themarigold/daily-briefing/blob/main/docs/INSTALL.md">Install guide</a></li>
-        <li><a href="https://github.com/themarigold/daily-briefing/blob/main/docs/CONFIG.md">Configuration reference</a></li>
-        <li><a href="https://github.com/themarigold/daily-briefing/blob/main/docs/TROUBLESHOOTING.md">Troubleshooting</a></li>
-        <li><a href="https://github.com/themarigold/daily-briefing/blob/main/SECURITY.md">Reporting a security problem</a></li>
-        <li><a href="https://github.com/themarigold/daily-briefing/issues">Issues</a></li>
+        <li><a href="https://github.com/norn-app/daily-briefing">Source code on GitHub</a></li>
+        <li><a href="https://github.com/norn-app/daily-briefing/releases/latest">Latest release</a></li>
+        <li><a href="https://github.com/norn-app/daily-briefing/blob/main/docs/INSTALL.md">Install guide</a></li>
+        <li><a href="https://github.com/norn-app/daily-briefing/blob/main/docs/CONFIG.md">Configuration reference</a></li>
+        <li><a href="https://github.com/norn-app/daily-briefing/blob/main/docs/TROUBLESHOOTING.md">Troubleshooting</a></li>
+        <li><a href="https://github.com/norn-app/daily-briefing/blob/main/SECURITY.md">Reporting a security problem</a></li>
+        <li><a href="https://github.com/norn-app/daily-briefing/issues">Issues</a></li>
       </ul>
     </section>
   </main>

@@ -10,6 +10,16 @@
 
 # daily-briefing v{{VERSION}}
 
+<!--# "What's new" is written for each release: replace its bullets before tagging. -->
+## What's new
+
+- **A redesigned desktop app.** The briefing now reads as a set of slides, with new Settings pages.
+- **Today's calendar (optional, off by default).** Add a private calendar link (Google, Outlook or iCloud), or, in the desktop app on macOS 14 or later, connect the Mac Calendar app, and the briefing shows your day. Your AI provider also gets today's events, so its suggestions fit around your meetings; how much detail it gets depends on the provider. The desktop app adds Join buttons. See the README's Privacy section for exactly what is read, sent and kept.
+- **AI summaries (optional, off by default).** A short summary and a Good morning sentence on the desktop app's slides, using one more call to your provider. Not available on Windows yet.
+- **More than one AI provider.** Set an order, and the next one takes over when one fails.
+- **Act on a card in the desktop app.** Open your work on GitHub, compare a branch or copy a push command, and on macOS, open a project in your editor.
+- **The optional check for new versions works again.** Older copies still can't find updates, so if you're on one, get this release from the Releases page.
+
 ## Verify before you run anything
 
 Every file in this release is listed in `SHA256SUMS`. In the folder you downloaded into, run:
@@ -22,7 +32,7 @@ Every file in this release is listed in `SHA256SUMS`. In the folder you download
 
 ## Command-line binaries
 
-The engine as a single binary. Installing from source is still supported: see [docs/INSTALL.md](https://github.com/themarigold/daily-briefing/blob/main/docs/INSTALL.md#from-a-source-checkout).
+The engine as a single binary. Installing from source is still supported: see [docs/INSTALL.md](https://github.com/norn-app/daily-briefing/blob/main/docs/INSTALL.md#from-a-source-checkout).
 
 {{CLI_ASSETS}}
 

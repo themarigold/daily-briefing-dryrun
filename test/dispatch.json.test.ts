@@ -4,11 +4,12 @@ import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off 
 // THE H2 LESSON IS THE WHOLE FILE: no new flag or subcommand may fall through to a briefing run or a
 // day-stamp. The old catch-all routed ANY leading flag — `--help` included — straight into a full
 // generate + stamp, and every assertion below is a variant of "and it did NOT invoke run()".
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, spyOn } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { dispatch } from "../src/main";
+import * as json from "../src/json";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 /** Routes every command through injected stand-ins, so a routing test never executes a real surface
@@ -222,6 +223,28 @@ describe("the read-only subcommands", () => {
     } finally { s.restore(); }
   });
 
+  test("with no injected validator, `config validate` runs the BOUNDED form, never the sync one", async () => {
+    // P3-M1-T1 checkpoint MED: the CLI's `config validate` must run `validateCandidateBounded` (its key-ownership rows
+    // on the async shell under a 2 s deadline), or a user's own `apiKeyFile` on a stalled mount holds the app's save
+    // path. Every other test here INJECTS `configValidate`, so none of them would see `main.ts` revert to the sync
+    // `validateCandidate`; this one passes no validator and spies on both real ones (calls go through).
+    const s = spy();
+    const { configValidate: _injected, ...deps } = s.deps;
+    const bounded = spyOn(json, "validateCandidateBounded");
+    const sync = spyOn(json, "validateCandidate");
+    const candidate = join(removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-cand-"))), "candidate.json");
+    writeFileSync(candidate, JSON.stringify({ provider: { cli: "claude", argv: ["-p"], promptVia: "stdin" } }));
+    try {
+      expect(await dispatch(["bun", "bin", "config", "validate", "--json", "--file", candidate], deps)).toBe(0);
+      expect(bounded).toHaveBeenCalledTimes(1);
+      expect(sync).toHaveBeenCalledTimes(0);
+      expect(s.seen.validated).toBe(0);
+      const report = JSON.parse(s.seen.out[0]!);
+      expect(report.valid).toBe(true);
+      expect(report.providers).toEqual([{ index: 0, testTimeoutMs: 80_000, loopback: false, keyOptional: false, keyMoved: false }]);
+    } finally { bounded.mockRestore(); sync.mockRestore(); s.restore(); }
+  });
+
   test("a CANDIDATE source is required — it never silently validates the installed config", async () => {
     // ⚠ Found by the redirected-HOME probe, not by reasoning: the first version defaulted to
     // `configPath()`, so the command's answer depended on $HOME and the test failed under a scratch
@@ -303,6 +326,64 @@ describe("the read-only subcommands", () => {
         expect(`${bad} → ${await dispatch(["bun", "bin", bad, "--json"], s.deps)}`).toBe(`${bad} → 2`);
       }
       expect(s.seen.ran).toBe(0);
+    } finally { s.restore(); }
+  });
+});
+
+// ── calendar v0.3.0 (plan M2b): the INTERNAL `calendar-parse` ────────────────────────────────────────
+// The engine re-invokes itself with it (src/calendar/parse-runner.ts). It is a KNOWN command — so the H2 swallow
+// guard refuses `--json calendar-parse` instead of running a briefing — it is listed in `--help` as INTERNAL
+// (the plan's "listed as internal" option), it takes no arguments, and it never reaches run(). The real child in a
+// real process (stdin → stdout, nothing else touched) is pinned in test/calendar-parse.test.ts.
+describe("calendar-parse (internal)", () => {
+  function calSpy() {
+    const s = spy();
+    let parsed = 0;
+    const deps = { ...s.deps, calendarParse: async () => { parsed++; return 0; } };
+    return { ...s, deps, parsed: () => parsed };
+  }
+
+  test("routes to the parse child, and to nothing else", async () => {
+    const s = calSpy();
+    try {
+      expect(await dispatch(["bun", "bin", "calendar-parse"], s.deps)).toBe(0);
+      expect(s.parsed()).toBe(1);
+      expect([s.seen.ran, s.seen.inited, s.seen.status, s.seen.doctor, s.seen.validated]).toEqual([0, 0, 0, 0, 0]);
+    } finally { s.restore(); }
+  });
+
+  test("any argument after it is refused (exit 2) without reaching the child", async () => {
+    const s = calSpy();
+    try {
+      for (const extra of [["--json"], ["x"], ["--json-out", "/tmp/x.json"], ["--force"]]) {
+        expect(`${extra.join(" ")} → ${await dispatch(["bun", "bin", "calendar-parse", ...extra], s.deps)}`).toBe(`${extra.join(" ")} → 2`);
+      }
+      expect([s.parsed(), s.seen.ran]).toEqual([0, 0]);
+      expect(s.seen.err.join("\n")).toContain("calendar-parse: internal command");
+    } finally { s.restore(); }
+  });
+
+  test("after a leading run-flag, or after an explicit `run`, it is a SWALLOWED command: refused, never a briefing run", async () => {
+    const s = calSpy();
+    try {
+      for (const argv of [["--json", "calendar-parse"], ["--force", "calendar-parse"], ["run", "calendar-parse"], ["--json-out", "calendar-parse"]]) {
+        expect(`${argv.join(" ")} → ${await dispatch(["bun", "bin", ...argv], s.deps)}`).toBe(`${argv.join(" ")} → 2`);
+      }
+      expect([s.parsed(), s.seen.ran]).toEqual([0, 0]);
+      expect(s.seen.err.join("\n")).toContain("must come FIRST");
+    } finally { s.restore(); }
+  });
+
+  test("`--help` lists it, as internal", async () => {
+    const s = calSpy();
+    try {
+      expect(await dispatch(["bun", "bin", "--help"], s.deps)).toBe(0);
+      const help = s.seen.out.join("\n");
+      const at = help.indexOf("calendar-parse");
+      expect(`listed: ${at >= 0}`).toBe("listed: true");
+      expect(`under the Internal heading: ${help.lastIndexOf("Internal", at) >= 0 && help.lastIndexOf("Internal", at) > help.lastIndexOf("Usage:", at)}`)
+        .toBe("under the Internal heading: true");
+      expect(s.parsed()).toBe(0);
     } finally { s.restore(); }
   });
 });

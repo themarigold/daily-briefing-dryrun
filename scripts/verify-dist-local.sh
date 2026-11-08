@@ -360,6 +360,12 @@ step_build() {
     unset TAURI_BUNDLER_DMG_IGNORE_CI
     export CI=true
     export APPLE_SIGNING_IDENTITY=-
+    # v0.3.0 calendar (plan M11): the universal Calendar Reader the bundle ships in Contents/Resources
+    # (tauri.macos.conf.json bundle.macOS.files) — built first, as each release leg's "Calendar Reader" step
+    # does. READER_BUILD_CMD is the tests' seam (a recording stub), never set in a real run.
+    # Explicit `|| exit 1`: errexit does not apply inside a subshell whose status is tested by `||` below, and a
+    # failed rebuild would otherwise ship the previous build's reader (reader/build/ persists between runs).
+    if [ -n "${READER_BUILD_CMD:-}" ]; then "$READER_BUILD_CMD" || exit 1; else bash "$PROJECT/reader/build.sh" || exit 1; fi
     cd "$GUI" && "$TAURI_CMD" build
   ) || { note "tauri build failed"; return 1; }
   note "outputs: gui/src-tauri/target/release/bundle/{dmg,macos}/"

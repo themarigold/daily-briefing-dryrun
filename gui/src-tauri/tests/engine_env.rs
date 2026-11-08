@@ -7,9 +7,12 @@
 //!      every morning would end in a missing-binary ProviderError with a confusing message. It does
 //!      not reproduce under `cargo tauri dev`, which inherits the developer's shell PATH, so it only
 //!      shows up for the stranger.
-//!   2. **`caffeinate -i`.** The plist wraps the engine in it (`src/schedule/units.ts`,
-//!      `launchdPlist`) so a 30-120s provider call cannot be interrupted by idle sleep. Plan R1
-//!      grafts it onto ALL app spawns, not only scheduled ones.
+//!   2. **`caffeinate -i`.** A scheduled run holds idle sleep off so a 30-120s provider call
+//!      cannot be interrupted — the plist used to wrap the engine in it; since 2026-10-11 the
+//!      engine starts `caffeinate -i -w <its pid>` itself on the plist's
+//!      `DAILY_BRIEFING_KEEP_AWAKE=1` (`src/schedule/units.ts` `launchdPlist`,
+//!      `src/keep-awake.ts`). Plan R1 grafts the wrapper onto ALL app spawns, not only scheduled
+//!      ones.
 //!
 //! ⚠ **NOTHING HERE SPAWNS THE REAL ENGINE, and nothing here uses a MUTATING operation.** Every
 //! test drives a fake sidecar that reports its own environment, its own argv, or sleeps. The
@@ -354,8 +357,10 @@ fn processes_carrying(tag: &str) -> Vec<String> {
 
 /// Every macOS spawn is `/usr/bin/caffeinate -i <sidecar> <argv…>`, in that order.
 ///
-/// ⚠ THE ORDER IS THE CONTRACT, and it is the engine's own (`src/schedule/units.ts`: *"putting it
-/// after the binary would make it an argument TO the briefing rather than a wrapper around it"*).
+/// ⚠ THE ORDER IS THE CONTRACT: caffeinate after the sidecar would make it an argument TO the
+/// briefing rather than a wrapper around it. (This reason was quoted from `src/schedule/units.ts`
+/// while the plist used the same wrapper; the plist now starts the engine directly, so the app's
+/// spawn is the only `caffeinate -i <bin>` shape left.)
 #[cfg(target_os = "macos")]
 #[test]
 fn the_macos_command_line_is_caffeinate_wrapping_the_sidecar() {

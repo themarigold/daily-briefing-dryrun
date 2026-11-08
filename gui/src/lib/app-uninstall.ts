@@ -129,7 +129,8 @@ export type SettingsReport = {
   asked: boolean;
   /** The settings folder (`configPath`'s parent, the preview's `settingsFolder`); `null` when unknown. */
   folder: string | null;
-  /** One line per distinct `provider.api.apiKeyFile` the readable configs name, its `path` in full
+  /** One line per distinct `apiKeyFile` the readable configs name in ANY entry's `api` block (item 1's
+   *  and every fallback's, P3-M6-T4), its `path` in full
    *  after `~` expansion (a relative one as written, never `~`-shortened): `removed` (its
    *  `reason` the other-link note when another link still holds the file), `absent`, `kept` with
    *  why, or `failed` with the error. A path that IS `config.json` or `config.json.bak` reads
@@ -154,6 +155,26 @@ export type SettingsReport = {
    *  `keyFiles[].reason`. The done screen says each once, where it belongs: a target that is gone
    *  with the removals ({@link removedList}), what remains under {@link stillOnThisMachine}. */
   notes: string[];
+};
+
+/** {@link UninstallReport.keys} — Rust's `KeysReport` (provider fallback P3-M6-T4, spec r9 §6
+ *  "Uninstall"): the key leg, behind the settings box. Rust asks the engine to remove every key this app
+ *  stored (`provider key delete-all`: the `daily-briefing.app-key` Keychain items on macOS, the state
+ *  folder's `keys/` elsewhere) unless it is refused. ALWAYS present; all `null`/`false` when the box was
+ *  not ticked. The done screen draws it with {@link removedList} and {@link stillOnThisMachine}. */
+export type KeysReport = {
+  /** The settings box was ticked. */
+  asked: boolean;
+  /** How many keys the engine removed (on a failure, at least this many); `null` when it was not asked
+   *  or gave no count. */
+  deleted: number | null;
+  /** Files in the key folder that are not this app's keys, left there with the folder. */
+  kept: number | null;
+  /** Why the leg did not run, shown verbatim: the settings step's own refusal (the same text), or
+   *  Rust's sentence for an unknown settings file or a kept scheduler that may use these keys. */
+  refused: string | null;
+  /** The engine was asked and some keys may remain: its message. */
+  error: string | null;
 };
 
 export type UninstallReport = {
@@ -194,6 +215,8 @@ export type UninstallReport = {
   /** Batch 2 (spec 3.3.7, 3.5.3): the settings step — ALWAYS present; with the box unticked it only
    *  names the folder that stays. */
   settings: SettingsReport;
+  /** P3-M6-T4: the key leg — ALWAYS present ({@link KeysReport}). */
+  keys: KeysReport;
   /** `std::env::consts::OS` — the last step (how the app itself is removed) is per platform. */
   os: string;
 };
@@ -319,6 +342,9 @@ function engineCopyNote(os: string): string {
   return "";
 }
 
+/** v0.3.0: what the engine-data box says of the calendar links' files it removes (spec r4 §8). */
+export const CALENDAR_LINKS_CLAUSE = "your calendar links (reset any that may have leaked)";
+
 /** The sentence a consent label adds when the engine could not say where its files are (spec
  *  3.6.2: the third sentence, only when the box is blocked). Rust re-reads the folder at execute
  *  time, so "until it can" is literal: an engine that answers by then is acted on. */
@@ -340,12 +366,17 @@ function unknownFolder(what: string): string {
  *
  * ⚠ The script-parity claim is macOS only (round 4, B4-L5): `scripts/uninstall.sh` is a macOS
  * source-checkout script, and its `rm` list is pinned equal to Rust's by `tests/uninstall.rs`.
+ *
+ * v0.3.0 (plan M9; spec r4 §8): the same box removes `<state>/calendar/` — the calendar links' private
+ * files among it — so the label names them, and says to reset a link that may have leaked (only the
+ * calendar provider can make an old link stop working). Squeezed into the first sentence on purpose:
+ * the view's 100-word budget (spec 3.6.2) has room for those words and not for a third sentence.
  */
 export function consentLabel(preview: UninstallPreview): string {
   const where = preview.engineStateDir === null ? "" : ` in ${preview.engineStateDir}`;
   const head =
     `Also remove the engine's data${where}: your whole briefing archive and its log, which cannot be ` +
-    `recovered${engineCopyNote(preview.os)}.`;
+    `recovered, ${CALENDAR_LINKS_CLAUSE}${engineCopyNote(preview.os)}.`;
   const bound =
     preview.os === "macos"
       ? "These are the files `bash scripts/uninstall.sh` removes; nothing else in that folder is touched."
@@ -356,15 +387,23 @@ export function consentLabel(preview: UninstallPreview): string {
   return `${head} ${bound}${blocked}`;
 }
 
-/** The settings box's label (spec 3.5.3: "Also remove my settings and API key file (in <folder>)",
- *  off by default), naming the folder it empties — the preview's `settingsFolder`. With that folder
- *  unknown the box is blocked, and the label says so in its one extra sentence (spec 3.6.2). */
+/** The settings box's label (spec 3.5.3, off by default), naming the folder it empties — the preview's
+ *  `settingsFolder`. Since provider fallback PR 3 (P3-M6-T4) the same box is the KEY leg's consent (spec
+ *  r9 §6: "behind the existing consent"), so "API keys" means the API keys this app stored as well as the
+ *  key files the settings name. With that folder unknown the box is blocked — Rust refuses the key leg too
+ *  then, so "removes nothing" holds for the keys — and the label says so in its one extra sentence
+ *  (spec 3.6.2). */
 export function settingsLabel(preview: UninstallPreview): string {
-  const head = "Also remove my settings and API key file";
+  // "API keys" covers both: the key files the settings name in that folder, and every key this app
+  // stored. No longer than the label it replaces ("… and API key file (in <folder>)."): the view's
+  // 100-word budget (spec 3.6.2) has no room for more.
   return preview.settingsFolder === null
-    ? `${head}. ${unknownFolder("they are")}`
-    : `${head} (in ${preview.settingsFolder}).`;
+    ? `Also remove my settings and API keys. ${unknownFolder("they are")}`
+    : `Also remove my settings (in ${preview.settingsFolder}) and API keys.`;
 }
+
+/** P3-M6-T4: what the done screen calls the keys the key leg removes. */
+const APP_KEYS = "API keys this app stored";
 
 /**
  * The execute button's words (Phase E final harden round 3, A3-L2): what clicking WILL do, read from
@@ -660,7 +699,7 @@ export type FailureState = ConsentState & {
  *     their panels answer them, and Try again sends what was sent — drawn, while it is in flight, as the
  *     form that sent it (checkpoint M6a follow-up: a locked "Uninstall anyway" form's retry showed the
  *     user's earlier ticks for as long as it ran, though it correctly sent them as false).
- * Only `ScheduleForeign` undoes "Uninstall anyway". `AppSettings.svelte` applies the whole result, then
+ * Only `ScheduleForeign` undoes "Uninstall anyway". `settings/UninstallPanel.svelte` applies the whole result, then
  * re-reads when asked, then shows the error.
  */
 export function stateAfterFailure(
@@ -904,6 +943,21 @@ export function stillOnThisMachine(report: UninstallReport): StillLine[] {
     for (const note of notes.remaining) text(note);
   }
 
+  // P3-M6-T4: the key leg — a refusal (pointed at when it is the settings step's own), a failure, and
+  // the key folder kept for files that are not this app's.
+  const keys = report.keys;
+  if (keys.asked) {
+    if (keys.refused !== null) {
+      const same = settings.asked && keys.refused === settings.refused;
+      text(same ? `${APP_KEYS}: kept, for the same reason as the settings.` : `${APP_KEYS}: kept — ${keys.refused}`);
+    } else if (keys.error !== null) {
+      text(`${APP_KEYS}: some may still be there — ${keys.error}`);
+    }
+    if (keys.kept !== null && keys.kept > 0) {
+      text(`The key folder was kept: ${keys.kept} ${keys.kept === 1 ? "file in it is" : "files in it are"} not this app's keys.`);
+    }
+  }
+
   for (const copy of report.engineCopies) {
     if (copy.outcome === "kept") {
       // Kept for the engine data's own refusal (spec 3.5.2): pointed at, not said twice.
@@ -941,6 +995,12 @@ export function removedList(report: UninstallReport): string[] {
     }
     for (const name of settings.removed) lines.push(`Settings file removed (${name})`);
     lines.push(...placeNotes(settings.notes, settings.removed).gone);
+  }
+  // P3-M6-T4: the keys the key leg removed — a count (a lower bound when it failed), or that none was left.
+  const keys = report.keys;
+  if (keys.asked && keys.refused === null && keys.deleted !== null) {
+    if (keys.deleted > 0) lines.push(`${APP_KEYS} removed (${keys.deleted})`);
+    else if (keys.error === null) lines.push(`No API key this app stored was left to remove.`);
   }
   for (const copy of report.engineCopies) {
     if (copy.outcome === "removed") lines.push(`Engine copy removed (${copy.path})`);

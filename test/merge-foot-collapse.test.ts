@@ -196,12 +196,23 @@ describe("the suggestion guard still fires — the collapse is render-time ONLY"
   // then the struct shape that protects it, then the rendered page.
   test("runCore: two in-window PR merges → the guard drops a suggestion naming one, the struct carries per-merge texts, the page carries ONE collapsed line", async () => {
     const yesterday = () => { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - 1); return d.toISOString(); };
-    const plus = (iso: string, h: number) => new Date(Date.parse(iso) + h * 3600e3).toISOString();
-    const dir = await buildRepo([{ file: "w.ts", content: "x", isoDate: yesterday() }]);
-    await branchCommit(dir, "feat-a", "a.txt", yesterday());
-    await mergeBranchWith(dir, "feat-a", "Merge pull request #7 from o/feat/a", plus(yesterday(), 1));
-    await branchCommit(dir, "feat-b", "b.txt", plus(yesterday(), 2));
-    await mergeBranchWith(dir, "feat-b", "Merge pull request #8 from o/feat/b", plus(yesterday(), 3));
+    // The commits are dated "yesterday", so their SHAs change every day, and git abbreviates to all digits
+    // ~4% of the time: a token `extractCitedShas` does not mine, by design (the residual written down above).
+    // On such a day the last assertion went red for no code reason (2026-10-23: `8205360`). So shift every
+    // commit by whole minutes until both merge SHAs carry a hex letter; the window and every assertion are
+    // unchanged.
+    const mergeShas = (repo: string) =>
+      Bun.spawnSync(["git", "log", "--merges", "--format=%H"], { cwd: repo }).stdout.toString().trim().split("\n").map((s) => s.slice(0, 7));
+    let dir = "";
+    for (let shift = 0; shift < 30; shift++) {
+      const at = (h: number) => new Date(Date.parse(yesterday()) + (h * 60 + shift) * 60e3).toISOString();
+      dir = await buildRepo([{ file: "w.ts", content: "x", isoDate: at(0) }]);
+      await branchCommit(dir, "feat-a", "a.txt", at(0));
+      await mergeBranchWith(dir, "feat-a", "Merge pull request #7 from o/feat/a", at(1));
+      await branchCommit(dir, "feat-b", "b.txt", at(2));
+      await mergeBranchWith(dir, "feat-b", "Merge pull request #8 from o/feat/b", at(3));
+      if (mergeShas(dir).every(isShaShaped)) break;
+    }
     const cfg: Config = { repos: [dir], excludeCommitPatterns: [], lookbackCapDays: 30, provider: { cli: "echo", argv: [], promptVia: "stdin" } };
     const stub: Provider = { generate: async () => "## RESUME\n- [x] r\n## RECAP\n- [x] c | evidence: HEAD\n## SUGGESTIONS\n- merge #7 once CI is green\n- add tests for w.ts" };
     const r = await runCore(cfg, { provider: stub, netProbe: async () => true });

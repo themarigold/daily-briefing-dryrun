@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { redactCredentials } from "./transcripts/credentials";
+import { writePrivateAtomic } from "./strictFile";
 
 // Cross-platform state dir (mirrors config.ts's XDG-aware configPath, so state doesn't land in a fake
 // ~/Library tree off macOS): macOS → ~/Library/Application Support, Windows → %LOCALAPPDATA%, else the
@@ -131,6 +132,9 @@ export type LastSkip = {
   localDate: string;   // the LOCAL day it belonged to (same two-units rule as stampTick — see its docstring)
   reason: string;      // one of SKIP_REASONS (src/json.ts) — a closed vocabulary the GUI switches on
   detail?: string;     // free text for a human; never parsed
+  /** Provider fallback (P1-M9-T2, spec r9 §5): set on a `limited` skip when EVERY provider is out of usage (step 7
+   *  row 1). Additive: older apps ignore it, and older engines never write it. */
+  allOutOfUsage?: true;
 };
 
 export function lastSkipPath(): string {
@@ -147,7 +151,9 @@ export function lastSkipPath(): string {
  *  GUI's Schedule panel both read this file back, so an unredacted detail reached the screen. */
 export async function writeLastSkip(s: LastSkip): Promise<void> {
   const safe = s.detail === undefined ? s : { ...s, detail: redactCredentials(s.detail) };
-  try { await Bun.write(lastSkipPath(), `${JSON.stringify(safe)}\n`); } catch { /* diagnostic only */ }
+  // Through the shared private, atomic writer (round 3 L5): it carries the same provider-derived detail as
+  // `last-failure.json`, so it gets the same 0600 mode. Content and path unchanged.
+  try { await writePrivateAtomic(lastSkipPath(), `${JSON.stringify(safe)}\n`); } catch { /* diagnostic only */ }
 }
 
 /** Remove the skip record. Fail-open: an undeletable record is a stale diagnostic, never a lost run. */
@@ -163,7 +169,48 @@ export async function readLastSkip(): Promise<LastSkip | undefined> {
     if (!(await f.exists())) return undefined;
     const o = JSON.parse(await f.text()) as Partial<LastSkip>;
     if (typeof o?.iso !== "string" || typeof o.localDate !== "string" || typeof o.reason !== "string") return undefined;
-    return { iso: o.iso, localDate: o.localDate, reason: o.reason, ...(typeof o.detail === "string" ? { detail: o.detail } : {}) };
+    return {
+      iso: o.iso, localDate: o.localDate, reason: o.reason, ...(typeof o.detail === "string" ? { detail: o.detail } : {}),
+      ...(o.allOutOfUsage === true ? { allOutOfUsage: true as const } : {}),
+    };
+  } catch { return undefined; }
+}
+
+// ── `<state>/last-failure.json` (provider fallback P1-M9-T1; spec r9 §5 Reporting "Unresolved failure") ─────────────
+// The day's unresolved FAILURE, for the app's banner: written on every failure-class skip (`FAILURE_SKIP_REASONS`),
+// cleared ONLY on delivery. Unlike `last-skip.json`, a later quiet skip (offline, concurrent, limited) never erases
+// it, so a failed morning stays visible until a briefing arrives. Not in `statePaths()` (the `run --json` envelope's
+// `paths`, which the calendar-off goldens pin byte for byte); it joins the engine-owned path list in P1-M10-T2.
+
+/** The app's FAILED class (spec r9 §5): the skip reasons that write `last-failure.json`. */
+export const FAILURE_SKIP_REASONS: ReadonlySet<string> = new Set(["provider-fail", "parse-empty", "write-fail", "marker-fail", "crashed"]);
+
+export type LastFailure = { localDate: string; reason: string; detail: string };
+
+export function lastFailurePath(): string {
+  return join(supportDir(), "last-failure.json");
+}
+
+/** Total and non-fatal, like `writeLastSkip`; `detail` is REDACTED here, at the file boundary, with the same
+ *  `redactCredentials` — it is the same provider-derived free text (spec r9 §5). */
+export async function writeLastFailure(f: LastFailure): Promise<void> {
+  // Through the shared private, atomic writer (M9): 0600, and a torn write can never make the FAILED banner vanish.
+  try { await writePrivateAtomic(lastFailurePath(), `${JSON.stringify({ ...f, detail: redactCredentials(f.detail) })}\n`); } catch { /* diagnostic only */ }
+}
+
+/** Remove the record — on delivery only. Fail-open. */
+export async function clearLastFailure(): Promise<void> {
+  try { await unlink(lastFailurePath()); } catch { /* absent (the common case) or unremovable */ }
+}
+
+/** Read it back, or `undefined` when absent or corrupt. Never throws. */
+export async function readLastFailure(): Promise<LastFailure | undefined> {
+  try {
+    const f = Bun.file(lastFailurePath());
+    if (!(await f.exists())) return undefined;
+    const o = JSON.parse(await f.text()) as Partial<LastFailure>;
+    if (typeof o?.localDate !== "string" || typeof o.reason !== "string" || typeof o.detail !== "string") return undefined;
+    return { localDate: o.localDate, reason: o.reason, detail: o.detail };
   } catch { return undefined; }
 }
 
@@ -208,6 +255,39 @@ export function recapCampaignsPath(): string {
  */
 export function updateCheckPath(): string {
   return join(supportDir(), "update-check.json");
+}
+
+/**
+ * `<state>/run-record.json` — the morning run's record for the desktop app's live git check (B1, wave-2
+ * plan B1-M1-T3): the page's date, the repo list, the window start, the labels and the page's own commit
+ * lists. Written by `src/main.ts` after the page is saved, through `src/runRecord.ts`, and read by the live
+ * check, which never writes it.
+ *
+ * ⚠ NOT a `StatePaths` field (disagreement 1): `statePaths()` is the `run --json` envelope's `paths`, which
+ * the calendar-off goldens pin. `json.ts` lists it in `engineOwnedPaths()` and `engineOwns`, so `--json-out`
+ * can never truncate it.
+ */
+export function runRecordPath(): string {
+  return join(supportDir(), "run-record.json");
+}
+
+/**
+ * `<state>/provider-status.json` — per-entry status for the provider list (provider fallback, spec r9 §5
+ * Reporting): each label's revision, newest walk and key-test observations, `failingSince` and the quick-check
+ * latch. Read and written by `src/providerStatus.ts` only. Resolves through `supportDir()`.
+ */
+export function providerStatusPath(): string {
+  return join(supportDir(), "provider-status.json");
+}
+
+/**
+ * `<state>/keys` — the folder (0700) of app-owned API key files, `k-<12 hex>.key` at 0600 (provider-fallback
+ * spec r9 §6). PR 2's key store (`src/keyStore.ts`) is its only writer, and a file there is read back only
+ * through the strict reader (`src/strictFile.ts`). Defined here first because `isAppOwnedKey`
+ * (src/providerList.ts) judges `apiKeyFile` paths against it. Resolves through `supportDir()`.
+ */
+export function keysDir(): string {
+  return join(supportDir(), "keys");
 }
 
 /** The marker FILE exists at all (any date) — i.e. a briefing has succeeded at least once.

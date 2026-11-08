@@ -55,7 +55,7 @@
 //!    the engine's own `detail` string, which already made that decision. There is no field here a
 //!    reset time could be invented into. See [`Phase::Skipped`].
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /* ── the closed skip vocabulary ───────────────────────────────────────────────────────────────── */
 
@@ -80,6 +80,7 @@ pub const SKIP_REASONS: &[&str] = &[
     "provider-fail",
     "parse-empty",
     "marker-fail",
+    "write-fail",
     "crashed",
 ];
 
@@ -105,6 +106,7 @@ pub enum SkipReason {
     ProviderFail,
     ParseEmpty,
     MarkerFail,
+    WriteFail,
     Crashed,
     Unknown(String),
 }
@@ -125,6 +127,7 @@ impl SkipReason {
             "provider-fail" => SkipReason::ProviderFail,
             "parse-empty" => SkipReason::ParseEmpty,
             "marker-fail" => SkipReason::MarkerFail,
+            "write-fail" => SkipReason::WriteFail,
             "crashed" => SkipReason::Crashed,
             other => SkipReason::Unknown(other.to_string()),
         }
@@ -146,6 +149,7 @@ impl SkipReason {
             SkipReason::ProviderFail => "provider-fail",
             SkipReason::ParseEmpty => "parse-empty",
             SkipReason::MarkerFail => "marker-fail",
+            SkipReason::WriteFail => "write-fail",
             SkipReason::Crashed => "crashed",
             SkipReason::Unknown(raw) => raw,
         }
@@ -200,9 +204,16 @@ pub struct LastSkip {
     pub local_date: String,
     /// One of [`SKIP_REASONS`], as a string — kept raw here and parsed by [`SkipReason::parse`].
     pub reason: String,
-    /// Free text for a human, never parsed. For `limited` this is `limitedSkipMessage`'s output,
-    /// which is the ONLY place a reset time may come from (module header, trap 3).
+    /// Free text for a human, never parsed. For `limited` it is `limitedSkipMessage`'s line — preceded,
+    /// when every provider is out of usage (the engine's `allOutOfUsage`), by a FIRST line from
+    /// `outOfUsageLine`, the notification body. The engine's text is the ONLY place a reset time may come
+    /// from (module header, trap 3).
     pub detail: Option<String>,
+    /// The engine's `allOutOfUsage` (provider fallback, spec r9 §5, requirement 11): `true` on a
+    /// `limited` skip where EVERY provider is out of usage (step 7 row 1), which is what makes that
+    /// skip notify ([`crate::notifications::skip_notify_class`]). The engine writes it only when
+    /// true, so an absent field — every older engine, every other skip — reads as `false`.
+    pub all_out_of_usage: bool,
 }
 
 /// The `lastTick` object on both envelopes: `<iso> local=<YYYY-MM-DD> today=<n>`, already parsed by
@@ -264,8 +275,175 @@ pub struct StatusView {
     pub last_tick: Option<TickLine>,
     /// `briefing-latest.md`'s mtime, ISO-8601 — the delivery TIME [`Phase::Delivered`] shows.
     pub latest_briefing_mtime: Option<String>,
+    /// The summary record bound to the latest page: its identity, revision and state. The engine
+    /// omits it while summaries are off or no record exists.
+    ///
+    /// ⚠ READ LENIENTLY ([`lenient_latest_summary_revision`]), like `providers` below, and so is
+    /// [`Self::ai_summary_status`]: the container's `default` covers a MISSING member only, and a
+    /// wrong-typed one would otherwise fail the whole envelope's parse.
+    #[serde(deserialize_with = "lenient_latest_summary_revision")]
+    pub latest_summary_revision: Option<LatestSummaryRevision>,
+    /// The resolved `aiSummary` switch and its fixed warning codes. Absent reads as off.
+    #[serde(deserialize_with = "lenient_ai_summary_status")]
+    pub ai_summary_status: AiSummaryStatus,
     pub morning_time: MorningTime,
     pub paths: StatePaths,
+    /// `status --json`'s `providers` (provider fallback P1-M10-T1): one row per combined-list entry
+    /// and per DROPPED entry, in list order. Only each row's `kind` is read, to count the VALID
+    /// entries ([`StatusView::valid_provider_entries`]) for the older-background-engine warning — the
+    /// engine resolved the list; this app counts its answer and never resolves it a second time.
+    ///
+    /// ⚠ READ LENIENTLY ([`lenient_provider_rows`]): a `providers` that is not an array reads as no
+    /// rows, rather than failing the WHOLE envelope's parse — which would blank the Schedule screen
+    /// over a field only one warning reads. An older engine sends none: no rows.
+    #[serde(deserialize_with = "lenient_provider_rows")]
+    pub providers: Vec<ProviderRow>,
+}
+
+impl StatusView {
+    /// The number of VALID combined-list entries the engine reported. ⚠ A dropped row (`kind:
+    /// "invalid"`) does NOT count (plan Q18): one valid entry plus a dropped one behaves
+    /// single-entry on old and new engines alike, so it is no reason to warn. A row with no `kind`
+    /// is not evidence of an entry either.
+    pub fn valid_provider_entries(&self) -> usize {
+        self.providers
+            .iter()
+            .filter(|row| row.kind.as_deref().is_some_and(|kind| kind != "invalid"))
+            .count()
+    }
+}
+
+/// One `status --json` `providers` row, reduced to the one field this app reads. `kind` is the
+/// entry's provider kind for a resolved entry and `"invalid"` for a dropped one (`src/json.ts`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProviderRow {
+    pub kind: Option<String>,
+}
+
+/// `providers`, never an error: an array's elements are read for a string `kind` (anything else is
+/// a row with none); any other value is no rows.
+fn lenient_provider_rows<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ProviderRow>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(match value {
+        serde_json::Value::Array(rows) => rows
+            .iter()
+            .map(|row| ProviderRow {
+                kind: row
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// A stored summary record's state (`src/summary/store.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryState {
+    Pending,
+    Ready,
+    Unavailable,
+}
+
+/// Every fixed summary diagnostic. Codes only: the GUI maps them to text, so nothing a model, a
+/// provider or a config wrote can reach a screen through this list. `SummaryConfigInvalid` comes
+/// from the config resolver and appears in status only, never in a stored record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SummaryWarningCode {
+    SummaryUnavailable,
+    SummaryTextOmitted,
+    SummaryUsageLimit,
+    SummaryConfigInvalid,
+}
+
+/// `status --json`'s `latestSummaryRevision`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatestSummaryRevision {
+    pub page_hash: String,
+    pub page_version: String,
+    pub revision: u8,
+    pub state: SummaryState,
+}
+
+/// `status --json`'s `aiSummaryStatus`. Bounded by construction: deduplicated fixed codes.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSummaryStatus {
+    pub enabled: bool,
+    pub warnings: Vec<SummaryWarningCode>,
+}
+
+/// Exactly 64 lowercase hex digits: a `pageHash` or `pageVersion`, never a path.
+pub fn is_page_identity(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `latestSummaryRevision`, never an error: anything but a whole, consistent value reads as absent.
+fn lenient_latest_summary_revision<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<LatestSummaryRevision>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let identity = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| is_page_identity(text))
+            .map(str::to_string)
+    };
+    let state = value
+        .get("state")
+        .cloned()
+        .and_then(|state| serde_json::from_value(state).ok());
+    let revision = value.get("revision").and_then(serde_json::Value::as_u64);
+    Ok(
+        match (
+            identity("pageHash"),
+            identity("pageVersion"),
+            state,
+            revision,
+        ) {
+            (Some(page_hash), Some(page_version), Some(state), Some(revision))
+                if revision == u64::from(state != SummaryState::Pending) =>
+            {
+                Some(LatestSummaryRevision {
+                    page_hash,
+                    page_version,
+                    revision: u8::from(state != SummaryState::Pending),
+                    state,
+                })
+            }
+            _ => None,
+        },
+    )
+}
+
+/// `aiSummaryStatus`, never an error: anything but `{enabled: boolean, warnings: array}` reads as
+/// off with no warnings. An unknown code in the array is dropped, and a repeat kept once.
+fn lenient_ai_summary_status<'de, D: Deserializer<'de>>(d: D) -> Result<AiSummaryStatus, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let enabled = value.get("enabled").and_then(serde_json::Value::as_bool);
+    let rows = value.get("warnings").and_then(serde_json::Value::as_array);
+    let (Some(enabled), Some(rows)) = (enabled, rows) else {
+        return Ok(AiSummaryStatus::default());
+    };
+    let mut warnings = Vec::new();
+    for code in rows
+        .iter()
+        .filter_map(|row| serde_json::from_value(row.clone()).ok())
+    {
+        if !warnings.contains(&code) {
+            warnings.push(code);
+        }
+    }
+    Ok(AiSummaryStatus { enabled, warnings })
 }
 
 /// The state-dir paths, straight from the engine. **Never recomputed app-side** — `src/json.ts`'s
@@ -321,6 +499,198 @@ pub struct ScheduleView {
     /// The engine's manual removal steps for this machine's paths (spec 3.1.8), with no closing
     /// line; `null` off launchd and systemd (Windows and unsupported platforms).
     pub remove_steps: Option<String>,
+    /// Provider fallback (P2-M5-T3, `docs/gui-seam.md` §2): the scheduled binary's version as it
+    /// answers NOW (`<binPath> --version`, bounded) — `null` when there is no record, no absolute
+    /// `binPath`, or the read failed. NOT [`Self::installed_engine_version`], the install-time
+    /// record, which goes stale once the binary is replaced in place. An older engine sends none.
+    pub scheduled_engine_version: Option<String>,
+}
+
+/* ── the older-background-engine warning (provider fallback spec §6, P3-M6-T2) ─────────────── */
+
+/// The sentinel [`FIRST_SAME_RUN_SWITCHING_VERSION`] held until the v0.3.0 release step: "no released
+/// version contains same-run switching yet — compare against this app's own version". So a build from
+/// `main` before that release (app and engine both at the same version) never warned about its own engine.
+///
+/// ⚠ THE RELEASE STEP REPLACED IT (plan "Build conventions", spec §6): it set the constant to the
+/// version being released, with previous release tag < constant ≤ that version.
+/// `the_threshold_sentinel_is_replaced_before_any_release` (`tests/schedule_state.rs`) fails once
+/// the crate version moves past [`SENTINEL_INTRODUCED_IN`] with the sentinel still here.
+pub const UNSET_UNTIL_RELEASE: &str = "UNSET_UNTIL_RELEASE";
+
+/// The first RELEASED engine version that contains provider fallback PR 1 (same-run switching, the
+/// `fallbacks` reader) — or [`UNSET_UNTIL_RELEASE`].
+///
+/// Set by the v0.3.0 release step. Measured 2026-11-06: `gh release list -R norn-app/daily-briefing`
+/// lists v0.2.0 as the latest release, and v0.2.0's tree has no `src/providerList.ts` (the contents
+/// API answers 404), so v0.3.0 is the first release to contain PR 1 (#645, merged 2026-10-17).
+pub const FIRST_SAME_RUN_SWITCHING_VERSION: &str = "0.3.0";
+
+/// This crate's version when the sentinel landed — `gui/src-tauri/Cargo.toml`'s `[package]`
+/// `version`, read at build time on 2026-10-18 (not assumed). Every release bumps the version past
+/// it, which is what makes the guard test fire on a release that forgot the sentinel.
+pub const SENTINEL_INTRODUCED_IN: &str = "0.2.1";
+
+/// This app's own version — the other half of the lower-of rule.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Whether `version` is OLDER than `than`, by semver precedence (semver.org §11): numeric
+/// major.minor.patch (`0.2.10` is newer than `0.2.9` — not today's string inequality), a
+/// pre-release below its release, build metadata ignored. `None` when either side is not a bare
+/// semver (the engine reads `scheduledEngineVersion` only when it is one, gui-seam §2).
+pub fn version_older(version: &str, than: &str) -> Option<bool> {
+    let (a, b) = (Semver::parse(version)?, Semver::parse(than)?);
+    Some(a.cmp(&b) == std::cmp::Ordering::Less)
+}
+
+/// A parsed bare semver: `MAJOR.MINOR.PATCH[-PRE][+BUILD]`, the shape the engine's `VERSION_LINE`
+/// accepts (`src/schedule/status.ts`). Its `Ord` is semver precedence; `BUILD` is dropped.
+#[derive(Debug, PartialEq, Eq)]
+struct Semver<'a> {
+    core: [u64; 3],
+    pre: Vec<&'a str>,
+}
+
+impl<'a> Semver<'a> {
+    fn parse(text: &'a str) -> Option<Self> {
+        let text = text.split_once('+').map_or(text, |(v, _build)| v);
+        let (core_text, pre_text) = match text.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (text, None),
+        };
+        let mut core = [0u64; 3];
+        let mut parts = core_text.split('.');
+        for slot in &mut core {
+            let part = parts.next()?;
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            *slot = part.parse().ok()?;
+        }
+        if parts.next().is_some() {
+            return None;
+        }
+        let pre = match pre_text {
+            None => Vec::new(),
+            Some(pre) => {
+                let ids: Vec<&str> = pre.split('.').collect();
+                let well_formed = |id: &&str| {
+                    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                };
+                if !ids.iter().all(well_formed) {
+                    return None;
+                }
+                ids
+            }
+        };
+        Some(Self { core, pre })
+    }
+}
+
+impl Ord for Semver<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        self.core.cmp(&other.core).then_with(|| {
+            match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => Ordering::Equal,
+                // A pre-release sorts BELOW its release.
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => {
+                    for (a, b) in self.pre.iter().zip(&other.pre) {
+                        let numeric = |id: &str| -> Option<u64> {
+                            if id.bytes().all(|b| b.is_ascii_digit()) {
+                                id.parse().ok()
+                            } else {
+                                None
+                            }
+                        };
+                        let order = match (numeric(a), numeric(b)) {
+                            (Some(x), Some(y)) => x.cmp(&y),
+                            // Numeric identifiers sort below alphanumeric ones.
+                            (Some(_), None) => Ordering::Less,
+                            (None, Some(_)) => Ordering::Greater,
+                            (None, None) => a.cmp(b),
+                        };
+                        if order != Ordering::Equal {
+                            return order;
+                        }
+                    }
+                    self.pre.len().cmp(&other.pre.len())
+                }
+            }
+        })
+    }
+}
+
+impl PartialOrd for Semver<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The older-background-engine warning, for BOTH owners (spec §6): the combined list has two or more
+/// VALID entries, and the scheduled engine's MEASURED version is older than the LOWER of `threshold`
+/// ([`FIRST_SAME_RUN_SWITCHING_VERSION`]) and `app_version`. The sentinel means "the app's own
+/// version". An unknown or unreadable version is not evidence of age: no warning.
+///
+/// ⚠ NAMED LIMIT (spec §6): before the release, the bar is the app's own version, so a same-version
+/// engine with and without same-run switching cannot be told apart; the guarantee holds for
+/// released builds only.
+pub fn older_engine_warning(
+    valid_entries: usize,
+    scheduled: Option<&str>,
+    threshold: &str,
+    app_version: &str,
+) -> bool {
+    if valid_entries < 2 {
+        return false;
+    }
+    let Some(scheduled) = scheduled else {
+        return false;
+    };
+    let bar = if threshold == UNSET_UNTIL_RELEASE {
+        app_version
+    } else {
+        match version_older(threshold, app_version) {
+            Some(true) => threshold,
+            Some(false) => app_version,
+            None => return false,
+        }
+    };
+    version_older(scheduled, bar) == Some(true)
+}
+
+/// The release-step guard: `Err` while `threshold` is still the sentinel and `crate_version` has
+/// moved past `introduced_in` (a release that forgot to set it), or when `threshold` is neither
+/// the sentinel nor a bare semver (a typo would silently disable the warning).
+pub fn sentinel_guard(
+    threshold: &str,
+    crate_version: &str,
+    introduced_in: &str,
+) -> Result<(), String> {
+    if threshold != UNSET_UNTIL_RELEASE {
+        return match Semver::parse(threshold) {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "FIRST_SAME_RUN_SWITCHING_VERSION is {threshold:?}: neither {UNSET_UNTIL_RELEASE} \
+                 nor a bare semver, so the older-engine warning could never fire"
+            )),
+        };
+    }
+    match version_older(introduced_in, crate_version) {
+        Some(false) => Ok(()),
+        Some(true) => Err(format!(
+            "FIRST_SAME_RUN_SWITCHING_VERSION is still {UNSET_UNTIL_RELEASE}, but this crate is \
+             {crate_version}, past {introduced_in} where the sentinel landed: the release step must \
+             set it to the first released version containing provider fallback PR 1 (plan \
+             \"Build conventions\"; spec §6)"
+        )),
+        None => Err(format!(
+            "cannot compare the crate version {crate_version:?} with SENTINEL_INTRODUCED_IN \
+             {introduced_in:?}: both must be bare semvers"
+        )),
+    }
 }
 
 /// The instant [`derive`] is evaluated at. An operand, so the machine reads no clock.
@@ -483,6 +853,15 @@ pub struct ScheduleState {
     /// [`ScheduleView::remove_steps`]: the engine's manual removal steps, verbatim; `null` off
     /// launchd and systemd, or when the schedule envelope is missing.
     pub remove_steps: Option<String>,
+    /// [`ScheduleView::scheduled_engine_version`]: the MEASURED version of the scheduled binary,
+    /// straight through. The older-engine warning reads this, never the install-time record.
+    pub scheduled_engine_version: Option<String>,
+    /// The older-background-engine warning (spec §6): the combined list has two or more VALID
+    /// entries and the scheduled engine is older than the first engine with same-run switching
+    /// ([`older_engine_warning`]). ⚠ FOR BOTH OWNERS — unlike [`Self::engine_update_available`] —
+    /// but the remedy differs: a CLI-owned schedule is updated the way it was installed, never
+    /// through this app's install (which would be a take-over).
+    pub older_engine_warning: bool,
 }
 
 impl ScheduleState {
@@ -524,6 +903,7 @@ fn status_line(phase: &Phase, floor: &str) -> String {
             SkipReason::ProviderFail => "The provider failed".to_string(),
             SkipReason::ParseEmpty => "The briefing came back empty".to_string(),
             SkipReason::MarkerFail => "Delivered, but the day marker failed".to_string(),
+            SkipReason::WriteFail => "The briefing could not be saved".to_string(),
             SkipReason::Crashed => "The last run crashed".to_string(),
             // `is_noise` keeps these four out of `Phase::Skipped`; the arms exist because the match
             // is exhaustive and a `_` would hide a future reason behind a wrong line.
@@ -649,6 +1029,14 @@ pub fn derive(
             _ => false,
         };
 
+    let scheduled_engine_version = schedule.and_then(|s| s.scheduled_engine_version.clone());
+    let older_engine_warning = older_engine_warning(
+        status.valid_provider_entries(),
+        scheduled_engine_version.as_deref(),
+        FIRST_SAME_RUN_SWITCHING_VERSION,
+        APP_VERSION,
+    );
+
     ScheduleState {
         status_line: status_line(&phase, &floor),
         phase,
@@ -676,6 +1064,8 @@ pub fn derive(
         record_file_present: schedule.is_some_and(|s| s.record_file_present),
         registered_reason: schedule.and_then(|s| s.registered_reason.clone()),
         remove_steps: schedule.and_then(|s| s.remove_steps.clone()),
+        scheduled_engine_version,
+        older_engine_warning,
     }
 }
 

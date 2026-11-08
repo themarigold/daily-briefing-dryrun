@@ -1,5 +1,6 @@
 // src/generator.ts
 import type { Activity, DoneItem, ReducedContext, BriefingStruct, Provider } from "./types";
+import type { CalendarPromptBlocks } from "./calendar/prompt";
 import { repoLabelFor, rootOf, rootsForRepo, unitForCommit, rankUnits, INFRA_DENYLIST, norm, type Unit } from "./subprojects";
 import { summarize, STAGE1_LIST_CAP } from "./reduce";
 // SHA_RE + isShaShaped live in ./sha so the generator's grounding guard and the audit's citation miner
@@ -7,7 +8,7 @@ import { summarize, STAGE1_LIST_CAP } from "./reduce";
 // resolve; 4-char floor catches short garbles like "2ee140"; only runs over parsed evidence, not prose.)
 import { SHA_RE, isShaShaped, isExtractableSha, evidenceTokens, bareToken, shaPrefixMatch } from "./sha";
 import { isBranchNotable } from "./git";
-import { matchesCredentialAnyCase, redactCredentials } from "./transcripts/credentials";
+import { matchesCredential, matchesCredentialAnyCase, redactCredentials } from "./transcripts/credentials";
 // Only `doneSubjectAsShown` now — the two CHECK functions moved to their true call site in core.ts
 // (see the tombstone at the foot of `generateBriefing`). This import stays because `buildDoneBlock`
 // renders the prompt's DONE list with the same definition the freshness matcher compares against;
@@ -62,7 +63,11 @@ function verifyEvidence(evidence: string | undefined, shas: string[]): { evidenc
   return { evidence: kept.length ? kept.join(", ") : undefined, dropped };
 }
 
-type Meta = { date: string; machineScope: string; provider: string; warnings?: string[]; today?: { repo: string; text: string }[]; windowMerges?: { repo: string; text: string }[]; stateAsOf?: string; morningFloor?: string; todaySuppress?: DoneItem[] };
+/** `calendarPrompt` (v0.3.0 calendar, plan M3b — spec r4 §6): today's calendar block in its two variants.
+ *  ABSENT whenever calendar is off, and then the prompt and the provider call are exactly what they were
+ *  before (pinned by test/calendar-off.golden.test.ts). Never copied into the struct (`parseBriefing` names
+ *  its fields one by one). */
+type Meta = { date: string; machineScope: string; provider: string; warnings?: string[]; today?: { repo: string; text: string }[]; windowMerges?: { repo: string; text: string }[]; stateAsOf?: string; morningFloor?: string; todaySuppress?: DoneItem[]; calendarPrompt?: CalendarPromptBlocks };
 
 export function activityLine(a: Activity): string {
   const text = a.text ?? a.target ?? "";
@@ -205,7 +210,16 @@ SUGGESTIONS: do NOT suggest work these commits already completed — if a natura
 export const PROMPT_HEADER =
   "You are writing a developer's resumption-focused daily briefing from LOCAL GIT ACTIVITY on THIS machine only.";
 
-export function buildPrompt(ctx: ReducedContext, rankedUnits: Unit[], rootsByRepo?: Map<string, string[]>, todaySuppress?: DoneItem[]): string {
+/** The AI summary's prompt opens with this line (`src/summary/job.ts`). `isSelfPrompt` keys on it, so a transcript of that
+ *  call is never read back as the user's own work. ⚠ Same rule as `PROMPT_HEADER`: if it changes, append the old value to
+ *  `HISTORICAL_PROMPT_HEADERS` first. */
+export const SUMMARY_PROMPT_HEADER = "You summarise one developer's daily briefing page.";
+
+// `calendarBlock` (v0.3.0 calendar, plan M3b — spec r4 §6): one variant of today's calendar block, inserted
+// IMMEDIATELY BEFORE `GIT ACTIVITY:` so text written by other people is never the last thing the model reads.
+// Absent or "" (calendar off, or no room in the budget) ⇒ the prompt is byte-identical to before — the same
+// empty-when-off contract as `buildDoneBlock` — pinned by test/calendar-off.golden.test.ts.
+export function buildPrompt(ctx: ReducedContext, rankedUnits: Unit[], rootsByRepo?: Map<string, string[]>, todaySuppress?: DoneItem[], calendarBlock?: string): string {
   const paths = ctx.repos.map((r) => r.repo);
 
   const body = ctx.repos.map((r) => {
@@ -311,7 +325,7 @@ When several commits in the window touch the same file, the NEWEST is the curren
 Describe each commit from its FILE LIST first, its subject second. When they disagree — e.g. a "fix(tests):" subject whose files are mostly non-test (schema, config, source) — the files win: say what the files show and note the subject's framing, never the reverse. A subject prefix is the author's label; the file list is what happened.
 Same-day items in the DONE block carry NO file lists — do not narrate their order or causal relationships ("then", "found while reviewing X"); state only what each subject itself says.
 
-GIT ACTIVITY:
+${calendarBlock ? `${calendarBlock}\n\n` : ""}GIT ACTIVITY:
 ${body || "(no activity in the window)"}${ctx.note ? `\n\nNOTE: ${ctx.note}` : ""}${buildDoneBlock(body, todaySuppress)}`;
 }
 
@@ -320,6 +334,14 @@ export function section(text: string, name: string): string[] {
   const m = text.match(re);
   if (!m) return [];
   return m[1]!.split("\n").map((l) => l.replace(/^\s*[-*]\s?/, "").trim()).filter(Boolean);
+}
+
+/** Does a raw model answer carry at least one briefing section (RESUME, RECAP or SUGGESTIONS, each non-empty)?
+ *  THE ONE COPY of the check (provider fallback, spec r9 §5 step 4): `main.ts`'s parse-empty gate calls it,
+ *  and the provider walk calls it to tell a usable answer from an `unusable-answer`. Read on the RAW output,
+ *  exactly as `main.ts` always read it. */
+export function hasBriefingSection(rawText: string): boolean {
+  return !["RESUME", "RECAP", "SUGGESTIONS"].every((h) => section(rawText, h).length === 0);
 }
 
 function repoOf(line: string): { repo: string; text: string } {
@@ -634,12 +656,22 @@ const clipSubject = (raw: string) => {
   return t.length <= NOT_SHOWN_SUBJECT_CLIP ? t : `${t.slice(0, NOT_SHOWN_SUBJECT_CLIP - 1)}…`;
 };
 
-export function recapCoverage(
-  recap: BriefingStruct["recap"], ctx: ReducedContext, units: Unit[], rootsByRepo?: Map<string, string[]>,
-): BriefingStruct["recapCoverage"] {
-  const commits = ctx.repos.flatMap((r) => r.activities)
+// ── B1-M1-T3 (wave 2): `recapCoverage`'s three pieces, extracted UNCHANGED and exported, so the run record
+// (src/runRecord.ts) reads the page's own population, coverage and attribution from ONE copy of each rule.
+// `recapCoverage` calls all three; its output is byte-identical (pinned by its own tests, the
+// characterization tests in test/recap-coverage.characterize.test.ts, the stranded-SHA golden and the
+// calendar-off goldens). ⚠ Decision-feeding: the page's "NOT shown above" lines and the record's `missing`
+// list must never be computed twice.
+
+/** The window commits `recapCoverage` counts: every commit activity with an `event_id`, in repo order. */
+export function windowCommits(ctx: ReducedContext): Activity[] {
+  return ctx.repos.flatMap((r) => r.activities)
     .filter((a) => a.kind === "commit" && typeof a.event_id === "string");
-  if (!commits.length) return undefined;
+}
+
+/** The commits of `commits` the recap does NOT cover, under `recapCoverage`'s rules (a citation covers a
+ *  commit only when it is hex-shaped, `SHA_RE`, and prefixes EXACTLY one of `commits`). */
+export function coverageMissing(recap: BriefingStruct["recap"], commits: Activity[]): Activity[] {
   const covered = new Set<string>();
   for (const r of recap) {
     if (!r.evidence) continue;
@@ -677,17 +709,30 @@ export function recapCoverage(
       if (hits.length === 1) covered.add(hits[0]!.event_id!);
     }
   }
-  const missing = commits.filter((a) => !covered.has(a.event_id!));
-  if (!missing.length) return undefined;
+  return commits.filter((a) => !covered.has(a.event_id!));
+}
+
+/** A commit's page label, as the "NOT shown above" lines print it. */
+export function commitLabeler(ctx: ReducedContext, units: Unit[], rootsByRepo?: Map<string, string[]>): (a: Activity) => string {
   const repos = ctx.repos.map((r) => r.repo);
   // Same fallback as buildPrompt's: threading rootsByRepo is optional so direct callers still work.
-  const labelOf = (a: Activity): string => {
+  return (a: Activity): string => {
     const roots = rootsByRepo?.get(a.repo ?? "") ?? rootsForRepo(units, a.repo ?? "");
     const root = unitForCommit(a, roots);
     return units.find((u) => u.repo === a.repo && u.root === root)?.label
       || (a.repo ? repoLabelFor(a.repo, repos) : "")
       || "unlabeled";   // never render an empty `[]` (cold review LOW-5)
   };
+}
+
+export function recapCoverage(
+  recap: BriefingStruct["recap"], ctx: ReducedContext, units: Unit[], rootsByRepo?: Map<string, string[]>,
+): BriefingStruct["recapCoverage"] {
+  const commits = windowCommits(ctx);
+  if (!commits.length) return undefined;
+  const missing = coverageMissing(recap, commits);
+  if (!missing.length) return undefined;
+  const labelOf = commitLabeler(ctx, units, rootsByRepo);
   return {
     // COMMIT counts on both sides, from the same array (cold review MEDIUM-2). The first draft used
     // `recap.length` and `recap.length + missing.length`, which is a bullet count and a mixed sum:
@@ -1502,6 +1547,16 @@ export function promoteResumeActions(
     // ⚠ The terminator must be followed by whitespace or end-of-string, so "v1.2" and "day-42." are
     // not mistaken for sentence ends mid-action.
     const stop = rest.search(/[.!?](\s|$)/);
+    // ⚠ A CREDENTIAL IN THE SENTENCE DECLINES THE ACTION, checked BEFORE the cut. The cut drops the
+    // terminator and trailing `,`, which a credential may need: `PASSWORD=abcdefg.` meets the 8-char
+    // floor only with its `.`, so the bare action `PASSWORD=abcdefg` matched nothing and rendered in
+    // clear (main.ts redacts the rendered text, not this span). Declined, not redacted: this channel
+    // never edits text, and redacting first would swallow the terminator into `[redacted]` and run
+    // the capture on into the next sentence. The source bullet still renders, redacted, in RESUME.
+    // The sentence is the action plus its trim and terminator, and no pattern spans `[.!?]` followed
+    // by whitespace, so this check sees every credential the action could carry.
+    const sentence = stop >= 0 ? rest.slice(0, stop + 1) : rest;
+    if (matchesCredential(sentence)) return undefined;
     const action = (stop >= 0 ? rest.slice(0, stop) : rest).trim()
       .replace(/[.!?,]+$/, "").trim();
     if (action.length < MIN_ACTION_CHARS || action.length > MAX_ACTION_CHARS) return undefined;
@@ -1586,11 +1641,29 @@ export function dropMergedPrSuggestions<T extends { text: string }>(
   return { kept, droppedPrs };
 }
 
-export async function generateBriefing(ctx: ReducedContext, provider: Provider, meta: Meta, units: Unit[], rootsByRepo?: Map<string, string[]>): Promise<BriefingStruct> {
+export async function generateBriefing(
+  ctx: ReducedContext, provider: Provider, meta: Meta, units: Unit[], rootsByRepo?: Map<string, string[]>,
+  /** Provider fallback (P1-M6-T3): the walk's per-attempt deadline, passed to `Provider.generate`. Absent ⇒ the
+   *  call is exactly today's (one argument with calendar off). */
+  gopts?: { signal?: AbortSignal },
+): Promise<BriefingStruct> {
   // Computed exactly ONCE: shared by the prompt's Tier-1 RESUME enumeration (§9's "called once"
   // invariant) and the post-parse reorder/backfill below, so both stages agree on rank.
   const ranked = rankUnits(units);
-  const text = await provider.generate(buildPrompt(ctx, ranked, rootsByRepo, meta.todaySuppress));
+  // CALENDAR (spec r4 §6): the prompt is built once per variant, identical but for the calendar block, and
+  // `prompt` itself is ALWAYS the unlocked one — so a provider that ignores the second argument can only ever
+  // send unlocked text. Which variant an attempt actually sends is the provider's choice, at spawn time
+  // (`src/harden.ts`). Rebuilt on every attempt (withRetry and the ladder call this again), so no retry layer
+  // can drop the option or carry a stale variant. Calendar off ⇒ the one-argument call, exactly as before.
+  const cal = meta.calendarPrompt;
+  const prompt = buildPrompt(ctx, ranked, rootsByRepo, meta.todaySuppress, cal?.unlocked);
+  const signal = gopts?.signal;
+  const text = cal === undefined
+    ? (signal === undefined ? await provider.generate(prompt) : await provider.generate(prompt, { signal }))
+    : await provider.generate(prompt, {
+        calendarVariants: { locked: buildPrompt(ctx, ranked, rootsByRepo, meta.todaySuppress, cal.locked), unlocked: prompt },
+        ...(signal !== undefined ? { signal } : {}),
+      });
   const struct = parseBriefing(text, meta);
   struct.resume = orderResumeByRank(struct.resume, ranked);
   // Post-generation grounding guard: never surface a cited SHA that doesn't resolve to a real

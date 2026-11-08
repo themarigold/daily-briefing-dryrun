@@ -37,6 +37,11 @@ test("T4.7: uninstall removes briefing.log.1, audit-*.md and transcript-health.j
   const archiveDir = basename(dirname(archivedBriefingPath("2026-08-14")));
   mkdirSync(join(dir, archiveDir), { recursive: true });
   writeFileSync(join(dir, archiveDir, "2026-08-14.md"), "x");
+  // v0.3.0 calendar (spec r4 §8): the engine's calendar folder — a managed link file holding a secret address,
+  // and the health file — goes whole.
+  mkdirSync(join(dir, "calendar", "links"), { recursive: true });
+  writeFileSync(join(dir, "calendar", "links", "work.url"), "https://calendar.example/SECRET-SENTINEL/basic.ics\n", { mode: 0o600 });
+  writeFileSync(join(dir, "calendar", "health.json"), "{}");
   expect(existsSync(plist)).toBe(false);
   for (const f of artifacts) expect(existsSync(join(dir, f))).toBe(true);   // created, so removal is meaningful
 
@@ -85,6 +90,12 @@ test("T4.7: uninstall removes briefing.log.1, audit-*.md and transcript-health.j
   const proc = Bun.spawn([BASH, SCRIPT], { cwd: base, env, stdout: "pipe", stderr: "pipe" });
   const code = await proc.exited;
   expect(code, await new Response(proc.stderr).text()).toBe(0);
+  const stdout = await new Response(proc.stdout).text();
+  expect(existsSync(join(dir, "calendar"))).toBe(false);
+  // …and the two leftovers it cannot remove are named: the live address at its provider, and the OS permission.
+  expect(stdout).toContain("reset it at the calendar provider");
+  expect(stdout).toContain("System Settings → Privacy & Security → Calendars");
+  expect(stdout).not.toContain("SECRET-SENTINEL");
   // Only the read-only verbs reached launchd's stub — the one check, once each — and nothing reached the
   // keychain tool.
   const calls = existsSync(log) ? readFileSync(log, "utf8").trimEnd().split("\n").filter(Boolean).map((l) => l.split("\t")) : [];

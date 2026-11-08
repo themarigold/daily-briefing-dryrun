@@ -29,7 +29,7 @@
 import { norm, labelBoundary } from "./subprojects";
 import { STAGE1_TEXT_CAP } from "./reduce";
 import type { BriefingStruct, DoneItem } from "./types";
-import { redactCredentials } from "./transcripts/credentials";
+import { clipBeforeCredential, redactCredentials } from "./transcripts/credentials";
 
 // Re-exported so this module's tests and callers keep one import site; the DEFINITION is in
 // ./types, because four other places spelled the same shape inline (see the comment there).
@@ -64,7 +64,7 @@ export type Suggestion = { text: string; repo?: string; promoted?: true; stash?:
  * degrades silently and no test fails. One definition removes the coupling instead of documenting it.
  */
 export const doneSubjectAsShown = (subject: string): string =>
-  subject.replace(/[\r\n]+/g, " ").slice(0, STAGE1_TEXT_CAP);
+  clipBeforeCredential(subject.replace(/[\r\n]+/g, " "), STAGE1_TEXT_CAP);
 
 /** `info` — true = calibration telemetry, not a finding. Printed as `postcheck-info [rule]` (core.ts) so
  *  the EVAL convention `grep -c "postcheck \["` — and everything downstream of it — counts nothing new.

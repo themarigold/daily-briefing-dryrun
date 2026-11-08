@@ -409,3 +409,12 @@ test("A3: the cleartext warning is invisible to the posture phrase", () => {
   expect(isPostureWarning(CLEAR)).toBe(false);
   expect(posturePhrase([CLEAR])).toBe("full");
 });
+
+test("the run lock's fail-open diagnostic is classified: it is NOT a posture warning (provider fallback P1-M8-T2)", async () => {
+  // It describes the RUN LOCK — a run proceeding without ownership checks — not the provider's authority, so it must
+  // never render `degraded`. It is a console line in main.ts, not a `runtimeWarnings` entry, so the scanner above
+  // never sees it; classified here explicitly instead.
+  const { FAIL_OPEN_LOCK_DIAGNOSTIC } = await import("../src/runlock");
+  expect(isPostureWarning(FAIL_OPEN_LOCK_DIAGNOSTIC)).toBe(false);
+  expect(posturePhrase([FAIL_OPEN_LOCK_DIAGNOSTIC])).toBe("full");
+});

@@ -11,10 +11,17 @@ import { ProviderError, API_LABEL_ANTHROPIC, type ProviderApi } from "../types";
 import { ApiTransport, type ApiProviderOpts } from "./base";
 import { postJson } from "./http";
 import { ANTHROPIC_DEFAULT_BASE_URL, endpointUrl, requestUrl } from "./endpoint";
+import { dropTrailingPartialToken } from "../transcripts/credentials";
 
 /** Anthropic REQUIRES `max_tokens`, so unlike the openai-compatible transport there is no "omit it"
- *  option — a default must exist. Sized for a briefing plus headroom. */
-export const ANTHROPIC_DEFAULT_MAX_TOKENS = 4096;
+ *  option — a default must exist. Sized for a briefing plus headroom: archived briefings run 24-32 KB,
+ *  about 6,000-8,000 tokens, and the old 4096 cut them off (design 2026-10-24). */
+export const ANTHROPIC_DEFAULT_MAX_TOKENS = 16_000;
+
+/** `provider test`'s output limit (P2-M4-T1; spec r9 §6: "one tiny generate with a small `max_tokens`"). Anthropic
+ *  requires the field, so the probe sends a small one — a Test proves the key and the endpoint, and its answer is
+ *  discarded. Production never sends it (`send` keeps `maxTokens ?? ANTHROPIC_DEFAULT_MAX_TOKENS`). */
+export const ANTHROPIC_PROBE_MAX_TOKENS = 16;
 
 /** Pinned per the API's own versioning policy. A date, not "latest": the response shape this file
  *  parses is the shape this version promises. */
@@ -25,8 +32,40 @@ export class AnthropicApiProvider extends ApiTransport {
 
   constructor(api: ProviderApi, opts: ApiProviderOpts = {}) { super(api, opts); }
 
-  protected async send(prompt: string): Promise<string> {
+  private maxTokens(): number { return this.api.maxTokens ?? ANTHROPIC_DEFAULT_MAX_TOKENS; }
+
+  protected async send(prompt: string, signal?: AbortSignal): Promise<string> {
+    const parsed = await this.request(prompt, signal ? { signal } : {});
+    const maxTokens = this.maxTokens();
+
+    const blocks = Array.isArray(parsed?.content) ? parsed!.content as unknown[] : [];
+    // CONCATENATE every `type === "text"` block IN ORDER and ignore the rest. A response can legally
+    // carry thinking or tool blocks interleaved; dropping them is right (nothing downstream consumes
+    // them) but dropping the text between them would silently truncate the briefing.
+    let text = blocks
+      .filter((b): b is Record<string, unknown> => !!b && typeof b === "object" && (b as Record<string, unknown>).type === "text")
+      .map((b) => typeof b.text === "string" ? b.text : "")
+      .join("");
+
+    if (parsed?.stop_reason === "max_tokens") {
+      this.warnTruncated(maxTokens);
+      text = dropTrailingPartialToken(text);
+    }
+
+    // A 200 that parsed but carries no text. `empty-output` is RETRYABLE, which is right: the CLI path
+    // classifies an empty stdout the same way, and a genuinely empty completion is more often a flake
+    // than a permanent condition.
+    if (text.trim() === "") {
+      throw new ProviderError("empty-output", `${this.label}: the response contained no text content (stop_reason ${typeof parsed?.stop_reason === "string" ? parsed.stop_reason : "unknown"})`);
+    }
+    return text;
+  }
+
+  protected async request(prompt: string, opts: { signal?: AbortSignal; probe?: boolean }): Promise<Record<string, unknown> | null> {
+    const { signal } = opts;
+    this.throwIfAborted(signal);
     const { key } = await this.key();
+    this.throwIfAborted(signal);
     if (key === undefined) throw this.missingKey();
 
     const base = endpointUrl(this.api) ?? new URL(ANTHROPIC_DEFAULT_BASE_URL);
@@ -34,9 +73,10 @@ export class AnthropicApiProvider extends ApiTransport {
     // spellings are pinned by a test, because "it works on my config" is exactly how this class of bug
     // ships.
     const url = requestUrl(base, "/v1/messages");
-    const maxTokens = this.api.maxTokens ?? ANTHROPIC_DEFAULT_MAX_TOKENS;
+    const maxTokens = opts.probe === true ? ANTHROPIC_PROBE_MAX_TOKENS : this.maxTokens();
 
-    const parsed = await postJson({
+    this.throwIfAborted(signal);
+    return await postJson({
       url,
       headers: {
         "x-api-key": key,
@@ -51,25 +91,7 @@ export class AnthropicApiProvider extends ApiTransport {
       secret: key,
       ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),
       ...(this.opts.now ? { now: this.opts.now } : {}),
+      ...(signal ? { signal } : {}),
     }) as Record<string, unknown> | null;
-
-    const blocks = Array.isArray(parsed?.content) ? parsed!.content as unknown[] : [];
-    // CONCATENATE every `type === "text"` block IN ORDER and ignore the rest. A response can legally
-    // carry thinking or tool blocks interleaved; dropping them is right (nothing downstream consumes
-    // them) but dropping the text between them would silently truncate the briefing.
-    const text = blocks
-      .filter((b): b is Record<string, unknown> => !!b && typeof b === "object" && (b as Record<string, unknown>).type === "text")
-      .map((b) => typeof b.text === "string" ? b.text : "")
-      .join("");
-
-    if (parsed?.stop_reason === "max_tokens") this.warnTruncated(maxTokens);
-
-    // A 200 that parsed but carries no text. `empty-output` is RETRYABLE, which is right: the CLI path
-    // classifies an empty stdout the same way, and a genuinely empty completion is more often a flake
-    // than a permanent condition.
-    if (text.trim() === "") {
-      throw new ProviderError("empty-output", `${this.label}: the response contained no text content (stop_reason ${typeof parsed?.stop_reason === "string" ? parsed.stop_reason : "unknown"})`);
-    }
-    return text;
   }
 }

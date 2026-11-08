@@ -64,10 +64,18 @@ use common::{fake_sidecar, process_gone, sq, ReapTagged};
 #[cfg(unix)]
 use daily_briefing_gui_lib::engine::ProcessGroupKill;
 use daily_briefing_gui_lib::engine::{
-    config_file_path, is_refused_format_character, json_out_name, resolve_sidecar,
-    sidecar_path_beside, EngineClient, EngineError, InputRefusal, Invoker, NoProgress, Operation,
-    Outcome, ProgressSink, REFUSED_FORMAT_CHARACTERS,
+    config_file_path, is_refused_format_character, json_out_name, key_id, label, mac_only,
+    provider_index, resolve_sidecar, sidecar_path_beside, DetailsFailure, DetailsRaw, EngineClient,
+    EngineError, InputRefusal, Invoker, KeySecret, LinkHandback, NoProgress, Operation, Outcome,
+    ProgressSink, ReposBranch, ReposLabel, ReposRefusal, ReposRequest, ReposScope, ResetTarget,
+    SecretBytes, CALENDAR_CONNECT_MAC_TIMEOUT, CALENDAR_DETAILS_TIMEOUT, CALENDAR_TEST_TIMEOUT,
+    KEY_DELETE_ALL_TIMEOUT, KEY_SET_TIMEOUT, KEY_STDIN_MAX_BYTES, LABEL_STDIN_MAX_BYTES,
+    MAX_PROVIDER_INDEX, PROVIDER_OP_TIMEOUT, PROVIDER_TEST_LOOPBACK_CAP,
+    PROVIDER_TEST_LOOPBACK_EXTRA, PROVIDER_TEST_REMOTE_TIMEOUT, REFUSED_FORMAT_CHARACTERS,
+    REPOS_BRANCH_MAX_BYTES, REPOS_KEY_MAX_SCALARS, REPOS_MAX_BRANCHES, REPOS_MAX_LABELS,
+    REPOS_STDIN_MAX_BYTES, REPOS_TOKENS_PER_LABEL, REPOS_TOKENS_TOTAL,
 };
+use daily_briefing_gui_lib::shell::ENGINE_READ_TIMEOUT;
 
 /* ── a recording progress sink ────────────────────────────────────────────────────────────────── */
 
@@ -106,6 +114,7 @@ fn argv_matches_the_engine_grammar() {
         (
             Operation::Run {
                 force: false,
+                now: false,
                 json_out: None,
             },
             vec!["run", "--json"],
@@ -113,13 +122,32 @@ fn argv_matches_the_engine_grammar() {
         (
             Operation::Run {
                 force: true,
+                now: false,
                 json_out: None,
             },
             vec!["run", "--json", "--force"],
         ),
+        // `--now` (the app's Run now): exempt from the morning floor only, still once a day.
         (
             Operation::Run {
                 force: false,
+                now: true,
+                json_out: None,
+            },
+            vec!["run", "--json", "--now"],
+        ),
+        (
+            Operation::Run {
+                force: false,
+                now: true,
+                json_out: Some(json_out_name("envelope.json").expect("a valid name")),
+            },
+            vec!["run", "--json", "--now", "--json-out", "envelope.json"],
+        ),
+        (
+            Operation::Run {
+                force: false,
+                now: false,
                 json_out: Some(json_out_name("envelope.json").expect("a valid name")),
             },
             vec!["run", "--json", "--json-out", "envelope.json"],
@@ -127,6 +155,7 @@ fn argv_matches_the_engine_grammar() {
         (
             Operation::Run {
                 force: true,
+                now: false,
                 json_out: Some(json_out_name("run-2026-09-15.json").expect("a valid name")),
             },
             vec![
@@ -193,6 +222,116 @@ fn argv_matches_the_engine_grammar() {
         // Phase E (E12). `update`'s whole vocabulary is `--check` plus `--json` (`src/main.ts`,
         // UPDATE_VERBS/UPDATE_FLAGS); a bare `update` exits 2, so `--check` is never optional here.
         (Operation::UpdateCheck, vec!["update", "--check", "--json"]),
+        // v0.3.0 (plan M8): the four calendar operations, as spec r4 §8's CLI spells them
+        // (`daily-briefing calendar connect mac | … | list | test | status`, each with `--json`).
+        // The subcommands arrive in the engine with W1's M5; until then these are pinned against
+        // the spec and driven against fakes.
+        (
+            Operation::CalendarStatus,
+            vec!["calendar", "status", "--json"],
+        ),
+        (Operation::CalendarList, vec!["calendar", "list", "--json"]),
+        (Operation::CalendarTest, vec!["calendar", "test", "--json"]),
+        (
+            Operation::CalendarConnectMac,
+            vec!["calendar", "connect", "mac", "--json"],
+        ),
+        // Wave 2, C-M3-T7: the live details read. Its two flags are the only operands, both
+        // Rust-built booleans; the remembered URLs travel on stdin, never here.
+        (
+            Operation::CalendarDetails {
+                skip_mac: false,
+                skip_commands: false,
+            },
+            vec!["calendar", "details", "--json"],
+        ),
+        (
+            Operation::CalendarDetails {
+                skip_mac: true,
+                skip_commands: false,
+            },
+            vec!["calendar", "details", "--json", "--skip-mac"],
+        ),
+        (
+            Operation::CalendarDetails {
+                skip_mac: false,
+                skip_commands: true,
+            },
+            vec!["calendar", "details", "--json", "--skip-commands"],
+        ),
+        (
+            Operation::CalendarDetails {
+                skip_mac: true,
+                skip_commands: true,
+            },
+            vec!["calendar", "details", "--json", "--skip-mac", "--skip-commands"],
+        ),
+        // Provider fallback PR 3 (P3-M1-T1): the `provider` verbs as `docs/gui-seam.md` §1d spells
+        // them (and `src/providerCli.ts`'s `VERBS` parses them) — `--json` exactly once. No key and
+        // no label appears in any of them: those travel on stdin.
+        (Operation::KeySet, vec!["provider", "key", "set", "--json"]),
+        (
+            Operation::KeyMigrate {
+                index: provider_index(3).expect("a valid index"),
+            },
+            vec!["provider", "key", "migrate", "--index", "3", "--json"],
+        ),
+        (
+            Operation::KeyDelete {
+                id: key_id("k-0123456789ab").expect("a valid id"),
+            },
+            vec![
+                "provider",
+                "key",
+                "delete",
+                "--id",
+                "k-0123456789ab",
+                "--json",
+            ],
+        ),
+        (
+            Operation::KeyDeleteAll,
+            vec!["provider", "key", "delete-all", "--json"],
+        ),
+        (
+            Operation::KeyScrubBackup,
+            vec!["provider", "key", "scrub-backup", "--json"],
+        ),
+        (
+            Operation::ProviderReset {
+                target: ResetTarget::Index(provider_index(0).expect("a valid index")),
+            },
+            vec!["provider", "reset", "--index", "0", "--json"],
+        ),
+        (
+            Operation::ProviderReset {
+                target: ResetTarget::Label(label("work").expect("a valid label")),
+            },
+            vec!["provider", "reset", "--label-stdin", "--json"],
+        ),
+        (
+            Operation::ProviderTest {
+                file: config_file_path("/tmp/provider-check-1.json").expect("a valid path"),
+                index: provider_index(999_999).expect("the largest index"),
+                test_timeout_ms: 80_000,
+            },
+            vec![
+                "provider",
+                "test",
+                "--file",
+                "/tmp/provider-check-1.json",
+                "--index",
+                "999999",
+                "--json",
+            ],
+        ),
+        // B1-M4-T11: the request is the operand, and it rides on STDIN (`stdin_payload`), never here.
+        (
+            Operation::ReposStatus {
+                request: a_repos_request(),
+            },
+            vec!["repos", "status", "--json"],
+        ),
     ];
 
     for (op, expected) in cases {
@@ -206,6 +345,15 @@ fn argv_matches_the_engine_grammar() {
             !argv[0].starts_with('-'),
             "argv[0] for {op:?} is a FLAG, not a subcommand — the engine would route it to `run`"
         );
+        // PR 3: the engine REQUIRES `--json` exactly once on every `provider` verb (§1d: "missing or
+        // twice" is a `usage` refusal).
+        if argv[0] == "provider" {
+            assert_eq!(
+                argv.iter().filter(|a| *a == "--json").count(),
+                1,
+                "{op:?}: `--json` must appear exactly once"
+            );
+        }
     }
 }
 
@@ -237,11 +385,42 @@ fn every_operation() -> Vec<Operation> {
             Operation::ScheduleUninstall { .. } => Some(Operation::ScheduleStatus),
             Operation::ScheduleStatus => Some(Operation::ScheduleVerify),
             Operation::ScheduleVerify => Some(Operation::UpdateCheck),
-            Operation::UpdateCheck => None,
+            Operation::UpdateCheck => Some(Operation::CalendarStatus),
+            Operation::CalendarStatus => Some(Operation::CalendarList),
+            Operation::CalendarList => Some(Operation::CalendarTest),
+            Operation::CalendarTest => Some(Operation::CalendarConnectMac),
+            Operation::CalendarConnectMac => Some(Operation::KeySet),
+            Operation::KeySet => Some(Operation::KeyMigrate {
+                index: provider_index(0).expect("a valid index"),
+            }),
+            Operation::KeyMigrate { .. } => Some(Operation::KeyDelete {
+                id: key_id("k-000000000000").expect("a valid id"),
+            }),
+            Operation::KeyDelete { .. } => Some(Operation::KeyDeleteAll),
+            Operation::KeyDeleteAll => Some(Operation::KeyScrubBackup),
+            Operation::KeyScrubBackup => Some(Operation::ProviderReset {
+                target: ResetTarget::Index(provider_index(0).expect("a valid index")),
+            }),
+            Operation::ProviderReset { .. } => Some(Operation::ProviderTest {
+                file: config_file_path("/tmp/candidate.json").expect("a valid path"),
+                index: provider_index(0).expect("a valid index"),
+                test_timeout_ms: 80_000,
+            }),
+            // Wave 2, relinked by the second lander (plan §1.3, P5-M5): B1's `ReposStatus`, then C's
+            // `CalendarDetails`, then the end of the chain.
+            Operation::ProviderTest { .. } => Some(Operation::ReposStatus {
+                request: a_repos_request(),
+            }),
+            Operation::ReposStatus { .. } => Some(Operation::CalendarDetails {
+                skip_mac: false,
+                skip_commands: false,
+            }),
+            Operation::CalendarDetails { .. } => None,
         }
     }
     let mut all = vec![Operation::Run {
         force: false,
+        now: false,
         json_out: None,
     }];
     while let Some(op) = next(all.last().expect("the seed")) {
@@ -264,8 +443,21 @@ fn every_operation_variant_is_accounted_for() {
     assert_eq!(
         names,
         [
+            "calendar-connect-mac",
+            "calendar-details",
+            "calendar-list",
+            "calendar-status",
+            "calendar-test",
             "config-validate",
             "doctor",
+            "provider-key-delete",
+            "provider-key-delete-all",
+            "provider-key-migrate",
+            "provider-key-scrub-backup",
+            "provider-key-set",
+            "provider-reset",
+            "provider-test",
+            "repos-status",
             "run",
             "schedule-install",
             "schedule-status",
@@ -274,14 +466,20 @@ fn every_operation_variant_is_accounted_for() {
             "status",
             "update-check",
         ],
-        "the operation set changed. `init` and `calendar` are deliberately absent — the first \
-         because first-config creation (T16) is undesigned, the second because the ENGINE does not \
-         have it (`src/main.ts`'s KNOWN_COMMANDS). `schedule verify` WAS in that list until B6: the \
+        "the operation set changed. `init` is deliberately absent — first-config creation is \
+         `config_create` (T16), not the engine's template. `calendar` WAS absent until v0.3.0 \
+         (plan M8): the engine gains `calendar status|list|test|connect mac` in the same release \
+         (W1's M5), and its `add-link`/`remove-link` stay absent here because they read the URL \
+         from STDIN, which the app's spawns never give the engine — `crate::calendar` writes the \
+         link file itself. `schedule verify` WAS in that list until B6: the \
          kickstart is still engine-side inside `schedule install` (plan R1), and this operation is \
          the re-run of that same engine-side kick, which is what keeps the app's exec surface \
          engine-only. `update --check` WAS in it until Phase E: E11 gave the engine the subcommand \
-         and E12 granted it (notify-only, not mutating). Adding one needs a grant in the capability \
-         and a reason in the same change."
+         and E12 granted it (notify-only, not mutating). The seven `provider` operations arrive \
+         with provider fallback PR 3 (the engine's `provider` command, `docs/gui-seam.md` §1d); \
+         `provider test` is the one with no grant — only the candidate-staging command reaches it. \
+         Adding one needs a grant in the capability (or a stated reason it has none) and a reason in \
+         the same change."
     );
     assert_eq!(
         all.len(),
@@ -316,14 +514,22 @@ fn the_in_flight_guard_covers_exactly_the_state_changing_operations() {
     let mutating = [
         Operation::Run {
             force: false,
+            now: false,
             json_out: None,
         },
         Operation::Run {
             force: true,
+            now: false,
             json_out: None,
         },
         Operation::Run {
             force: false,
+            now: true,
+            json_out: None,
+        },
+        Operation::Run {
+            force: false,
+            now: false,
             json_out: Some(json_out_name("out.json").expect("a valid name")),
         },
         Operation::ScheduleInstall {
@@ -355,6 +561,37 @@ fn the_in_flight_guard_covers_exactly_the_state_changing_operations() {
         // engine and a briefing can be generated and the day stamped. A verify racing a Run Now is
         // two generations, which is what this guard exists to prevent.
         Operation::ScheduleVerify,
+        // v0.3.0 (plan M8): installs and re-signs the helper copy through the keychain identity a
+        // schedule install also uses, and raises the Calendar permission dialog.
+        Operation::CalendarConnectMac,
+        // PR 3 (spec §6 "the writing operations … hold the in-flight guard"): ALL SEVEN `provider`
+        // operations. Each writes the key store, the settings backup or the marks/status files —
+        // `provider test` included, which records its outcome (a second Test is refused `Busy`).
+        Operation::KeySet,
+        Operation::KeyMigrate {
+            index: provider_index(1).expect("a valid index"),
+        },
+        Operation::KeyDelete {
+            id: key_id("k-abcdef012345").expect("a valid id"),
+        },
+        Operation::KeyDeleteAll,
+        Operation::KeyScrubBackup,
+        Operation::ProviderReset {
+            target: ResetTarget::Index(provider_index(1).expect("a valid index")),
+        },
+        Operation::ProviderReset {
+            target: ResetTarget::Label(label("--help").expect("a valid label")),
+        },
+        Operation::ProviderTest {
+            file: config_file_path("/tmp/candidate.json").expect("a valid path"),
+            index: provider_index(1).expect("a valid index"),
+            test_timeout_ms: 80_000,
+        },
+        Operation::ProviderTest {
+            file: config_file_path("/tmp/candidate.json").expect("a valid path"),
+            index: provider_index(1).expect("a valid index"),
+            test_timeout_ms: 600_000 + 17_000,
+        },
     ];
     let read_only = [
         Operation::Status,
@@ -367,6 +604,27 @@ fn the_in_flight_guard_covers_exactly_the_state_changing_operations() {
         // its one write is the engine's own atomic update-check record. A "Check now" refused with
         // Busy because a briefing is generating would be a refusal guarding nothing.
         Operation::UpdateCheck,
+        // v0.3.0 (plan M8): the three calendar reads — the configuration and last scheduled reads,
+        // the calendar list, and a Test of every source now. None changes a schedule or a briefing.
+        Operation::CalendarStatus,
+        Operation::CalendarList,
+        Operation::CalendarTest,
+        // B1-M4-T11: the live git check reads repos and the run record and writes nothing; its own
+        // one-in-flight latch is `repos::ReposLive`'s, not this guard (plan §1.4, P5-M5).
+        Operation::ReposStatus {
+            request: a_repos_request(),
+        },
+        // Wave 2 (C-M3-T7): the live details read changes no schedule and no briefing state, and
+        // writes no health file (the engine's jail test); its one-in-flight rule is its own latch
+        // in `calendar_details.rs`, not this guard.
+        Operation::CalendarDetails {
+            skip_mac: false,
+            skip_commands: false,
+        },
+        Operation::CalendarDetails {
+            skip_mac: true,
+            skip_commands: true,
+        },
     ];
     for op in &mutating {
         assert!(
@@ -396,6 +654,280 @@ fn the_in_flight_guard_covers_exactly_the_state_changing_operations() {
         classified, all,
         "an Operation variant is in neither list above; classify it"
     );
+}
+
+/// v0.3.0 (plan M8): the four calendar operations carry their OWN wall-clock bounds — and, since
+/// provider fallback PR 3 (P3-M1-T1), so do the seven `provider` operations (spec §6: "every new
+/// operation has an explicit app-side timeout … the engine's own worst case plus 5 s"). No OTHER
+/// operation does, so every pre-M8 path behaves exactly as before (the read paths keep wrapping
+/// `invoke` in `ENGINE_READ_TIMEOUT` themselves; the older mutating ones stay unbounded here).
+///
+/// The harness cap ([`EngineClient::with_timeout_cap`]) SHORTENS a bound and never invents one —
+/// pinned here because the timeout tests below depend on exactly that.
+#[test]
+fn only_the_calendar_and_provider_operations_carry_their_own_bounds() {
+    assert_eq!(
+        Operation::CalendarStatus.timeout(),
+        Some(ENGINE_READ_TIMEOUT)
+    );
+    assert_eq!(Operation::CalendarList.timeout(), Some(ENGINE_READ_TIMEOUT));
+    assert_eq!(ENGINE_READ_TIMEOUT, Duration::from_secs(30));
+    assert_eq!(
+        Operation::CalendarTest.timeout(),
+        Some(CALENDAR_TEST_TIMEOUT)
+    );
+    assert_eq!(CALENDAR_TEST_TIMEOUT, Duration::from_secs(75));
+    // Spec r4 §8: "`CalendarConnectMac` (mutating, 150 s: the helper's own 120 s request limit plus
+    // headroom, …)" — 120 s at M8, raised by the hub's decision at M9 so the engine's own timeout
+    // status arrives before the Rust bound fires.
+    assert_eq!(
+        Operation::CalendarConnectMac.timeout(),
+        Some(CALENDAR_CONNECT_MAC_TIMEOUT)
+    );
+    assert_eq!(CALENDAR_CONNECT_MAC_TIMEOUT, Duration::from_secs(150));
+    // Wave 2 (C-M3-T7): the engine's 30 s calendar bound (`CALENDAR_STEP_BOUND_MS`) + 15 s for the
+    // process start, the config load and the reader launch; no network probe, so not 75 s.
+    assert_eq!(CALENDAR_DETAILS_TIMEOUT, Duration::from_secs(45));
+
+    // PR 3 — the numbers, as spec §6 (amended at the P2-M2 / P2-M3-T1 / P2-M4 checkpoints) states
+    // them: `key set`/`migrate` 1 + 10 + 3 = 14 s + 5; `delete-all` 1 + 10 = 11 s + 5; `delete`,
+    // `reset`, `scrub-backup` 10 s + 5; `test` 80 s remote.
+    assert_eq!(KEY_SET_TIMEOUT, Duration::from_secs(19));
+    assert_eq!(KEY_DELETE_ALL_TIMEOUT, Duration::from_secs(16));
+    assert_eq!(PROVIDER_OP_TIMEOUT, Duration::from_secs(15));
+    assert_eq!(PROVIDER_TEST_REMOTE_TIMEOUT, Duration::from_secs(80));
+    assert_eq!(PROVIDER_TEST_LOOPBACK_CAP, Duration::from_secs(30 * 60));
+    assert_eq!(PROVIDER_TEST_LOOPBACK_EXTRA, Duration::from_secs(17));
+    let idx = || provider_index(2).expect("a valid index");
+    let test_op = |test_timeout_ms| Operation::ProviderTest {
+        file: config_file_path("/tmp/candidate.json").expect("a valid path"),
+        index: idx(),
+        test_timeout_ms,
+    };
+    let bounds: Vec<(Operation, Duration)> = vec![
+        (Operation::KeySet, KEY_SET_TIMEOUT),
+        (Operation::KeyMigrate { index: idx() }, KEY_SET_TIMEOUT),
+        (Operation::KeyDeleteAll, KEY_DELETE_ALL_TIMEOUT),
+        (
+            Operation::KeyDelete {
+                id: key_id("k-0123456789ab").expect("a valid id"),
+            },
+            PROVIDER_OP_TIMEOUT,
+        ),
+        (Operation::KeyScrubBackup, PROVIDER_OP_TIMEOUT),
+        (
+            Operation::ProviderReset {
+                target: ResetTarget::Index(idx()),
+            },
+            PROVIDER_OP_TIMEOUT,
+        ),
+        (
+            Operation::ProviderReset {
+                target: ResetTarget::Label(label("work").expect("a valid label")),
+            },
+            PROVIDER_OP_TIMEOUT,
+        ),
+        // `test_timeout_ms` is ALWAYS the entry's validate-row `testTimeoutMs`, every entry kind
+        // (`docs/gui-seam.md` §1d). A remote or CLI row is 80 000: 80 s, whatever the entry's own
+        // `timeoutMs`.
+        (test_op(80_000), PROVIDER_TEST_REMOTE_TIMEOUT),
+        // A loopback row: the effective `timeoutMs` + 17 s, already summed by the engine, so taken
+        // as given — including BELOW 80 s (a loopback `timeoutMs` under 63 s), which is why the
+        // floor is 17 s and not the remote 80 s…
+        (test_op(120_000 + 17_000), Duration::from_millis(137_000)),
+        (test_op(5_000 + 17_000), Duration::from_millis(22_000)),
+        // …capped at 30 minutes (plan Q12), so a hand-edited `timeoutMs` cannot hold the in-flight
+        // guard for hours: exactly at the cap is the cap, anything above is the cap…
+        (test_op(30 * 60_000), PROVIDER_TEST_LOOPBACK_CAP),
+        (test_op(30 * 60_000 + 1), PROVIDER_TEST_LOOPBACK_CAP),
+        (test_op(6 * 3_600_000), PROVIDER_TEST_LOOPBACK_CAP),
+        (test_op(u64::MAX), PROVIDER_TEST_LOOPBACK_CAP),
+        // …and never below the +17 s the engine always adds (its smallest possible answer), so a
+        // zero cannot abandon a Test the moment it starts.
+        (test_op(0), PROVIDER_TEST_LOOPBACK_EXTRA),
+        (test_op(16_999), PROVIDER_TEST_LOOPBACK_EXTRA),
+        // B1-M4-T11: the live git check is a read, bounded like the calendar reads; the engine's own
+        // overall budget is 25 s, 5 s under this (`REPOS_STATUS_BUDGET_MS`, src/repos/status.ts).
+        (
+            Operation::ReposStatus {
+                request: a_repos_request(),
+            },
+            ENGINE_READ_TIMEOUT,
+        ),
+        (
+            Operation::CalendarDetails {
+                skip_mac: false,
+                skip_commands: false,
+            },
+            CALENDAR_DETAILS_TIMEOUT,
+        ),
+        (
+            Operation::CalendarDetails {
+                skip_mac: true,
+                skip_commands: true,
+            },
+            CALENDAR_DETAILS_TIMEOUT,
+        ),
+    ];
+    for (op, bound) in &bounds {
+        assert_eq!(op.timeout(), Some(*bound), "{op:?} carries the wrong bound");
+    }
+
+    for op in every_operation() {
+        if !op.name().starts_with("calendar-")
+            && !op.name().starts_with("provider-")
+            && !op.name().starts_with("repos-")
+        {
+            assert_eq!(
+                op.timeout(),
+                None,
+                "{op:?} gained a bound at the invoke layer"
+            );
+        } else {
+            assert!(op.timeout().is_some(), "{op:?} lost its own bound");
+        }
+    }
+
+    let capped = EngineClient::with_program("/nowhere/engine".into())
+        .with_timeout_cap(Duration::from_secs(1));
+    assert_eq!(
+        capped.effective_timeout(&Operation::CalendarConnectMac),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        capped.effective_timeout(&Operation::Status),
+        None,
+        "the cap invented a bound for an operation that has none"
+    );
+    let plain = EngineClient::with_program("/nowhere/engine".into());
+    assert_eq!(
+        plain.effective_timeout(&Operation::CalendarConnectMac),
+        Some(CALENDAR_CONNECT_MAC_TIMEOUT)
+    );
+}
+
+/// The one macOS-only operation answers `unsupported` off macOS — the `access.rs` precedent — and is
+/// admitted on it. A pure decision with the platform as an operand, so BOTH answers are pinned on
+/// whichever platform runs the suite; `tests/capability.rs` drives the command's non-macOS refusal
+/// through IPC under `#[cfg(not(target_os = "macos"))]`.
+#[test]
+fn connect_mac_is_unsupported_off_macos_and_admitted_on_it() {
+    assert_eq!(mac_only(true), Ok(()));
+    let refused = mac_only(false).expect_err("off macOS the Mac source is refused");
+    match &refused {
+        EngineError::Unsupported { detail } => {
+            assert!(detail.contains("macOS"), "{detail}");
+            assert!(
+                detail.contains("links"),
+                "the refusal should say links still work: {detail}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    let wire = serde_json::to_value(&refused).expect("an EngineError serialises");
+    assert_eq!(wire["kind"], "unsupported", "{wire}");
+    // And the two new error variants read as sentences, not as Rust.
+    assert_eq!(
+        refused.to_string(),
+        mac_only(false).unwrap_err().to_string()
+    );
+    let timeout = EngineError::Timeout {
+        operation: "calendar-connect-mac".into(),
+        seconds: 150,
+    };
+    assert_eq!(
+        timeout.to_string(),
+        "the engine's calendar-connect-mac did not finish within 150 s and was stopped"
+    );
+    assert_eq!(
+        serde_json::to_value(&timeout).expect("serialises")["kind"],
+        "timeout"
+    );
+}
+
+/// Run a fresh fake to completion, so the run under a bound is not its first exec. On macOS a freshly
+/// written script's first exec took a median of 703 ms and up to 1843 ms at load 6-9 (the second: 4 ms,
+/// up to 24 ms), which left a 2.5 s bound firing before the fake had written its pid. The fake must exit
+/// at once on `warm`.
+#[cfg(unix)]
+fn spend_first_exec(program: &std::path::Path) {
+    let status = std::process::Command::new(program)
+        .arg("warm")
+        .status()
+        .expect("the fake runs");
+    assert!(status.success(), "warming the fake failed: {status}");
+}
+
+/// ⚠ THE BOUND IS APPLIED, NOT JUST DECLARED: a calendar operation that outlives it is ABANDONED —
+/// its fake killed with its process group — and answers `Timeout`; a MUTATING one (connect mac)
+/// releases the in-flight guard as it goes, so the next mutating call starts rather than `Busy`.
+///
+/// Driven with the harness cap at 2.5 s instead of 75 s / 150 s; the cap only shortens the bound
+/// the operation declares (pinned above), so this is the shipped mechanism at a shorter duration.
+/// (MEASURED: at 400 ms the bound fired before the fake had written its pid when the whole binary ran
+/// in parallel — a slow spawn, not a defect — so the cap leaves the fake time to start.)
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_calendar_operation_past_its_bound_is_stopped_and_answers_timeout() {
+    let _turn = serialise().await;
+    let scratch = ScratchDir::new("caltimeout");
+    let _reap = ReapTagged(scratch.tag());
+    // `sleeper` is called for its tagged `<scratch>/sleep` symlink; its own script is unused.
+    let _ = sleeper(&scratch.path, "unused.sh", 1);
+    let pid_file = scratch.join("pid");
+    let program = fake_sidecar(
+        &scratch.path,
+        "slow.sh",
+        &format!(
+            "[ \"$1\" = warm ] && exit 0\necho $$ > {}\nexec {} 30",
+            sq(&pid_file.display().to_string()),
+            sq(&scratch.join("sleep").display().to_string()),
+        ),
+    );
+    spend_first_exec(&program);
+    let client = EngineClient::with_program(program).with_timeout_cap(Duration::from_millis(2500));
+
+    for op in [Operation::CalendarTest, Operation::CalendarConnectMac] {
+        let _ = std::fs::remove_file(&pid_file);
+        let started = std::time::Instant::now();
+        let answer = client.invoke(op.clone(), &NoProgress).await;
+        assert!(
+            matches!(&answer, Err(EngineError::Timeout { operation, .. }) if operation == op.name()),
+            "{op:?} past its bound must answer Timeout, got {answer:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{op:?} waited {:?} — the bound was not applied",
+            started.elapsed()
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap_or_else(|e| panic!("{op:?}: the fake never started ({e}) — vacuous"))
+            .trim()
+            .to_string();
+        let mut gone = false;
+        for _ in 0..40 {
+            if process_gone(&pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            gone,
+            "{op:?}: the abandoned fake (pid {pid}) is still running"
+        );
+    }
+
+    // The abandoned connect released the guard: a new mutating call STARTS (and is still sleeping
+    // when this gives up on it) instead of answering Busy.
+    let uncapped = EngineClient::with_program(sleeper(&scratch.path, "slow2.sh", 30));
+    let mut after = Box::pin(uncapped.invoke(Operation::CalendarConnectMac, &NoProgress));
+    let verdict = tokio::time::timeout(Duration::from_millis(600), &mut after).await;
+    assert!(
+        verdict.is_err(),
+        "after a timed-out connect, the next one should have STARTED, but it returned: {verdict:?}"
+    );
+    drop(after);
 }
 
 /* ── the operand validators ───────────────────────────────────────────────────────────────────── */
@@ -429,6 +961,10 @@ const FILE_ORACLE: &str =
 ///     values where the port ADMITS and the regex REFUSES, and asserts each section as such — a
 ///     port that narrowed anything the regex admitted would fail the first, and one that quietly
 ///     re-refused the app's own directories would fail the second.
+///
+/// PR 3's three provider operands (`--index`, `--id`, the reset label) had no capability regex to
+/// port; their differential test is `the_provider_operand_validators_agree_with_the_engines_own_rules`,
+/// whose oracles are read from the engine's source.
 #[test]
 fn the_operand_validators_agree_with_the_capability_regexes_they_port() {
     let json_out = regex::Regex::new(&format!("^{JSON_OUT_ORACLE}$")).expect("the oracle compiles");
@@ -854,6 +1390,1482 @@ fn format_characters_are_refused() {
     assert!(config_file_path("/Users/josé/candidate.json").is_ok());
 }
 
+/* ── the provider operands (PR 3, P3-M1-T1) ───────────────────────────────────────────────────── */
+
+/// The engine source file `rel` (relative to `daily_briefing_application/`), read at test time.
+///
+/// ⚠ THE ORACLES BELOW ARE THE ENGINE'S OWN RULES, READ FROM ITS SOURCE — not a second hand-typed
+/// copy of them. The Rust validators port `docs/gui-seam.md` §1d's grammar, and nothing else links
+/// the two languages; reading the TypeScript here is what makes a change on one side fail on the
+/// other (the `tests/engine_env.rs` precedent for the launchd PATH).
+fn engine_source(rel: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("the engine source {} is readable: {e}", path.display()))
+}
+
+/// The value of `export const <name> = <expr>;` in an engine source file, where `<expr>` is a
+/// product of integer literals (`30 * 60_000`). Anything else is a parse failure, loudly — a
+/// constant rewritten as `minutes(30)` must fail here rather than read as some other number.
+fn engine_const(rel: &str, name: &str) -> u64 {
+    let source = engine_source(rel);
+    let prefix = format!("export const {name} = ");
+    let line = source
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("{rel} has no `{prefix}…;` line"));
+    let expr = line[prefix.len()..]
+        .strip_suffix(';')
+        .unwrap_or_else(|| panic!("{rel}: `{line}` does not end in `;`"));
+    expr.split('*')
+        .map(|factor| {
+            factor
+                .trim()
+                .replace('_', "")
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{rel}: `{line}` is not a product of integer literals"))
+        })
+        .product()
+}
+
+/// The `key delete --id` and provider `--index` validators against the ENGINE's regexes, read from
+/// its source, and the label rules the engine's `--label-stdin` reader applies.
+///
+/// ⚠ `\d` IS TRANSLATED, AND THAT IS THE ONE EDIT TO THE ORACLE. The engine's `/^\d{1,6}$/` has no
+/// `u` flag, so in JavaScript `\d` is ASCII `[0-9]` only; Rust's `regex` crate reads `\d` as ANY
+/// Unicode decimal digit (`٣`, `７`), which would make the oracle wider than the engine. The
+/// translation is asserted to have happened, so a rewritten engine regex cannot slip past it.
+#[test]
+fn the_provider_operand_validators_agree_with_the_engines_own_rules() {
+    // ── key ids: `KEY_ID_SOURCE` (src/keyFile.ts), anchored as `KEY_ID_RE` anchors it.
+    let key_file = engine_source("src/keyFile.ts");
+    let source_line = key_file
+        .lines()
+        .find(|l| l.starts_with("export const KEY_ID_SOURCE = \""))
+        .expect("src/keyFile.ts declares KEY_ID_SOURCE as a string literal");
+    let key_id_source = source_line
+        .trim_start_matches("export const KEY_ID_SOURCE = \"")
+        .trim_end_matches("\";");
+    assert!(
+        key_file.contains("export const KEY_ID_RE = new RegExp(`^${KEY_ID_SOURCE}$`);"),
+        "KEY_ID_RE is no longer `^KEY_ID_SOURCE$` with no flags — re-read the engine's rule"
+    );
+    let key_oracle = regex::Regex::new(&format!("^{key_id_source}$")).expect("the oracle compiles");
+    let key_corpus = [
+        "k-0123456789ab",
+        "k-000000000000",
+        "k-ffffffffffff",
+        "k-abcdefabcdef",
+        "k-0123456789AB", // uppercase: the engine's rule is LOWERCASE hex
+        "K-0123456789ab",
+        "k-0123456789a",
+        "k-0123456789abc",
+        "k-0123456789ag",
+        "k_0123456789ab",
+        "0123456789ab",
+        "k-",
+        "",
+        " k-0123456789ab",
+        "k-0123456789ab ",
+        "k-0123456789ab\n",
+        "--k-0123456789ab",
+        "k-01234567８９ab",
+        "k-0123456789ab.key",
+        "../k-0123456789ab",
+    ];
+    for value in key_corpus {
+        assert_eq!(
+            key_id(value).is_ok(),
+            key_oracle.is_match(value),
+            "the key-id validator and the engine's KEY_ID_RE disagree about {value:?}"
+        );
+        if let Ok(id) = key_id(value) {
+            assert_eq!(id.as_str(), value);
+        } else {
+            assert_eq!(
+                key_id(value).err(),
+                Some(InputRefusal::NotKeyId),
+                "{value:?}"
+            );
+        }
+    }
+    assert!(
+        key_corpus.iter().any(|v| key_oracle.is_match(v))
+            && key_corpus.iter().any(|v| !key_oracle.is_match(v)),
+        "the key-id corpus needs both accepted and refused values"
+    );
+
+    // ── indexes: `parseIndex`'s regex (src/providerCli.ts).
+    let cli = engine_source("src/providerCli.ts");
+    let parse_index = &cli[cli
+        .find("function parseIndex(")
+        .expect("src/providerCli.ts defines parseIndex")..];
+    let body = &parse_index[..parse_index.find("\n}").expect("parseIndex ends")];
+    let open = body.find("/^").expect("parseIndex tests a regex literal");
+    let close = body[open..]
+        .find("$/")
+        .expect("the regex literal is anchored")
+        + open;
+    let js = &body[open + 1..close + 1];
+    assert_eq!(
+        js, r"^\d{1,6}$",
+        "the engine's index rule changed: re-port it"
+    );
+    let ascii = js.replace(r"\d", "[0-9]");
+    assert_ne!(ascii, js, "the `\\d` translation did not happen");
+    let index_oracle = regex::Regex::new(&ascii).expect("the oracle compiles");
+    for n in [
+        0_u64,
+        1,
+        9,
+        10,
+        99_999,
+        100_000,
+        999_998,
+        999_999,
+        1_000_000,
+        9_999_999,
+        u64::from(u32::MAX),
+        u64::from(u32::MAX) + 1,
+        u64::MAX,
+    ] {
+        let rendered = n.to_string();
+        assert_eq!(
+            provider_index(n).is_ok(),
+            index_oracle.is_match(&rendered),
+            "the index validator and the engine's parseIndex disagree about {n}"
+        );
+        if let Ok(index) = provider_index(n) {
+            assert_eq!(
+                index.to_string(),
+                rendered,
+                "an index renders as plain decimal"
+            );
+            assert_eq!(u64::from(index.get()), n);
+        } else {
+            assert_eq!(provider_index(n).err(), Some(InputRefusal::IndexOutOfRange));
+        }
+    }
+    assert_eq!(u64::from(MAX_PROVIDER_INDEX), 999_999);
+
+    // ── the two stdin caps, the engine's numbers.
+    assert_eq!(
+        engine_const("src/providerCli.ts", "LABEL_STDIN_MAX_BYTES"),
+        LABEL_STDIN_MAX_BYTES as u64
+    );
+    assert_eq!(
+        engine_const("src/providerCli.ts", "KEY_STDIN_MAX_BYTES"),
+        KEY_STDIN_MAX_BYTES as u64
+    );
+}
+
+/// A reset label: non-empty, no NUL, and its `{"label": …}` payload within the engine's 64 KiB —
+/// measured on the PAYLOAD, which is what the engine counts (`Buffer.byteLength` of stdin).
+#[test]
+fn label_refusals_name_their_class_and_the_cap_is_measured_on_the_payload() {
+    assert_eq!(label("").err(), Some(InputRefusal::Empty));
+    assert_eq!(label("a\0b").err(), Some(InputRefusal::Nul));
+    assert_eq!(label("\0").err(), Some(InputRefusal::Nul));
+    // Flag-shaped, whitespace-bearing, quoting and non-ASCII labels are all LABELS: the engine's
+    // reader takes any non-empty string, and argv never sees one.
+    for ok in [
+        "-h",
+        "--help",
+        "-v",
+        "--version",
+        "--old",
+        " ",
+        "a b",
+        "\"",
+        "\\",
+        "ünï",
+        "\u{1}",
+    ] {
+        assert!(label(ok).is_ok(), "{ok:?} is a legal label and was refused");
+    }
+
+    // `{"label":"` + L + `"}` is 12 + L bytes for a label that needs no escaping.
+    let wrapper = br#"{"label":""}"#.len();
+    assert_eq!(wrapper, 12);
+    let at_cap = "a".repeat(LABEL_STDIN_MAX_BYTES - wrapper);
+    let payload = label(&at_cap)
+        .expect("a label whose payload is exactly 64 KiB")
+        .stdin_payload();
+    assert_eq!(payload.len(), LABEL_STDIN_MAX_BYTES);
+    assert_eq!(
+        label(&format!("{at_cap}a")).err(),
+        Some(InputRefusal::TooLarge),
+        "one byte over the engine's cap"
+    );
+    // ⚠ ESCAPING COUNTS. A control byte serialises as `\u0001` — six bytes — so a label of 10,921
+    // of them is 10,921 bytes long and a 65,538-byte payload. A cap on the label's own length
+    // would admit it and the engine would refuse it as too large.
+    let escaped_ok = "\u{1}".repeat((LABEL_STDIN_MAX_BYTES - wrapper) / 6);
+    assert!(label(&escaped_ok).is_ok());
+    let escaped_over = "\u{1}".repeat((LABEL_STDIN_MAX_BYTES - wrapper) / 6 + 1);
+    assert!(escaped_over.len() < LABEL_STDIN_MAX_BYTES);
+    assert_eq!(label(&escaped_over).err(), Some(InputRefusal::TooLarge));
+
+    // The payload is exactly `{"label": <the label>}` and nothing else (the engine refuses any
+    // other member).
+    for text in ["--help", "a\"b", "line\nbreak", "ünï", "\u{1}"] {
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&label(text).expect("legal").stdin_payload()).expect("JSON");
+        assert_eq!(parsed, serde_json::json!({ "label": text }), "{text:?}");
+    }
+
+    // A label is user text that may itself be a key (spec §4): its Debug prints a length only.
+    let shown = format!(
+        "{:?}",
+        label("sk-ant-api03-LABEL-THAT-IS-A-KEY").expect("legal")
+    );
+    assert!(!shown.contains("sk-ant"), "{shown}");
+    let op = Operation::ProviderReset {
+        target: ResetTarget::Label(label("sk-ant-api03-LABEL-THAT-IS-A-KEY").expect("legal")),
+    };
+    assert!(!format!("{op:?}").contains("sk-ant"), "{op:?}");
+
+    // And the refusals read as sentences, never echoing the value.
+    for reason in [
+        InputRefusal::IndexOutOfRange,
+        InputRefusal::NotKeyId,
+        InputRefusal::TooLarge,
+    ] {
+        assert!(!reason.message().is_empty());
+    }
+}
+
+/// ⚠ HUB Q20: A LABEL NEVER REACHES ARGV. The labels most likely to be misread — `-h`, `--help`,
+/// `-v`, `--version`, which the engine's dispatch reads ANYWHERE in argv as help/version, and
+/// `--old` — produce an argv of fixed literals plus `--label-stdin`, and the label itself is the
+/// stdin payload. Checked on `argv()` and on `command_line` (the caffeinate-wrapped form the spawn
+/// actually executes).
+#[test]
+fn a_reset_label_is_never_an_argv_operand() {
+    let client = EngineClient::with_program("/nowhere/engine".into());
+    for text in [
+        "-h",
+        "--help",
+        "-v",
+        "--version",
+        "--old",
+        "work",
+        "provider",
+    ] {
+        let op = Operation::ProviderReset {
+            target: ResetTarget::Label(label(text).expect("a legal label")),
+        };
+        assert_eq!(
+            op.argv(),
+            ["provider", "reset", "--label-stdin", "--json"],
+            "{text:?}"
+        );
+        let (_, executed) = client.command_line(&op);
+        assert!(
+            executed.ends_with(&["provider", "reset", "--label-stdin", "--json"].map(String::from)),
+            "{text:?}: {executed:?}"
+        );
+        if text != "provider" {
+            assert!(
+                !executed.iter().any(|a| a == text),
+                "the label {text:?} reached argv: {executed:?}"
+            );
+        }
+        let payload: serde_json::Value = serde_json::from_slice(
+            &op.stdin_payload()
+                .expect("a label reset has a stdin payload"),
+        )
+        .expect("JSON");
+        assert_eq!(payload, serde_json::json!({ "label": text }));
+    }
+    // An index reset carries its operand in argv and reads no stdin; no other operation does.
+    let by_index = Operation::ProviderReset {
+        target: ResetTarget::Index(provider_index(4).expect("valid")),
+    };
+    assert_eq!(by_index.stdin_payload(), None);
+    for op in every_operation() {
+        // B1-M4-T11: `repos status`'s operand, the request, rides on stdin (pinned in
+        // `the_repos_request_is_the_engines_stdin_contract`); it is the one exclusion, by name.
+        if op.name() == "repos-status" {
+            assert!(op.stdin_payload().is_some(), "{op:?} lost its stdin operand");
+            assert!(!op.takes_key() && !op.kills_its_group_on_return(), "{op:?}");
+            continue;
+        }
+        assert_eq!(op.stdin_payload(), None, "{op:?} gained a stdin payload");
+        assert_eq!(op.takes_key(), matches!(op, Operation::KeySet), "{op:?}");
+        assert_eq!(
+            op.kills_its_group_on_return(),
+            matches!(op, Operation::ProviderTest { .. }),
+            "{op:?}"
+        );
+    }
+}
+
+/// `KeySecret` has no `Debug` — a COMPILE-TIME fact, read here through the inherent-const probe the
+/// `impls` crate uses (an inherent associated const bounded on `T: Debug` shadows the blanket
+/// trait's `false`, and is only selected when the bound holds). Decoys both ways first, so a probe
+/// that always answered one value would fail.
+#[test]
+fn the_key_secret_cannot_be_debug_printed() {
+    use std::marker::PhantomData;
+    trait NotDebug {
+        const IS_DEBUG: bool = false;
+    }
+    struct Probe<T>(PhantomData<T>);
+    impl<T> NotDebug for Probe<T> {}
+    impl<T: std::fmt::Debug> Probe<T> {
+        #[allow(dead_code)]
+        const IS_DEBUG: bool = true;
+    }
+    struct Plain;
+    assert!(
+        Probe::<String>::IS_DEBUG,
+        "the probe cannot see a Debug impl"
+    );
+    assert!(!Probe::<Plain>::IS_DEBUG, "the probe sees Debug everywhere");
+    assert!(
+        !Probe::<KeySecret>::IS_DEBUG,
+        "KeySecret implements Debug — the key could be printed by any `{{:?}}`"
+    );
+    // Operation stays Debug (it carries no key), and that is what makes the separation necessary.
+    assert!(Probe::<Operation>::IS_DEBUG);
+
+    assert_eq!(
+        KeySecret::new(String::new()).err(),
+        Some(InputRefusal::Empty)
+    );
+    assert_eq!(
+        KeySecret::new("a".repeat(KEY_STDIN_MAX_BYTES + 1)).err(),
+        Some(InputRefusal::TooLarge)
+    );
+    assert!(KeySecret::new("a".repeat(KEY_STDIN_MAX_BYTES)).is_ok());
+}
+
+/* ── wave 2, C-M3-T7: the sealed details path ──────────────────────────────────────────────────── */
+
+/// A remembered command-link URL that must never surface: in an error, a `Debug`, an argv, a log.
+const MARKER_URL: &str = "https://vault.example/secret-MARKER-9f3a/calendar.ics";
+
+/// One sealed `calendar details --json` document (`src/calendar/details.ts`'s `CalendarDetailsJson`),
+/// whose one command link reports `url`.
+fn sealed_document(url: &str) -> String {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "readAt": "2026-10-24T09:00:00.000Z",
+        "events": [{
+            "title": "Standup", "location": null, "rowText": "09:30–09:45 Standup",
+            "time": { "kind": "timed", "startMs": 1_000, "endMs": 2_000 },
+            "status": "confirmed", "ended": false, "fromMac": false,
+            "people": [{ "name": "Priya Shah", "organiser": true }, { "name": null, "organiser": false }],
+            "notes": "Agenda first",
+            "join": { "kind": "known", "url": "https://zoom.us/j/123", "host": "zoom.us" }
+        }],
+        "sources": [
+            { "id": "work", "kind": "link", "status": "incomplete", "reason": "unreachable" },
+            { "id": "macos", "kind": "macos", "skipped": true }
+        ],
+        "readerOutdated": false,
+        "links": [{ "id": "work", "entryHash": "a".repeat(64), "url": url }]
+    })
+    .to_string()
+}
+
+/// `{"links":[…]}`, the handback document, as raw bytes in a zeroing buffer.
+fn handback_of(url: &str) -> LinkHandback {
+    let doc = format!(
+        "{{\"links\":[{{\"id\":\"work\",\"entryHash\":\"{}\",\"url\":\"{url}\"}}]}}",
+        "a".repeat(64)
+    );
+    LinkHandback::new(SecretBytes::from_vec(doc.into_bytes()))
+}
+
+fn details(skip_mac: bool, skip_commands: bool) -> Operation {
+    Operation::CalendarDetails {
+        skip_mac,
+        skip_commands,
+    }
+}
+
+/// ⚠ NOTHING THAT HOLDS A REMEMBERED URL CAN BE PRINTED OR SERIALISED — compile-time facts, read
+/// through the same inherent-const probe as `KeySecret`'s, for `Debug`, `Display` and `Serialize`,
+/// each with a positive decoy (a type that has the trait: the probe says yes) and a negative one (a
+/// plain struct: the probe says no), so a probe that always answers one value fails here first.
+#[test]
+fn the_sealed_details_types_cannot_be_printed_or_serialised() {
+    use std::marker::PhantomData;
+    struct Probe<T>(PhantomData<T>);
+    trait NotDebug {
+        const IS_DEBUG: bool = false;
+    }
+    impl<T> NotDebug for Probe<T> {}
+    impl<T: std::fmt::Debug> Probe<T> {
+        #[allow(dead_code)]
+        const IS_DEBUG: bool = true;
+    }
+    struct DProbe<T>(PhantomData<T>);
+    trait NotDisplay {
+        const IS_DISPLAY: bool = false;
+    }
+    impl<T> NotDisplay for DProbe<T> {}
+    impl<T: std::fmt::Display> DProbe<T> {
+        #[allow(dead_code)]
+        const IS_DISPLAY: bool = true;
+    }
+    struct SProbe<T>(PhantomData<T>);
+    trait NotSerialize {
+        const IS_SERIALIZE: bool = false;
+    }
+    impl<T> NotSerialize for SProbe<T> {}
+    impl<T: serde::Serialize> SProbe<T> {
+        #[allow(dead_code)]
+        const IS_SERIALIZE: bool = true;
+    }
+    struct Plain;
+    // The decoys, both ways, for each probe.
+    assert!(Probe::<String>::IS_DEBUG && !Probe::<Plain>::IS_DEBUG);
+    assert!(DProbe::<String>::IS_DISPLAY && !DProbe::<Plain>::IS_DISPLAY);
+    assert!(SProbe::<String>::IS_SERIALIZE && !SProbe::<Plain>::IS_SERIALIZE);
+
+    assert!(!Probe::<LinkHandback>::IS_DEBUG, "LinkHandback implements Debug");
+    assert!(!DProbe::<LinkHandback>::IS_DISPLAY, "LinkHandback implements Display");
+    assert!(!SProbe::<LinkHandback>::IS_SERIALIZE, "LinkHandback implements Serialize");
+    assert!(!Probe::<DetailsRaw>::IS_DEBUG, "DetailsRaw implements Debug");
+    assert!(!DProbe::<DetailsRaw>::IS_DISPLAY, "DetailsRaw implements Display");
+    assert!(!SProbe::<DetailsRaw>::IS_SERIALIZE, "DetailsRaw implements Serialize");
+    assert!(!Probe::<SecretBytes>::IS_DEBUG, "SecretBytes implements Debug");
+    assert!(!DProbe::<SecretBytes>::IS_DISPLAY, "SecretBytes implements Display");
+    assert!(!SProbe::<SecretBytes>::IS_SERIALIZE, "SecretBytes implements Serialize");
+    // The failure IS printable — and holds no text from the child (its variants are fixed codes).
+    assert!(Probe::<DetailsFailure>::IS_DEBUG);
+}
+
+/// The attributes and impls a sealed type is declared with, read from `src/engine.rs` as code.
+/// Returns the offending derive or impl, if any. ⚠ Strings and comments are removed first
+/// (`common::code_only`), so a doc comment that MENTIONS `Debug` is not a finding.
+fn printable_traits_of(code: &str, name: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let lines: Vec<&str> = code.lines().collect();
+    let is_decl = |l: &str| {
+        let t = l.trim_start();
+        let t = t.strip_prefix("pub(crate) ").or_else(|| t.strip_prefix("pub ")).unwrap_or(t);
+        [format!("struct {name}"), format!("enum {name}")]
+            .iter()
+            .any(|d| t.starts_with(d.as_str()) && !t[d.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    };
+    let decls: Vec<usize> = (0..lines.len()).filter(|&i| is_decl(lines[i])).collect();
+    assert_eq!(decls.len(), 1, "`{name}` is declared {} times in the scan", decls.len());
+    let mut i = decls[0];
+    while i > 0 {
+        i -= 1;
+        let t = lines[i].trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !t.starts_with("#[") {
+            break;
+        }
+        for banned in ["Debug", "Clone", "Serialize"] {
+            if t.starts_with("#[derive(") && t.contains(banned) {
+                found.push(format!("{name}: {t}"));
+            }
+        }
+    }
+    let impls = regex::Regex::new(&format!(
+        r"impl\s*(?:<[^>]*>)?\s*(?:[A-Za-z_]+::)*(Debug|Display|Serialize|Clone)\s+for\s+{name}\b"
+    ))
+    .expect("a valid regex");
+    for m in impls.find_iter(code) {
+        found.push(m.as_str().to_string());
+    }
+    found
+}
+
+/// ⚠ NO SEALED TYPE DERIVES OR HAND-IMPLEMENTS `Debug`, `Clone` OR `Serialize` (or `Display`), the
+/// private ones included — the probes above reach only the `pub` ones. Decoys first.
+#[test]
+fn no_sealed_details_type_derives_or_implements_a_printable_trait() {
+    let decoy = "#[derive(Debug, Deserialize)]\npub struct RawLink { id: String }\n";
+    assert_eq!(printable_traits_of(decoy, "RawLink").len(), 1, "the scan cannot see a derive");
+    let decoy = "pub struct RawLink(String);\nimpl std::fmt::Debug for RawLink { fn fmt() {} }\n";
+    assert_eq!(printable_traits_of(decoy, "RawLink").len(), 1, "the scan cannot see an impl");
+    let decoy = "#[derive(Deserialize)]\n#[serde(rename_all = \"camelCase\")]\nstruct RawLink { id: String }\nimpl Clone for RawLinkish {}\n";
+    assert!(printable_traits_of(decoy, "RawLink").is_empty(), "the scan flags a clean type");
+
+    let code = common::code_only(&std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine.rs"),
+    )
+    .expect("src/engine.rs is readable"));
+    for name in [
+        "SecretBytes",
+        "LinkHandback",
+        "DetailsRaw",
+        "DetailsDoc",
+        "DetailsRead",
+        "RawEvent",
+        "RawPerson",
+        "RawOtherNote",
+        "RawJoin",
+        "RawSource",
+        "RawLink",
+        "WireRead",
+        "WireRefused",
+        "SealedDetails",
+        "StdinPayload",
+    ] {
+        let found = printable_traits_of(&code, name);
+        assert!(found.is_empty(), "a sealed type is printable: {found:?}");
+    }
+}
+
+/// ⚠ ONE VOLATILE LOOP WIPES BOTH SECRETS (plan C-M3-T7, R4-M7): `KeySecret`'s overwrite moved,
+/// unchanged, into `wipe_bytes`, and `KeySecret`'s `Drop` and `SecretBytes::wipe` both call it, so a
+/// second copy that drifted (a plain `fill(0)` the optimiser may drop) cannot exist.
+#[test]
+fn one_volatile_loop_wipes_both_secrets() {
+    fn body_after<'a>(code: &'a str, head: &str) -> &'a str {
+        let at = code.find(head).unwrap_or_else(|| panic!("no `{head}` in src/engine.rs"));
+        let open = at + code[at..].find('{').expect("a body");
+        let mut depth = 0usize;
+        for (i, c) in code[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &code[open..=open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after `{head}`")
+    }
+    let code = common::code_only(&std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine.rs"),
+    )
+    .expect("src/engine.rs is readable"));
+    assert_eq!(code.matches("write_volatile").count(), 1, "there must be exactly one volatile loop");
+    assert!(body_after(&code, "fn wipe_bytes(").contains("write_volatile"));
+    assert!(body_after(&code, "impl Drop for KeySecret").contains("wipe_bytes("));
+    assert!(body_after(&code, "fn wipe(&mut self)").contains("wipe_bytes("));
+    assert!(body_after(&code, "impl Drop for SecretBytes").contains(".wipe()"));
+}
+
+/// `DetailsRaw::parse` takes the sealed document, or the calendar-off refusal, and nothing else —
+/// and a refusal of anything else is the fixed `Malformed`, never the parser's text (a serde error
+/// can quote the offending value, which here could be a URL).
+#[test]
+fn details_raw_parse_takes_only_the_sealed_document() {
+    let raw = DetailsRaw::parse(sealed_document(MARKER_URL).as_bytes())
+        .unwrap_or_else(|f| panic!("the sealed document parses: {f:?}"));
+    assert!(!raw.calendar_off());
+    let off = DetailsRaw::parse(br#"{"schemaVersion":1,"refused":"calendar-off"}"#)
+        .unwrap_or_else(|f| panic!("the refusal parses: {f:?}"));
+    assert!(off.calendar_off());
+    let mut wrong_version: serde_json::Value =
+        serde_json::from_str(&sealed_document(MARKER_URL)).expect("JSON");
+    wrong_version["schemaVersion"] = serde_json::json!(2);
+    let mut no_events = wrong_version.clone();
+    no_events["schemaVersion"] = serde_json::json!(1);
+    no_events.as_object_mut().expect("an object").remove("events");
+    let mut both = no_events.clone();
+    both["events"] = serde_json::json!([]);
+    both["sources"] = serde_json::json!([{ "id": "x", "kind": "link", "status": "ok", "skipped": true }]);
+    let mut bad_url_type = both.clone();
+    bad_url_type["sources"] = serde_json::json!([]);
+    bad_url_type["links"] = serde_json::json!([{ "id": "work", "entryHash": "a".repeat(64), "url": [MARKER_URL] }]);
+    for bad in [
+        wrong_version.to_string(),
+        no_events.to_string(),
+        both.to_string(),
+        bad_url_type.to_string(),
+        r#"{"schemaVersion":1,"refused":"something-else"}"#.to_string(),
+        format!("not json {MARKER_URL}"),
+        String::new(),
+    ] {
+        match DetailsRaw::parse(bad.as_bytes()) {
+            Ok(_) => panic!("parsed a document it must refuse: {bad:.120}"),
+            Err(f) => {
+                assert_eq!(f, DetailsFailure::Malformed);
+                assert!(!format!("{f:?}").contains("MARKER"));
+            }
+        }
+    }
+}
+
+/// ⚠ ONLY `CalendarDetails` TAKES A HANDBACK, BOTH WAYS, BEFORE ANY SPAWN: `invoke_sealed` refuses
+/// every other operation, and `invoke` / `invoke_with_key` refuse `CalendarDetails` (it must not run
+/// through `classify`, whose `EngineOutcome` keeps stdout verbatim). On a client whose program and
+/// caffeinate are absent, so a spawn attempt answers `Spawn` and cannot pass for a refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_calendar_details_takes_a_handback() {
+    let scratch = ScratchDir::new("handbackonly");
+    let absent = EngineClient::with_program(scratch.join("absent-program"))
+        .with_caffeinate_path(scratch.join("absent-caffeinate"));
+    match absent.invoke_sealed(details(false, false), handback_of(MARKER_URL)).await {
+        Err(EngineError::Spawn { detail }) => assert!(!detail.contains("MARKER"), "{detail}"),
+        Err(other) => panic!("the control must fail AT the spawn, got {other:?}"),
+        Ok(_) => panic!("the control must fail AT the spawn, and it answered"),
+    }
+    let mut seen_details = 0;
+    for op in every_operation() {
+        if matches!(op, Operation::CalendarDetails { .. }) {
+            seen_details += 1;
+            for answer in [
+                absent.invoke(op.clone(), &NoProgress).await,
+                absent
+                    .invoke_with_key(
+                        op.clone(),
+                        KeySecret::new("sk-test-0123456789".into()).expect("a key"),
+                        &NoProgress,
+                    )
+                    .await,
+            ] {
+                match answer {
+                    Err(EngineError::InvalidInput { field, reason }) => {
+                        assert_eq!(field, "handback");
+                        assert_eq!(reason, "is required for this operation");
+                    }
+                    other => panic!("{op:?} without a handback: expected InvalidInput, got {other:?}"),
+                }
+            }
+            continue;
+        }
+        match absent.invoke_sealed(op.clone(), handback_of(MARKER_URL)).await {
+            Err(EngineError::InvalidInput { field, reason }) => {
+                assert_eq!(field, "handback", "{op:?}");
+                assert_eq!(reason, format!("is not an input of {}", op.name()));
+                assert!(!reason.contains("MARKER"));
+            }
+            Err(other) => panic!("{op:?} with a handback: expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("{op:?} with a handback was run"),
+        }
+    }
+    assert_eq!(seen_details, 1, "every_operation lost CalendarDetails");
+}
+
+/// A fake engine that records its argv and everything on its stdin, echoes the stdin to STDERR as
+/// well (so a leak through stderr would carry the URL), and answers `stdout` with `exit`.
+#[cfg(unix)]
+fn sealed_recorder(dir: &std::path::Path, name: &str, stdout: &str, exit: i32) -> std::path::PathBuf {
+    let rec = |f: &str| dir.join(f).display().to_string();
+    std::fs::write(dir.join(format!("{name}.out")), stdout).expect("write the canned stdout");
+    common::fake_sidecar(
+        dir,
+        name,
+        &format!(
+            "printf '%s\\n' \"$@\" > {argv}\ntee {stdin} >&2\ncat {out}\nexit {exit}",
+            argv = sq(&rec("argv")),
+            stdin = sq(&rec("stdin")),
+            out = sq(&rec(&format!("{name}.out"))),
+        ),
+    )
+}
+
+/// ⚠ THE HANDBACK REACHES THE ENGINE ON STDIN, AND THE ANSWER IS PARSED INSIDE RUST. The URL is on
+/// the child's stdin, byte for byte, and in no argv, `Debug` or failure; stderr — here an echo of the
+/// URL — is reduced to a fixed code and never forwarded (there is no sink to forward it to).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sealed_read_hands_back_on_stdin_and_parses_inside_rust() {
+    let scratch = ScratchDir::new("sealedread");
+    let op = details(false, true);
+    assert_eq!(
+        format!("{op:?}"),
+        "CalendarDetails { skip_mac: false, skip_commands: true }"
+    );
+    let ok = EngineClient::with_program(sealed_recorder(
+        &scratch.path,
+        "ok.sh",
+        &sealed_document(MARKER_URL),
+        0,
+    ));
+    let raw = match tokio::time::timeout(
+        Duration::from_secs(10),
+        ok.invoke_sealed(op.clone(), handback_of(MARKER_URL)),
+    )
+    .await
+    .expect("the invocation ended — so the stdin pipe was closed after the handback")
+    {
+        Ok(Ok(raw)) => raw,
+        Ok(Err(f)) => panic!("the sealed document did not parse: {f:?}"),
+        Err(e) => panic!("the fake did not run: {e}"),
+    };
+    assert!(!raw.calendar_off());
+    let stdin = std::fs::read_to_string(scratch.join("stdin")).expect("the fake recorded its stdin");
+    assert_eq!(
+        stdin,
+        format!(
+            "{{\"links\":[{{\"id\":\"work\",\"entryHash\":\"{}\",\"url\":\"{MARKER_URL}\"}}]}}",
+            "a".repeat(64)
+        )
+    );
+    let argv = std::fs::read_to_string(scratch.join("argv")).expect("argv");
+    assert_eq!(argv, "calendar\ndetails\n--json\n--skip-commands\n");
+
+    // The failures: each a fixed code, the echoed URL nowhere in it.
+    for (name, out, exit, want) in [
+        ("exit1.sh", String::new(), 1, DetailsFailure::Exit(Some(1))),
+        ("garbled.sh", format!("{{ not the document {MARKER_URL}"), 0, DetailsFailure::Malformed),
+    ] {
+        let client = EngineClient::with_program(sealed_recorder(&scratch.path, name, &out, exit));
+        match client.invoke_sealed(op.clone(), handback_of(MARKER_URL)).await {
+            Ok(Err(f)) => {
+                assert_eq!(f, want, "{name}");
+                assert!(!format!("{f:?}").contains("MARKER"), "{name}: {f:?}");
+            }
+            Ok(Ok(_)) => panic!("{name}: a failure parsed as a document"),
+            Err(e) => panic!("{name}: the fake did not run: {e}"),
+        }
+    }
+    // The engine's own fixed codes are recognised — and only when stderr is exactly one of them.
+    for (code, want) in [
+        ("bad-arguments", DetailsFailure::BadArguments),
+        ("stdin-too-large", DetailsFailure::StdinTooLarge),
+        ("stdin-invalid", DetailsFailure::StdinInvalid),
+        ("config-unreadable", DetailsFailure::ConfigUnreadable),
+        ("internal", DetailsFailure::Internal),
+    ] {
+        let program = common::fake_sidecar(
+            &scratch.path,
+            &format!("{code}.sh"),
+            &format!("cat > /dev/null\necho 'calendar details: {code}' >&2\nexit 2"),
+        );
+        match EngineClient::with_program(program)
+            .invoke_sealed(op.clone(), handback_of(MARKER_URL))
+            .await
+        {
+            Ok(Err(f)) => assert_eq!(f, want, "{code}"),
+            _ => panic!("{code}: expected the fixed failure"),
+        }
+    }
+    // The calendar-off refusal is an answer, not a failure.
+    let off = EngineClient::with_program(sealed_recorder(
+        &scratch.path,
+        "off.sh",
+        r#"{"schemaVersion":1,"refused":"calendar-off"}"#,
+        0,
+    ));
+    match off.invoke_sealed(op, handback_of(MARKER_URL)).await {
+        Ok(Ok(raw)) => assert!(raw.calendar_off()),
+        _ => panic!("the calendar-off refusal must parse"),
+    }
+}
+
+/// `invoke_sealed` is bounded by `effective_timeout` (so the harness cap still shortens it), under
+/// the same `Timeout` answer as every bounded operation — and the answer names no URL.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sealed_read_past_its_bound_answers_timeout() {
+    let scratch = ScratchDir::new("sealedtimeout");
+    let _reap = ReapTagged(scratch.tag());
+    let program = sleeper(&scratch.path, "slow.sh", 30);
+    let client = EngineClient::with_program(program).with_timeout_cap(Duration::from_millis(1500));
+    assert_eq!(
+        client.effective_timeout(&details(false, false)),
+        Some(Duration::from_millis(1500))
+    );
+    let started = std::time::Instant::now();
+    match client.invoke_sealed(details(false, false), handback_of(MARKER_URL)).await {
+        Err(e @ EngineError::Timeout { .. }) => {
+            assert!(matches!(&e, EngineError::Timeout { operation, .. } if operation == "calendar-details"));
+            assert!(!e.to_string().contains("MARKER") && !format!("{e:?}").contains("MARKER"));
+        }
+        Err(other) => panic!("expected Timeout, got {other:?}"),
+        Ok(_) => panic!("expected Timeout, and it answered"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(10), "the bound was not applied");
+}
+
+/// The app's Test bounds equal the engine's restated copies — read from `src/attemptBounds.ts`.
+///
+/// ⚠ THE 30-MINUTE CAP EXISTS TWICE AND NOTHING ELSE LINKS THE COPIES (P2-M4 checkpoint fix, into
+/// P3-M1-T1): the engine caps a loopback probe at `APP_LOOPBACK_TEST_CAP_MS − 17 s` so its answer
+/// lands inside THIS bound. If the Rust cap moved down alone, every long loopback Test would be
+/// abandoned before its answer; moved up alone, the engine's cap would no longer be what bounds it.
+#[test]
+fn the_provider_test_bounds_equal_the_engines_copies() {
+    const BOUNDS: &str = "src/attemptBounds.ts";
+    assert_eq!(
+        engine_const(BOUNDS, "APP_LOOPBACK_TEST_CAP_MS"),
+        PROVIDER_TEST_LOOPBACK_CAP.as_millis() as u64,
+        "the app's loopback Test cap and the engine's APP_LOOPBACK_TEST_CAP_MS differ"
+    );
+    assert_eq!(
+        engine_const(BOUNDS, "APP_LOOPBACK_TEST_EXTRA_MS"),
+        PROVIDER_TEST_LOOPBACK_EXTRA.as_millis() as u64
+    );
+    assert_eq!(
+        engine_const(BOUNDS, "APP_REMOTE_TEST_TIMEOUT_MS"),
+        PROVIDER_TEST_REMOTE_TIMEOUT.as_millis() as u64
+    );
+    // And the engine's probe cap is derived from the two, not restated (so the sum stays ≤ cap).
+    assert!(
+        engine_source(BOUNDS).contains(
+            "export const PROBE_LOOPBACK_MAX_TIMEOUT_MS = APP_LOOPBACK_TEST_CAP_MS - APP_LOOPBACK_TEST_EXTRA_MS;"
+        ),
+        "the engine's loopback probe cap is no longer cap − extra"
+    );
+}
+
+/// A fake that records its argv, its whole environment and EVERYTHING it reads on stdin, then
+/// answers one `ok` JSON line — the shape `provider`'s answers have.
+#[cfg(unix)]
+fn stdin_recorder(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let rec = |f: &str| dir.join(f).display().to_string();
+    common::fake_sidecar(
+        dir,
+        name,
+        &format!(
+            "printf '%s\\n' \"$@\" > {argv}\n/usr/bin/env > {env}\ncat > {stdin}\nprintf '%s' {answer}\nexit 0",
+            argv = sq(&rec("argv")),
+            env = sq(&rec("env")),
+            stdin = sq(&rec("stdin")),
+            answer = sq(r#"{"schemaVersion":1,"ok":true}"#),
+        ),
+    )
+}
+
+/// ⚠ THE KEY REACHES THE ENGINE ON STDIN AND NOWHERE ELSE — not argv, not the environment, not the
+/// `Operation`'s `Debug`, not the outcome — and the pipe is CLOSED after it (the fake's `cat` returns
+/// only at EOF, so a never-closed stdin would hang this invocation instead of answering).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_key_travels_on_stdin_and_nowhere_else() {
+    let _turn = serialise().await;
+    let scratch = ScratchDir::new("keystdin");
+    let client = EngineClient::with_program(stdin_recorder(&scratch.path, "engine.sh"));
+    const SECRET: &str = "sk-test-SECRET-0123456789abcdef";
+
+    let op = Operation::KeySet;
+    assert!(!format!("{op:?}").contains(SECRET));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.invoke_with_key(
+            op.clone(),
+            KeySecret::new(SECRET.to_string()).expect("a key"),
+            &NoProgress,
+        ),
+    )
+    .await
+    .expect("the invocation ended — so the stdin pipe was closed after the key")
+    .expect("the fake ran");
+    assert_eq!(outcome.outcome, Outcome::Delivered, "{outcome:?}");
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("stdin")).expect("the fake recorded its stdin"),
+        SECRET,
+        "the engine must read exactly the key on stdin"
+    );
+    let argv = std::fs::read_to_string(scratch.join("argv")).expect("argv");
+    assert_eq!(argv, "provider\nkey\nset\n--json\n");
+    let env = std::fs::read_to_string(scratch.join("env")).expect("env");
+    assert!(!env.contains(SECRET), "the key reached the environment");
+    assert!(!format!("{outcome:?}").contains(SECRET));
+    assert!(!serde_json::to_string(&outcome)
+        .expect("serialises")
+        .contains(SECRET));
+
+    // Every other operation's stdin is `/dev/null`: the same fake reads nothing.
+    let _ = std::fs::remove_file(scratch.join("stdin"));
+    client
+        .invoke(Operation::KeyDeleteAll, &NoProgress)
+        .await
+        .expect("the fake ran");
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("stdin")).expect("stdin recorded"),
+        ""
+    );
+
+    // The pairing is enforced BEFORE any spawn, both ways. PR 3 final, the second post-cap fix (N2):
+    // the cases run on a client whose program AND caffeinate wrapper are both absent (on macOS
+    // `command_line` wraps the program in caffeinate when that path exists), so ANY spawn attempt
+    // answers `Spawn` — a refusal moved after the spawn can no longer pass by the child being killed
+    // on drop before the fake recorded anything (r5's C1 rested on that race).
+    let absent = EngineClient::with_program(scratch.join("absent-program"))
+        .with_caffeinate_path(scratch.join("absent-caffeinate"));
+    assert!(
+        !scratch.join("absent-program").exists() && !scratch.join("absent-caffeinate").exists()
+    );
+    // The control: a correctly paired invocation on that client reaches the spawn, and the spawn fails.
+    match absent.invoke(Operation::KeyDeleteAll, &NoProgress).await {
+        Err(EngineError::Spawn { .. }) => {}
+        other => panic!("the absent client must fail AT the spawn, got {other:?}"),
+    }
+    enum Mispaired {
+        KeySetWithoutKey,
+        KeyForStatus,
+        KeyBesideLabel,
+    }
+    for case in [
+        Mispaired::KeySetWithoutKey,
+        Mispaired::KeyForStatus,
+        Mispaired::KeyBesideLabel,
+    ] {
+        let (answer, what) = match case {
+            Mispaired::KeySetWithoutKey => (
+                absent.invoke(Operation::KeySet, &NoProgress).await,
+                "key set without a key",
+            ),
+            Mispaired::KeyForStatus => (
+                absent
+                    .invoke_with_key(
+                        Operation::Status,
+                        KeySecret::new(SECRET.to_string()).expect("a key"),
+                        &NoProgress,
+                    )
+                    .await,
+                "a key for an operation that reads none",
+            ),
+            Mispaired::KeyBesideLabel => (
+                absent
+                    .invoke_with_key(
+                        Operation::ProviderReset {
+                            target: ResetTarget::Label(label("work").expect("legal")),
+                        },
+                        KeySecret::new(SECRET.to_string()).expect("a key"),
+                        &NoProgress,
+                    )
+                    .await,
+                "a key beside an operation's own stdin payload",
+            ),
+        };
+        match &answer {
+            Err(EngineError::InvalidInput { field, reason }) => {
+                assert_eq!(field, "key", "{what}");
+                assert!(!reason.contains(SECRET), "{what}: {reason}");
+            }
+            // `Spawn` here means the refusal came only after a spawn was attempted.
+            other => panic!("{what}: expected InvalidInput before any spawn, got {other:?}"),
+        }
+    }
+}
+
+/// The label reaches the engine as `{"label": …}` on stdin, and the pipe is closed after it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_label_is_written_to_stdin_as_json() {
+    let _turn = serialise().await;
+    let scratch = ScratchDir::new("labelstdin");
+    let client = EngineClient::with_program(stdin_recorder(&scratch.path, "engine.sh"));
+    for text in ["--help", "-v", "work \"two\"", "ünï"] {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.invoke(
+                Operation::ProviderReset {
+                    target: ResetTarget::Label(label(text).expect("legal")),
+                },
+                &NoProgress,
+            ),
+        )
+        .await
+        .expect("the invocation ended — so the stdin pipe was closed")
+        .expect("the fake ran");
+        assert_eq!(outcome.outcome, Outcome::Delivered, "{outcome:?}");
+        let got: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(scratch.join("stdin")).expect("stdin recorded"),
+        )
+        .expect("the stdin is JSON");
+        assert_eq!(got, serde_json::json!({ "label": text }));
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("argv")).expect("argv"),
+            "provider\nreset\n--label-stdin\n--json\n",
+            "{text:?}"
+        );
+    }
+}
+
+/* ── B1-M4-T11: `repos status --json`'s request ───────────────────────────────────────────────── */
+
+fn repos_label(key: &str, tokens: &[&str]) -> ReposLabel {
+    ReposLabel {
+        key: key.to_string(),
+        tokens: tokens.iter().map(|t| t.to_string()).collect(),
+    }
+}
+
+fn repos_branch(key: &str, name: &str) -> ReposBranch {
+    ReposBranch {
+        key: key.to_string(),
+        name: name.to_string(),
+    }
+}
+
+fn repos_request(
+    labels: Vec<ReposLabel>,
+    branches: Vec<ReposBranch>,
+) -> Result<ReposRequest, ReposRefusal> {
+    ReposRequest::new(ReposScope::All, "2026-10-24", labels, branches)
+}
+
+/// A small valid request, for the operation pins that need one.
+fn a_repos_request() -> ReposRequest {
+    repos_request(
+        vec![repos_label("daily_briefing_application", &["abc1234"])],
+        vec![repos_branch("daily_briefing_application", "feat/x")],
+    )
+    .expect("a valid request")
+}
+
+/// A fixture under `tests/fixtures/`, parsed.
+fn fixture_json(name: &str) -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("the fixture {} is readable: {e}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name} is JSON: {e}"))
+}
+
+/// Each refusal of the request's validation (plan B1-M4-T11), and the edges it admits. Rust refuses
+/// the WHOLE request on one bad entry, which is why the webview's `reposRequest` (B1-M5-T14) never
+/// sends one; the shared fixture below keeps the two rules equal.
+#[test]
+fn repos_request_refusals_name_their_class() {
+    // Admitted: the Other card's key `""`, every limit exactly, both hex cases.
+    let forty = "0123456789abcdefABCDEF0123456789abcdef01";
+    assert_eq!(forty.len(), 40);
+    let key80 = "é".repeat(REPOS_KEY_MAX_SCALARS);
+    assert!(repos_request(vec![repos_label("", &["a"])], vec![]).is_ok(), "the Other card");
+    assert!(repos_request(vec![repos_label(&key80, &[forty])], vec![repos_branch(&key80, "")]).is_ok());
+    assert!(repos_request(vec![], vec![repos_branch("", &"a".repeat(REPOS_BRANCH_MAX_BYTES))]).is_ok());
+    let many = |n: usize| -> Vec<ReposLabel> {
+        (0..n).map(|i| repos_label(&format!("l{i}"), &[])).collect()
+    };
+    let branches = |n: usize| -> Vec<ReposBranch> {
+        (0..n).map(|i| repos_branch(&format!("l{i}"), "main")).collect()
+    };
+    assert!(repos_request(many(REPOS_MAX_LABELS), branches(REPOS_MAX_BRANCHES)).is_ok());
+    let tokens = |n: usize| vec!["abc"; n];
+    assert!(repos_request(vec![repos_label("k", &tokens(REPOS_TOKENS_PER_LABEL))], vec![]).is_ok());
+    let full: Vec<ReposLabel> = (0..REPOS_TOKENS_TOTAL / REPOS_TOKENS_PER_LABEL)
+        .map(|i| repos_label(&format!("l{i}"), &tokens(REPOS_TOKENS_PER_LABEL)))
+        .collect();
+    assert!(repos_request(full.clone(), vec![]).is_ok(), "exactly 4 096 tokens in all");
+
+    let mut over_total = full;
+    over_total.push(repos_label("one more", &["a"]));
+    let cases: Vec<(&str, Result<ReposRequest, ReposRefusal>, ReposRefusal)> = vec![
+        ("a non-hex token", repos_request(vec![repos_label("k", &["abcg"])], vec![]), ReposRefusal::TokenNotHex),
+        ("an empty token", repos_request(vec![repos_label("k", &[""])], vec![]), ReposRefusal::TokenNotHex),
+        ("a 41-character token", repos_request(vec![repos_label("k", &[&"a".repeat(41)])], vec![]), ReposRefusal::TokenNotHex),
+        ("a token of non-ASCII digits", repos_request(vec![repos_label("k", &["١٢٣"])], vec![]), ReposRefusal::TokenNotHex),
+        ("a token with a space", repos_request(vec![repos_label("k", &["abc "])], vec![]), ReposRefusal::TokenNotHex),
+        ("65 labels", repos_request(many(REPOS_MAX_LABELS + 1), vec![]), ReposRefusal::TooManyLabels),
+        ("65 branch entries", repos_request(vec![], branches(REPOS_MAX_BRANCHES + 1)), ReposRefusal::TooManyBranches),
+        ("513 tokens on one label", repos_request(vec![repos_label("k", &tokens(REPOS_TOKENS_PER_LABEL + 1))], vec![]), ReposRefusal::TooManyTokensInLabel),
+        ("4 097 tokens in all", repos_request(over_total, vec![]), ReposRefusal::TooManyTokens),
+        ("an 81-scalar label key", repos_request(vec![repos_label(&"é".repeat(81), &[])], vec![]), ReposRefusal::LabelKeyTooLong),
+        ("a control character in a label key", repos_request(vec![repos_label("a\u{7}b", &[])], vec![]), ReposRefusal::LabelKeyCharacter),
+        ("a newline in a label key", repos_request(vec![repos_label("a\nb", &[])], vec![]), ReposRefusal::LabelKeyCharacter),
+        ("a bidi control in a label key", repos_request(vec![repos_label("a\u{202E}b", &[])], vec![]), ReposRefusal::LabelKeyCharacter),
+        ("an 81-scalar branch key", repos_request(vec![], vec![repos_branch(&"é".repeat(81), "main")]), ReposRefusal::BranchKeyTooLong),
+        ("a control character in a branch key", repos_request(vec![], vec![repos_branch("a\u{1b}b", "main")]), ReposRefusal::BranchKeyCharacter),
+        ("a zero-width space in a branch key", repos_request(vec![], vec![repos_branch("a\u{200B}", "main")]), ReposRefusal::BranchKeyCharacter),
+        ("a 256-byte branch name", repos_request(vec![], vec![repos_branch("", &"a".repeat(256))]), ReposRefusal::BranchNameTooLong),
+        // 86 × "€" is 86 scalars but 258 UTF-8 bytes: the limit is bytes.
+        ("a 258-byte name of 86 scalars", repos_request(vec![], vec![repos_branch("", &"€".repeat(86))]), ReposRefusal::BranchNameTooLong),
+        ("a control character in a branch name", repos_request(vec![], vec![repos_branch("", "feat/\u{7f}x")]), ReposRefusal::BranchNameCharacter),
+        ("a bidi isolate in a branch name", repos_request(vec![], vec![repos_branch("", "feat/\u{2066}x")]), ReposRefusal::BranchNameCharacter),
+    ];
+    for (what, got, want) in cases {
+        assert_eq!(got.err(), Some(want), "{what}");
+    }
+    for bad in ["2026-02-30", "2026-1-01", "20261024", "", "0000-01-01", "2026-13-01", "2026-10-24 ", "２０２6-10-24"] {
+        assert_eq!(
+            ReposRequest::new(ReposScope::All, bad, vec![], vec![]).err(),
+            Some(ReposRefusal::PageDate),
+            "{bad:?}"
+        );
+    }
+    // A refusal is a sentence naming its field, and never the value.
+    for r in [ReposRefusal::TokenNotHex, ReposRefusal::LabelKeyCharacter, ReposRefusal::BranchNameTooLong, ReposRefusal::PageDate] {
+        let e: EngineError = r.into();
+        match e {
+            EngineError::InvalidInput { field, reason } => {
+                assert!(!field.is_empty() && !reason.is_empty(), "{r:?}");
+                assert!(!reason.contains("abcg"), "{r:?}");
+            }
+            other => panic!("{r:?} → {other:?}"),
+        }
+    }
+}
+
+/// THE SHARED FIXTURE (plan B1-M4-T11; post-cap review PC-M2, PC-M3): `repos-request-limits.json`,
+/// read here and by the webview's `git-detail.check.ts` (B1-M5-T14), so a limit or a refused range
+/// changed on one side alone goes red on one of the two.
+///
+/// - every Rust constant equals its `limits` entry;
+/// - every `chars` entry is classed as stated by the Rust rule (`char::is_control` or
+///   `is_refused_format_character`), AND by the request's own validation, as a label key and as a
+///   branch name (so the validator cannot use some other predicate);
+/// - `chars` is COMPLETE for the Rust rule: for every range of `REFUSED_FORMAT_CHARACTERS`
+///   (iterated, not copied) it holds `lo`, `hi`, `lo − 1` and `hi + 1`, plus the control edges.
+///
+/// The fixture is written by hand once; this test checks its entries, it never generates them.
+#[test]
+fn the_repos_request_limits_are_the_shared_fixtures() {
+    let fx = fixture_json("repos-request-limits.json");
+    let mut top: Vec<&String> = fx.as_object().expect("an object").keys().collect();
+    top.sort_unstable();
+    assert_eq!(top, ["chars", "limits"], "the fixture holds `limits` and `chars` only");
+    let limits = fx["limits"].as_object().expect("`limits` is an object");
+    let want = [
+        ("REPOS_MAX_LABELS", REPOS_MAX_LABELS),
+        ("REPOS_MAX_BRANCHES", REPOS_MAX_BRANCHES),
+        ("REPOS_KEY_MAX_SCALARS", REPOS_KEY_MAX_SCALARS),
+        ("REPOS_TOKENS_PER_LABEL", REPOS_TOKENS_PER_LABEL),
+        ("REPOS_TOKENS_TOTAL", REPOS_TOKENS_TOTAL),
+        ("REPOS_BRANCH_MAX_BYTES", REPOS_BRANCH_MAX_BYTES),
+    ];
+    assert_eq!(limits.len(), want.len(), "{limits:?}");
+    for (name, value) in want {
+        assert_eq!(limits[name].as_u64(), Some(value as u64), "{name}");
+    }
+    // The plan's figures, so the fixture and the constants cannot move together unseen.
+    assert_eq!(
+        want.map(|(_, v)| v),
+        [64, 64, 80, 512, 4096, 255],
+        "the six figures are plan B1-M4-T11's"
+    );
+
+    let chars: Vec<(u32, bool)> = fx["chars"]
+        .as_array()
+        .expect("`chars` is an array")
+        .iter()
+        .map(|e| {
+            let cp = e["cp"].as_str().expect("`cp` is a string");
+            let hex = cp.strip_prefix("U+").unwrap_or_else(|| panic!("{cp} is spelled U+XXXX"));
+            let n = u32::from_str_radix(hex, 16).unwrap_or_else(|_| panic!("{cp} is hex"));
+            (n, e["refused"].as_bool().expect("`refused` is a boolean"))
+        })
+        .collect();
+    let rule = |c: char| c.is_control() || is_refused_format_character(c);
+    for (cp, refused) in &chars {
+        let c = char::from_u32(*cp).unwrap_or_else(|| panic!("U+{cp:04X} is a scalar value"));
+        assert_eq!(rule(c), *refused, "U+{cp:04X} is classed wrongly in the fixture");
+        let as_key = repos_request(vec![repos_label(&format!("k{c}"), &[])], vec![]);
+        assert_eq!(as_key.is_err(), *refused, "U+{cp:04X} as a label key: {as_key:?}");
+        let as_name = repos_request(vec![], vec![repos_branch("k", &format!("feat/{c}"))]);
+        assert_eq!(as_name.is_err(), *refused, "U+{cp:04X} in a branch name: {as_name:?}");
+        let as_branch_key = repos_request(vec![], vec![repos_branch(&format!("{c}"), "main")]);
+        assert_eq!(as_branch_key.is_err(), *refused, "U+{cp:04X} as a branch key");
+    }
+    let held: std::collections::BTreeSet<u32> = chars.iter().map(|(cp, _)| *cp).collect();
+    assert_eq!(held.len(), chars.len(), "a `chars` entry is listed twice");
+    for (lo, hi) in REFUSED_FORMAT_CHARACTERS {
+        for cp in [*lo as u32, *hi as u32, *lo as u32 - 1, *hi as u32 + 1] {
+            assert!(
+                held.contains(&cp),
+                "the fixture lacks U+{cp:04X}, an edge of the refused range U+{:04X}..U+{:04X}",
+                *lo as u32,
+                *hi as u32
+            );
+        }
+    }
+    for cp in [0x0000, 0x001F, 0x0020, 0x007F, 0x009F, 0x00A0] {
+        assert!(held.contains(&cp), "the fixture lacks the control edge U+{cp:04X}");
+    }
+}
+
+/// ⚠ THE REQUEST IS EXACTLY THE ENGINE'S STDIN CONTRACT, pinned on both sides by one fixture
+/// (`repos-request-wire.json`): this test asserts Rust serialises each sample request to exactly
+/// the fixture's bytes (and that `stdin_payload` is those bytes), and `test/repos.status.test.ts`
+/// asserts the engine's `parseReposRequest` (src/repos/status.ts) accepts each and reads it back
+/// whole — `{ scope, pageDate, labels: [{ key, tokens }], branches: [{ key, name }] }`, camelCase,
+/// no other member (the engine refuses one). The engine's stdin bound is pinned the same way.
+#[test]
+fn the_repos_request_is_the_engines_stdin_contract() {
+    let fx = fixture_json("repos-request-wire.json");
+    assert_eq!(
+        fx["stdinMaxBytes"].as_u64(),
+        Some(REPOS_STDIN_MAX_BYTES as u64),
+        "the engine's REPOS_STDIN_MAX_BYTES"
+    );
+    let samples = [
+        ReposRequest::new(
+            ReposScope::All,
+            "2026-10-24",
+            vec![
+                repos_label("daily_briefing_application", &["abc1234", "DEADBEEF"]),
+                repos_label("", &["0123456789abcdef0123456789abcdef01234567"]),
+                repos_label("ünï €", &[]),
+            ],
+            vec![repos_branch("daily_briefing_application", "feat/dba-\"x\"")],
+        )
+        .expect("valid"),
+        ReposRequest::new(ReposScope::Uncommitted, "2026-01-31", vec![], vec![]).expect("valid"),
+    ];
+    let wires = fx["wires"].as_array().expect("`wires` is an array");
+    assert_eq!(wires.len(), samples.len());
+    for (request, wire) in samples.into_iter().zip(wires) {
+        let wire = wire.as_str().expect("each wire is a string");
+        assert_eq!(serde_json::to_string(&request).expect("serialises"), wire);
+        let op = Operation::ReposStatus { request };
+        assert_eq!(op.stdin_payload(), Some(wire.as_bytes().to_vec()));
+    }
+}
+
+/// The largest request the validation admits fits the engine's `readStdinBounded(256 * 1024)`
+/// (plan B1-M4-T11, round 4 LOW and round 5 LOW): every multi-byte character at 4 bytes, and the
+/// quote-escaped twin, whose branch names are 255 `"` characters each serialised as `\"`.
+#[test]
+fn the_largest_admitted_repos_request_fits_the_engines_stdin_bound() {
+    let wide = "\u{1F600}"; // 4 UTF-8 bytes, needs no JSON escape
+    let key: String = wide.repeat(REPOS_KEY_MAX_SCALARS);
+    assert_eq!(key.len(), 4 * REPOS_KEY_MAX_SCALARS);
+    let token = "f".repeat(40);
+    let per_label = REPOS_TOKENS_TOTAL / REPOS_MAX_LABELS;
+    let labels = || -> Vec<ReposLabel> {
+        (0..REPOS_MAX_LABELS)
+            .map(|_| ReposLabel {
+                key: key.clone(),
+                tokens: vec![token.clone(); per_label],
+            })
+            .collect()
+    };
+    // 63 four-byte scalars and 3 ASCII bytes: 255 bytes, the most a name may hold.
+    let name = format!("{}abc", wide.repeat(63));
+    assert_eq!(name.len(), REPOS_BRANCH_MAX_BYTES);
+    let quotes = "\"".repeat(REPOS_BRANCH_MAX_BYTES);
+    for (what, branch_name) in [("multi-byte", name), ("quote-escaped", quotes)] {
+        let branches = (0..REPOS_MAX_BRANCHES)
+            .map(|_| ReposBranch {
+                key: key.clone(),
+                name: branch_name.clone(),
+            })
+            .collect();
+        let request = ReposRequest::new(ReposScope::Uncommitted, "2026-10-24", labels(), branches)
+            .unwrap_or_else(|e| panic!("the {what} maximal request is admitted: {e:?}"));
+        let len = serde_json::to_vec(&request).expect("serialises").len();
+        assert!(
+            len < REPOS_STDIN_MAX_BYTES,
+            "the {what} maximal request is {len} bytes, over the engine's {REPOS_STDIN_MAX_BYTES}"
+        );
+    }
+    assert_eq!(REPOS_STDIN_MAX_BYTES, 256 * 1024);
+}
+
+/// The request reaches the engine on STDIN and the pipe is closed after it; argv is the three fixed
+/// literals and holds no key, token or branch name; the operation's `Debug` holds no path.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repos_request_is_written_to_stdin_and_never_argv() {
+    let scratch = ScratchDir::new("reposstdin");
+    let program = stdin_recorder(&scratch.path, "engine.sh");
+    let client = EngineClient::with_program(program.clone());
+    let request = ReposRequest::new(
+        ReposScope::All,
+        "2026-10-24",
+        vec![repos_label("--help", &["abc1234"]), repos_label("", &["DEADBEEF"])],
+        vec![repos_branch("--help", "-v")],
+    )
+    .expect("valid");
+    let op = Operation::ReposStatus {
+        request: request.clone(),
+    };
+    let shown = format!("{op:?}");
+    assert!(!shown.contains(&scratch.path.display().to_string()), "{shown}");
+    assert!(!shown.contains(&program.display().to_string()), "{shown}");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), client.invoke(op, &NoProgress))
+        .await
+        .expect("the invocation ended — so the stdin pipe was closed")
+        .expect("the fake ran");
+    assert_eq!(outcome.outcome, Outcome::Delivered, "{outcome:?}");
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("stdin")).expect("stdin recorded"),
+        serde_json::to_string(&request).expect("serialises")
+    );
+    let argv = std::fs::read_to_string(scratch.join("argv")).expect("argv recorded");
+    assert_eq!(argv, "repos\nstatus\n--json\n");
+    for operand in ["--help", "-v", "abc1234", "DEADBEEF"] {
+        assert!(!argv.lines().any(|l| l == operand), "{operand} reached argv: {argv}");
+    }
+}
+
+/// ⚠ THE BOUNDS ARE APPLIED, NOT JUST DECLARED, for the provider operations too: one past its
+/// bound is abandoned — its fake killed — and answers `Timeout`, and (all seven being mutating)
+/// the in-flight guard is released. Driven with the harness cap, as the calendar test is.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_operation_past_its_bound_is_stopped_and_answers_timeout() {
+    let _turn = serialise().await;
+    let scratch = ScratchDir::new("provtimeout");
+    let _reap = ReapTagged(scratch.tag());
+    let _ = sleeper(&scratch.path, "unused.sh", 1);
+    let pid_file = scratch.join("pid");
+    let program = fake_sidecar(
+        &scratch.path,
+        "slow.sh",
+        &format!(
+            "[ \"$1\" = warm ] && exit 0\necho $$ > {}\nexec {} 30",
+            sq(&pid_file.display().to_string()),
+            sq(&scratch.join("sleep").display().to_string()),
+        ),
+    );
+    spend_first_exec(&program);
+    let client = EngineClient::with_program(program).with_timeout_cap(Duration::from_millis(2500));
+    let test_op = Operation::ProviderTest {
+        file: config_file_path("/tmp/provider-check-x.json").expect("valid"),
+        index: provider_index(0).expect("valid"),
+        test_timeout_ms: 29 * 60_000,
+    };
+    for (op, key) in [
+        (Operation::KeySet, true),
+        (test_op, false),
+        (Operation::KeyScrubBackup, false),
+    ] {
+        let _ = std::fs::remove_file(&pid_file);
+        let started = std::time::Instant::now();
+        let answer = if key {
+            client
+                .invoke_with_key(
+                    op.clone(),
+                    KeySecret::new("sk-test-0123456789".into()).expect("a key"),
+                    &NoProgress,
+                )
+                .await
+        } else {
+            client.invoke(op.clone(), &NoProgress).await
+        };
+        assert!(
+            matches!(&answer, Err(EngineError::Timeout { operation, .. }) if operation == op.name()),
+            "{op:?} past its bound must answer Timeout, got {answer:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{op:?}: the bound was not applied"
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap_or_else(|e| panic!("{op:?}: the fake never started ({e}) — vacuous"))
+            .trim()
+            .to_string();
+        let mut gone = false;
+        for _ in 0..40 {
+            if process_gone(&pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            gone,
+            "{op:?}: the abandoned fake (pid {pid}) is still running"
+        );
+    }
+}
+
+/// ⚠ `provider test` TAKES ITS PROCESS GROUP WITH IT WHEN IT RETURNS (P2-M4 checkpoint, into P3): a
+/// CLI Test's backgrounded grandchild can outlive the engine. The fake backgrounds a sleeper with
+/// its stdio on `/dev/null` (so the invocation returns while it lives — the
+/// `a_completed_invocation_leaves_what_the_engine_backgrounded_running` shape), answers, exits 0.
+///
+/// Three things are measured, each the precondition of the next: the engine is the LEADER of its
+/// own group (pgid == pid — "verify the engine runs in its own group first"), the grandchild is in
+/// that group, and after a `ProviderTest` returns the grandchild is gone while the engine's exit
+/// status is still the 0 it chose (the kill lands before the reap, on an exiting process). The
+/// control is the same fake under another provider operation, which must leave it running.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_test_takes_its_process_group_with_it_when_it_returns() {
+    let _turn = serialise().await;
+    let scratch = ScratchDir::new("testgroup");
+    let _reap = ReapTagged(scratch.tag());
+    let _ = sleeper(&scratch.path, "unused.sh", 1);
+    let rec = |f: &str| sq(&scratch.join(f).display().to_string());
+    let program = fake_sidecar(
+        &scratch.path,
+        "backgrounding.sh",
+        &format!(
+            "echo $$ > {pid}\nps -o pgid= -p $$ | tr -d ' ' > {pgid}\n\
+             {sleep} 41 >/dev/null 2>&1 </dev/null &\necho $! > {child}\n\
+             printf '%s' {answer}\nexit 0",
+            pid = rec("pid"),
+            pgid = rec("pgid"),
+            sleep = rec("sleep"),
+            child = rec("child.pid"),
+            answer = sq(r#"{"schemaVersion":1,"ok":true,"passed":true,"recorded":true}"#),
+        ),
+    );
+    let client = EngineClient::with_program(program);
+    let read = |f: &str| {
+        std::fs::read_to_string(scratch.join(f))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+
+    // The control first: another provider operation keeps what the engine backgrounded.
+    let kept = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.invoke(Operation::KeyScrubBackup, &NoProgress),
+    )
+    .await
+    .expect("returned within 10 s — the sleeper does not hold the pipes")
+    .expect("the fake ran");
+    assert_eq!(kept.exit_code, Some(0), "{kept:?}");
+    let kept_child = read("child.pid");
+    assert!(
+        kept_child.parse::<u32>().is_ok(),
+        "no background child recorded"
+    );
+    let watch_until = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < watch_until {
+        assert!(
+            !process_gone(&kept_child),
+            "a scrub-backup killed its group on return — only `provider test` may"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Now the Test.
+    let tested = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.invoke(
+            Operation::ProviderTest {
+                file: config_file_path("/tmp/provider-check-1.json").expect("valid"),
+                index: provider_index(0).expect("valid"),
+                test_timeout_ms: 80_000,
+            },
+            &NoProgress,
+        ),
+    )
+    .await
+    .expect("returned within 10 s")
+    .expect("the fake ran");
+    let pid = read("pid");
+    assert_eq!(
+        read("pgid"),
+        pid,
+        "the engine is not the leader of its own process group, so killing \"its group\" would be \
+         killing someone else's"
+    );
+    let child = read("child.pid");
+    assert!(child.parse::<u32>().is_ok(), "no background child recorded");
+    assert_eq!(
+        (tested.outcome.clone(), tested.exit_code),
+        (Outcome::Delivered, Some(0)),
+        "the kill-on-return replaced the engine's own exit status: {tested:?}"
+    );
+    assert_eq!(
+        tested.payload.as_ref().map(|p| p["passed"].clone()),
+        Some(true.into())
+    );
+    let mut gone = false;
+    for _ in 0..40 {
+        if process_gone(&child) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        gone,
+        "the Test's backgrounded grandchild (pid {child}) outlived it"
+    );
+}
+
 /* ── the real sidecar ─────────────────────────────────────────────────────────────────────────── */
 
 fn sandboxed(scratch: &ScratchDir) -> EngineClient {
@@ -956,6 +2968,95 @@ async fn the_read_only_operations_reach_the_real_sidecar() {
     );
 }
 
+/// PR 3: the `provider` verbs that READ BEFORE THEY WRITE, end to end against the real engine in a
+/// sandbox with NO config — so each refuses with `code: "config"` before it locks, stores or probes
+/// anything (`src/providerCli.ts`: the saved config, or `test`'s candidate, is read first).
+///
+/// ⚠ THE DISCRIMINATING CASE IS THE `--help` LABEL. Had the label reached argv, the engine's
+/// dispatch would have printed help (no JSON line at all); had the stdin not been the
+/// `{"label": …}` JSON, or not been closed within the engine's 1 s, the refusal would be
+/// `code: "usage"`. Only a correctly written, correctly closed stdin gets as far as the config.
+///
+/// ⚠ `key set`, `key delete` and `key delete-all` ARE NEVER EXECUTED AGAINST THE REAL ENGINE (Q27:
+/// Keychain tests are fake-only). On macOS their store is the login Keychain; the engine's own
+/// backstop (`DBA_TEST_UNIT_DIR`, set by the sandbox) would refuse the `security` call, but a
+/// backstop is not a licence. They are covered by the fakes above.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_provider_verbs_reach_the_real_sidecar_and_refuse_without_a_config() {
+    let _turn = serialise().await;
+    let scratch = ScratchDir::new("realprov");
+    let client = sandboxed(&scratch);
+    let missing = scratch.join("no-such-candidate.json");
+    let cases = [
+        (
+            Operation::ProviderReset {
+                target: ResetTarget::Label(label("--help").expect("legal")),
+            },
+            "reset: ",
+        ),
+        (
+            Operation::ProviderReset {
+                target: ResetTarget::Label(label("-v").expect("legal")),
+            },
+            "reset: ",
+        ),
+        (
+            Operation::ProviderReset {
+                target: ResetTarget::Index(provider_index(0).expect("valid")),
+            },
+            "reset: ",
+        ),
+        (
+            Operation::KeyMigrate {
+                index: provider_index(0).expect("valid"),
+            },
+            "key migrate: ",
+        ),
+        (
+            Operation::ProviderTest {
+                file: config_file_path(&missing.display().to_string()).expect("valid"),
+                index: provider_index(0).expect("valid"),
+                test_timeout_ms: 80_000,
+            },
+            "test: ",
+        ),
+    ];
+    for (op, verb) in cases {
+        let out = client
+            .invoke(op.clone(), &NoProgress)
+            .await
+            .unwrap_or_else(|e| panic!("{op:?} invokes: {e}"));
+        let payload = out.payload.as_ref().unwrap_or_else(|| {
+            panic!("{op:?}: no JSON line — the engine crashed or printed help: {out:?}")
+        });
+        assert_eq!(payload["schemaVersion"], 1, "{op:?}: {payload}");
+        assert_eq!(payload["ok"], false, "{op:?}: {payload}");
+        assert_eq!(
+            payload["code"], "config",
+            "{op:?}: expected the no-config refusal (a `usage` code means the argv or the stdin \
+             payload was malformed): {payload}"
+        );
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(verb),
+            "{op:?}: {payload}"
+        );
+        assert_eq!(
+            out.outcome,
+            Outcome::ConfigError,
+            "{op:?}: exit 2 is `config`"
+        );
+    }
+    // Nothing was written into the sandbox's config folder by any of them.
+    let config_dir = scratch.join("config");
+    let written: Vec<_> = std::fs::read_dir(&config_dir)
+        .map(|d| d.filter_map(Result::ok).map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(written.is_empty(), "the refusals wrote {written:?}");
+}
+
 /// A non-forced run on a machine with no config: exit 0, no provider, `skipReason: "no-config"`.
 ///
 /// This is the shape that makes running the REAL `run` safe here at all — see the module header.
@@ -969,6 +3070,7 @@ async fn a_run_against_a_sandbox_with_no_config_is_skipped_not_delivered() {
         .invoke(
             Operation::Run {
                 force: false,
+                now: false,
                 json_out: None,
             },
             &NoProgress,
@@ -1003,6 +3105,7 @@ async fn a_forced_run_with_no_config_is_a_config_error() {
         .invoke(
             Operation::Run {
                 force: true,
+                now: false,
                 json_out: None,
             },
             &recorder,
@@ -1064,6 +3167,7 @@ async fn a_forced_run_with_a_malformed_config_is_a_config_error() {
         .invoke(
             Operation::Run {
                 force: true,
+                now: false,
                 json_out: None,
             },
             &recorder,
@@ -1502,6 +3606,7 @@ async fn a_second_mutating_invocation_is_refused_as_busy() {
     let mut first = Box::pin(client.invoke(
         Operation::Run {
             force: false,
+            now: false,
             json_out: None,
         },
         &NoProgress,
@@ -1519,6 +3624,7 @@ async fn a_second_mutating_invocation_is_refused_as_busy() {
         .invoke(
             Operation::Run {
                 force: true,
+                now: false,
                 json_out: None,
             },
             &NoProgress,
@@ -1551,9 +3657,8 @@ async fn a_second_mutating_invocation_is_refused_as_busy() {
     // `Ok` with the fake's own exit 0 means the check really SPAWNED and completed (not merely "was
     // not refused"), and it did so while `first` still holds the guard.
     let checked = reader.invoke(Operation::UpdateCheck, &NoProgress).await;
-    let checked = checked.unwrap_or_else(|e| {
-        panic!("an update check was refused while a run was in flight: {e:?}")
-    });
+    let checked = checked
+        .unwrap_or_else(|e| panic!("an update check was refused while a run was in flight: {e:?}"));
     assert_eq!(
         (checked.operation.as_str(), checked.exit_code),
         ("update-check", Some(0)),
@@ -1567,6 +3672,7 @@ async fn a_second_mutating_invocation_is_refused_as_busy() {
     let mut after = Box::pin(client.invoke(
         Operation::Run {
             force: false,
+            now: false,
             json_out: None,
         },
         &NoProgress,

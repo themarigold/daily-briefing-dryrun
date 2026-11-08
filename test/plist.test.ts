@@ -5,7 +5,7 @@
 // below is the ORIGINAL assertion pointed at it — the same properties, checked against the thing that
 // actually gets installed.
 import { test, expect } from "bun:test";
-import { launchdPlist, type ScheduleOpts } from "../src/schedule/units";
+import { launchdPlist, KEEP_AWAKE_ENV, type ScheduleOpts } from "../src/schedule/units";
 import { parseFloor } from "../src/schedule";
 
 /** Stands in for what `schedule install` computes. Paths are literals, not real ones: these tests are
@@ -19,10 +19,23 @@ const OPTS: ScheduleOpts = {
   pathEnv: "/Users/x/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
 };
 
-test("plist ProgramArguments wraps the binary in /usr/bin/caffeinate -i, in order, keeping <bin> run", () => {
+test("plist ProgramArguments is EXACTLY [<bin>, run] — the whole array, with no wrapper in front", () => {
   const plist = launchdPlist(OPTS);
-  // Assert the FULL ordered argv, so a reorder (e.g. caffeinate after the binary) fails the test.
+  // Anchored on the key and both ends of the array, so a sub-run cannot match: the old wrapped argv
+  // `[/usr/bin/caffeinate, -i, <bin>, run]` CONTAINS `<bin>, run` and would pass an unanchored pattern.
+  // macOS names the job after ProgramArguments[0], which is the whole point of this pin (units.ts).
   expect(plist).toMatch(
-    /<string>\/usr\/bin\/caffeinate<\/string>\s*<string>-i<\/string>\s*<string>\/Users\/x\/Library\/Application Support\/daily-briefing\/daily-briefing<\/string>\s*<string>run<\/string>/,
+    /<key>ProgramArguments<\/key>\s*<array>\s*<string>\/Users\/x\/Library\/Application Support\/daily-briefing\/daily-briefing<\/string>\s*<string>run<\/string>\s*<\/array>/,
   );
+});
+
+test("the plist names no caffeinate anywhere — keep-awake is the engine's job now", () => {
+  expect(launchdPlist(OPTS)).not.toContain("caffeinate");
+});
+
+test("EnvironmentVariables carries DAILY_BRIEFING_KEEP_AWAKE=1, the switch dispatch's run branch reads", () => {
+  expect(KEEP_AWAKE_ENV).toEqual({ name: "DAILY_BRIEFING_KEEP_AWAKE", value: "1" });
+  const env = launchdPlist(OPTS).match(/<key>EnvironmentVariables<\/key><dict>(.*?)<\/dict>/)?.[1] ?? "";
+  expect(env).toContain(`<key>PATH</key><string>${OPTS.pathEnv}</string>`);   // non-vacuity: the dict was found
+  expect(env).toContain("<key>DAILY_BRIEFING_KEEP_AWAKE</key><string>1</string>");
 });

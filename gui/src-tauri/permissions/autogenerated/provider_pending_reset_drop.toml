@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-provider-pending-reset-drop"
+description = "Enables the provider_pending_reset_drop command without any pre-configured scope."
+commands.allow = ["provider_pending_reset_drop"]
+
+[[permission]]
+identifier = "deny-provider-pending-reset-drop"
+description = "Denies the provider_pending_reset_drop command without any pre-configured scope."
+commands.deny = ["provider_pending_reset_drop"]

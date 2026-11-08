@@ -267,6 +267,26 @@ jobs:
             exit 1
           }
           echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+      # v0.3.0 calendar (plan M11): the universal Mac Calendar Reader that tauri.macos.conf.json's
+      # bundle.macOS.files ships in Contents/Resources. reader/build.sh fails unless `lipo -archs` shows arm64
+      # and x86_64, and ad-hoc signs it so it is never unsigned nested code. Tauri never signs a
+      # bundle.macOS.files entry (gui/scripts/nesting-probe.sh), so in SIGNED mode it is re-signed here with the
+      # release identity, the hardened runtime, a secure timestamp and its Calendars entitlement — what
+      # notarization requires of nested code. No id, deliberately: a failure here skips Build, whose `skipped`
+      # outcome the marker reads as build-failed.
+      - name: Calendar Reader (universal)
+        env:
+          SIGNING: ${{ needs.gate.outputs.signing }}
+        run: |
+          set -euo pipefail
+          bash ../reader/build.sh
+          if [ "$SIGNING" = signed ]; then
+            [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ "$APPLE_SIGNING_IDENTITY" != "-" ] || { echo "signed mode, but APPLE_SIGNING_IDENTITY is empty or ad hoc" >&2; exit 1; }
+            codesign --force --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp \
+              --entitlements ../reader/Reader.entitlements --identifier local.daily-briefing.calendar \
+              "../reader/build/Daily Briefing Calendar Reader.app"
+            codesign --verify --strict "../reader/build/Daily Briefing Calendar Reader.app"
+          fi
       # Notarization: parameterized and EMPTY until Apple enrollment. The secrets are mapped only to
       # DBA_NOTARIZE_* names (never the APPLE_* names Tauri reads); ci-tauri-build.sh exports Tauri's
       # variables only from one complete set, and only in signed mode.
@@ -295,6 +315,7 @@ jobs:
           rc=0
           bun ../scripts/check-size-budget.ts "$RUNNER_TEMP/stage/daily-briefing-${GITHUB_REF_NAME#v}-darwin-$ASSET_ARCH.dmg" "$DMG_ROW" || rc=1
           bun ../scripts/check-size-budget.ts "src-tauri/target/$TRIPLE/release/bundle/macos/Daily Briefing.app" "$APP_ROW" || rc=1
+          bun ../scripts/check-size-budget.ts "../reader/build/Daily Briefing Calendar Reader.app" reader-universal-apple-darwin || rc=1
           exit "$rc"
       # Proves the artifact the release will attach: mounted from the STAGED DMG, copied out, and
       # checked as shipped. `codesign -dvv` (verbosity 2: `-dv` prints no Authority= line; it writes to
@@ -346,6 +367,22 @@ jobs:
               printf '%s\n' "$info" | grep -Fxq "Signature=adhoc" || fail "$bin: no 'Signature=adhoc' line (unsigned mode)"
             fi
           done
+          # v0.3.0 calendar (plan M11): the Calendar Reader ships in Resources, universal, validly signed, and
+          # answers through a real FIFO from a copy outside the app (reader/smoke.sh: `status` mode only — no
+          # event store, no dialog).
+          reader="$app/Contents/Resources/Daily Briefing Calendar Reader.app"
+          reader_exe="$reader/Contents/MacOS/Daily Briefing Calendar Reader"
+          [ -x "$reader_exe" ] || fail "the Calendar Reader is missing from Contents/Resources, or not executable"
+          rarchs=" $(lipo -archs "$reader_exe") "
+          case "$rarchs" in *" arm64 "*) ;; *) fail "the Calendar Reader has no arm64 slice ($rarchs)" ;; esac
+          case "$rarchs" in *" x86_64 "*) ;; *) fail "the Calendar Reader has no x86_64 slice ($rarchs)" ;; esac
+          codesign --verify --strict "$reader"
+          if [ "$SIGNING" = signed ]; then
+            codesign -dvv "$reader" 2>&1 | grep -Fxq "Authority=$IDENTITY" || fail "the Calendar Reader: no 'Authority=$IDENTITY' line (signed mode)"
+          fi
+          mkdir -p "$RUNNER_TEMP/reader-smoke"
+          cp -R "$reader" "$RUNNER_TEMP/reader-smoke/"
+          bash ../reader/smoke.sh "$RUNNER_TEMP/reader-smoke/Daily Briefing Calendar Reader.app"
           # Natively, on both legs: each runs on its own architecture (the toolchain step checked the host).
           got="$("$sidecar" --version)"
           [ "$got" = "$version" ] || fail "sidecar --version printed '$got', expected '$version'"

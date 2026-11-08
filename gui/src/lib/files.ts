@@ -17,6 +17,9 @@ import { invoke } from "@tauri-apps/api/core";
 /* ── briefings ────────────────────────────────────────────────────────────────────────────────── */
 
 export interface BriefingFile {
+  /** Opaque identities from the same Rust file read; absent on older engines and Windows. */
+  pageHash?: string;
+  pageVersion?: string;
   /** The engine's path, for display only. */
   path: string;
   /** ⚠ UNTRUSTED git-derived text. Render it through `briefing-md.ts`, never as markup. */
@@ -47,9 +50,16 @@ export interface FieldNote {
   message: string;
 }
 
-/** What `config_read` shows in place of a stored literal `provider.api.apiKey` — `config_save`
- *  restores the stored key when this comes back unchanged (`config_save::REDACTED_API_KEY`). */
+/** What `config_read` shows in place of the value at EVERY `apiKey` slot (item 1's, each `fallbacks` entry's, any
+ *  spelling anywhere — `config_save::redact`). `config_save` restores the stored key when this comes back unchanged
+ *  at the same pointer, under the same entry (by a label no other entry shares), sent to the same `api.kind` and
+ *  endpoint origin; anything else is `apiKeyChanged` (`config_save::restore_api_key`, `REDACTED_API_KEY`). */
 export const REDACTED_API_KEY = "(a literal API key is stored in config.json; Daily Briefing never displays it)";
+
+/** Where the user edits the settings as JSON text: the button on Settings' Advanced page (Redesign D). Every sentence
+ *  that sends the user there uses this phrase — set once here, the leaf every one of them already reaches — so a
+ *  renamed button or page is one edit, not a dozen. */
+export const EDIT_AS_JSON = "Edit settings as JSON on Settings → Advanced";
 
 export interface ConfigDocument {
   /** `status --json`'s `paths.configPath`. */
@@ -122,7 +132,12 @@ function isTagged(e: unknown): e is { kind: string } & Record<string, unknown> {
   return typeof e === "object" && e !== null && typeof (e as { kind?: unknown }).kind === "string";
 }
 
-/** One sentence for any rejection from these commands (or the engine commands). Plain text. */
+/** One sentence for any rejection from these commands (or the engine commands, or the calendar link
+ *  commands — `lib/calendar.ts`'s `CalendarError`, v0.3.0). Plain text.
+ *
+ *  ⚠ A CALENDAR ERROR NEVER CARRIES A LINK'S URL (Rust names the class of a problem, a field's
+ *  POSITION, a path under the state folder or a link id that passed the grammar), so nothing here
+ *  can echo one — and nothing here is handed one to echo. */
 export function describeFailure(e: unknown): string {
   if (e instanceof Error) return e.message;
   if (typeof e === "string") return e;
@@ -137,6 +152,8 @@ export function describeFailure(e: unknown): string {
       return f("detail");
     case "busy":
       return `Another engine operation is already running (${f("running")}), so this one was not started.`;
+    case "timeout":
+      return `The engine's ${f("operation")} did not finish within ${f("seconds")} seconds and was stopped.`;
     case "invalidInput":
       return `${f("field")} ${f("reason")}`;
     case "notFound":
@@ -159,7 +176,7 @@ export function describeFailure(e: unknown): string {
     case "transcriptsChanged":
       return "Not saved: the transcripts setting cannot be changed from this app. Re-enabling transcripts is a maintainer decision.";
     case "apiKeyChanged":
-      return "Not saved: a literal API key cannot be set or changed from this app. Point provider.api.apiKeyFile or provider.api.apiKeyCommand at it instead; removing a stored key is allowed.";
+      return `Not saved: an API key written into config.json cannot be set or changed from this app, cannot move to another provider, to another kind of API, or to another address (host or port), and cannot stay with a provider whose name another provider also uses. A key the saved settings already hold: move it to the app's key store first (the provider's Move this key button), or remove it. A key typed in here: remove it with ${EDIT_AS_JSON} (or discard your changes), then give the provider its key with Replace key. For a provider not saved yet, Replace key is not offered: save it without the key first, or remove it and add it with Add a provider, which takes a pasted key.`;
     case "candidateDir":
       return `Not saved: ${f("detail")}`;
     case "write":
@@ -168,7 +185,59 @@ export function describeFailure(e: unknown): string {
       return `Not saved: the config's backup, ${f("path")}, is ${f("detail")}, not a regular file, so it cannot be replaced. Move it out of the way and save again; the config and that backup are unchanged.`;
     case "unsupported":
       return f("detail");
+    /* v0.3.0 (plan M9): `CalendarError` (`src-tauri/src/calendar.rs`). */
+    case "invalidId":
+      // From a link write the reason is the bare refusal ("is empty"); from a block save it names the
+      // field's position ("calendar.links[2].id is missing or not text").
+      return f("reason").startsWith("calendar.")
+        ? `Not saved: ${f("reason")}.`
+        : `Not saved: the link's short name ${f("reason")}.`;
+    case "invalidUrl":
+      return `Not saved: the calendar link ${f("reason")}. Nothing was written.`;
+    case "invalidBlock":
+      return `Not saved: ${f("reason")}.`;
+    case "duplicateId":
+      return `Not saved: two calendar links are both called "${f("id")}".`;
+    case "urlInConfig":
+      return `Not saved: ${f("field")} looks like a calendar link. A link's address is a secret and is never stored in the config — paste it into the link field instead.`;
+    case "tooManyLinks":
+      return `Not saved: at most ${f("limit")} calendar links can be connected.`;
+    case "linkFolder":
+      return `The calendar links folder could not be used: ${f("path")} ${f("detail")}. Nothing was changed.`;
+    case "linkFile":
+      return `${f("path")} ${f("detail")}.`;
+    case "config":
+      return describeFailure(e["error"]);
+    case "configInvalid": {
+      const notes = Array.isArray(e["errors"]) ? (e["errors"] as FieldNote[]) : [];
+      const listed = notes.map((n) => (n.field !== "" ? `${n.field}: ${n.message}` : n.message)).join("; ");
+      return `The link was not replaced: the engine refused the config${listed !== "" ? ` (${listed})` : ""}. The old link and its confirmed address still stand.`;
+    }
+    case "writeAfterConfirmationCleared":
+      return `The link was not replaced: ${describeFailure(e["error"])} Its confirmed address was already removed from the settings, so confirm it again after the link is saved.`;
+    case "configAfterRemoval":
+      return `The link file was ${f("removed") === "removed" ? "removed" : "already gone"}, but its entry is still in the config: ${describeFailure(e["error"])}`;
     default:
       return JSON.stringify(e);
   }
+}
+
+/** Post-cap (R5-M3, pre-existing on main): the Settings screen's words for a save it sent that was refused. A conflict
+ *  (the file changed after it was loaded) says what that screen offers — with an unsaved edit on screen (`editing`),
+ *  the save bar's Discard, which loads the file; with none, the file is loaded again at once (`reload`: the screen owes
+ *  the reload, `owedReloadRuns`). Every other refusal, and every other caller (the wizard re-reads by itself, the
+ *  Calendar panel has no bar), keeps `describeFailure`'s words.
+ *
+ *  Final small fix (the LOWs): an Add's or a Replace's Save (`flow`, pending) on a clean draft says what works — Save
+ *  again, which tests the provider on the file first (its draft changed, `addSaveDecision`), then Save once more (tiny
+ *  fix, delta L1: the first Save only tests) — not "make the change again"; and `loaded` is the line once the owed
+ *  reload has drawn the file, which the screen shows in place of a conflict line still pointing at Discard. */
+export function settingsSaveRefusal(e: unknown, on: { editing: boolean; flow: boolean }): { line: string; reload: boolean; loaded: string } {
+  if (!isTagged(e) || e.kind !== "conflict") {
+    const line = describeFailure(e);
+    return { line, reload: false, loaded: line };
+  }
+  const changed = `Not saved: ${String(e["path"] ?? "")} changed on disk after it was loaded.`;
+  const loaded = `${changed} It is loaded again now: ${on.flow ? "Save again: it tests the provider first, then Save once more." : "make the change again."}`;
+  return { line: on.editing ? `${changed} Discard to load it, then make the change again.` : loaded, reload: true, loaded };
 }

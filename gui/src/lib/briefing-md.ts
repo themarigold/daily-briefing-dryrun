@@ -30,7 +30,15 @@
  * ⚠ LINE SHAPES ARE THE ENGINE'S, and they are a closed set (`renderBriefing` is the only producer).
  * Each line is classified by its fixed prefix; an unknown line — an older archive, a hand edit —
  * degrades to a `text` block, never to an error and never to markup.
+ *
+ * ⚠ ONE SHAPE IS SECTION-BOUNDED, NOT PREFIX-ONLY: the calendar section (v0.3.0, spec r4 §7). From a
+ * line matching `isCalendarHeading` (with or without ` (incomplete)`) to the next `▶ ` heading, a line
+ * starting with `CALENDAR_LINE_PREFIX` is a `calendar` block — the engine audit's own boundary rule
+ * (spec §10). Outside that section the same prefix is not special, so a page with no calendar
+ * section classifies exactly as it did before. A calendar line is PLAIN TEXT, with no inline forms:
+ * its words are event titles and locations other people wrote (`renderStruct` draws them the same way).
  */
+import { CALENDAR_LINE_PREFIX, isCalendarHeading } from "./calendar-contract";
 
 export type SpanKind = "text" | "strong" | "code" | "sha" | "link";
 
@@ -42,6 +50,7 @@ export interface Span {
 }
 
 export type BlockKind =
+  | "notice" // ℹ︎ Skipped "…": … — used "…" — a provider-walk line ABOVE the title (provider fallback)
   | "title" // ☀️  Daily briefing — <date>  (this machine: …)
   | "outage" // ⚠️  No briefing for N days — …
   | "legend" // (labels: … are areas of repo …)
@@ -54,6 +63,7 @@ export type BlockKind =
   | "why" // — you wrote: "…"
   | "placeholder" // (nothing in progress) / (none) / (no commits in the window)
   | "warnings" // ⚠ a; b
+  | "calendar" // ◦ a line inside the ▶ Today's calendar section (v0.3.0) — an event or a source's status
   | "footer" // — generated via <provider>  (archives before 0.2.0: — generated locally via <provider>)
   | "text"; // any other line
 
@@ -77,6 +87,9 @@ const NESTED = "      ◦ ";
  *  group's member under a campaign, the third level. Classified before the fallbacks; an archived
  *  two-level page carries no such line, so its classification is unchanged. Pinned against `src/`. */
 export const NESTED2 = "         ▪ ";
+/** `src/failover.ts`, `NOTICE_PREFIX` (U+2139 U+FE0E, a space): every line above the title the provider walk writes
+ *  (provider fallback, P1-M9-T4). Pinned against the engine's constant in tests-web/briefing.check.ts. */
+export const NOTICE_PREFIX = "ℹ\uFE0E ";
 const HEADING = "▶ ";
 const INDENT = "   ";
 const PLACEHOLDERS = new Set(["(nothing in progress)", "(none)", "(no commits in the window)"]);
@@ -181,6 +194,7 @@ export function inlineSpans(src: string): Span[] {
 /** Classify one line by its fixed prefix; return the kind and the text after the prefix. */
 export function classifyLine(line: string): { kind: BlockKind; text: string } | null {
   if (line.trim() === "") return null;
+  if (line.startsWith(NOTICE_PREFIX)) return { kind: "notice", text: line };
   if (TITLE.test(line)) return { kind: "title", text: line };
   if (line.startsWith("⚠️  No briefing for")) return { kind: "outage", text: line };
   if (line.startsWith(HEADING)) return { kind: "heading", text: line.slice(HEADING.length) };
@@ -204,8 +218,15 @@ export function classifyLine(line: string): { kind: BlockKind; text: string } | 
 /** A briefing's markdown → blocks. Pure. */
 export function renderMarkdown(markdown: string): Block[] {
   const blocks: Block[] = [];
+  /** Inside the calendar section: from its heading to the next `▶ ` heading (see the header). */
+  let inCalendar = false;
   for (const raw of markdown.split("\n")) {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    if (line.startsWith(HEADING)) inCalendar = isCalendarHeading(line);
+    if (inCalendar && line.startsWith(CALENDAR_LINE_PREFIX)) {
+      blocks.push({ kind: "calendar", spans: [{ kind: "text", text: line.slice(CALENDAR_LINE_PREFIX.length) }] });
+      continue;
+    }
     const classified = classifyLine(line);
     if (classified === null) continue;
     blocks.push({ kind: classified.kind, spans: inlineSpans(classified.text) });

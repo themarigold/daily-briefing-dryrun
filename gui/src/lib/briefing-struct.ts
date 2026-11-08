@@ -23,8 +23,29 @@
  * ⚠ AND IT RE-APPLIES THE ENGINE'S SANITISER (`stripControl`, `src/render.ts`) to every line,
  * as `docs/gui-seam.md` §5 requires of a new render surface. The struct is the RAW pipeline value:
  * the engine strips control bytes only when it renders.
+ *
+ * ⚠ THE CALENDAR SECTION (v0.3.0, plan M9) IS CHECKED AGAINST A FROZEN FIXTURE, NOT AGAINST
+ * `renderBriefing`: the engine's renderer gains the section in W1's M4, and both it and this mirror
+ * must reproduce M0's `test/fixtures/calendar/rendered-section.txt` byte for byte
+ * (`tests-web/calendar.check.ts` reads that file from the engine's test folder). Its times are in this
+ * machine's LOCAL zone, as the engine's are, so those tests run in UTC.
  */
 import type { Block, BlockKind } from "./briefing-md";
+import {
+  CALENDAR_HEADING,
+  CALENDAR_INCOMPLETE_SUFFIX,
+  CALENDAR_LINE_PREFIX,
+  CALENDAR_MACOS_LABEL,
+  CALENDAR_MAX_EVENT_LINES,
+  CALENDAR_NO_EVENTS_TEXT,
+  CALENDAR_NOT_CONNECTED_TEXT,
+  CALENDAR_STATUS_TEXT,
+  CALENDAR_UNAVAILABLE_TEXT,
+  CALENDAR_UNTITLED_TEXT,
+  calendarClockChangeMark,
+  type CalendarStruct,
+  type CalendarStructEvent,
+} from "./calendar-contract";
 
 /** `src/types.ts`, `BriefingStruct` — the fields this renderer reads (the engine's type is the source). */
 export interface BriefingStruct {
@@ -50,6 +71,12 @@ export interface BriefingStruct {
     notShown: { label: string; sha: string; subject: string }[];
   };
   whys?: Record<string, string>;
+  /** v0.3.0 (spec r4 §7): present only when calendar is on. Rendered after "Today so far", before
+   *  "Suggested next" — `calendarSectionLines`. */
+  calendar?: CalendarStruct;
+  /** Provider fallback (P1-M9-T4): the walk's lines above the title — present only for a combined list of two or
+   *  more, each starting `NOTICE_PREFIX`. Rendered first, as `notice` blocks, as the engine's file does. */
+  notices?: string[];
 }
 
 /** `src/render.ts`, `LEGEND_LABEL_CAP`. */
@@ -159,11 +186,127 @@ export function collapseWindowMerges(
   return out;
 }
 
+/* ── the calendar section (v0.3.0, plan M9; spec r4 §7) ──────────────────────────────────────── */
+//
+// The layout rules are M0's (`test/fixtures/calendar/contract.ts`, its header); the frozen text file
+// wins on any doubt. Times are HH:MM in this machine's LOCAL zone; "today" is the struct's `date`.
+
+const pad2 = (n: number): string => String(n).padStart(2, "0");
+
+/** `YYYY-MM-DD` of an instant in the local zone. (Exported for Settings → Calendar, which shows a
+ *  source's last read the way the section shows a time.) */
+export function localDateOf(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** `HH:MM` of an instant in the local zone. */
+export function hm(ms: number): string {
+  const d = new Date(ms);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** `date` shifted by whole days — zone-free arithmetic on the calendar date itself. */
+function shiftDate(date: string, days: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (m === null) return date;
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + days)).toISOString().slice(0, 10);
+}
+
+/** The local instant the day AFTER `date` begins (DST-safe: built from the date, not by adding 24 h). */
+function nextLocalMidnight(date: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (m === null) return Number.NaN;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + 1, 0, 0, 0, 0).getTime();
+}
+
+/** `Oct 12` — the English three-letter month and the day without a leading zero. */
+export function monthDay(date: string): string {
+  return `${MONTHS[Number(date.slice(5, 7)) - 1] ?? "?"} ${Number(date.slice(8, 10))}`;
+}
+
+/** A timed event's span (rule 6, "timed"). */
+function timedSpan(startMs: number, endMs: number, today: string): string {
+  const startDate = localDateOf(startMs);
+  const startToday = startDate === today;
+  const start = startToday
+    ? hm(startMs)
+    : startDate === shiftDate(today, -1)
+      ? "since yesterday"
+      : startDate < today
+        ? `since ${monthDay(startDate)}`
+        : `${monthDay(startDate)} ${hm(startMs)}`;
+  if (endMs === startMs) return start;
+  const endDate = localDateOf(endMs);
+  let end: string;
+  let endsToday = false;
+  if (endMs === nextLocalMidnight(today)) {
+    end = "24:00";
+    endsToday = true;
+  } else if (endDate === today) {
+    end = hm(endMs);
+    endsToday = true;
+  } else if (endDate === shiftDate(today, 1)) {
+    end = `${hm(endMs)} tomorrow`;
+  } else {
+    end = `${monthDay(endDate)} ${hm(endMs)}`;
+  }
+  // Final harden r3: a span across a DST change carries the engine's mark (never a backwards `01:45–01:15`).
+  return `${startToday && endsToday ? `${start}–${end}` : `${start} → ${end}`}${calendarClockChangeMark(startMs, endMs)}`;
+}
+
+/** One event line, without the prefix (rule 6). */
+function calendarEventText(e: CalendarStructEvent, today: string): string {
+  const title = e.title.trim() === "" ? CALENDAR_UNTITLED_TEXT : e.title;
+  const what = `${title}${e.location !== undefined && e.location.trim() !== "" ? ` (${e.location})` : ""}`;
+  // The decided merge mark first (spec 2026-10-31 §6), then tentative, then ended — the engine's `calEventLine` order.
+  const merged = e.merged === undefined ? "" : e.merged.mark === "calendars" ? ` · on ${e.merged.count} calendars` : ` · ${e.merged.count} copies`;
+  const marks = `${merged}${e.status === "tentative" ? " · tentative" : ""}${e.ended === true ? " · ended" : ""}`;
+  switch (e.time.kind) {
+    case "allDay":
+      return `all day — ${what}${marks}`;
+    case "unclear":
+      return `time unclear (${e.time.wallStart}–${e.time.wallEnd} ${e.time.tzid})  ${what}${marks}`;
+    case "timed":
+      return `${timedSpan(e.time.startMs, e.time.endMs, today)}  ${what}${marks}`;
+  }
+}
+
+/**
+ * The calendar section's lines, heading first, EXACTLY as the engine renders them (M0's frozen
+ * fixture): the heading (` (incomplete)` when `incomplete`); "No calendar is connected" alone when
+ * there are no sources at all; "Calendar unavailable today" when no source was read even in part
+ * (then only the status lines); one status line per source that is not `ok`, in `sources` order
+ * (notices render nothing); the events in struct order, at most `CALENDAR_MAX_EVENT_LINES`, then
+ * `+N more`; or "No events today". Every line control-stripped.
+ */
+export function calendarSectionLines(date: string, cal: CalendarStruct): string[] {
+  const out = [`${CALENDAR_HEADING}${cal.incomplete ? CALENDAR_INCOMPLETE_SUFFIX : ""}`];
+  const line = (text: string) => out.push(`${CALENDAR_LINE_PREFIX}${text}`);
+  if (cal.sources.length === 0) {
+    line(CALENDAR_NOT_CONNECTED_TEXT);
+    return out.map(stripControl);
+  }
+  const allFailed = !cal.sources.some((s) => s.status === "ok" || s.status === "incomplete");
+  if (allFailed) line(CALENDAR_UNAVAILABLE_TEXT);
+  for (const s of cal.sources) {
+    if (s.status === "ok") continue;
+    line(`${s.kind === "macos" ? CALENDAR_MACOS_LABEL : s.id}: ${CALENDAR_STATUS_TEXT[s.status]}`);
+  }
+  if (allFailed) return out.map(stripControl);
+  const shown = cal.events.slice(0, CALENDAR_MAX_EVENT_LINES);
+  for (const e of shown) line(calendarEventText(e, date));
+  if (cal.events.length > shown.length) line(`+${cal.events.length - shown.length} more`);
+  if (cal.events.length === 0) line(CALENDAR_NO_EVENTS_TEXT);
+  return out.map(stripControl);
+}
+
 export function renderStruct(b: BriefingStruct): Block[] {
   const out: Block[] = [];
   const push = (kind: BlockKind, text: string) =>
     out.push({ kind, spans: [{ kind: "text", text: stripControl(text) }] });
 
+  for (const n of b.notices ?? []) push("notice", n);
   push("title", `☀️  Daily briefing — ${b.date}  (this machine: ${b.machineScope})`);
   if (b.outage) {
     const n = b.outage.missedDays;
@@ -279,6 +422,14 @@ export function renderStruct(b: BriefingStruct): Block[] {
   if (b.today?.length) {
     push("heading", "Today so far");
     for (const t of b.today) push("bullet", `[${t.repo}] ${t.text}`);
+  }
+
+  // v0.3.0 (spec r4 §7): after "Today so far", before "Suggested next" — the heading as a `heading`
+  // block, every other line as a `calendar` block, as `briefing-md.ts` classifies the file.
+  if (b.calendar !== undefined) {
+    const [heading = CALENDAR_HEADING, ...lines] = calendarSectionLines(b.date, b.calendar);
+    push("heading", heading.slice("▶ ".length));
+    for (const l of lines) push("calendar", l.slice(CALENDAR_LINE_PREFIX.length));
   }
 
   push("heading", "Suggested next");

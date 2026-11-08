@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "enabledSet": true,
+  "macSupported": true,
+  "configWarnings": [],
+  "sources": [
+    {
+      "id": "macos",
+      "kind": "macos",
+      "lastScheduledRead": {
+        "at": "2026-10-14T07:21:09.000Z",
+        "status": "ok",
+        "notices": [
+          "helper-outdated"
+        ]
+      }
+    },
+    {
+      "id": "home",
+      "kind": "link",
+      "name": "Home (Google)",
+      "lastScheduledRead": {
+        "at": "2026-10-14T07:21:09.000Z",
+        "status": "ok"
+      }
+    },
+    {
+      "id": "work",
+      "kind": "link",
+      "name": "Work (Outlook)",
+      "lastScheduledRead": {
+        "at": "2026-10-14T07:21:09.000Z",
+        "status": "link-refused",
+        "reason": "http-refused"
+      }
+    },
+    {
+      "id": "team",
+      "kind": "link",
+      "lastScheduledRead": null
+    }
+  ]
+}

@@ -8,7 +8,9 @@
 //! the app watched happen, or a failure the engine recorded today — or merely the state the world
 //! was already in. The distinction is a TRANSITION: the first snapshot after startup is absorbed as
 //! the baseline and never fires, because a briefing that was already delivered when the app opened
-//! is not an event, it is furniture.
+//! is not an event, it is furniture. The one exception (provider fallback, requirement 11): TODAY's
+//! FAILED or OUT-OF-USAGE record with no persisted firing fires even at start, and the per-day
+//! dedupe survives restarts through `notified-dates.json` ([`Observation`]'s docs).
 //!
 //! ## The classes, and the never-notify rule
 //!
@@ -17,7 +19,7 @@
 //!     differing from the baseline the machine holds). Title carries the date; the body is the
 //!     briefing's first resume line; the click route is Today.
 //!   * **FAILED** — today's skip record says the engine TRIED and failed: `provider-fail` (after
-//!     the engine's own retries), `parse-empty`, `marker-fail`, `crashed`. The body is the engine's
+//!     the engine's own retries), `parse-empty`, `marker-fail`, `write-fail`, `crashed`. The body is the engine's
 //!     literal error line (the skip record's `detail` — the engine redacts its own diagnostics
 //!     since PR #496, so it is relayed without app-side redaction; control characters are still
 //!     stripped, §5's sanitization boundary, which is not redaction). Click route: the Schedule
@@ -32,13 +34,18 @@
 //!   * **NEVER for a legitimate skip.** [`skip_notify_class`] enumerates the ENGINE's whole
 //!     `SKIP_REASONS` vocabulary (pinned against `src/json.ts` by
 //!     `the_skip_vocabulary_matches_the_engine`) and maps `already-ran`, `below-floor`, `offline`,
-//!     `darkwake`, `concurrent`, `limited`, `no-config` and `config-error` to SILENCE — notifying
-//!     on normal behaviour trains the user to ignore the app, and the standing conditions among
-//!     them (`no-config`, `config-error`) are what the tray line and the window already say all
-//!     day. An UNKNOWN reason is silence too (the additive rule: a reason this build has never
+//!     `darkwake`, `concurrent`, a plain `limited`, `no-config` and `config-error` to SILENCE —
+//!     notifying on normal behaviour trains the user to ignore the app, and the standing
+//!     conditions among them (`no-config`, `config-error`) are what the tray line and the window
+//!     already say all day. An UNKNOWN reason is silence too (the additive rule: a reason this build has never
 //!     heard of must not surprise anyone; the Schedule screen still renders it). The appendix's
 //!     "quiet-day" is not a member — the engine emits no such skip; a quiet day is a DELIVERED
 //!     briefing (`(no commits in the window)`) and notifies as one.
+//!   * **OUT-OF-USAGE** — a `limited` skip whose record carries the engine's `allOutOfUsage: true`
+//!     (provider fallback, spec r9 §5, requirement 11): every provider is out of usage, so no
+//!     briefing can arrive until a limit resets. Title "No briefing yet today"; the body is the
+//!     skip `detail`'s FIRST line, which the engine writes as the notification text (naming a
+//!     reset time only when it parsed one); click route: Today. Once per day, like the others.
 //!
 //! ## Notify ownership — the resolved-capability rule (plan T18, R1)
 //!
@@ -89,18 +96,21 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::briefing_files::read_text_capped;
-use crate::schedule_state::{Phase, SkipReason, StatusView};
+use crate::schedule_state::{LastSkip, Phase, SkipReason, StatusView};
 use crate::watcher::Snapshot;
 
 /* ── the classes ──────────────────────────────────────────────────────────────────────────────── */
 
-/// The three notification classes T18 ships. A CLOSED set: anything else is silence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+/// The notification classes: T18's three, plus provider fallback's `OutOfUsage` (spec r9 §5).
+/// A CLOSED set: anything else is silence. `Deserialize` is what keys `notified-dates.json`'s read
+/// ([`read_notified_dates`]): the derived spelling, so no hand-kept list of variants can miss one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NotifyClass {
     Delivered,
     Failed,
     Blocked,
+    OutOfUsage,
 }
 
 impl NotifyClass {
@@ -113,7 +123,7 @@ impl NotifyClass {
     /// header), so today it documents intent and serves the recording sink's assertions.
     pub fn route(self) -> &'static str {
         match self {
-            NotifyClass::Delivered => "today",
+            NotifyClass::Delivered | NotifyClass::OutOfUsage => "today",
             NotifyClass::Failed | NotifyClass::Blocked => "schedule",
         }
     }
@@ -124,11 +134,12 @@ impl NotifyClass {
             NotifyClass::Delivered => "delivered",
             NotifyClass::Failed => "failed",
             NotifyClass::Blocked => "blocked",
+            NotifyClass::OutOfUsage => "out-of-usage",
         }
     }
 }
 
-/// Which notification class a skip reason belongs to, or `None` for silence.
+/// Which notification class a skip record belongs to, or `None` for silence.
 ///
 /// ⚠ EXHAUSTIVE OVER THE CLOSED VOCABULARY, NO WILDCARD ARM except the typed `Unknown` — so a
 /// `SkipReason` variant added tomorrow is a COMPILE error here, forcing the notify decision to be
@@ -137,23 +148,37 @@ impl NotifyClass {
 ///   * `already-ran`, `below-floor` — the ordinary day, ~17 hours of it.
 ///   * `offline`, `darkwake` — the machine's own mornings; the next tick retries.
 ///   * `concurrent` — another run holds the lock (a manual run raced the tick); transient.
-///   * `limited` — every account at its usage limit; the engine keeps trying and may deliver when
-///     the limit resets, and the Today screen carries the engine's own `detail` line with the
-///     reset time where one is honest. A 07:20 banner would be noise about a state that may
-///     resolve itself by 09:00.
+///   * a PLAIN `limited` (no `allOutOfUsage`) — an older engine's `limited`, which never carries
+///     the field and includes the "the next tick will use another account" case: not out of
+///     usage, and a state that resolves itself, so a banner would be noise. Without the field the
+///     app cannot tell that case from a real wall, so a plain `limited` stays silent and a new app
+///     beside an older engine behaves as before (spec r9 §5). The Today screen still carries the
+///     engine's own `detail` line, with the reset time where one is honest.
 ///   * `no-config`, `config-error` — STANDING conditions, rewritten by every tick (144/day): the
 ///     tray line and the Schedule screen show them all day, and a daily banner for a state that
 ///     does not change trains the user to swipe it away.
 ///   * `Unknown(_)` — the additive rule: an engine newer than this app must not surprise the user
 ///     with a banner this build has no wording for. Silence, and the Schedule screen still shows
 ///     the raw reason.
-pub fn skip_notify_class(reason: &SkipReason) -> Option<NotifyClass> {
+///
+/// The one record-dependent row: a `limited` skip carrying `allOutOfUsage: true` (step 7 row 1,
+/// spec r9 §5 — EVERY provider is out of usage) is [`NotifyClass::OutOfUsage`] (requirement 11,
+/// user decision 2026-10-16). That is not a self-resolving blip: no briefing can arrive until a
+/// limit resets, possibly hours later, so the user hears once a day — the per-(class, date)
+/// dedupe — while the engine keeps skipping quietly and delivers when one resets. That is why
+/// this takes the skip RECORD and not only its [`SkipReason`].
+pub fn skip_notify_class(skip: &LastSkip) -> Option<NotifyClass> {
+    // ⚠ Spelled `match reason {` on purpose: the engine's `test/last-failure.test.ts` (round 3 L14)
+    // reads this function as text and pins its FAILED arm against `FAILURE_SKIP_REASONS`.
+    let reason = &SkipReason::parse(&skip.reason);
     match reason {
         SkipReason::ProviderFail
         | SkipReason::ParseEmpty
         | SkipReason::MarkerFail
+        | SkipReason::WriteFail
         | SkipReason::Crashed => Some(NotifyClass::Failed),
         SkipReason::Blocked => Some(NotifyClass::Blocked),
+        SkipReason::Limited if skip.all_out_of_usage => Some(NotifyClass::OutOfUsage),
         SkipReason::AlreadyRan
         | SkipReason::BelowFloor
         | SkipReason::NoConfig
@@ -438,14 +463,22 @@ pub struct Facts {
     /// The RAW `last-skip` record's dedupe key — (class, localDate) for a notifiable reason —
     /// independent of the derived phase, for the same priming reason as
     /// [`Facts::last_run_date`]: `Phase::Skipped` is shadowed by the same scheduler-trouble
-    /// phases, so a primer must absorb the record the payload actually carries. Any date is
-    /// absorbed as-is: an old record's key can never block a new day's firing (the dedupe is per
-    /// date), and today's key is exactly the stale banner this exists to swallow.
+    /// phases, so a primer must absorb the record the payload actually carries. An earlier date
+    /// is absorbed as-is (an old record's key can never block a new day's firing — the dedupe is
+    /// per date), and so is today's for BLOCKED; today's FAILED / `OutOfUsage` key is NOT
+    /// absorbed ([`Facts::today`], requirement 11 — see [`Observation`]).
     pub raw_skip_key: Option<(NotifyClass, String)>,
     /// `paths.configPath` / `paths.latestBriefingPath`, for the ownership predicate and the
     /// DELIVERED body.
     pub config_path: Option<String>,
     pub briefing_path: Option<String>,
+    /// The APP's local date when this snapshot was observed — `on_snapshot`'s clock, not part of
+    /// the snapshot (which carries no date of its own), so [`facts_of`] leaves it `None`. It
+    /// decides one thing: which raw skip key is TODAY's, because FAILED and `OutOfUsage` escape
+    /// start-up absorption for today's local date only ([`Observation`], spec r9 §5 requirement
+    /// 11). `None` (no clock, or no local conversion) calls nothing today, so everything absorbs
+    /// as it did before.
+    pub today: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,7 +518,7 @@ pub fn facts_of(snapshot: &Snapshot) -> Facts {
     // field docs). The watcher copies `last_skip` straight off the status payload.
     if let Some(skip) = &snapshot.last_skip {
         if !skip.local_date.is_empty() {
-            if let Some(class) = skip_notify_class(&SkipReason::parse(&skip.reason)) {
+            if let Some(class) = skip_notify_class(skip) {
                 facts.raw_skip_key = Some((class, skip.local_date.clone()));
             }
         }
@@ -498,12 +531,14 @@ pub fn facts_of(snapshot: &Snapshot) -> Facts {
             facts.delivered_date = status.and_then(|s| s.last_run_date);
         }
         Phase::Skipped { reason, detail, .. } => {
-            if let Some(class) = skip_notify_class(reason) {
-                // `Phase::Skipped` is derived from TODAY's record, so the record is present and
-                // its `localDate` is the skip's day; a snapshot that somehow lacks it has no
-                // honest dedupe key, and silence beats a key invented here.
-                if let Some(skip) = &snapshot.last_skip {
-                    if !skip.local_date.is_empty() {
+            // `Phase::Skipped` is derived from TODAY's record — this same `snapshot.last_skip`
+            // (`Snapshot::assemble` hands it to `derive`) — so the record is present and its
+            // `localDate` is the skip's day; a snapshot that somehow lacks it has no honest dedupe
+            // key, and silence beats a key invented here. The class reads the RECORD, not only
+            // the phase's reason: its `allOutOfUsage` decides a `limited` skip (spec r9 §5).
+            if let Some(skip) = &snapshot.last_skip {
+                if !skip.local_date.is_empty() {
+                    if let Some(class) = skip_notify_class(skip) {
                         facts.skip = Some(SkipFact {
                             class,
                             date: skip.local_date.clone(),
@@ -518,6 +553,15 @@ pub fn facts_of(snapshot: &Snapshot) -> Facts {
     }
     facts
 }
+
+/// The `OutOfUsage` body when the skip carries no usable first `detail` line (no engine writes
+/// that, but the record's `detail` is optional): EXACTLY the engine's `outOfUsageLine`
+/// (`src/failover.ts`) with no reset time — pinned against that file by
+/// `the_out_of_usage_fallback_is_the_engines_line_without_a_time`. Never "failed", never a time
+/// the app made up.
+pub const OUT_OF_USAGE_FALLBACK_BODY: &str =
+    "No briefing yet today — every provider is out of usage. \
+It will arrive once one resets, if your Mac is awake.";
 
 /// One decision to notify. What the machine emits and the gates then admit or suppress.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,8 +636,30 @@ impl Firing {
 ///
 /// ⚠ THE DEDUPE KEY IS THE DATE, PER CLASS. A watcher double-fire, five rapid events, a re-derive,
 /// a `--force` regenerate later the same day — all map to a (class, date) the map already holds
-/// and stay silent. In-memory only, deliberately: across a restart the first snapshot is absorbed,
-/// which covers the same ground without a file.
+/// and stay silent.
+///
+/// ⚠ ONCE A DAY ACROSS RESTARTS, AND TWO CLASSES ESCAPE START-UP ABSORPTION (P3-M5-T2, spec r9 §5,
+/// requirement 11: "one notification per state per day … including across app restarts and when
+/// the app opens after the state began"). Absorption alone could miss a day (the app opens after
+/// the day's first all-out tick and absorbs it) and double-fire (a quiet `offline` skip overwrites
+/// the record, the app restarts, the next all-out tick fires again). So:
+///
+///   * the map is SEEDED at start from `notified-dates.json` ([`Observation::seed`], read by
+///     [`on_snapshot`]) and written back at every firing — a persisted date blocks that class
+///     for that date whatever happened in between; at priming a persisted date LATER than
+///     [`Facts::today`] is discarded (a clock or time zone that moved backwards — P3-M5 checkpoint
+///     L2), then the LATER of the persisted and the absorbed date wins per class;
+///   * FAILED and `OutOfUsage` are NOT absorbed when the raw record is dated TODAY
+///     ([`Facts::today`]): the first observed record for today with no persisted firing fires —
+///     at the primer itself when its phase says `Skipped`, or once a shadowed phase surfaces —
+///     so the mixed state (out of usage plus paused after failures, which the engine reports as a
+///     FAILED skip) cannot be missed by opening the app late. An EARLIER day's record is absorbed
+///     as before, and DELIVERED and BLOCKED keep today's absorption: a briefing or a block that
+///     predates the app is furniture, and the Today/Schedule screens already say so.
+///
+/// Without the file (missing, garbage, unwritable) the map is the in-memory one it always was. The
+/// accepted one-time residual (spec): on the first launch of an app with this rule there is no file
+/// yet, so a FAILED the previous app version already announced that day can fire once more.
 ///
 /// ⚠ THE BRIEFING BASELINE MOVES ONLY AT ABSORPTION AND AT A DELIVERED FIRING. The engine's stamp
 /// and its briefing write can land in TWO batches (>1 s apart — `watcher.rs`'s measured rates), so
@@ -605,11 +671,64 @@ impl Firing {
 pub struct Observation {
     primed: bool,
     baseline_mtime: Option<String>,
-    /// The last date each class fired (or was absorbed) for.
+    /// The last date each class fired (or was absorbed) for — what `notified-dates.json` holds.
     fired: BTreeMap<NotifyClass, String>,
+    /// Whether [`Observation::seed`] has run (once, at start, before the first observation).
+    seeded: bool,
+}
+
+/// The classes exempt from start-up absorption for TODAY's date (requirement 11). DELIVERED and
+/// BLOCKED are absent on purpose: see the [`Observation`] docs.
+fn escapes_todays_absorption(class: NotifyClass) -> bool {
+    matches!(class, NotifyClass::Failed | NotifyClass::OutOfUsage)
 }
 
 impl Observation {
+    /// Merge the persisted dates in — the later date wins per class (`YYYY-MM-DD` strings order as
+    /// dates). Called once, at start; marks the machine seeded even for an empty map. A seeded
+    /// date LATER than the primer's [`Facts::today`] is discarded at priming ([`Self::observe`]).
+    pub fn seed(&mut self, persisted: BTreeMap<NotifyClass, String>) {
+        for (class, date) in persisted {
+            self.insert_later(class, &date);
+        }
+        self.seeded = true;
+    }
+
+    pub fn is_seeded(&self) -> bool {
+        self.seeded
+    }
+
+    /// The dedupe map as it stands — what [`on_snapshot`] persists after a firing.
+    pub fn fired(&self) -> &BTreeMap<NotifyClass, String> {
+        &self.fired
+    }
+
+    fn insert_later(&mut self, class: NotifyClass, date: &str) {
+        let later = self
+            .fired
+            .get(&class)
+            .is_none_or(|held| date > held.as_str());
+        if later {
+            self.fired.insert(class, date.to_string());
+        }
+    }
+
+    /// The skip half of a firing decision: today's notifiable skip, unless its (class, date) is
+    /// already held.
+    fn fire_skip(&mut self, facts: &Facts, out: &mut Vec<Firing>) {
+        if let Some(skip) = &facts.skip {
+            if self.fired.get(&skip.class) != Some(&skip.date) {
+                self.fired.insert(skip.class, skip.date.clone());
+                out.push(Firing::Skip {
+                    class: skip.class,
+                    date: skip.date.clone(),
+                    detail: skip.detail.clone(),
+                    reason: skip.reason.clone(),
+                });
+            }
+        }
+    }
+
     pub fn observe(&mut self, facts: &Facts) -> Vec<Firing> {
         if !self.primed {
             // A snapshot without a structurally real status payload carries no baseline and no
@@ -620,17 +739,42 @@ impl Observation {
             }
             self.primed = true;
             self.baseline_mtime = facts.briefing_mtime.clone();
+            // P3-M5 checkpoint L2 (hub, 2026-10-18): a persisted date LATER than today is
+            // discarded (treated as absent) before "later wins" runs. Dates only increase in
+            // normal running, so a future date means the clock or the time zone moved backwards;
+            // kept, it outranked today's absorbed DELIVERED/BLOCKED key and a morning that
+            // predates the app fired. Before priming nothing has fired, so `fired` holds only the
+            // seeded dates here. With no today, nothing is discarded (the earlier behaviour).
+            if let Some(today) = facts.today.as_deref() {
+                self.fired.retain(|_, date| date.as_str() <= today);
+            }
             // The RAW evidence, not the phase-derived views: `delivered_date` and `skip` are
             // empty whenever scheduler trouble shadows the phase (struct docs, deviation 121),
             // and priming from them let the next good snapshot fire a morning that predates the
             // app — round 2's MED.
+            // The later of a persisted (seeded) date and the absorbed one wins, per class.
             if let Some(date) = &facts.last_run_date {
-                self.fired.insert(NotifyClass::Delivered, date.clone());
+                self.insert_later(NotifyClass::Delivered, date);
             }
+            let mut out = Vec::new();
             if let Some((class, date)) = &facts.raw_skip_key {
-                self.fired.insert(*class, date.clone());
+                let todays = facts.today.as_deref() == Some(date.as_str());
+                if escapes_todays_absorption(*class) && todays {
+                    // Requirement 11: today's FAILED / OutOfUsage is not absorbed. It fires now if
+                    // the primer's own phase surfaces it (and no persisted firing holds the key),
+                    // or later, once a shadowed phase does.
+                    if facts
+                        .skip
+                        .as_ref()
+                        .is_some_and(|s| s.class == *class && &s.date == date)
+                    {
+                        self.fire_skip(facts, &mut out);
+                    }
+                } else {
+                    self.insert_later(*class, date);
+                }
             }
-            return Vec::new();
+            return out;
         }
         let mut out = Vec::new();
         if let Some(date) = &facts.delivered_date {
@@ -643,17 +787,7 @@ impl Observation {
                 out.push(Firing::Delivered { date: date.clone() });
             }
         }
-        if let Some(skip) = &facts.skip {
-            if self.fired.get(&skip.class) != Some(&skip.date) {
-                self.fired.insert(skip.class, skip.date.clone());
-                out.push(Firing::Skip {
-                    class: skip.class,
-                    date: skip.date.clone(),
-                    detail: skip.detail.clone(),
-                    reason: skip.reason.clone(),
-                });
-            }
-        }
+        self.fire_skip(facts, &mut out);
         out
     }
 }
@@ -698,6 +832,8 @@ pub fn build_notification(firing: &Firing, briefing: Option<&str>) -> Notificati
             let date = notification_line(date);
             let title = match class {
                 NotifyClass::Blocked => format!("Briefing blocked — {date}"),
+                // Spec r9 §5: the fixed title; the day is in the engine's own body ("today").
+                NotifyClass::OutOfUsage => "No briefing yet today".to_string(),
                 _ => format!("Briefing failed — {date}"),
             };
             let body = match class {
@@ -709,6 +845,13 @@ pub fn build_notification(firing: &Firing, briefing: Option<&str>) -> Notificati
                                          briefing was generated. Open the Schedule screen for \
                                          details."
                     .to_string(),
+                // The engine's detail's FIRST line is the body (spec r9 §5: `outOfUsageLine`, which
+                // names a reset time only when every usage mark has a parsed one — the app never
+                // builds a time). Without one, the engine's own no-time line: never "failed".
+                NotifyClass::OutOfUsage => match detail.as_deref().map(notification_line) {
+                    Some(line) if !line.is_empty() => line,
+                    _ => OUT_OF_USAGE_FALLBACK_BODY.to_string(),
+                },
                 _ => match detail.as_deref().map(notification_line) {
                     Some(line) if !line.is_empty() => line,
                     _ => format!("The engine's run failed ({}).", notification_line(reason)),
@@ -749,6 +892,58 @@ pub struct NotifyRecord {
 /// budget).
 pub const STORE_FILE: &str = "notify-state.json";
 pub const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
+/// The dedupe map's file — `<app_data_dir>/notified-dates.json`: one JSON object, the class's wire
+/// spelling (serde's, which [`NotifyClass::as_str`] matches) to a `YYYY-MM-DD` local date. It is
+/// the whole in-memory map, written at each firing — so a date absorbed at start-up reaches the
+/// file only when a later firing writes the map. App-owned and tiny, like the record. (Uninstall's
+/// `APP_DATA_FILES` gains it in P3-M6-T4. ⚠ A firing later in the SAME app session writes it again —
+/// nothing here learns that the leg ran: `capabilities/README.md` "Known gaps", PR 3 final r5 H4.)
+pub const NOTIFIED_DATES_FILE: &str = "notified-dates.json";
+
+/// A `YYYY-MM-DD` shape — the only values the later-date comparison can order honestly.
+fn is_local_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// Read the persisted map. Missing, unreadable or garbage is EMPTY — the in-memory behaviour the
+/// app had before the file existed (spec r9 §5: a failure falls back to it); a key that is not a
+/// class this build knows, or a value that is not a `YYYY-MM-DD` date, is dropped, never guessed.
+/// The key parses through `NotifyClass`'s derived `Deserialize` (P3-M5 checkpoint L3): every
+/// variant, with no hand-kept list to forget one in.
+pub fn read_notified_dates(dir: &Path) -> BTreeMap<NotifyClass, String> {
+    let Ok(text) = read_text_capped(&dir.join(NOTIFIED_DATES_FILE), MAX_RECORD_BYTES) else {
+        return BTreeMap::new();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
+        return BTreeMap::new();
+    };
+    map.into_iter()
+        .filter_map(|(key, date)| {
+            let class = serde_json::from_value::<NotifyClass>(Value::String(key)).ok()?;
+            let date = date.as_str()?;
+            is_local_date(date).then(|| (class, date.to_string()))
+        })
+        .collect()
+}
+
+/// Write the map, temp-then-rename through `autostart::replace_atomically` (the record's
+/// discipline — [`write_record`]).
+pub fn write_notified_dates(
+    dir: &Path,
+    fired: &BTreeMap<NotifyClass, String>,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // Keyed by the derived `Serialize` — the spelling [`read_notified_dates`] parses back.
+    let text = serde_json::to_string_pretty(fired)
+        .map_err(|e| format!("the notified dates could not be serialised: {e}"))?;
+    crate::autostart::replace_atomically(&dir.join(NOTIFIED_DATES_FILE), text.as_bytes())
+}
 
 /// Read the record; missing/unreadable/malformed is `Default` (never asked). Same posture as
 /// `access::read_record`, for the same reason.
@@ -813,6 +1008,9 @@ pub struct NotifyState {
     sink: Option<Arc<dyn NotifySink>>,
     store_dir: Option<PathBuf>,
     suppressed: Mutex<Vec<Suppressed>>,
+    /// `None` = [`crate::schedule_state::now_local`], the watcher's own clock. Tests inject one:
+    /// the fixtures' day is not the real one, and [`Facts::today`] decides the exemption.
+    clock: Option<crate::watcher::Clock>,
 }
 
 impl NotifyState {
@@ -828,6 +1026,12 @@ impl NotifyState {
         self
     }
 
+    /// **Test harness only** — see the field docs.
+    pub fn with_clock(mut self, clock: crate::watcher::Clock) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
     fn store_dir<R: Runtime>(&self, app: &AppHandle<R>) -> Result<PathBuf, String> {
         if let Some(dir) = &self.store_dir {
             return Ok(dir.clone());
@@ -835,6 +1039,15 @@ impl NotifyState {
         app.path()
             .app_data_dir()
             .map_err(|e| format!("this app's data directory could not be resolved: {e}"))
+    }
+
+    /// The app's local date now, or `None` when there is no local conversion (an empty date).
+    fn today(&self) -> Option<String> {
+        let now = match &self.clock {
+            Some(clock) => clock(),
+            None => crate::schedule_state::now_local(),
+        };
+        Some(now.local_date).filter(|d| !d.is_empty())
     }
 
     fn note_suppressed(&self, entry: Suppressed) {
@@ -897,16 +1110,37 @@ pub fn on_snapshot<R: Runtime>(app: &AppHandle<R>, snapshot: &Snapshot) {
     let Some(state) = app.try_state::<NotifyState>() else {
         return;
     };
-    let facts = facts_of(snapshot);
+    let mut facts = facts_of(snapshot);
+    facts.today = state.today();
+    let dir = state.store_dir(app);
     let firings = match state.observation.lock() {
-        Ok(mut observation) => observation.observe(&facts),
+        Ok(mut observation) => {
+            // "Loaded at start": the first snapshot is the first moment the app handle can name
+            // the data dir, and it precedes the priming the persisted dates must take part in.
+            if !observation.is_seeded() {
+                let persisted = dir.as_deref().map(read_notified_dates).unwrap_or_default();
+                observation.seed(persisted);
+            }
+            let firings = observation.observe(&facts);
+            // Written at EVERY firing, before the gates — so a firing withheld because
+            // notifications are off or never asked is persisted too. Under the lock, so two
+            // writes cannot land out of order. A failure is the in-memory behaviour, not an error.
+            if !firings.is_empty() {
+                if let Ok(dir) = &dir {
+                    if let Err(e) = write_notified_dates(dir, observation.fired()) {
+                        eprintln!("daily-briefing: the notified dates could not be saved ({e})");
+                    }
+                }
+            }
+            firings
+        }
         Err(_) => return,
     };
     if firings.is_empty() {
         return;
     }
-    let record = match state.store_dir(app) {
-        Ok(dir) => read_record(&dir),
+    let record = match &dir {
+        Ok(dir) => read_record(dir),
         // No store: the safe reading is "never asked", which posts nothing.
         Err(_) => NotifyRecord::default(),
     };

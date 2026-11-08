@@ -16,6 +16,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCore, type RunDeps } from "../src/core";
 import * as factory from "../src/providerFactory";
+import * as phase from "../src/recapCampaignsPhase";
+import { API_TIMEOUT_MS } from "../src/provider";
 import { PROMPT_HEADER } from "../src/generator";
 import { API_LABEL_ANTHROPIC, type Config } from "../src/types";
 import type { RecapRecordV2 } from "../src/recapCampaigns";
@@ -64,7 +66,7 @@ const promptOf = (bodyText: string): string => {
 
 /** One owned-API run: the fake answers the MAIN prompt with the busy briefing and B's prompt with an
  *  empty campaign list. Returns the fake's requests, the record lines and the construction count. */
-async function ownedRun(mode: "off" | "trial") {
+async function ownedRun(mode: "off" | "trial", timeoutMs: number | null = 10_000) {   // null: none configured
   const main = busyReply(busy, 16);
   const s = await startFakeApi((req) => okJson({
     content: [{ type: "text", text: promptOf(req.bodyText).includes(B_PROMPT_MARK) ? JSON.stringify({ campaigns: [] }) : main }],
@@ -74,7 +76,7 @@ async function ownedRun(mode: "off" | "trial") {
   const cfg: Config = busyCfg(busy, {
     recapCampaigns: { mode },
     provider: {
-      cli: API_LABEL_ANTHROPIC, argv: [], promptVia: "stdin", timeoutMs: 10_000,
+      cli: API_LABEL_ANTHROPIC, argv: [], promptVia: "stdin", ...(timeoutMs !== null ? { timeoutMs } : {}),
       api: { kind: "anthropic", model: "claude-sonnet-5", baseUrl: s.origin, apiKeyEnv: KEY_VAR },
     },
   });
@@ -84,12 +86,13 @@ async function ownedRun(mode: "off" | "trial") {
     persistHealth: async () => {}, persistRecapRecord: async (line) => { records.push(JSON.parse(line)); },
   };
   const built = spyOn(factory, "buildProvider");
+  const ran = spyOn(phase, "runRecapCampaignsPhase");
   const oErr = console.error;
   console.error = () => {};
   try {
     const r = await runCore(cfg, deps, true);
-    return { r, main, requests: [...s.requests], records, constructions: built.mock.calls.length };
-  } finally { console.error = oErr; built.mockRestore(); }
+    return { r, main, requests: [...s.requests], records, constructions: built.mock.calls.length, phaseTimeouts: ran.mock.calls.map((c) => c[0].timeoutMs) };
+  } finally { console.error = oErr; built.mockRestore(); ran.mockRestore(); }
 }
 
 describe("[TB-P3] an OWNED API provider against the loopback fake", () => {
@@ -109,6 +112,13 @@ describe("[TB-P3] an OWNED API provider against the loopback fake", () => {
     expect(x.r.promptText).toBe(mainPrompt!);
     expect(x.r.rawText).toBe(x.main);
     expect(x.r.promptText).not.toContain(B_PROMPT_MARK);
+  }, LONG);
+
+  test("[TB-P3] the grouper's deadline is built from the winner's timeout — unset, the API default it waits for (5 min)", async () => {
+    // The grouper reuses the winner's instance, which waits `API_TIMEOUT_MS` when no timeout is configured; a deadline
+    // derived from the CLI's 120 s would cut that call short.
+    expect((await ownedRun("trial", null)).phaseTimeouts).toEqual([API_TIMEOUT_MS]);
+    expect((await ownedRun("trial", 10_000)).phaseTimeouts).toEqual([10_000]);
   }, LONG);
 
   test("[TB-P3] mode off → exactly 1 request, no record", async () => {

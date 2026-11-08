@@ -18,6 +18,13 @@
    * webview is known to be listening.
    *
    * ⚠ EVERY ENGINE-DERIVED STRING IS `{}`-INTERPOLATED (`docs/gui-seam.md` §5). No `{@html}`.
+   *
+   * P3-M4-T4 — THE SCRUB ON OPEN. On every open, whatever screen is shown, `key scrub-backup` runs once (retried while
+   * it times out or the engine is busy — `lib/provider-flows.ts` `scrubBackup`), never awaited by start-up: it is
+   * idempotent, so a scrub a migrate's save could not finish (the app exited) is finished here, and Rust detects
+   * nothing. What it says goes to a dismissable notice beside the tray notice ("keys no longer in your settings were
+   * removed from the backup"; `otherCopies` says which file to look for and delete). Nothing at all when it removed
+   * nothing, and nothing for a plain `config` refusal (Settings already reports invalid settings; P3-M4 checkpoint).
    */
   import { onMount } from "svelte";
   import {
@@ -29,6 +36,7 @@
     type ProbeResult,
   } from "./lib/access";
   import {
+    calendarStatus,
     detailsOpen,
     onProgress,
     run,
@@ -36,13 +44,20 @@
     type LastRunResult,
     type ProgressEvent,
   } from "./lib/engine";
+  import { loadAppPrefs } from "./lib/app-prefs-store";
+  import { readStatusThroughStore } from "./lib/today-store";
   import { configRead, describeFailure } from "./lib/files";
+  import { loginItemsOffHint } from "./lib/login-items";
   import { archiveList, keepArchive } from "./lib/history";
   import { notifySetEnabled, notifyStatus } from "./lib/notify";
   import { osFromUserAgent } from "./lib/platform";
   import { notifyOffer, type NotifyOffer } from "./lib/settings-model";
+  import { scrubBackup, scrubLines } from "./lib/provider-flows";
   import QuitDialog from "./lib/QuitDialog.svelte";
-  import { envelopeOf, type RunEnvelope } from "./lib/today";
+  import { noteRunStart } from "./lib/deck-state";
+  import { limitedOf, NO_RUN_LINE, runLineSeen, runLineSettled, runLineStarted, runResultSentence } from "./lib/run-result";
+  import { summaryStatusDriver, type SummaryStatusState } from "./lib/summary-status";
+  import { envelopeOf, knownMtime, type RunEnvelope } from "./lib/today";
   import type { UninstallReport } from "./lib/app-uninstall";
   import type { UninstallLine } from "./lib/uninstall-flow";
   import History from "./routes/History.svelte";
@@ -50,6 +65,7 @@
   import Settings from "./routes/Settings.svelte";
   import Today from "./routes/Today.svelte";
   import Wizard from "./routes/Wizard.svelte";
+  import { wizardTabShown } from "./lib/wizard";
   import {
     onNavigate,
     onQuitRequested,
@@ -63,6 +79,10 @@
   } from "./lib/state";
 
   let route = $state<Route>("today");
+  /** The briefing redesign's A: the app-prefs store (first name, slides switch) has SETTLED — loaded, or
+   *  fell back to its defaults. Only the Today branch waits on it, so the deck never flashes before the
+   *  classic view (A spec, "The slides switch"). */
+  let prefsSettled = $state(false);
   /** v0.2.1 §3.5: the OS wording (the wizard's, and the notification ask's on Schedule and
    *  Settings) comes from the webview's own user agent — no Tauri command (that would change the
    *  pinned capability surface). */
@@ -70,6 +90,14 @@
   let snapshot = $state<Snapshot | null>(null);
   /** Why the very first snapshot could not be fetched at all (a missing sidecar, typically). */
   let snapshotError = $state<string | null>(null);
+  let summaryState = $state.raw<SummaryStatusState>({ known: false, status: { enabled: false, warnings: [] }, revision: null });
+  /** Why the summary driver's last status read failed. Its own slot: only its next good read clears it, and `applySnapshot` neither writes nor hides it. */
+  let summaryStatusError = $state<string | null>(null);
+  const summaryStatus = summaryStatusDriver({ readSnapshot: stateSnapshot, publish: (next) => (summaryState = next), onerror: (error) => { summaryStatusError = describeFailure(error); }, onrecovered: () => { summaryStatusError = null; } });
+  function refreshSummaryStatus(): Promise<boolean> { return summaryStatus.refresh(); }
+  /** Where `summaryStatusError` shows, nothing else would read again (also the route effect below). Today's reader has
+   *  its own focus read. No minute tick. */
+  function onWindowFocus(): void { if (route !== "today") summaryStatus.retryIfFailed(); }
   let quit = $state<QuitDialogCopy | null>(null);
   /** What the open Quit dialog offers for the engine's `notify` (read when it opens). */
   let quitOffer = $state<NotifyOffer>({ kind: "checking" });
@@ -78,6 +106,15 @@
    *  across a failed read so an open briefing does not vanish (review round 1, M6). */
   let archive = $state<string[] | null>(null);
   let trayNotice = $state<string | null>(null);
+  /** P3-M4-T4: what the scrub on open said, or `null` (nothing to say, or dismissed). */
+  let scrubNotice = $state<string[] | null>(null);
+
+  /** P3-M4-T4: the scrub on open (header). Runs in the background; its lines, if any, become the notice. */
+  async function scrubOnOpen(): Promise<void> {
+    const result = await scrubBackup((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const lines = scrubLines(result, "open");
+    if (lines.length > 0) scrubNotice = lines;
+  }
 
   /** B6 (T17): the last `access_snapshot`, the launch-time revocation check, and their trouble. */
   let access = $state<AccessSnapshot | null>(null);
@@ -142,6 +179,7 @@
     removalFailed = false;
     removalInProgress = false;
   });
+  $effect(() => { if (route === "history" || route === "schedule") summaryStatus.retryIfFailed(); });
 
   /**
    * B7 (T18): the app's notification opt-in as last read — `undefined` before the first read (no
@@ -168,12 +206,12 @@
 
   let running = $state(false);
   let progress = $state<string[]>([]);
-  let runResult = $state("");
+  let runLine = $state.raw(NO_RUN_LINE);
   /** The last Run Now's result — whether Today's Details disclosure starts open (`detailsOpen`). */
   let lastRunResult = $state.raw<LastRunResult>(null);
   /** Today's `detailsOpen` prop, held in an explicit `$derived` so it changes only when its VALUE does:
    *  a run that ends `delivered` after the run-start `null` (false to false) is no change, and Today's
-   *  disclosure keeps the user's toggle (`routes/TodayView.svelte`, the comment on `open`). */
+   *  disclosure keeps the user's toggle (`lib/RunControls.svelte`, the comment on `open`). */
   const detailsOpenNow = $derived(detailsOpen(lastRunResult));
   /** The envelope of the last run this app started — Today shows its struct while it is the file. */
   let lastRun = $state.raw<RunEnvelope | null>(null);
@@ -188,6 +226,17 @@
    * removal's not-configured snapshot never takes the done screen away.
    */
   let wizardOffered = $state(false);
+  /**
+   * Design 2026-10-31 D3 (M3): setup keeps its place while another tab is shown. Set by the effect below whenever the
+   * route is the wizard; cleared when setup ends — Finish and "Finish setup later" (`onfinished`), "Set up later"
+   * (`oncancel`, before the save only), and an Uninstall execute's START (`onuninstallstarted`: the app is being
+   * uninstalled, and its settings may be removed with it). While it holds, `<Wizard>` stays mounted, hidden on every
+   * other route, and the Setup tab shows (`wizardTabShown`).
+   */
+  let wizardOpen = $state(false);
+  $effect(() => {
+    if (route === "wizard") wizardOpen = true;
+  });
 
   /**
    * M9 round 3: the Uninstall execute's report (spec 3.6.3's done screen) and whether an execute is in
@@ -223,6 +272,7 @@
 
   function applySnapshot(next: Snapshot): void {
     snapshot = next;
+    runLine = runLineSeen(runLine, knownMtime(next));
     snapshotError = next.error;
     archive = keepArchive(archive, next);
     if (!wizardOffered && next.scheduleState?.phase.phase === "not-configured") {
@@ -245,12 +295,17 @@
       });
   }
 
-  async function refresh(): Promise<void> {
+  /** Whether a snapshot came back. */
+  async function refresh(): Promise<boolean> {
     try {
-      applySnapshot(await stateSnapshot());
+      const next = await stateSnapshot();
+      applySnapshot(next);
+      summaryStatus.noteStatus(next);
+      return true;
     } catch (e) {
       // A `#[tauri::command]` rejection arrives as the serialised `EngineError`, not as an Error.
       snapshotError = describeFailure(e);
+      return false;
     }
   }
 
@@ -284,41 +339,47 @@
     }
   }
 
-  /** One human sentence for a finished run. The engine's own lines are in `progress`. */
+  /** One human sentence for a finished run, in plain words (wave 2 polish §6, `lib/run-result.ts`): never a raw code
+   *  on its own. The engine's own lines are in `progress`, behind Details. */
   function describe(outcome: EngineOutcome): string {
     switch (outcome.outcome.kind) {
       case "delivered":
         return "Done — today's briefing was generated.";
       case "skipped":
-        return `The engine did not generate a briefing (${outcome.outcome.reason ?? "no reason given"}).`;
       case "failed":
-        return `The run failed (${outcome.outcome.reason ?? `exit ${outcome.exitCode ?? "by signal"}`}).`;
+        return runResultSentence({ kind: outcome.outcome.kind, reason: outcome.outcome.reason }, limitedOf(outcome.payload), new Date(), "today");
       case "configError":
-        return "The engine refused to run — see Details below.";
+        return runResultSentence({ kind: "configError", reason: null }, limitedOf(outcome.payload), new Date(), "today");
     }
   }
 
   async function runNow(): Promise<void> {
     if (running) return;
     running = true;
+    // The deck's run rule numbers each run (post-cap L2): one jump to Good morning per run, across Today's remounts.
+    noteRunStart();
     progress = [];
-    runResult = "";
+    runLine = runLineStarted(runLine);
+    const thisRun = runLine.run;
     lastRunResult = null;
     try {
-      const outcome = await run({ force: false });
-      runResult = describe(outcome);
+      // `now`: the engine lifts its morning-time floor for Run now and keeps once a day (no `force`).
+      const outcome = await run({ now: true });
+      runLine = { ...runLine, text: describe(outcome) };
       lastRunResult = { outcome };
       const envelope = envelopeOf(outcome.payload);
       if (envelope !== null) lastRun = envelope;
     } catch (e) {
       // A `busy` refusal says which operation is already running; nothing was started.
-      runResult = describeFailure(e);
+      runLine = { ...runLine, text: describeFailure(e) };
       lastRunResult = { threw: true };
     } finally {
       running = false;
       // The watcher will push a `state:changed` of its own once the engine's files settle; this
-      // is for the case where the run changed nothing on disk (a skip) and no event follows.
-      await refresh();
+      // is for the case where the run changed nothing on disk (a skip) and no event follows, and it
+      // dates every run's line.
+      const read = await refresh();
+      runLine = runLineSettled(runLine, thisRun, read, knownMtime(snapshot));
     }
   }
 
@@ -326,6 +387,7 @@
     const unlisteners: Promise<() => void>[] = [
       onStateChanged((next) => {
         applySnapshot(next);
+        summaryStatus.onWatcher(next);
       }),
       onNavigate((next) => {
         route = next;
@@ -347,15 +409,24 @@
     // `allSettled`, not `all`: a listener that failed to register must not also stop the first
     // snapshot from being fetched.
     void Promise.allSettled(unlisteners).then(() => refresh());
+    // PB-M3 (spec §5): the calendar status, through the Today store, at start — not waiting for Today to mount, so
+    // "on" and "never asked" are known wherever the app opens. A failed or dropped read changes nothing.
+    void readStatusThroughStore(() => calendarStatus());
     // The access check is separate and deliberately NOT awaited with it: it runs `doctor --json`,
     // which walks the repositories and can take 20 s, and the Today screen must not wait for it.
     void refreshAccess(true);
+    // P3-M4-T4: the backup scrub, on every open and in the background (header).
+    void scrubOnOpen();
+    // The briefing redesign's A: the app-prefs store, once. `loadAppPrefs` never rejects (a failed read
+    // keeps the defaults), and Today mounts when it settles.
+    void loadAppPrefs().finally(() => (prefsSettled = true));
     // B7 (T18): whether the notification ask has ever been answered — for the Schedule screen's
     // explained ask. A failed read shows no ask (Settings still carries the toggle).
     void notifyStatus()
       .then((s) => (notifyEnabled = s.enabled))
       .catch(() => {});
     return () => {
+      summaryStatus.dispose();
       for (const pending of unlisteners) void pending.then((off) => off()).catch(() => {});
     };
   });
@@ -365,7 +436,7 @@
   <header>
     <h1>Daily Briefing</h1>
     <nav>
-      {#if route === "wizard" || snapshot?.scheduleState?.phase.phase === "not-configured"}
+      {#if wizardTabShown(route, snapshot?.scheduleState?.phase.phase, wizardOpen)}
         <button class:active={route === "wizard"} onclick={() => (route = "wizard")}>Setup</button>
       {/if}
       <button class:active={route === "today"} onclick={() => (route = "today")}>Today</button>
@@ -385,6 +456,17 @@
     <div class="notice" role="status">
       <p>{trayNotice}</p>
       <button onclick={() => (trayNotice = null)}>Dismiss</button>
+    </div>
+  {/if}
+
+  {#if scrubNotice !== null}
+    <div class="notice" role="status">
+      <div>
+        {#each scrubNotice as line, n (n)}
+          <p>{line}</p>
+        {/each}
+      </div>
+      <button onclick={() => (scrubNotice = null)}>Dismiss</button>
     </div>
   {/if}
 
@@ -408,27 +490,70 @@
   {/if}
 
   <div class="screen">
+  <!-- B8 (T16): the first-run wizard. It performs its OWN config_read / access_snapshot /
+       doctor calls; what it takes from here is only the live pushed state its step 6 watches
+       and the notification ask's record state (dev 107: same command, same copy).
+       Design 2026-10-31 D3 (M3): mounted once while open, OUTSIDE the route chain, so another tab hides it
+       (the hidden attribute, no author display rule) instead of unmounting it — it keeps its place. -->
+  {#if wizardOpen || route === "wizard"}
+    <div hidden={route !== "wizard"}>
+      <Wizard
+        scheduleState={snapshot?.scheduleState ?? null}
+        {os}
+        shown={route === "wizard"}
+        evidence={{
+          skipIso: snapshot?.lastSkip?.iso ?? null,
+          delivered: snapshot?.scheduleState?.phase.phase === "delivered",
+        }}
+        notifyAsk={notifyEnabled === null}
+        {notifyAskError}
+        onnotifychoice={(enabled) => void chooseNotifications(enabled)}
+        oncancel={() => {
+          wizardOpen = false;
+          route = "today";
+        }}
+        onfinished={() => {
+          wizardOpen = false;
+          if (route === "wizard") route = "today";
+          void refresh();
+          void refreshAccess(false);
+        }}
+      />
+    </div>
+  {/if}
   {#if route === "today"}
-    <Today
-      {snapshot}
-      {lastRun}
-      {running}
-      {progress}
-      {runResult}
-      detailsOpen={detailsOpenNow}
-      onrun={runNow}
-    />
+    <!-- Round-2 L6: above Today, so a failed state_snapshot is seen, not left below the full-height Good morning. -->
     {#if snapshot === null && snapshotError !== null}
       <pre class="failed">{snapshotError}</pre>
     {/if}
+    {#if prefsSettled}
+      <Today
+        {snapshot}
+        summaryStatusKnown={summaryState.known}
+        aiSummaryStatus={summaryState.status}
+        latestSummaryRevision={summaryState.revision}
+        onstatusrefresh={refreshSummaryStatus}
+        summaryKept={summaryStatus.kept}
+        {lastRun}
+        {running}
+        {progress}
+        runResult={runLine.text}
+        detailsOpen={detailsOpenNow}
+        onrun={runNow}
+        onhistory={() => (route = "history")}
+      />
+    {:else}
+      <p class="muted">Loading…</p>
+    {/if}
   {:else if route === "history"}
-    <History dates={archive} error={snapshotError} stale={archiveList(snapshot) === null} />
+    <History dates={archive} error={snapshotError ?? summaryStatusError} stale={archiveList(snapshot) === null} />
   {:else if route === "schedule"}
     <Schedule
       state={snapshot?.scheduleState ?? null}
-      error={snapshotError}
+      error={snapshotError ?? summaryStatusError}
       stale={snapshot?.scheduleStale ?? false}
       stopped={snapshot?.updatesStopped ?? false}
+      loginItemsHint={loginItemsOffHint(snapshot?.schedule)}
       {access}
       {launchProbe}
       {accessError}
@@ -470,35 +595,18 @@
       {os}
     />
   {:else if route === "wizard"}
-    <!-- B8 (T16): the first-run wizard. It performs its OWN config_read / access_snapshot /
-         doctor calls; what it takes from here is only the live pushed state its step 6 watches
-         and the notification ask's record state (dev 107: same command, same copy). -->
-    <Wizard
-      scheduleState={snapshot?.scheduleState ?? null}
-      {os}
-      evidence={{
-        skipIso: snapshot?.lastSkip?.iso ?? null,
-        delivered: snapshot?.scheduleState?.phase.phase === "delivered",
-      }}
-      notifyAsk={notifyEnabled === null}
-      {notifyAskError}
-      onnotifychoice={(enabled) => void chooseNotifications(enabled)}
-      oncancel={() => (route = "today")}
-      onfinished={() => {
-        route = "today";
-        void refresh();
-        void refreshAccess(false);
-      }}
-    />
+    <!-- Setup is drawn above, outside this chain (D3). This arm stays empty so the bare else below is Settings only. -->
   {:else}
     {#key uninstallReportSeq}
     <Settings
+      onconfigsaved={summaryStatus.saved}
       {os}
       {uninstallReport}
       {uninstallRunning}
       {settingsRemovedByUninstall}
       onuninstallstarted={() => {
         wizardOffered = true;
+        wizardOpen = false;
         uninstallRunning = true;
         uninstallReport = null;
       }}
@@ -515,6 +623,8 @@
   {/if}
   </div>
 </main>
+
+<svelte:window onfocus={onWindowFocus} />
 
 {#if quit !== null}
   <QuitDialog
@@ -548,6 +658,27 @@
   }
   .screen {
     margin-top: 1.75rem;
+  }
+  /* Round-3 L4: while Today draws the deck, main is a full-height flex column and the screen takes what is left
+     after the header and any notice, so the deck (a flex item, `Deck.svelte`) fits the window whatever is above it.
+     Every other screen, and Today without the deck, flows as before. Where `:has()` is unsupported nothing here
+     applies, and the deck keeps its own `100vh - 10rem` fallback (round-4 L3). */
+  main:has(:global(.deck)) {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  main:has(:global(.deck)) > .screen {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  /* Today's "Loading…" line while the app-prefs store settles (round-1 L7: the class had no rule in scope). */
+  .muted {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.85rem;
   }
   nav {
     display: flex;

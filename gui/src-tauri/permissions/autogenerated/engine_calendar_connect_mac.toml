@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-engine-calendar-connect-mac"
+description = "Enables the engine_calendar_connect_mac command without any pre-configured scope."
+commands.allow = ["engine_calendar_connect_mac"]
+
+[[permission]]
+identifier = "deny-engine-calendar-connect-mac"
+description = "Denies the engine_calendar_connect_mac command without any pre-configured scope."
+commands.deny = ["engine_calendar_connect_mac"]

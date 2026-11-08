@@ -19,8 +19,11 @@ import { render } from "svelte/server";
 // READ-ONLY import of the engine's own resolver. `notify.ts` imports `proc`/`render`/`types`,
 // none of which needs a Bun-only API at import time.
 import { notifyArgv, notifyPayload } from "../../src/notify";
-import AppSettings from "../src/lib/AppSettings.svelte";
+import AppGeneralControls from "../src/lib/settings/AppGeneralControls.svelte";
+import CliShimControl from "../src/lib/settings/CliShimControl.svelte";
+import UninstallPanel from "../src/lib/settings/UninstallPanel.svelte";
 import {
+  NOTIFY_CLASSES,
   engineNotifyLine,
   notifyAskExplanation,
   suppressedLine,
@@ -88,11 +91,15 @@ describe("the wording helpers", () => {
     }
     // The double-silence case §4 exists for: "auto" configured, resolving to nothing here.
     expect(engineNotifyLine({ value: "auto", willNotify: false })).toContain("posts nothing");
+    // Redesign D: the engine's own setting is on Settings → Advanced now, not "the form below" the app's control.
+    const invalid = engineNotifyLine({ value: "invalid", willNotify: false });
+    expect(invalid).toContain("Fix it in Settings → Advanced, under Notifications from the engine.");
+    expect(invalid).not.toContain("form below");
   });
 
   test("every suppression reason has its line", () => {
     for (const reason of ["never-asked", "disabled", "engine-notifies", "post-failed"] as const) {
-      for (const cls of ["delivered", "failed", "blocked"] as const) {
+      for (const cls of NOTIFY_CLASSES) {
         const s: Suppressed = { class: cls, date: "2026-09-17", reason };
         expect(suppressedLine(s)).toContain("2026-09-17");
       }
@@ -100,6 +107,38 @@ describe("the wording helpers", () => {
     expect(
       suppressedLine({ class: "delivered", date: "2026-09-17", reason: "engine-notifies" }),
     ).toContain("engine's own notifier");
+  });
+
+  // P3-M5-T2 (spec r9 §5, requirement 11; carried L1): a withheld out-of-usage notification is
+  // described as out of usage — never as a failed run, which is what the old fall-through said.
+  test("a withheld out-of-usage notification reads as out of usage, never as a failed run", () => {
+    for (const reason of ["never-asked", "disabled", "engine-notifies", "post-failed"] as const) {
+      const line = suppressedLine({ class: "out-of-usage", date: "2026-09-17", reason });
+      expect(line).toContain("out of usage");
+      expect(line).toContain("2026-09-17");
+      expect(line.toLowerCase()).not.toContain("fail");
+      expect(line).not.toContain("blocked");
+    }
+    // The other classes keep their words.
+    expect(suppressedLine({ class: "failed", date: "2026-09-17", reason: "disabled" })).toContain(
+      "failed",
+    );
+    expect(suppressedLine({ class: "blocked", date: "2026-09-17", reason: "disabled" })).toContain(
+      "was blocked",
+    );
+  });
+
+  // The union is the Rust class set, member for member: `NotifyClass::as_str` is what
+  // `notify_status`'s suppression log carries, so a class Rust adds must reach this list (and its
+  // wording) or fail here — the drift that left out-of-usage reading as "failed".
+  test("NOTIFY_CLASSES is Rust's NotifyClass::as_str set", () => {
+    const rust = readFileSync(new URL("../src-tauri/src/notifications.rs", import.meta.url), "utf8");
+    const start = rust.indexOf("pub fn as_str(self) -> &'static str {");
+    expect(start).toBeGreaterThan(-1);
+    const body = rust.slice(start, rust.indexOf("\n    }\n", start));
+    const spelled = [...body.matchAll(/NotifyClass::\w+ => "([a-z-]+)"/g)].map((m) => m[1]);
+    expect(spelled.length).toBe(4);
+    expect([...spelled].sort()).toEqual([...NOTIFY_CLASSES].sort());
   });
 
   test("the ask explains before anything can post, and on macOS never promises silence about macOS", () => {
@@ -121,28 +160,28 @@ function status(enabled: boolean | null, extra?: Partial<NotifyStatus>): NotifyS
   };
 }
 
-/** The panel's uninstall props, REQUIRED since the M9 LOW pass (L5): nothing running, no report — the
- *  panel's first view, which is all these notification and autostart cases are about. */
+/** The uninstall panel's props, REQUIRED since the M9 LOW pass (L5): nothing running, no report — the
+ *  panel's first view. (Redesign D split AppSettings: the notification and autostart cases render
+ *  `AppGeneralControls`, which takes none of these; the uninstall cases render `UninstallPanel`.) */
 const UNINSTALL = { uninstallReport: null, uninstallRunning: false, onuninstallstarted: () => {}, onuninstallended: () => {} };
 
-describe("AppSettings", () => {
+describe("AppGeneralControls and UninstallPanel (split from the old AppSettings panel)", () => {
   test("never asked: the explained ask with Enable and Not now", () => {
-    const body = html(AppSettings, { ...UNINSTALL, notify: status(null), autostart: true, onrefresh: () => {} });
+    const body = html(AppGeneralControls, {notify: status(null), autostart: true, onrefresh: () => {} });
     expect(body).toContain("Nothing is shown until");
     expect(buttons(body)).toContain("Enable notifications");
     expect(buttons(body)).toContain("Not now");
   });
 
   test("enabled: Turn off, and the who-notifies line", () => {
-    const body = html(AppSettings, { ...UNINSTALL, notify: status(true), autostart: true, onrefresh: () => {} });
+    const body = html(AppGeneralControls, {notify: status(true), autostart: true, onrefresh: () => {} });
     expect(body).toContain("Notifications are on");
     expect(buttons(body)).toContain("Turn off");
     expect(body).toContain("this app is the notifier");
   });
 
   test("engine-owns: the panel says the engine is expected to post and this app stays quiet", () => {
-    const body = html(AppSettings, {
-      ...UNINSTALL,
+    const body = html(AppGeneralControls, {
       notify: status(true, { engine: { value: "auto", willNotify: true } }),
       autostart: true,
       onrefresh: () => {},
@@ -154,8 +193,7 @@ describe("AppSettings", () => {
   });
 
   test("a suppressed firing is reported, and hostile text in its date stays literal", () => {
-    const body = html(AppSettings, {
-      ...UNINSTALL,
+    const body = html(AppGeneralControls, {
       notify: status(false, {
         suppressed: [{ class: "delivered", date: HOSTILE, reason: "disabled" }],
       }),
@@ -170,7 +208,7 @@ describe("AppSettings", () => {
     // B25 round-1 fix F5. What SSR can render is the INITIAL state (no click handler runs —
     // §10f), which is exactly the fact worth pinning first: before the preview loads there is no
     // removal control at all — no consent checkbox, no execute button, only the preview trigger.
-    const body = html(AppSettings, { ...UNINSTALL, notify: status(true), autostart: true, onrefresh: () => {} });
+    const body = html(UninstallPanel, { ...UNINSTALL, onrefresh: () => {} });
     expect(buttons(body)).toContain("Uninstall app…");
     expect(body).not.toContain('type="checkbox"');
     expect(body).not.toContain("Remove app pieces");
@@ -179,7 +217,7 @@ describe("AppSettings", () => {
     // discipline). Batch 2 (spec 3.6.2) moved the consent view into its own component, which
     // `coexistence.check.ts` server-renders (the boxes off by default, the radio group's default,
     // the word budget); the lines this test pinned now live there, and are pinned there.
-    const source = readFileSync(new URL("../src/lib/AppSettings.svelte", import.meta.url), "utf8")
+    const source = readFileSync(new URL("../src/lib/settings/UninstallPanel.svelte", import.meta.url), "utf8")
       .replace(/\s+/g, " ");
     const view = readFileSync(new URL("../src/lib/UninstallConsent.svelte", import.meta.url), "utf8")
       .replace(/\s+/g, " ");
@@ -207,10 +245,10 @@ describe("AppSettings", () => {
   });
 
   test("the autostart toggle reflects the REAL state it was handed", () => {
-    const on = html(AppSettings, { ...UNINSTALL, notify: status(true), autostart: true, onrefresh: () => {} });
+    const on = html(AppGeneralControls, {notify: status(true), autostart: true, onrefresh: () => {} });
     expect(on).toContain("starts when you log in");
     expect(buttons(on)).toContain("Turn off");
-    const off = html(AppSettings, { ...UNINSTALL, notify: status(true), autostart: false, onrefresh: () => {} });
+    const off = html(AppGeneralControls, {notify: status(true), autostart: false, onrefresh: () => {} });
     expect(off).toContain("does not start at login");
     expect(buttons(off)).toContain("Start at login");
     // The scheduler-keeps-working truth (R1's delegated model) is stated, not implied.
@@ -218,8 +256,7 @@ describe("AppSettings", () => {
   });
 
   test("errors are shown, and a loading state says so", () => {
-    const body = html(AppSettings, {
-      ...UNINSTALL,
+    const body = html(AppGeneralControls, {
       notify: null,
       notifyError: "the store could not be read",
       autostart: null,
@@ -228,6 +265,90 @@ describe("AppSettings", () => {
     });
     expect(body).toContain("the store could not be read");
     expect(body).toContain("plugin autostart not found");
+  });
+});
+
+/* ── Redesign D (D-M3-T4): AppSettings split into three parts, which draw what it drew ────────────── */
+
+describe("D-M3-T4: AppGeneralControls, CliShimControl and UninstallPanel, in the shell's order, draw what AppSettings drew", () => {
+  // Captured ONCE at 404d9f0c7, before `lib/AppSettings.svelte` was deleted, by server-rendering it with the three
+  // inputs below through a throwaway check (run once and deleted, never committed): each render's text, tags and
+  // comments removed, whitespace collapsed. D-M5-T11's label audit may change these, editing them in the same commit.
+  const LITERALS = {
+    neverAsked:
+      "This app Notifications Daily Briefing can show a system notification when your morning briefing arrives — and when a run fails or is blocked, so a silent morning is never a mystery. Nothing is shown until you turn this on. Enable notifications Not now The engine's own notifications are off (the default) — this app is the notifier when enabled here. Start at login Daily Briefing starts when you log in (the default), so it is there to show and announce the morning briefing. Turn off The daily-briefing command in Terminal Checking… Uninstall Removes this app's start-at-login entry and its own files; your briefing archive and settings stay unless you choose to remove them. Uninstall app…",
+    enabled:
+      "This app Notifications Notifications are on: briefing arrivals, failed runs and blocked runs. Turn off The engine's own notifications are off (the default) — this app is the notifier when enabled here. Start at login Daily Briefing starts when you log in (the default), so it is there to show and announce the morning briefing. Turn off The daily-briefing command in Terminal Checking… Uninstall Removes this app's start-at-login entry and its own files; your briefing archive and settings stay unless you choose to remove them. Uninstall app…",
+    engineOwns:
+      "This app Notifications Notifications are on: briefing arrivals, failed runs and blocked runs. Turn off The engine's own notification setting is active on this platform, so the engine is the one expected to post the arrival notification — if your setup shows its banner — and this app stays quiet about deliveries (failures are still this app's to report). Start at login Daily Briefing starts when you log in (the default), so it is there to show and announce the morning briefing. Turn off The daily-briefing command in Terminal Checking… Uninstall Removes this app's start-at-login entry and its own files; your briefing archive and settings stay unless you choose to remove them. Uninstall app…",
+  };
+  const text = (body: string): string =>
+    body.replace(/<!--[\s\S]*?-->/g, "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  /** The three parts in the shell's order, each handed the same inputs AppSettings was. */
+  const parts = (props: Record<string, unknown>): string =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    text([AppGeneralControls, CliShimControl, UninstallPanel].map((c) => render(c as any, { props }).body).join(" "));
+
+  test("never asked, enabled and engine-owns: the joined text equals the captured literals", () => {
+    const inputs = {
+      neverAsked: { ...UNINSTALL, notify: status(null), autostart: true, onrefresh: () => {} },
+      enabled: { ...UNINSTALL, notify: status(true), autostart: true, onrefresh: () => {} },
+      engineOwns: { ...UNINSTALL, notify: status(true, { engine: { value: "auto", willNotify: true } }), autostart: true, onrefresh: () => {} },
+    } as const;
+    for (const [name, props] of Object.entries(inputs)) {
+      expect({ name, text: parts(props) }).toEqual({ name, text: LITERALS[name as keyof typeof LITERALS] });
+    }
+  });
+
+  test("each part is mounted on its page (redesign D-M4-T8), and every tag down the chain carries what the part needs", () => {
+    const root = new URL("../src/", import.meta.url).pathname;
+    const markupOf = (rel: string): string => {
+      const text = readFileSync(`${root}${rel}`, "utf8");
+      return text.slice(text.indexOf("</script>"));
+    };
+    expect(readFileSync(`${root}routes/Settings.svelte`, "utf8")).not.toContain("AppSettings");
+    expect([...new Bun.Glob("**/AppSettings.svelte").scanSync({ cwd: root })]).toEqual([]);
+    // General draws the controls before UpdateCheck (This app, then Updates); Advanced the shim; About the panel.
+    const general = markupOf("lib/settings/GeneralPage.svelte");
+    expect(general.indexOf("<AppGeneralControls")).toBeGreaterThan(-1);
+    expect(general.indexOf("<AppGeneralControls")).toBeLessThan(general.indexOf("<UpdateCheck"));
+    // The app's state and `os` to the controls, `os` to the shim (its refusal's wording), and the reload and the four
+    // uninstall props to the panel (a missing `onrefresh` would turn a landed execute into a rejection once `await
+    // onrefresh()` throws) — at every step: the shell, SettingsPages, the page.
+    const tag = (rel: string, open: string): string => {
+      const markup = markupOf(rel);
+      expect({ rel, open, found: markup.includes(open) }).toEqual({ rel, open, found: true });
+      return markup.slice(markup.indexOf(open), markup.indexOf("/>", markup.indexOf(open)));
+    };
+    for (const [rel, open, props] of [
+      ["routes/Settings.svelte", "<SettingsPages", ["notify={appNotify}", "notifyError={appNotifyError}", "autostart={appAutostart}", "autostartError={appAutostartError}", "onrefresh={loadApp}", "{os}", "{uninstallReport}", "{uninstallRunning}", "{onuninstallstarted}", "{onuninstallended}"]],
+      ["lib/settings/SettingsPages.svelte", "<GeneralPage", ["{notify}", "{notifyError}", "{autostart}", "{autostartError}", "{onrefresh}", "{os}"]],
+      ["lib/settings/GeneralPage.svelte", "<AppGeneralControls", ["{notify}", "{notifyError}", "{autostart}", "{autostartError}", "{onrefresh}", "{os}"]],
+      ["lib/settings/SettingsPages.svelte", "<AdvancedPage", ["{os}"]],
+      ["lib/settings/AdvancedPage.svelte", "<CliShimControl", ["{os}"]],
+      ["lib/settings/SettingsPages.svelte", "<AboutPage", ["{onrefresh}", "{uninstallReport}", "{uninstallRunning}", "{onuninstallstarted}", "{onuninstallended}"]],
+      ["lib/settings/AboutPage.svelte", "<UninstallPanel", ["{onrefresh}", "{uninstallReport}", "{uninstallRunning}", "{onuninstallstarted}", "{onuninstallended}"]],
+    ] as const) {
+      const text = tag(rel, open);
+      for (const prop of props) expect({ rel, open, prop, passed: text.includes(prop) }).toEqual({ rel, open, prop, passed: true });
+    }
+  });
+
+  test("what moved with each part stays with it: the controls share ONE busy flag and own the failure line (source pins)", () => {
+    const root = new URL("../src/lib/settings/", import.meta.url).pathname;
+    const controls = readFileSync(`${root}AppGeneralControls.svelte`, "utf8");
+    // One flag, guarding all three writes (notifications, autostart, the engine-notify offer), so no two run at once.
+    expect(controls.match(/let \w*[bB]usy\w* = \$state/g)).toEqual(["let busy = $state"]);
+    for (const fn of ["setNotifications", "setAutostart", "takeOffer"]) {
+      const body = controls.slice(controls.indexOf(`async function ${fn}(`), controls.indexOf("\n  }\n", controls.indexOf(`async function ${fn}(`)));
+      expect({ fn, guarded: body.includes("if (busy) return;") }).toEqual({ fn, guarded: true });
+    }
+    // The failure line is set only by these controls, so it is drawn here, after their blocks.
+    const markup = controls.slice(controls.indexOf("</script>"));
+    expect(markup).toMatch(/\{#if failure !== ""\}\s*<p class="bad">\{failure\}<\/p>\s*\{\/if\}\s*<\/div>/);
+    for (const other of ["CliShimControl.svelte", "UninstallPanel.svelte"]) {
+      expect({ other, failure: readFileSync(`${root}${other}`, "utf8").includes("let failure") }).toEqual({ other, failure: false });
+    }
   });
 });
 
@@ -279,11 +400,11 @@ describe("v0.2.1 §3.5: the notification ask follows the OS", () => {
     expect(noMac(MACOS)).toBe(false);
   });
 
-  test("AppSettings, rendered never-asked and turned-off: no Mac off macOS; macOS reads as before", () => {
+  test("AppGeneralControls, rendered never-asked and turned-off: no Mac off macOS; macOS reads as before", () => {
     for (const enabled of [null, false] as const) {
       const lead = enabled === null ? "" : "Notifications are off. ";
       const ask = (os: string) =>
-        askParagraph(html(AppSettings, { ...UNINSTALL, notify: status(enabled), autostart: true, onrefresh: () => {}, os }));
+        askParagraph(html(AppGeneralControls, {notify: status(enabled), autostart: true, onrefresh: () => {}, os }));
       for (const os of OFF_MAC) {
         const p = ask(os);
         expect({ enabled, os, p, noMac: noMac(p) }).toEqual({ enabled, os, p: lead + ELSEWHERE, noMac: true });
@@ -310,7 +431,7 @@ describe("v0.2.1 §3.5: the notification ask follows the OS", () => {
     const files = [...new Bun.Glob("**/*.{svelte,ts}").scanSync({ cwd: root })].sort();
     // prove-it 3b: the glob found the tree, callers and definition included.
     expect(files.length).toBeGreaterThan(20);
-    for (const rel of ["lib/notify.ts", "lib/AppSettings.svelte", "routes/Schedule.svelte", "routes/Wizard.svelte"]) {
+    for (const rel of ["lib/notify.ts", "lib/settings/AppGeneralControls.svelte", "routes/Schedule.svelte", "routes/Wizard.svelte"]) {
       expect(files).toContain(rel);
     }
     const src = (rel: string): string => readFileSync(`${root}${rel}`, "utf8");
@@ -326,9 +447,21 @@ describe("v0.2.1 §3.5: the notification ask follows the OS", () => {
       const withOs = (text.match(/notifyAskExplanation\(os\)/g) ?? []).length;
       expect({ rel, withOs }).toEqual({ rel, withOs: n });
     }
-    expect(calls).toEqual(["lib/AppSettings.svelte:2", "routes/Schedule.svelte:1", "routes/Wizard.svelte:1"]);
-    // REQUIRED (no `?`) with no default, in each consumer and in Settings, which passes it on.
-    for (const rel of ["lib/AppSettings.svelte", "routes/Schedule.svelte", "routes/Wizard.svelte", "routes/Settings.svelte"]) {
+    expect(calls).toEqual(["lib/settings/AppGeneralControls.svelte:2", "routes/Schedule.svelte:1", "routes/Wizard.svelte:1"]);
+    // REQUIRED (no `?`) with no default, in each consumer and in Settings, which passes it on. CliShimControl too: the
+    // shim's refusal wording (`describeShimFailure(e, os)`) read the old panel's required `os` before the split.
+    for (const rel of [
+      "lib/settings/AppGeneralControls.svelte",
+      "lib/settings/CliShimControl.svelte",
+      // Redesign D: the pages that pass it on require it too.
+      "lib/settings/SettingsPages.svelte",
+      "lib/settings/GeneralPage.svelte",
+      "lib/settings/AdvancedPage.svelte",
+      "lib/settings/CalendarPage.svelte",
+      "routes/Schedule.svelte",
+      "routes/Wizard.svelte",
+      "routes/Settings.svelte",
+    ]) {
       const text = src(rel);
       const end = text.indexOf("$props()");
       const destructure = text.slice(text.lastIndexOf("let {", end), end);
@@ -345,12 +478,27 @@ describe("v0.2.1 §3.5: the notification ask follows the OS", () => {
       expect({ open, found: at >= 0 }).toEqual({ open, found: true });
       return text.slice(at, text.indexOf("/>", at));
     };
-    expect(tag(src("routes/Settings.svelte"), "<AppSettings")).toContain("{os}");
+    // Redesign D: Settings → SettingsPages → GeneralPage → the controls.
+    expect(tag(src("routes/Settings.svelte"), "<SettingsPages")).toContain("{os}");
+    expect(tag(src("lib/settings/SettingsPages.svelte"), "<GeneralPage")).toContain("{os}");
+    expect(tag(src("lib/settings/GeneralPage.svelte"), "<AppGeneralControls")).toContain("{os}");
     const app = src("App.svelte");
     expect(app).toContain("const os = osFromUserAgent(navigator.userAgent);");
     // (`<Settings` carries more props since M9 round 3, one per line, so its tag is matched without the space.)
     for (const open of ["<Schedule", "<Settings", "<Wizard"]) {
       expect({ open, os: tag(app, open).includes("{os}") }).toEqual({ open, os: true });
     }
+    // Design 2026-10-31 r6 §4 (M3): the wizard's `shown` follows the same rule — REQUIRED, with no default — and App
+    // passes the route. Server renders omit it on purpose (their casts skip the type check; svelte-check does not).
+    const wizard = src("routes/Wizard.svelte");
+    const wizardEnd = wizard.indexOf("$props()");
+    const wizardDestructure = wizard.slice(wizard.lastIndexOf("let {", wizardEnd), wizardEnd);
+    expect(wizardEnd).toBeGreaterThan(-1);
+    expect({
+      required: /\n    shown: boolean;\n/.test(wizard),
+      destructured: /[{,\s]shown[,\s}]/.test(wizardDestructure),
+      defaulted: /\bshown\s*=/.test(wizardDestructure),
+    }).toEqual({ required: true, destructured: true, defaulted: false });
+    expect(tag(app, "<Wizard")).toContain('shown={route === "wizard"}');
   });
 });

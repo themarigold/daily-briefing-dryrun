@@ -5,7 +5,7 @@
 // still-pending (blackholed) connect is simply abandoned (harmless — the process exits per tick).
 import { DEFAULT_NETWORK_PROBE_HOSTS } from "./config";
 
-type ProbeHost = { host: string; port: number };
+export type ProbeHost = { host: string; port: number };
 
 // Normalize the hand-editable `networkProbeHosts` config value at the boundary (spec §6: degrade
 // gracefully + still deliver — never throw, never add a hard loadConfig error). A malformed value
@@ -100,7 +100,9 @@ export function tcpProbe(hosts: { host: string; port: number }[], perProbeMs: nu
 // run otherwise burns its provider retries in the ~minutes before wifi re-associates (audit 2026-07-10).
 export const NET_DEFAULT_GRACE_MS = 25_000;
 export const NET_DEFAULT_POLL_MS = 3_000;
-const NET_PER_PROBE_MS = 3_000;
+/** One probe round's bound. Exported for the run lock's heartbeat cap (provider fallback, P1-M4-T2), which
+ *  budgets an earlier entry's network re-check with it. */
+export const NET_PER_PROBE_MS = 3_000;
 
 export const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 

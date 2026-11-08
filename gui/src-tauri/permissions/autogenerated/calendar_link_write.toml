@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-calendar-link-write"
+description = "Enables the calendar_link_write command without any pre-configured scope."
+commands.allow = ["calendar_link_write"]
+
+[[permission]]
+identifier = "deny-calendar-link-write"
+description = "Denies the calendar_link_write command without any pre-configured scope."
+commands.deny = ["calendar_link_write"]

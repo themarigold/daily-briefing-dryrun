@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["gui/src-tauri/tests/fixtures/summary-roundtrip.ts"],
+  "exclude": []
+}

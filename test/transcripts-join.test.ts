@@ -247,6 +247,15 @@ test("T3.6b: a credential hit on the selected candidate drops the UNIT's why —
   expect(countAdoptedWhys(out)).toBe(0);
 });
 
+test("T3.6b: a URL password drops the why from both curves without substituting an earlier turn", () => {
+  const out = twoCandidateUnit("I prefer https://user:SECRETMARK@host/repo because the remote is reproducible");
+  expect(out.sources.size).toBe(0);
+  expect(out.sourcesStrictMajority.size).toBe(0);
+  expect(out.drops["credential-hit"]).toBe(1);
+  expect(whySourceFor(out, K("a"))).toBeUndefined();
+  expect(countAdoptedWhys(out)).toBe(0);
+});
+
 test("⚠ T7.7 + A9: a task-shaped turn is dropped from BOTH curves — union must not re-ship it", () => {
   // Sole-claimant + single-file ⇒ majority also qualifies. Before this pin, isTaskShaped only ran on
   // conservative: sources stayed empty, sourcesStrictMajority still held the turn, whySourceFor

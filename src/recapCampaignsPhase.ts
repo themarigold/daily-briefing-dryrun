@@ -16,7 +16,7 @@
 // The load guard therefore judges exit code and output, never the error class (plan K5). `readPrFacts`
 // still takes its budget as a PARAMETER; the phase reads `src/recapBudget.ts`, the leaf that exists so
 // both the lock and this phase can share `D_call` without that cycle.
-import { ProviderError, type Activity, type BriefingStruct } from "./types";
+import { LostLockError, ProviderError, type Activity, type BriefingStruct } from "./types";
 import { listDefaultRefMerges, mergeMembers, startGitBudget, type DefaultRefMerge } from "./git";
 import {
   attachPrFacts, isMarkedItem, buildCampaignItems, buildCampaignPrompt, busyByLoad, topLevelRecapCount,
@@ -150,7 +150,7 @@ export type RecapPhaseParams = {
   warningsOf: () => readonly string[];
   /** `laddered ? (laddered.hardeningActive() ? "on" : "off") : "n/a"`, evaluated at step 4. */
   hardeningOf: () => "on" | "off" | "n/a";
-  /** `cfg.provider.timeoutMs ?? TIMEOUT_MS`; `recapCallDeadlineMs` sanitises it. */
+  /** The winner's configured timeout, else its transport's default (`defaultTimeoutMs`); `recapCallDeadlineMs` sanitises it. */
   timeoutMs: number;
   /** The record writer: `deps.persistRecapRecord`, or `core.ts`'s append to `recapCampaignsPath()`. */
   persist: (line: string) => Promise<void>;
@@ -161,7 +161,10 @@ export type RecapPhaseParams = {
 /** A deadline settlement, distinguishable from any reply text. */
 const DEADLINE: unique symbol = Symbol("recap-call-deadline");
 
-/** Spec §4.2 steps 1–11, and NEVER throws. ONE main try/catch spans steps 1–9; any throw there is
+/** Spec §4.2 steps 1–11, and NEVER throws — EXCEPT a `LostLockError` (provider fallback, P1-M8 checkpoint HIGH 2): a
+ *  holder that lost the run lock (the grouper's `beforeSpawn`, or the ownership check `core.ts` puts in front of
+ *  `persist`) must stop, not record it as `grouper-throw` and append a record anyway. It propagates from every catch
+ *  below and `core.ts` turns it into the quiet `lostLock` result. ONE main try/catch spans steps 1–9; any throw there is
  *  `rejected`/`exception` with the struct untouched (the phase never writes it). Step 10 (the record
  *  append) and step 11 (the stderr line) each run in their OWN try/catch, once, whatever happened above —
  *  so a run that reaches the phase writes exactly ONE record line. Returns the candidate `recap` ONLY for
@@ -221,7 +224,8 @@ export async function runRecapCampaignsPhase(p: RecapPhaseParams): Promise<{ rec
       // 9. the runtime warnings B's own call appended — every outcome that reached step 4
       providerWarnings = copyWarnings();
     }
-  } catch {
+  } catch (e) {
+    if (e instanceof LostLockError) throw e;
     // Any throw in steps 1–9: `exception`, struct untouched. The call's warnings are copied only if the
     // call had started; nothing the run already built is withdrawn from the record (`labels`, `prFacts`).
     outcome = "rejected"; reason = "exception"; score = undefined;
@@ -253,7 +257,7 @@ export async function runRecapCampaignsPhase(p: RecapPhaseParams): Promise<{ rec
   try {
     await p.persist(formatRecapRecordLine(record));
     recordOk = true;
-  } catch { /* the outcome stands */ }
+  } catch (e) { if (e instanceof LostLockError) throw e; /* otherwise the outcome stands */ }
 
   // 11. the count-only stderr line — its OWN try/catch: a throwing `diagError` changes nothing
   try { diagError(formatRecapStderrLine(record, recordOk)); } catch { /* the outcome stands */ }
@@ -282,6 +286,7 @@ async function raceDeadline(
     if (settled === DEADLINE) return { ok: false, reason: "deadline" };
     return { ok: true, text: String(settled) };
   } catch (e) {
+    if (e instanceof LostLockError) throw e;      // a lost lock is never a grouper failure (see the phase's docstring)
     return { ok: false, reason: e instanceof ProviderError ? `provider-error:${e.code}` : "grouper-throw" };
   } finally {
     clearTimeout(timer);

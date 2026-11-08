@@ -7,6 +7,12 @@ import { renderWhy } from "./transcripts/frame";
 // reads the other's bindings at top level (both are used only inside functions), so either load order
 // works — under bun and in the compiled binary. Keep it that way.
 import { isDiscoverySummary } from "./discoverySummary";
+import type { CalendarStruct, CalendarStructEvent, CalDate } from "./calendar/types";
+import {
+  CALENDAR_HEADING, CALENDAR_INCOMPLETE_SUFFIX, CALENDAR_LINE_PREFIX, CALENDAR_MACOS_LABEL, CALENDAR_MAX_EVENT_LINES,
+  CALENDAR_NO_EVENTS_TEXT, CALENDAR_NOT_CONNECTED_TEXT, CALENDAR_STATUS_TEXT, CALENDAR_UNAVAILABLE_TEXT, CALENDAR_UNTITLED_TEXT,
+  calendarClockChangeMark,
+} from "./calendar/render-contract";
 
 /** The VERDICT-PATH MARKER's body (IN-2), rendered after `VERDICT_MARKER_PREFIX` under a suggestion
  *  whose `verdictPath` is set. A FIXED sentence, deliberately — no matched path, no SHA, no label:
@@ -269,6 +275,16 @@ export const API_NOTICE_TEXTS: readonly string[] = Object.freeze(
 );
 const API_NOTICE_SET: ReadonlySet<string> = new Set(API_NOTICE_TEXTS);
 
+/** The title, up to its date, and the clause after the date that names the computer. */
+export const TITLE_PREFIX = "☀️  Daily briefing — ";
+export const TITLE_MACHINE_CLAUSE = "  (this machine: ";
+/** The line that opens the briefing after an outage, which names the account. */
+export const OUTAGE_LINE_PREFIX = "⚠️  No briefing for ";
+/** The warnings block's lines. They carry whatever a warning holds: a key file's path, a folder, CLI output. */
+export const WARNING_LINE_PREFIX = "⚠ ";
+/** The closing line, which names the provider. A CLI's is `cfg.cli` verbatim, so it can be a path holding a user name. */
+export const FOOTER_LINE_PREFIX = "— generated via ";
+
 export function renderBriefing(b: BriefingStruct): string {
   const L: string[] = [];
   // ⚠ "Morning" was DROPPED 2026-08-17 (scope decision, user-directed): the deliverable is a
@@ -281,13 +297,22 @@ export function renderBriefing(b: BriefingStruct): string {
   // OLD text — so its matcher accepts both spellings and must keep doing so. See
   // `BRIEFING_HEADER_RE` in audit.ts (named rather than line-cited: a line number in a comment goes
   // stale silently, and this workspace has already shipped one such citation off by three).
-  L.push(`☀️  Daily briefing — ${b.date}  (this machine: ${b.machineScope})`);
+  // Provider fallback (P1-M9-T3, spec r9 §5 "Lines above the title"): the walk's notices — which entries were skipped
+  // or not tried, and the cost line — ABOVE the header, so audit's `lastBriefing` (which slices from the header) never
+  // grades them. A combined list of two or more only: absent otherwise, so a single-entry render is byte-identical.
+  // A label is config text: the render's own per-line `stripControl` (its return) cleans these lines like every other,
+  // and the redactor runs over the whole render in main.ts.
+  if (b.notices !== undefined && b.notices.length > 0) {
+    for (const n of b.notices) L.push(n);
+    L.push("");
+  }
+  L.push(`${TITLE_PREFIX}${b.date}${TITLE_MACHINE_CLAUSE}${b.machineScope})`);
   L.push("");
   // The outage line OPENS the briefing — the silence is what made the 2026-08-23 outage invisible for a
   // day and a half, so the recovery notice cannot be a trailing warning. Deliberately NOT the `warnings`
   // channel below, which renders after "Suggested next", semicolon-joined with unrelated text.
   if (b.outage) {
-    L.push(`⚠️  No briefing for ${b.outage.missedDays} day${b.outage.missedDays === 1 ? "" : "s"} — account "${b.outage.label}" was at its usage limit.`);
+    L.push(`${OUTAGE_LINE_PREFIX}${b.outage.missedDays} day${b.outage.missedDays === 1 ? "" : "s"} — account "${b.outage.label}" was at its usage limit.`);
     L.push("");
   }
   // ── SUB-PROJECT LABEL LEGEND (judge days 41, 43, 44). ONE code-built line, directly under the
@@ -484,6 +509,13 @@ export function renderBriefing(b: BriefingStruct): string {
     L.push(...b.today.map((t) => `   • [${t.repo}] ${t.text}`));
     L.push("");
   }
+  // v0.3.0 calendar (plan M4; spec r4 §7): `▶ Today's calendar`, after "Today so far" and before "Suggested next".
+  // Code-rendered from the restricted struct — the user's own calendar, so titles show whatever the AI attempt's
+  // lock state. ABSENT field ⇒ no section and no blank line: with calendar off the page is byte-identical.
+  if (b.calendar !== undefined) {
+    L.push(...renderCalendarSection(b.calendar, b.date));
+    L.push("");
+  }
   L.push("▶ Suggested next");
   // `(from resume)` (S1): PROVENANCE, not decoration. A promoted line is the verbatim tail of a
   // RESUME bullet the reader has already seen 20 lines up, so without the label it reads as the model
@@ -519,15 +551,95 @@ export function renderBriefing(b: BriefingStruct): string {
   const ordinaryWarnings = shownWarnings.filter((w) => !isDiscoverySummary(stripControl(w)));
   if (shownWarnings.length) {
     L.push("");
-    if (ordinaryWarnings.length) L.push("⚠ " + ordinaryWarnings.join("; "));
-    for (const w of shownWarnings) if (isDiscoverySummary(stripControl(w))) L.push("⚠ " + w);
+    if (ordinaryWarnings.length) L.push(WARNING_LINE_PREFIX + ordinaryWarnings.join("; "));
+    for (const w of shownWarnings) if (isDiscoverySummary(stripControl(w))) L.push(WARNING_LINE_PREFIX + w);
   }
   L.push("");
   // "generated via", not "generated locally via" (known item 10, Phase E final harden): the text is
   // produced by the model behind `<provider>` — a remote API for an HTTP provider, and for the default
   // CLI provider too, whose CLI sends the prompt to its own service. Only a local model (Ollama, …)
   // generates on this machine, so "locally" was false for nearly every briefing.
-  L.push(`— generated via ${b.provider}`);
+  L.push(`${FOOTER_LINE_PREFIX}${b.provider}`);
   // Sanitize each line, THEN join — structural newlines are added here, so no field can inject one.
   return L.map(stripControl).join("\n");
+}
+
+// ── v0.3.0 calendar: the section (plan M4; spec r4 §7) ─────────────────────────────────────────────────
+//
+// The FROZEN CONTRACT is `test/fixtures/calendar/rendered-section.txt` (its layout rules: the header of
+// `test/fixtures/calendar/contract.ts`); the desktop app's mirror (`gui/src/lib/briefing-struct.ts`, W2) renders the
+// same bytes. Every line but the heading starts with `CALENDAR_LINE_PREFIX`, which the audit's section-bounded
+// exclusion (M6a) keys on, so nothing in here may ever emit a line without it. Each line is control-stripped by
+// `renderBriefing`'s final pass like every other line (a title cannot forge a line of its own).
+
+const CAL_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
+const calPad = (n: number): string => String(n).padStart(2, "0");
+
+/** `YYYY-MM-DD` → its LOCAL midnight, by date arithmetic (`new Date(y, m, d)` — the DST-safe idiom). NaN when the
+ *  date is malformed, which every comparison below then reads as "not that day". */
+function calMidnight(date: CalDate, plusDays = 0): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + plusDays).getTime() : NaN;
+}
+
+const calHHMM = (ms: number): string => { const d = new Date(ms); return `${calPad(d.getHours())}:${calPad(d.getMinutes())}`; };
+const calMonDay = (ms: number): string => { const d = new Date(ms); return `${CAL_MONTHS[d.getMonth()]} ${d.getDate()}`; };
+
+/** A timed event's span against "today" = `date`, in the renderer's LOCAL zone — the contract's rule 6. */
+function calTimedSpan(startMs: number, endMs: number, date: CalDate): string {
+  const today = calMidnight(date), tomorrow = calMidnight(date, 1), dayAfter = calMidnight(date, 2), yesterday = calMidnight(date, -1);
+  const startToday = startMs >= today && startMs < tomorrow;
+  const start = startToday ? calHHMM(startMs)
+    : startMs >= yesterday && startMs < today ? "since yesterday"
+    : startMs < yesterday ? `since ${calMonDay(startMs)}`
+    : `${calMonDay(startMs)} ${calHHMM(startMs)}`;
+  if (endMs === startMs) return start;
+  const endToday = endMs > today && endMs < tomorrow;
+  const end = endToday ? calHHMM(endMs)
+    : endMs === tomorrow ? "24:00"
+    : endMs > tomorrow && endMs < dayAfter ? `${calHHMM(endMs)} tomorrow`
+    : `${calMonDay(endMs)} ${calHHMM(endMs)}`;
+  // Final harden r3: a span across a DST change carries the mark, so a fall-back hour never reads backwards.
+  return `${start}${startToday && (endToday || endMs === tomorrow) ? "–" : " → "}${end}${calendarClockChangeMark(startMs, endMs)}`;
+}
+
+/** One event line, without the prefix: `<when><sep><what><marks>`. Shared with the live details read's
+ *  `rowText` (redesign C, src/calendar/details.ts): the page's own line for an event, by construction. The marks are
+ *  the key-c merge mark (calendar near-duplicates, spec 2026-10-31 §6: the struct's decided `merged`, rendered as
+ *  given, never inferred), then ` · tentative`, then ` · ended`. */
+export function calEventLine(e: CalendarStructEvent, date: CalDate): string {
+  const title = e.title.trim() === "" ? CALENDAR_UNTITLED_TEXT : e.title;
+  const what = `${title}${e.location ? ` (${e.location})` : ""}`;
+  const merged = e.merged === undefined ? "" : e.merged.mark === "calendars" ? ` · on ${e.merged.count} calendars` : ` · ${e.merged.count} copies`;
+  const marks = `${merged}${e.status === "tentative" ? " · tentative" : ""}${e.ended === true ? " · ended" : ""}`;
+  const t = e.time;
+  switch (t.kind) {
+    case "allDay": return `all day — ${what}${marks}`;
+    case "unclear": return `time unclear (${t.wallStart}–${t.wallEnd} ${t.tzid})  ${what}${marks}`;
+    case "timed": return `${calTimedSpan(t.startMs, t.endMs, date)}  ${what}${marks}`;
+  }
+}
+
+/** The calendar section's lines, heading first, no trailing blank line. Exported for the contract test and the
+ *  sentinel tests; `renderBriefing` is its only production caller. */
+export function renderCalendarSection(cal: CalendarStruct, date: CalDate): string[] {
+  const L = [CALENDAR_HEADING + (cal.incomplete ? CALENDAR_INCOMPLETE_SUFFIX : "")];
+  if (cal.sources.length === 0) {
+    L.push(CALENDAR_LINE_PREFIX + CALENDAR_NOT_CONNECTED_TEXT);
+    return L;
+  }
+  const allFailed = cal.sources.every((s) => s.status !== "ok" && s.status !== "incomplete");
+  if (allFailed) L.push(CALENDAR_LINE_PREFIX + CALENDAR_UNAVAILABLE_TEXT);
+  for (const s of cal.sources) {
+    if (s.status === "ok") continue;
+    L.push(`${CALENDAR_LINE_PREFIX}${s.kind === "macos" ? CALENDAR_MACOS_LABEL : s.id}: ${CALENDAR_STATUS_TEXT[s.status]}`);
+  }
+  if (allFailed) return L;
+  if (cal.events.length === 0) {
+    L.push(CALENDAR_LINE_PREFIX + CALENDAR_NO_EVENTS_TEXT);
+    return L;
+  }
+  for (const e of cal.events.slice(0, CALENDAR_MAX_EVENT_LINES)) L.push(CALENDAR_LINE_PREFIX + calEventLine(e, date));
+  if (cal.events.length > CALENDAR_MAX_EVENT_LINES) L.push(`${CALENDAR_LINE_PREFIX}+${cal.events.length - CALENDAR_MAX_EVENT_LINES} more`);
+  return L;
 }

@@ -1,9 +1,19 @@
 # The capability — what the webview may ask the shell to do
 
-`default.json` is the whole of what this webview may invoke. It grants **thirty-five** entries: the
+`default.json` is the whole of what this webview may invoke. It grants **sixty-three** entries: the
 two core event permissions `listen()` needs (`core:event:allow-listen`, `core:event:allow-unlisten`),
-**ten** `allow-engine-*` permissions (Phase E's E12 adding `allow-engine-update-check` — see *Phase E's
-update check*), T11's three `allow-state-snapshot` / `allow-open-today` /
+**eighteen** `allow-engine-*` permissions (Phase E's E12 adding `allow-engine-update-check` — see *Phase E's
+update check* — v0.3.0's M8 the four `allow-engine-calendar-*` — see *v0.3.0's calendar
+connection* — and provider fallback PR 3 the five `allow-engine-provider-*`: `key-set` (the key on
+stdin only), `key-migrate`, `key-delete`, `key-scrub-backup` (holds the save
+lock) and `reset` (a label on stdin, never argv), all mutating and bounded; `provider test` has
+no grant of its own — it takes a file path, and only the candidate-staging command reaches it; and
+PR 3 final round 1 DROPPED two the app never called, `allow-engine-config-validate` (it handed the
+webview the engine's report verbatim — `normalized`, every literal `apiKey` of any absolute file it
+named, the real `config.json` included) and `allow-engine-provider-key-delete-all` (one call deleted
+every app key, around uninstall's kept-schedule refusal and consent): their operations stay
+Rust-side, for the settings guard, the candidate check and uninstall's key leg, and
+`the_dropped_config_validate_and_key_delete_all_commands_are_refused` pins both refused), T11's three `allow-state-snapshot` / `allow-open-today` /
 `allow-app-quit`, B5's five `allow-read-latest-briefing` / `allow-read-archived-briefing` /
 `allow-config-read` / `allow-config-save` / `allow-config-offer-notify-auto`, B6's four
 `allow-access-snapshot` / `allow-access-probe` / `allow-access-reveal-engine` /
@@ -13,13 +23,39 @@ B8's four `allow-config-create` (T16's first-config path) and `allow-cli-shim-st
 B25's two `allow-uninstall-preview` / `allow-uninstall-execute` (T25's Settings action — see
 *B25's two*), Phase E M5b's two `allow-autostart-set-enabled` / `allow-autostart-wizard-default`
 (the login item's ON/OFF, branded on macOS, and the wizard's pre-tick — see *Phase E M5b: the
-login item*), and ONE plugin grant, T19's `autostart:allow-is-enabled` (B7 granted the plugin's
+login item*), v0.3.0 M8's three `allow-calendar-link-write` / `allow-calendar-link-remove` /
+`allow-calendar-config-save` (a calendar link's Rust side — see *v0.3.0's calendar connection*),
+provider fallback PR 3's `allow-provider-candidate-check` (P3-M1-T2: the Providers screen's Check
+and Test — JSON text and a closed mode in, never a path; it refuses before staging a calendar link
+address and any literal key other than the redaction placeholder at a key slot (`config_read` shows
+the placeholder in place of a stored key, so any other value was typed in, and the save path refuses
+it anyway); it stages the candidate itself, 0600 under
+its own `provider-check-` name and removed on every outcome, and is the only route to `provider
+test --file`), P3-M4-T3's three `allow-provider-pending-reset-add` / `-flush` / `-drop` (Replace's
+Rust-owned pending-reset store: a label and the NEW key id each, never a path; `add` records a
+`pre-save` reset and runs `provider reset` with the label on stdin, `flush` resets again after the
+save, `drop` discards an unsaved replacement and deletes its key only when the saved config's
+`config validate` rows reference it nowhere), the briefing redesign's two `allow-app-prefs-get` /
+`allow-app-prefs-set` (A-M1: the first name and the slides switch in the app's own
+`app-prefs.json`, 0600; no path, no spawn, nothing sent to the engine), its B1's one live git
+read `allow-repos-status` (`repos_status`: a READ gated in Rust by the window's visibility, the
+current slide and a stat of each repo's git metadata, one check in flight; its validated request
+reaches the engine's `repos status --json` on stdin, never argv; the reply crosses without the
+engine-only repo paths and without any member the reply types do not declare), the briefing redesign's
+wave-2 four `allow-calendar-details-open` / `allow-calendar-details-get` / `allow-calendar-join` /
+`allow-calendar-app-open` (C: today's calendar details read live and never saved — see *Wave 2's
+live calendar details*), the wave-3 five `allow-open-github` / `allow-copy-push-command` /
+`allow-editor-list` / `allow-editor-open` / `allow-editor-choice-set` (B2: a click names a handle, a
+stable project key or a closed editor token, never a URL, path or command; what it opens or copies is
+read from what Rust holds), A2's one read `allow-read-latest-summary` (the stored AI summary bound to
+the latest page — see *A2's summary read*), and ONE plugin grant, T19's `autostart:allow-is-enabled` (B7 granted the plugin's
 whole allow-set; M5b took back `allow-enable` / `allow-disable` — see *B7's two app commands, and
 the first plugin grants*). **Nothing else: no
 `core:default`, no `shell:*` permission of any kind, nothing for `tauri-plugin-notification`
 (registered, live, refused — the tray's live-but-withheld command posture, though unlike the tray
-it also injects an init script; see its ⚠ below), and nothing for the opener or window-state
-plugins.**
+it also injects an init script; see its ⚠ below), nothing for `tauri-plugin-clipboard-manager`
+(registered, its six commands live and refused, `tests/capability.rs` naming each; `copy_push_command`
+is the one way to the clipboard), and nothing for the opener or window-state plugins.**
 
 ⚠ **B6 ADDS A PLUGIN DEPENDENCY AND GRANTS IT NOTHING — and it goes further than that.**
 `tauri-plugin-opener` `=2.5.5` is in `[dependencies]` because `src/access.rs` calls its FREE
@@ -48,9 +84,9 @@ table) and is pinned by `../tests/capability.rs`, `../tests/engine_client.rs` an
 
 | Layer | What it decides | Where |
 | --- | --- | --- |
-| The capability | which of the thirty-two app commands (ten engine operations, three shell commands, two briefing reads, four config commands, four access commands, two notify commands, three cli-shim commands, two uninstall commands, two autostart commands), which two core event commands, and which one autostart plugin command this webview may invoke | `default.json` |
+| The capability | which of the sixty app commands (eighteen engine operations, three shell commands, two briefing reads, five config commands, four access commands, two notify commands, three cli-shim commands, two uninstall commands, two autostart commands, three calendar-link commands, three pending-reset commands, two app-preference commands, one live git read, four calendar-details commands, two GitHub-and-copy commands, three editor commands, one summary read), which two core event commands, and which one autostart plugin command this webview may invoke | `default.json` |
 | The app ACL manifest | that app commands are checked against a capability **at all** | `../build.rs` |
-| `Operation` | the argv for each operation — fixed literals plus two validated operands | `../src/engine.rs` |
+| `Operation` | the argv for each operation — fixed literals plus validated operands (`--json-out`, `--file`, `--index`, `--id`) and closed enums (`--invoker`); a reset label and a key go on stdin, never into the argv | `../src/engine.rs` |
 | The validators | whether a caller-supplied operand may reach an argv position | `../src/engine.rs` |
 | The spawn | the program, the environment and the caffeinate wrapper | `../src/engine.rs` |
 
@@ -95,15 +131,22 @@ it with `write_if_changed` and never deletes a file (`acl/build.rs:307-309`), a 
 leaves `<old>.toml` behind defining a permission nothing grants.
 `autogenerated_permissions_match_the_command_set` reads the directory and catches exactly that;
 `the_capability_grants_exactly_the_app_commands` pins this file's grants, `build.rs`'s list,
-`commands::all_commands()` (engine, shell, briefing-file, config-save, access and — since B7 —
-notification commands) and `lib.rs`'s `generate_handler!` against each other.
+`commands::all_commands()` (the seventeen module lists `../src/commands.rs` chains, in its order: engine,
+shell, briefing-file, config-save, access, notification, CLI-shim, uninstall, autostart, calendar,
+pending-resets — since provider fallback PR 3 — app-preference commands — since the briefing
+redesign's A-M1 — the live git read — its B1 — the live calendar-details commands — its C — the
+GitHub-and-copy and editor commands — its B2 — and the summary read — its A2) and `lib.rs`'s `generate_handler!` against
+each other.
 
-### The two caller-supplied operands
+### The caller-supplied operands
 
-Only two argv positions are not fixed literals, and both are parsed into newtypes
-(`JsonOutName`, `ConfigFilePath`) that cannot be constructed without passing the validator — so an
+The argv positions that are not fixed literals or closed enums are parsed into newtypes
+(`JsonOutName`, `ConfigFilePath`, and since PR 3 `ProviderIndex` for `--index` and `KeyId` for `--id`)
+that cannot be constructed without passing the validator — so an
 `Operation` carrying an unvalidated string is unrepresentable rather than merely unlikely. An
 invalid operand is refused **before any process is created**, with a typed error naming the class.
+(Since PR 3 final round 1 no webview command supplies `--file`: every `ConfigFilePath` is a file
+Rust staged or owns — `../src/config_save.rs` — and the validator still runs over it.)
 
 | Flag | Accepts | Why that shape |
 | --- | --- | --- |
@@ -137,6 +180,11 @@ scheduler run the engine, which can generate a briefing and stamp the day
 Settings screen edits an existing config through `config_save` rather than running `init` — and no
 `--api-key` anywhere, because the engine has none: a literal secret on a command
 line lands in shell history and in the process table.
+
+**AMENDED IN v0.3.0 (plan M8): `calendar` now has typed commands** — the four operations of *v0.3.0's
+calendar connection* below, landing in the same release as the engine's `calendar` subcommands (W1's
+M5), so the rule this paragraph states still holds for every shipped build. What follows is the
+pre-v0.3.0 record.
 
 `calendar` is also absent, and that is a **change from B1**, which allowlisted it ahead of the engine
 per plan R1's forward list. It does not exist in the engine (`src/main.ts` dispatches `run | init |
@@ -341,7 +389,7 @@ The real `/usr/local/bin` leg is behind the injectable `ShimSink` and is **UNRUN
 | Command | What bounds it |
 | --- | --- |
 | `uninstall_preview` | takes nothing; two engine reads (`status --json`, for `paths.stateDir` and `paths.configPath`; `schedule status --json`, for the scheduler's facts, where a read that fails or times out is recorded as "status unreadable", never as an all-default view), one `is_enabled()` read through T19's sink-or-plugin resolution, and `lstat`s of the ENUMERATED names. Read-only — nothing is removed by a preview |
-| `uninstall_execute` | takes two booleans and one closed choice — `removeEngineState` (the explicit consent for the engine-data leg), `removeSettings` (the explicit consent for the settings leg; a missing one reads `false`) and `schedule` (`removeOwn`, `removeAny` or `keep`; a missing one reads `removeOwn`) — and no path anywhere: the app-file names are module constants (`uninstall.rs`: the three `STORE_FILE`s, the candidate dir, the window-state plugin's own `DEFAULT_FILENAME`), the engine-state names mirror `scripts/uninstall.sh`'s `$SUPPORT`-rooted list token for token (set-equality with a test-time PARSE of the script, `tests/uninstall.rs` — the T9 parity pattern), and the state dir and the settings folder are re-read from `status --json` (`paths.stateDir`, and `paths.configPath`'s parent). Its first step is the scheduler, and it never runs `launchctl` or `systemctl` itself: it runs the engine's own `schedule uninstall --invoker app`, the Schedule screen's operation, with `--take-over` only for `removeAny`; `keep` calls nothing, and `removeOwn` refuses, without calling the engine, a scheduler this app did not install or one whose status could not be read. Without its consent flag a data leg is not attempted at all, and both are refused while a kept scheduler was detected or the gate look still sees a scheduler record or unit. NEVER a recursive delete of the state dir (the two `remove_dir_all`s are the `briefings` and `provider-cwd` subdirectories the script itself `rm -rf`s; survivors pinned by test). The settings leg removes, in the engine's settings folder only, a key file a readable config names when it is a regular file directly in that folder, then `config.json` and `config.json.bak`, then the folder only if it is empty, never recursively. On Linux the engine-data leg also removes the managed engine copy, after its ownership checks, and its two folders only if empty. The login-item removal is T19's plugin `disable()` reused, not a plist removal of this module's own. ⚠ With consent this is the ONE webview-reachable surface that can remove the briefing archive — the consent wording must name it (`coexistence.check.ts` pins the label) — and `tests-web/history.check.ts` carries it as an enumerated, argued exception to its no-deletion-surface claim |
+| `uninstall_execute` | takes two booleans and one closed choice — `removeEngineState` (the explicit consent for the engine-data leg), `removeSettings` (the explicit consent for the settings leg; a missing one reads `false`) and `schedule` (`removeOwn`, `removeAny` or `keep`; a missing one reads `removeOwn`) — and no path anywhere: the app-file names are module constants (`uninstall.rs`: the three `STORE_FILE`s, the candidate dir, the window-state plugin's own `DEFAULT_FILENAME`), the engine-state names mirror `scripts/uninstall.sh`'s `$SUPPORT`-rooted list token for token (set-equality with a test-time PARSE of the script, `tests/uninstall.rs` — the T9 parity pattern), and the state dir and the settings folder are re-read from `status --json` (`paths.stateDir`, and `paths.configPath`'s parent). Its first step is the scheduler, and it never runs `launchctl` or `systemctl` itself: it runs the engine's own `schedule uninstall --invoker app`, the Schedule screen's operation, with `--take-over` only for `removeAny`; `keep` calls nothing, and `removeOwn` refuses, without calling the engine, a scheduler this app did not install or one whose status could not be read. Without its consent flag a data leg is not attempted at all, and both are refused while a kept scheduler was detected or the gate look still sees a scheduler record or unit. NEVER a recursive delete of the state dir (the `remove_dir_all`s are the `briefings`, `provider-cwd` and — v0.3.0 — `calendar` subdirectories the script itself `rm -rf`s; survivors pinned by test). The settings leg removes, in the engine's settings folder only, a key file a readable config names when it is a regular file directly in that folder, then `config.json` and `config.json.bak`, then the folder only if it is empty, never recursively. On Linux the engine-data leg also removes the managed engine copy, after its ownership checks, and its two folders only if empty. The login-item removal is T19's plugin `disable()` reused, not a plist removal of this module's own. ⚠ With consent this is the ONE webview-reachable surface that can remove the briefing archive — the consent wording must name it (`coexistence.check.ts` pins the label) — and `tests-web/history.check.ts` carries it as an enumerated, argued exception to its no-deletion-surface claim |
 
 The real filesystem defaults are behind the injectable `UninstallFs` sink and the two directory
 overrides; the real autostart-disable leg is **UNRUN in this suite** with the rest of T19
@@ -349,6 +397,63 @@ overrides; the real autostart-disable leg is **UNRUN in this suite** with the re
 directories only, and every test that reaches the scheduler step runs a fake engine program
 (`EngineClient::with_program`), never the bundled sidecar, so the real removal of a registered job
 is **UNRUN in this suite** too (`docs/gui-seam.md` §1b, §16c).
+
+### v0.3.0's calendar connection (plan M8): four engine operations and three link commands
+
+| Command | What bounds it |
+| --- | --- |
+| `engine_calendar_status` | `calendar status --json`; no operand. A read (no in-flight guard), bounded at 30 s by the operation itself (`Operation::timeout`, applied inside `EngineClient::invoke`). No network call, never a prompt |
+| `engine_calendar_list` | `calendar list --json`; no operand. A read, 30 s. The Mac calendars (`null` off macOS) and the configured links — never a link URL |
+| `engine_calendar_test` | `calendar test --json`; no operand. Reads every configured source NOW (the engine's link fetches, the Mac helper). NOT mutating — it changes no schedule and no briefing state, so it works while a run is in flight (the `UpdateCheck` rule) — and bounded at 75 s, derived from the engine's own 25 s network grace + 30 s calendar step (UNVERIFIED against W1's M5) |
+| `engine_calendar_connect_mac` | `calendar connect mac --json`; no operand. MUTATING — it installs and re-signs the helper copy (the keychain identity `schedule install` also uses) and raises the Calendar dialog — so the in-flight guard holds it; bounded at 150 s (spec r4 §8: the helper's own 120 s request limit plus headroom), the first MUTATING operation with a Rust bound, and a timeout kills the engine's process group mid-write (`engine::CALENDAR_CONNECT_MAC_TIMEOUT` says why that is accepted). Granted on every platform so the lists stay in parity on Linux CI; off macOS it answers `unsupported` before any spawn (`engine::mac_only`, the `access.rs` precedent) |
+| `calendar_link_write` | takes a link `id` (grammar `^[a-z0-9][a-z0-9-]{0,31}$`, `macos` reserved) and its `url` (https or webcal, a host, no whitespace / control / format character, ≤ 4096 bytes) — both refused before any spawn, neither ever echoed. Writes ONLY `<state>/calendar/links/<id>.url` under `status --json`'s `paths.stateDir`: the URL's trimmed bytes, 0600, staged `O_EXCL` in the same folder, `fsync`ed and renamed into place; the `links/` folder created 0700 and refused when it is a symlink, another user's, or carries any group/other bit; a symlink or folder AT the name refused and left alone; at most ten link files. Its one config edit: a DIFFERENT URL replacing an existing one first removes that link's `confirmedOwner` (spec §4.2), under the same save lock, before the file moves |
+| `calendar_link_remove` | takes the `id` alone; removes that link file (a symlink unlinked, never followed; a folder refused; nothing through a symlinked or foreign folder) and then the id's entry in `calendar.links` through the config-save path. Idempotent |
+| `calendar_config_save` | takes the `calendar` block as JSON text — no path, no base token (a one-key edit of the file as it is now, the Quit offer's shape) — and replaces that key through `config_save::edit_config_at`: engine-validated, atomic, `.bak` kept, every other field preserved. Refused before any spawn: a key spelled `url` anywhere, a URL in a name/owner/email, and everything the engine's all-or-nothing resolver would call malformed (closed key sets at both levels, field types, ids, ≤ 10 links) — a `config validate` warning does not block a save, so a block the engine would switch off must never be written |
+
+The three link commands hold `ConfigSaver`'s lock and honour its "settings removed by Uninstall"
+latch. Uninstall's consented engine-data leg removes `<state>/calendar/` whole (`ENGINE_STATE_REMOVALS`'
+`calendar` entry, mirrored by W1's M7 line in `scripts/uninstall.sh`). `src/calendar.rs` prints
+nothing, which `tests/calendar.rs` pins over its source.
+
+### Wave 2's live calendar details (C-M3-T9): four commands, no URL to the webview
+
+`calendar_details_open { request: { reason, current } }` asks for one live read of today's calendar
+details. It is gated in Rust (`src/calendar_details.rs`, `decide`): the main window must be shown
+(`src/live_gate.rs`), the calendar slide or the launchpad current, and one read is in flight at a
+time — a second ask waits, then re-samples the window and the clock and decides again. `reason` is
+one of `became-current`, `focus`, `timer`; only a `became-current` read may run a calendar link's
+`urlCommand` (every `focus` and `timer` read passes `--skip-commands`), and a `timer` read inside
+the 5-minute backstop answers from the held read. The read runs `calendar details --json` through
+`EngineClient::invoke_sealed`: its stdout is parsed inside Rust and never becomes an
+`EngineOutcome`, its stderr is reduced to a fixed code, and the remembered command-link URLs go to
+the engine on STDIN only, from a zeroing buffer. The reply carries each event's Join HOST, never a
+URL. `calendar_details_get { request: { handle } }` returns one event's people and notes from
+Rust's in-memory map and reads nothing. `calendar_join { request: { handle, confirmed } }` opens
+that event's meeting link by handle after Rust re-validates it with the `url` crate (https, no
+userinfo, no written port; the host lowercased and shown in punycode); a host outside the known
+meeting services answers `{ ask }` until `confirmed` — the webview's assertion, acceptable because
+the URL is chosen in Rust, by handle, never named by the webview — and the opener's own error text
+is never forwarded. `calendar_app_open` launches the Calendar app by bundle id on today
+(`/usr/bin/open -b com.apple.iCal ical://date/<now, UTC>?method=show`, the URL built from Rust's
+clock alone), macOS only, taking nothing from any event. Every request is
+`deny_unknown_fields`, so the webview cannot pass a URL (`tests/capability.rs`), and only
+`calendar_details_open` constructs `Operation::CalendarDetails`.
+
+### A2's summary read (A2-M4-T13): one command, two identities, nothing written
+
+`read_latest_summary { request: { pageHash, pageVersion } }` returns the stored AI summary only if it
+is bound to the page on disk now. Both operands are 64 lowercase hexadecimal digits and the request is
+`deny_unknown_fields`, so the webview cannot name a path; a bad operand is `{ kind: "invalidOperand" }`,
+refused before the engine is asked or a file is opened. It is no new engine operation: `status --json`
+gives the paths and the delivery marker's date, Rust re-checks the latest page's identity, reads only
+`<briefingsDir>/<date>.<pageHash>.<pageVersion>.summary.json` with a capped, no-symlink read
+(`src/summary.rs`) and revalidates every stored point and sentence itself. Stored keys are checked by
+syntax only, so card membership is the webview's. The reply is `{ state: "ready", pageHash,
+pageVersion, revision, projects, goodMorningSentence, warnings }` or `{ state: "pending" | "unavailable",
+warnings }`, with fixed warning codes only. Everything else is ordinary absence, `{ state: "unavailable",
+warnings: [] }`: no record, a mismatched identity, an unsafe or malformed file, an engine that fails, and
+an engine client that failed at startup, so no raw response, provider config or filesystem error
+crosses (`tests/capability.rs`, `a_failed_engine_client_is_absence_and_its_text_never_crosses`).
 
 ### Why not `core:default`
 
@@ -500,3 +605,25 @@ environment, no working directory and no program, so there is nothing left to fo
   which sets `PATH` only (`src/schedule/units.ts`), and it means the engine's `apiKeyEnv` rung
   (`src/apiKey.ts`) cannot resolve a key from the app any more than from launchd; a key must come
   from `apiKeyFile`, `apiKeyCommand` or the config. See `docs/gui-seam.md` §6 for the T15 note.
+- **`engine_provider_key_delete` has no Rust-side reference check (accepted residual, PR 3 final
+  r4).** It validates its one operand (`k-` and 12 lowercase hex, `engine::key_id`) and runs `provider
+  key delete --id`; it does not ask whether a saved entry still reads that key. The "only when no
+  saved entry uses it" rule is decided in the webview's TypeScript (`src/lib/unused-key.ts`, which
+  re-reads the saved settings and the engine's `config validate` rows before each delete), and the
+  key ids in use are visible to the webview in those rows. So a webview running other code could
+  delete a key a saved entry reads. It is accepted because the webview loads only the app's bundled
+  code (`tauri.conf.json`: `frontendDist` is `../dist`, and the CSP's `script-src 'self'`), so the
+  only caller is that rule. The Rust deletes the app makes itself do check, through `key_refs.rs`:
+  `provider_pending_reset_drop` (under the settings save lock) and Uninstall's key leg.
+- **`notified-dates.json` can come back after Uninstall in the same app session (known gap, PR 3
+  final r5, H4).** Uninstall's app-files leg (`../src/uninstall.rs`, step 8, `APP_DATA_FILES`)
+  removes it, but the notification path (`../src/notifications.rs`, `on_snapshot`) still holds its
+  dedupe map in memory and rewrites the file (`write_notified_dates`) at the next snapshot that
+  fires a notification class — nothing tells it the leg ran. The latch that would (`PendingResets`'
+  closed flag, which that leg sets through `close_for_uninstall`) is private to
+  `../src/pending_resets.rs`, and the settings latch (`ConfigSaver::settings_removed`) is the wrong
+  one: it is set by the SETTINGS leg, which can be left unticked while the app-files leg runs. Closing
+  this means plumbing a latch across `uninstall.rs`, `pending_resets.rs` (or `NotifyState`) and
+  `notifications.rs`, which the fix pass that found it did not do. What it costs: one small file of
+  per-class dates (`{"<class>": "<YYYY-MM-DD>"}`, no key, label or path) left in the app's data
+  folder — the same file a relaunch writes at its first firing; a second Uninstall removes it.

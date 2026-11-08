@@ -54,7 +54,7 @@ import { stateDirFor } from "../../src/marker";
 // static pin cannot see.
 import { manualRemoveSteps } from "../../src/schedule/install";
 
-import AppSettings from "../src/lib/AppSettings.svelte";
+import UninstallPanel from "../src/lib/settings/UninstallPanel.svelte";
 import ScheduleUninstall from "../src/lib/ScheduleUninstall.svelte";
 import UninstallConsent from "../src/lib/UninstallConsent.svelte";
 import * as appUninstall from "../src/lib/app-uninstall";
@@ -98,6 +98,7 @@ import {
   type SchedulerOutcome,
   type SchedulerReport,
   type SettingsReport,
+  type KeysReport,
   type StillLine,
   type UninstallPreview,
   type UninstallReport,
@@ -246,9 +247,16 @@ const FIXTURE_SHA = (() => {
   return sha;
 })();
 
-/* ── the GUI's on-disk presence, simulated (B4–B8's real list, read from the sources) ────────── */
+/* ── the GUI's on-disk presence, simulated (a hand copy of uninstall.rs's APP_DATA_FILES) ──────── */
 
-const APP_DATA_FILES = ["autostart-state.json", "notify-state.json", "access-state.json"];
+const APP_DATA_FILES = [
+  "autostart-state.json",
+  "notify-state.json",
+  "access-state.json",
+  "notified-dates.json",
+  "pending-resets.json",
+  "app-prefs.json",
+];
 const WINDOW_STATE_FILE = ".window-state.json";
 
 /** An XDG base dir as dirs 6.0.0 resolves it on Linux (`src/lin.rs`): the variable counts only
@@ -285,7 +293,9 @@ function appDirs(sb: Sandbox): { data: string; config: string } {
  *   app_data_dir (see `appDirs` for where that is per platform):
  *     autostart-state.json (src-tauri/src/autostart.rs STORE_FILE), notify-state.json
  *     (notifications.rs), access-state.json (access.rs), config-candidates/ (config_save.rs
- *     CANDIDATE_SUBDIR).
+ *     CANDIDATE_SUBDIR); and, added since, notified-dates.json (notifications.rs), pending-resets.json
+ *     (pending_resets.rs) and app-prefs.json (app_prefs.rs) — gui-seam item 158. `APP_DATA_FILES`
+ *     above is copied from uninstall.rs by hand; nothing checks the two agree.
  *   app_config_dir: .window-state.json (tauri-plugin-window-state 2.4.1 DEFAULT_FILENAME, saved
  *     through `app_config_dir()`, `src/lib.rs:122`) — the same directory as app_data_dir on
  *     macOS, a different one on Linux (gui-seam §16b dev 158).
@@ -727,8 +737,8 @@ describe("the uninstall wording names what consent actually removes", () => {
     const label = consentLabel(preview);
     expect(label).toBe(
       "Also remove the engine's data in /x/state: your whole briefing archive and its log, which cannot be " +
-        "recovered, and the background engine copy. These are the files `bash scripts/uninstall.sh` removes; " +
-        "nothing else in that folder is touched.",
+        "recovered, your calendar links (reset any that may have leaked), and the background engine copy. " +
+        "These are the files `bash scripts/uninstall.sh` removes; nothing else in that folder is touched.",
     );
     expect(label).toContain("briefing archive");
     expect(label).toContain("cannot be recovered");
@@ -745,8 +755,8 @@ describe("the uninstall wording names what consent actually removes", () => {
     const linux = consentLabel({ ...preview, os: "linux" });
     expect(linux).toBe(
       "Also remove the engine's data in /x/state: your whole briefing archive and its log, which cannot be " +
-        "recovered, and the background engine copy at ~/.local/share/daily-briefing/bin/daily-briefing. " +
-        "Nothing else in that folder is touched.",
+        "recovered, your calendar links (reset any that may have leaked), and the background engine copy at " +
+        "~/.local/share/daily-briefing/bin/daily-briefing. Nothing else in that folder is touched.",
     );
     expect(linux).not.toContain("does not remove");
     expect(linux).not.toContain("not removed");
@@ -793,11 +803,12 @@ describe("the uninstall wording names what consent actually removes", () => {
   });
 
   test("Batch 2 (spec 3.5.3): the settings box names the folder it empties; the folder unknown blocks it, in one more sentence", () => {
-    expect(settingsLabel(preview)).toBe("Also remove my settings and API key file (in /x/config).");
+    // P3-M6-T4: the same box is the key leg's consent, so it names the keys this app stored too.
+    expect(settingsLabel(preview)).toBe("Also remove my settings (in /x/config) and API keys.");
     expect(sentences(settingsLabel(preview))).toBe(1);
     const unknown = settingsLabel({ ...preview, settingsFolder: null });
     expect(unknown).toBe(
-      "Also remove my settings and API key file. The engine couldn't say where they are, so this removes nothing " +
+      "Also remove my settings and API keys. The engine couldn't say where they are, so this removes nothing " +
         "until it can.",
     );
     expect(sentences(unknown)).toBe(2);
@@ -945,10 +956,10 @@ describe("the uninstall wording names what consent actually removes", () => {
     expect(finishLine("windows")).not.toContain("Applications");
   });
 
-  test("Batch 2 (spec 3.6.3): AppSettings draws the done screen from the REPORT — the outcome line first, the refusal verbatim, \"Still on this machine\" before the finish — and no warning of its own", () => {
+  test("Batch 2 (spec 3.6.3): UninstallPanel draws the done screen from the REPORT — the outcome line first, the refusal verbatim, \"Still on this machine\" before the finish — and no warning of its own", () => {
     // The done view is reached only by clicking (SSR cannot get there), so its wiring is pinned by
-    // source — the way `wizard.check.ts` pins the last step.
-    const source = readFileSync(join(ROOT, "gui", "src", "lib", "AppSettings.svelte"), "utf8");
+    // source — the way `wizard.check.ts` pins the last step. (Redesign D: the panel was split out of AppSettings.)
+    const source = readFileSync(join(ROOT, "gui", "src", "lib", "settings", "UninstallPanel.svelte"), "utf8");
     const markup = source.slice(source.indexOf("</script>"));
     // The facts are the report's own (execute time) — no flag carried over from the preview, and no
     // scheduler fact read here at all (spec 3.3.8: the bare identifier, so a destructured one fails too).
@@ -992,8 +1003,8 @@ describe("the uninstall wording names what consent actually removes", () => {
     expect(markup).not.toContain("executeLabel");
   });
 
-  test("Batch 2 (spec 3.3.8): AppSettings routes the execute call's errors through executeFailure — Try again, \"Uninstall anyway\" and a re-read on ScheduleForeign", () => {
-    const source = readFileSync(join(ROOT, "gui", "src", "lib", "AppSettings.svelte"), "utf8");
+  test("Batch 2 (spec 3.3.8): UninstallPanel routes the execute call's errors through executeFailure — Try again, \"Uninstall anyway\" and a re-read on ScheduleForeign", () => {
+    const source = readFileSync(join(ROOT, "gui", "src", "lib", "settings", "UninstallPanel.svelte"), "utf8");
     const run = source.slice(source.indexOf("async function runUninstall"), source.indexOf("function tryAgain"));
     expect(run).toContain("const known = executeFailure(e);");
     // `describeFailure` only for what is none of the three (its `busy` arm reads another error's shape).
@@ -1061,10 +1072,10 @@ describe("the uninstall wording names what consent actually removes", () => {
 
   test("M9 round 3: an Uninstall execute that STARTS ends the auto-route to the setup wizard for the session, and App holds the report and the in-flight state — so a settings removal's not-configured snapshot, or a screen change, cannot take the done screen away", () => {
     const src = (rel: string) => readFileSync(join(ROOT, "gui", "src", rel), "utf8");
-    // AppSettings says the execute is starting BEFORE the IPC call (the watcher's event for a removed
+    // UninstallPanel says the execute is starting BEFORE the IPC call (the watcher's event for a removed
     // config.json can arrive before the call returns), hands the report up the moment it arrives, and says
     // the attempt ended — with no report — on any rejection.
-    const panel = src("lib/AppSettings.svelte");
+    const panel = src("lib/settings/UninstallPanel.svelte");
     const run = panel.slice(panel.indexOf("async function runUninstall"), panel.indexOf("function tryAgain"));
     const startAt = run.indexOf("onuninstallstarted();");
     expect(startAt).toBeGreaterThan(-1);
@@ -1076,11 +1087,19 @@ describe("the uninstall wording names what consent actually removes", () => {
     expect(panel).not.toMatch(/let uninstallReport = \$state/);
     expect(panel).toMatch(/\n    uninstallReport,\n/);
     expect(panel).toMatch(/\n    uninstallRunning,\n/);
-    // Settings passes all four through.
-    const settings = src("routes/Settings.svelte");
-    const tag = settings.slice(settings.indexOf("<AppSettings"), settings.indexOf("/>", settings.indexOf("<AppSettings")));
-    for (const prop of ["{uninstallReport}", "{uninstallRunning}", "{onuninstallstarted}", "{onuninstallended}"]) {
-      expect([prop, tag.includes(prop)]).toEqual([prop, true]);
+    // Settings passes all four through — redesign D: to SettingsPages, which hands them to AboutPage, which hands them
+    // to the panel. Each tag in the chain carries all four.
+    for (const [rel, open] of [
+      ["routes/Settings.svelte", "<SettingsPages"],
+      ["lib/settings/SettingsPages.svelte", "<AboutPage"],
+      ["lib/settings/AboutPage.svelte", "<UninstallPanel"],
+    ] as const) {
+      const text = src(rel);
+      const tag = text.slice(text.indexOf(open), text.indexOf("/>", text.indexOf(open)));
+      expect({ rel, open, found: text.includes(open) }).toEqual({ rel, open, found: true });
+      for (const prop of ["{uninstallReport}", "{uninstallRunning}", "{onuninstallstarted}", "{onuninstallended}"]) {
+        expect([rel, prop, tag.includes(prop)]).toEqual([rel, prop, true]);
+      }
     }
     // App holds both, like `removalLine`, and sets the no-wizard flag on the START callback.
     const app = src("App.svelte");
@@ -1091,7 +1110,8 @@ describe("the uninstall wording names what consent actually removes", () => {
     expect(mount).toContain("{uninstallReport}");
     expect(mount).toContain("{uninstallRunning}");
     // (M9 LOW pass, L2: the start also replaces the held report — "M9 round 4 (S2)" below.)
-    expect(mount).toMatch(/onuninstallstarted=\{\(\) => \{\s*wizardOffered = true;\s*uninstallRunning = true;\s*uninstallReport = null;\s*\}\}/);
+    // (Design 2026-10-31 D3, M3: the start also closes a setup left open behind another tab — `wizardOpen`.)
+    expect(mount).toMatch(/onuninstallstarted=\{\(\) => \{\s*wizardOffered = true;\s*wizardOpen = false;\s*uninstallRunning = true;\s*uninstallReport = null;\s*\}\}/);
     // (M9 round 4: the arrival also bumps the Settings mount's key — "M9 round 4 (S3)" below pins that.)
     expect(mount).toMatch(/onuninstallended=\{\(report\) => \{\s*uninstallRunning = false;\s*if \(report !== null\) \{\s*uninstallReport = report;/);
     // So a not-configured snapshot after the start callback changes no route: `applySnapshot` routes to the
@@ -1557,6 +1577,8 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
     schedule: { outcome: "removed", leftover: [], leftoverCommands: [], removeSteps: null },
     engineCopies: [],
     settings: settingsAskedClean,
+    // P3-M6-T4's key leg, neutral here (no count, nothing refused or failed): its own test sets it.
+    keys: { asked: true, deleted: null, kept: null, refused: null, error: null },
     os: "macos",
   };
   const withSchedule = (schedule: Partial<SchedulerReport>, os = "macos"): UninstallReport => ({
@@ -1575,19 +1597,16 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
   /** The panel's required props (M9 LOW pass, L5: the uninstall ones have no default any more), each case
    *  overriding what it is about. */
   const PANEL_PROPS = {
-    notify: null,
-    autostart: null,
     onrefresh: () => {},
-    os: "macos",
     uninstallReport: null,
     uninstallRunning: false,
     onuninstallstarted: () => {},
     onuninstallended: () => {},
   };
 
-  test("M9 round 3: AppSettings draws the done screen from the report App passes down — so it survives Settings unmounting — and, while App says an execute runs, a mount that knows nothing of it says Working…", () => {
+  test("M9 round 3: UninstallPanel draws the done screen from the report App passes down — so it survives Settings unmounting — and, while App says an execute runs, a mount that knows nothing of it says Working…", () => {
     const panel = (props: Record<string, unknown>): string =>
-      render(AppSettings as never, { props: { ...PANEL_PROPS, ...props } }).body.replace(/<!--[\s\S]*?-->/g, "");
+      render(UninstallPanel as never, { props: { ...PANEL_PROPS, ...props } }).body.replace(/<!--[\s\S]*?-->/g, "");
     const readableOf = (body: string): string =>
       body
         .replace(/<[^>]*>/g, " ")
@@ -1625,7 +1644,7 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
 
   test("M9 round 4 (S2) + M9 LOW pass (L2): the done screen carries \"Uninstall again…\" — the way out its refusals and the closing line name — which opens the flow in its place WITHOUT clearing App's report: Cancel or a failed preview shows the done screen again, and the report is replaced only when the next execute starts", () => {
     const panel = (props: Record<string, unknown>): string =>
-      render(AppSettings as never, { props: { ...PANEL_PROPS, ...props } }).body.replace(/<!--[\s\S]*?-->/g, "");
+      render(UninstallPanel as never, { props: { ...PANEL_PROPS, ...props } }).body.replace(/<!--[\s\S]*?-->/g, "");
     const againButton = (body: string) =>
       [...body.matchAll(/<button([^>]*)>([\s\S]*?)<\/button>/g)]
         .map((m) => ({ disabled: flag(m[1] ?? "", "disabled"), text: (m[2] ?? "").trim() }))
@@ -1640,7 +1659,7 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
     // "Uninstall app…" calls, and only a preview that LANDED draws it over the done screen — App is told nothing,
     // so a preview that fails leaves the done screen (and its manual steps) where they were, the error under it.
     const src = (rel: string) => readFileSync(join(ROOT, "gui", "src", rel), "utf8");
-    const source = src("lib/AppSettings.svelte");
+    const source = src("lib/settings/UninstallPanel.svelte");
     expect(source).toContain("let againOpen = $state(false);");
     expect(source).toMatch(
       /async function uninstallAgain\(\): Promise<void> \{\s*if \(uninstallBusy \|\| uninstallRunning\) return;\s*await openUninstall\(\);\s*againOpen = uninstall !== null;\s*\}/,
@@ -1666,11 +1685,18 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
     // No callback of its own any more: App clears the report when the next execute STARTS, and nowhere else.
     const settings = src("routes/Settings.svelte");
     const app = src("App.svelte");
-    for (const [name, text] of [["AppSettings", source], ["Settings", settings], ["App", app]] as const) {
+    // Redesign D: AppSettings was split into three parts; the sweep covers all three.
+    for (const [name, text] of [
+      ["UninstallPanel", source],
+      ["AppGeneralControls", src("lib/settings/AppGeneralControls.svelte")],
+      ["CliShimControl", src("lib/settings/CliShimControl.svelte")],
+      ["Settings", settings],
+      ["App", app],
+    ] as const) {
       expect([name, text.includes("onuninstallagain")]).toEqual([name, false]);
     }
     const mount = app.slice(app.indexOf("<Settings"), app.indexOf("/>", app.indexOf("<Settings")));
-    expect(mount).toMatch(/onuninstallstarted=\{\(\) => \{\s*wizardOffered = true;\s*uninstallRunning = true;\s*uninstallReport = null;\s*\}\}/);
+    expect(mount).toMatch(/onuninstallstarted=\{\(\) => \{\s*wizardOffered = true;\s*wizardOpen = false;\s*uninstallRunning = true;\s*uninstallReport = null;\s*\}\}/);
     // The flow over a report sends the same execute: its start is said before the call, as for a first one.
     const run = source.slice(source.indexOf("async function runUninstall"), source.indexOf("function tryAgain"));
     expect(run.indexOf("onuninstallstarted();")).toBeLessThan(run.indexOf("await uninstallExecute("));
@@ -1731,8 +1757,17 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
     expect(mount).toContain("{settingsRemovedByUninstall}");
     // Settings: both sentences, as the user reads them. The branch is drawn only once the config read in
     // `onMount` has landed (`doc`), which a server render never runs, so the two are read from the markup — each
-    // branch's text, tags dropped — rather than rendered.
-    const settings = src("routes/Settings.svelte");
+    // branch's text, tags dropped — rather than rendered. Redesign D: the config's state is drawn on Settings →
+    // General (`GeneralPage.svelte`), the flag passed down Settings → SettingsPages → GeneralPage.
+    for (const [rel, open] of [
+      ["routes/Settings.svelte", "<SettingsPages"],
+      ["lib/settings/SettingsPages.svelte", "<GeneralPage"],
+    ] as const) {
+      const text = src(rel);
+      const tag = text.slice(text.indexOf(open), text.indexOf("/>", text.indexOf(open)));
+      expect([rel, tag.includes("{settingsRemovedByUninstall}")]).toEqual([rel, true]);
+    }
+    const settings = src("lib/settings/GeneralPage.svelte");
     const markup = settings.slice(settings.indexOf("</script>"));
     const at = markup.indexOf("{#if !doc.exists}");
     expect(at).toBeGreaterThan(-1);
@@ -1751,10 +1786,10 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
     );
   });
 
-  test("M9 LOW pass (L5): the uninstall props are REQUIRED, with no default, in AppSettings and Settings — a mount that forgets one fails svelte-check instead of silently showing no done screen", () => {
+  test("M9 LOW pass (L5): the uninstall props are REQUIRED, with no default, in UninstallPanel and Settings — a mount that forgets one fails svelte-check instead of silently showing no done screen", () => {
     const src = (rel: string) => readFileSync(join(ROOT, "gui", "src", rel), "utf8");
     const props: Record<string, [name: string, type: string][]> = {
-      "lib/AppSettings.svelte": [
+      "lib/settings/UninstallPanel.svelte": [
         ["uninstallReport", "UninstallReport | null"],
         ["uninstallRunning", "boolean"],
         ["onuninstallstarted", "() => void"],
@@ -1767,6 +1802,21 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
         ["onuninstallended", "(report: UninstallReport | null) => void"],
         ["settingsRemovedByUninstall", "boolean"],
       ],
+      // Redesign D: every step of the chain between them requires them too.
+      "lib/settings/SettingsPages.svelte": [
+        ["uninstallReport", "UninstallReport | null"],
+        ["uninstallRunning", "boolean"],
+        ["onuninstallstarted", "() => void"],
+        ["onuninstallended", "(report: UninstallReport | null) => void"],
+        ["settingsRemovedByUninstall", "boolean"],
+      ],
+      "lib/settings/AboutPage.svelte": [
+        ["uninstallReport", "UninstallReport | null"],
+        ["uninstallRunning", "boolean"],
+        ["onuninstallstarted", "() => void"],
+        ["onuninstallended", "(report: UninstallReport | null) => void"],
+      ],
+      "lib/settings/GeneralPage.svelte": [["settingsRemovedByUninstall", "boolean"]],
     };
     for (const [rel, list] of Object.entries(props)) {
       const text = src(rel);
@@ -1788,9 +1838,16 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
     const mount = tag(src("App.svelte"), "<Settings");
     for (const name of ["uninstallReport", "uninstallRunning", "settingsRemovedByUninstall"]) expect([name, mount.includes(`{${name}}`)]).toEqual([name, true]);
     for (const name of ["onuninstallstarted=", "onuninstallended="]) expect([name, mount.includes(name)]).toEqual([name, true]);
-    const panelTag = tag(src("routes/Settings.svelte"), "<AppSettings");
-    for (const name of ["uninstallReport", "uninstallRunning", "onuninstallstarted", "onuninstallended"]) {
-      expect([name, panelTag.includes(`{${name}}`)]).toEqual([name, true]);
+    // Redesign D: Settings → SettingsPages → AboutPage → the panel, every step with all four.
+    for (const [rel, open] of [
+      ["routes/Settings.svelte", "<SettingsPages"],
+      ["lib/settings/SettingsPages.svelte", "<AboutPage"],
+      ["lib/settings/AboutPage.svelte", "<UninstallPanel"],
+    ] as const) {
+      const panelTag = tag(src(rel), open);
+      for (const name of ["uninstallReport", "uninstallRunning", "onuninstallstarted", "onuninstallended"]) {
+        expect([rel, name, panelTag.includes(`{${name}}`)]).toEqual([rel, name, true]);
+      }
     }
   });
 
@@ -1898,7 +1955,7 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
       keyFiles: [
         { path: "/h/.config/daily-briefing/key", outcome: "removed", reason: null },
         { path: "/h/.config/daily-briefing/old-key", outcome: "absent", reason: null },
-        { path: "/elsewhere/key", outcome: "kept", reason: "it isn't in the settings folder" },
+        { path: "/elsewhere/key", outcome: "kept", reason: "it isn't in the settings folder (a key the app stored is removed with the app's stored keys instead)" },
         { path: "/h/.config/daily-briefing/linked", outcome: "removed", reason: "another link to the same file still exists" },
         { path: "/h/.config/daily-briefing/CONFIG.JSON.BAK", outcome: "removed", reason: "handled with config.json.bak below" },
       ],
@@ -1913,7 +1970,7 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
       "Settings file removed (config.json.bak)",
     ]);
     expect(stillOnThisMachine(done)).toEqual([
-      { kind: "text", text: "Key file kept: it isn't in the settings folder (/elsewhere/key)" },
+      { kind: "text", text: "Key file kept: it isn't in the settings folder (a key the app stored is removed with the app's stored keys instead) (/elsewhere/key)" },
     ]);
     // A key file that would not unlink stops the leg: it and the configs stay, and the rest is not tried.
     const error =
@@ -2131,6 +2188,39 @@ describe("Batch 2 (spec 3.6.3): the done screen's outcome line, \"Still on this 
     expect(texts(stillOnThisMachine(withSettings({ folder: null, error: "status --json exited 2" })))).toEqual([
       "Settings: status --json exited 2",
     ]);
+  });
+
+  test("P3-M6-T4: the key leg — removed keys under \"Removed\"; a refusal, a failure and kept files under \"Still on this machine\"", () => {
+    const withKeys = (keys: Partial<KeysReport>, settings: Partial<SettingsReport> = {}): UninstallReport => ({
+      ...withSettings(settings),
+      keys: { ...report.keys, ...keys },
+    });
+    const keyLines = (r: UninstallReport) => texts(stillOnThisMachine(r)).filter((t) => t.includes("API keys this app stored"));
+    // Removed: the count, or that none was left.
+    expect(removedList(withKeys({ deleted: 2 }))).toContain("API keys this app stored removed (2)");
+    expect(removedList(withKeys({ deleted: 0 }))).toContain("No API key this app stored was left to remove.");
+    expect(keyLines(withKeys({ deleted: 2 }))).toEqual([]);
+    // Not asked: nothing about keys anywhere.
+    const unasked = withKeys({ asked: false, deleted: null }, { asked: false });
+    expect([...removedList(unasked), ...texts(stillOnThisMachine(unasked))].join("\n")).not.toContain("API key");
+    // Refused for its own reason: said in full. Refused with the settings leg: pointed at, not repeated.
+    expect(keyLines(withKeys({ deleted: null, refused: "A background scheduler may still be running, …" }))).toEqual([
+      "API keys this app stored: kept — A background scheduler may still be running, …",
+    ]);
+    const same = withKeys({ deleted: null, refused: REFUSED_FOR_KEPT_SCHEDULER }, { refused: REFUSED_FOR_KEPT_SCHEDULER });
+    expect(keyLines(same)).toEqual(["API keys this app stored: kept, for the same reason as the settings."]);
+    expect(removedList(same).join("\n")).not.toContain("API keys this app stored");
+    // Failed: what the engine said, and the lower-bound count still listed as removed.
+    const failed = withKeys({ deleted: 1, error: "key delete-all: the keychain did not answer in time" });
+    expect(keyLines(failed)).toEqual([
+      "API keys this app stored: some may still be there — key delete-all: the keychain did not answer in time",
+    ]);
+    expect(removedList(failed)).toContain("API keys this app stored removed (1)");
+    expect(removedList(failed)).not.toContain("No API key this app stored was left to remove.");
+    // Files in the key folder that are not the app's: the folder stays, and says why.
+    expect(texts(stillOnThisMachine(withKeys({ deleted: 1, kept: 2 })))).toContain(
+      "The key folder was kept: 2 files in it are not this app's keys.",
+    );
   });
 
   test("the Linux engine copies: kept and failed ones under \"Still on this machine\", a removed one under \"Removed\", one not there under neither", () => {
@@ -2611,7 +2701,7 @@ describe("Batch 2: the static steps, the GUI runner's engine imports, and the ex
     expect(BARRED.has(INSTALLER)).toBe(false);
   });
 
-  test("M9 round 3: the runner's preload ARMS DBA_TEST_UNIT_DIR — a scratch directory under the temp root, set whatever the ambient environment said, never removed or reassigned — so the engine's default exec refuses every scheduler change in this process, by any route", () => {
+  test("M9 round 3: the runner's preload ARMS DBA_TEST_UNIT_DIR — a scratch directory under the temp root, set whatever the ambient environment said; the VARIABLE is never removed or reassigned (the directory is removed at run end) — so the engine's default exec refuses every scheduler change in this process, by any route", () => {
     // Armed by the preload as an accessor nothing can remove (checked first, so nothing below writes the
     // variable if it is not).
     const d = Object.getOwnPropertyDescriptor(process.env, "DBA_TEST_UNIT_DIR");
@@ -2626,7 +2716,7 @@ describe("Batch 2: the static steps, the GUI runner's engine imports, and the ex
     for (const unitDir of [join("Library", "LaunchAgents"), join(".config", "systemd", "user")]) {
       expect([unitDir, `${real}/`.includes(`/${unitDir}/`)]).toEqual([unitDir, false]);
     }
-    // Never removed, never pointed elsewhere.
+    // The variable: never removed, never pointed elsewhere. (The directory goes at run end, svelte-loader.ts.)
     expect(() => {
       delete process.env.DBA_TEST_UNIT_DIR;
     }).toThrow();

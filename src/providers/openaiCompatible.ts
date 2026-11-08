@@ -16,14 +16,40 @@
 import { ProviderError, API_LABEL_OPENAI, type ProviderApi } from "../types";
 import { ApiTransport, type ApiProviderOpts } from "./base";
 import { postJson } from "./http";
-import { endpointUrl, isLoopbackHost, requestUrl } from "./endpoint";
+import { endpointUrl, keyOptional, requestUrl } from "./endpoint";
+import { dropTrailingPartialToken } from "../transcripts/credentials";
 
 export class OpenAiCompatibleProvider extends ApiTransport {
   get label(): string { return API_LABEL_OPENAI; }
 
   constructor(api: ProviderApi, opts: ApiProviderOpts = {}) { super(api, opts); }
 
-  protected async send(prompt: string): Promise<string> {
+  protected async send(prompt: string, signal?: AbortSignal): Promise<string> {
+    const parsed = await this.request(prompt, signal ? { signal } : {});
+
+    const choices = Array.isArray(parsed?.choices) ? parsed!.choices as Record<string, unknown>[] : [];
+    const first = choices[0];
+    const message = first && typeof first.message === "object" && first.message !== null
+      ? first.message as Record<string, unknown>
+      : undefined;
+    let text = typeof message?.content === "string" ? message.content : "";
+
+    if (first?.finish_reason === "length") {
+      this.warnTruncated(this.api.maxTokens);
+      text = dropTrailingPartialToken(text);
+    }
+
+    if (text.trim() === "") {
+      throw new ProviderError("empty-output", `${this.label}: the response contained no message content (finish_reason ${typeof first?.finish_reason === "string" ? first.finish_reason : "unknown"})`);
+    }
+    return text;
+  }
+
+  /** The production request. A probe sends exactly this too: no `max_tokens` unless the entry sets one (spec r9 §6 —
+   *  the production dialect), so `opts.probe` changes nothing here. */
+  protected async request(prompt: string, opts: { signal?: AbortSignal; probe?: boolean }): Promise<Record<string, unknown> | null> {
+    const { signal } = opts;
+    this.throwIfAborted(signal);
     const base = endpointUrl(this.api);
     if (base === undefined) {
       // PERMANENT for this run: no amount of retrying invents a baseUrl. `validateProviderApi` allows an
@@ -32,17 +58,19 @@ export class OpenAiCompatibleProvider extends ApiTransport {
       throw new ProviderError("missing-binary", `${this.label}: provider.api.baseUrl is required for the openai-compatible kind (e.g. "http://127.0.0.1:11434/v1" for Ollama)`);
     }
     const { key } = await this.key();
+    this.throwIfAborted(signal);
     // A non-loopback endpoint with no key is almost always a misconfiguration, and the request would
     // 401 anyway — fail permanently with a message that names the key sources rather than burning the
     // retry schedule. A LOOPBACK endpoint legitimately needs none.
-    if (key === undefined && !isLoopbackHost(base.hostname)) throw this.missingKey();
+    if (key === undefined && !keyOptional(this.api)) throw this.missingKey();
 
     // Trailing slashes normalized ONCE, so `…/v1` and `…/v1/` produce a byte-identical request URL, and
     // the configured QUERY STRING preserved — a gateway's `?api-version=…` is load-bearing. See
     // `requestUrl`.
     const url = requestUrl(base, "/chat/completions");
 
-    const parsed = await postJson({
+    this.throwIfAborted(signal);
+    return await postJson({
       url,
       headers: key !== undefined ? { authorization: `Bearer ${key}` } : {},
       kind: "openai-compatible",
@@ -58,20 +86,7 @@ export class OpenAiCompatibleProvider extends ApiTransport {
       label: this.label,
       ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),
       ...(this.opts.now ? { now: this.opts.now } : {}),
+      ...(signal ? { signal } : {}),
     }) as Record<string, unknown> | null;
-
-    const choices = Array.isArray(parsed?.choices) ? parsed!.choices as Record<string, unknown>[] : [];
-    const first = choices[0];
-    const message = first && typeof first.message === "object" && first.message !== null
-      ? first.message as Record<string, unknown>
-      : undefined;
-    const text = typeof message?.content === "string" ? message.content : "";
-
-    if (first?.finish_reason === "length") this.warnTruncated(this.api.maxTokens);
-
-    if (text.trim() === "") {
-      throw new ProviderError("empty-output", `${this.label}: the response contained no message content (finish_reason ${typeof first?.finish_reason === "string" ? first.finish_reason : "unknown"})`);
-    }
-    return text;
   }
 }

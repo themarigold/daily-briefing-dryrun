@@ -365,3 +365,36 @@ export function onEvidence(
   }
   return { state, kick: stage.attempt };
 }
+
+/* ── while the panel is hidden (design 2026-10-31 r6 §4) ──────────────────────────────────────── */
+
+/**
+ * Whether the parent's trigger arms the loop now. `"none"` when the trigger is spent (`trigger <= seen`),
+ * `"defer"` while the panel is suspended (the wizard hidden behind another tab), `"arm"` otherwise.
+ *
+ * ⚠ THE CALLER ADVANCES `seen` ONLY ON `"arm"`, so a trigger that arrives while hidden stays due and arms once
+ * when the panel is shown again — and the loop is never `verifying` without a call in flight.
+ */
+export function armDecision(trigger: number, seen: number, suspended: boolean): "arm" | "defer" | "none" {
+  if (trigger <= seen) return "none";
+  return suspended ? "defer" : "arm";
+}
+
+/**
+ * [`onEvidence`], with the kick SUPPRESSED while suspended. The transitions always apply (a delivery still ends
+ * the loop; the loop's own skip record is still absorbed), and the state is `onEvidence`'s own object, so a
+ * reactive caller's fixed point holds (`tests-web/wizard-nav.check.ts` pins the agreement).
+ *
+ * ⚠ NOTHING IS HELD (r6). A kick due while hidden is dropped, not remembered: the caller's effect reads
+ * `suspended`, so it re-runs when the panel is shown again, and `onEvidence` returns the same kick again on an
+ * unchanged state. If a delivery arrived meanwhile the loop is already `watching` and no kick is due — a held kick
+ * would have overwritten that confirmation with `verifying`, or fired twice into a red `refused`.
+ */
+export function evidenceStep(
+  loop: LoopState,
+  evidence: VerifyEvidence,
+  suspended: boolean,
+): { state: LoopState; kick: number | null } {
+  const next = onEvidence(loop, evidence);
+  return suspended ? { state: next.state, kick: null } : next;
+}

@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import pkg from "./package.json";
 
 // The app is a LOCAL-FIRST desktop shell: the production build is loaded from `dist/` by the
 // Tauri webview over the `tauri://` custom protocol, never over http. Nothing here may introduce
@@ -32,4 +33,11 @@ export default defineConfig({
   // Only variables the desktop shell deliberately exposes. Vite's default `VITE_` prefix plus
   // Tauri's own, so `import.meta.env` cannot accidentally leak the build machine's environment.
   envPrefix: ["VITE_", "TAURI_ENV_", "TAURI_PLATFORM"],
+
+  // The app's version for Settings → About (Redesign D), from this package.json — the number the Tauri bundle
+  // carries too (tauri.conf.json's "version" points here). Read only by the shell (`routes/Settings.svelte`), which
+  // passes it down as a prop: the test loader has no define. Declared in src/vite-env.d.ts.
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
 });

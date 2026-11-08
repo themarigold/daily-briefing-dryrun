@@ -15,6 +15,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
+import { OWNER_MARKER, ownerMarker } from "./fixtures/run-tmp";
+import { deadPid } from "./fixtures/dead-pid";
 
 const ROOT = decodeURIComponent(new URL("..", import.meta.url).pathname);
 const IN_MONOREPO = existsSync(`${ROOT}publish`);
@@ -48,28 +50,36 @@ test.skipIf(!IN_MONOREPO)("⚠ the public export passes its HARD residual sweep,
     // Paths that resolve in the monorepo can be missing in the exported layout; this is the suite that
     // guards the npm tarball, and the public CI and release.yml run it there. No `bun install` needed:
     // it imports only bun:test and node builtins (measured: 0.11 s in an uninstalled export).
-    // The inner run's preload arms its OWN isolation baselines (test/fixtures/isolate-state.ts) under its
-    // TMPDIR and, by design, never removes them. Left to inherit ours, that was a second
-    // `dba-isolated-*` set in TMPDIR after every full run, against the documented one set (measured when
-    // it was a pair; Batch 2 added `dba-isolated-units-*`, which the assertion below lists since the M9 LOW
-    // pass, L19).
-    // So its TMPDIR lives inside `parent`, which the `finally` below removes. It is handed over through
+    // The inner run's preload makes its OWN run root (test/fixtures/run-tmp.ts) under its TMPDIR, sweeps a
+    // dead earlier run's root there, and removes its own at the end. Until 2026-10-19 it instead left its
+    // isolation baselines (`dba-isolated-*`) behind, so its TMPDIR was kept apart from ours; it still is,
+    // because the assertion below reads it: its TMPDIR lives inside `parent`, which the `finally` below removes. It is handed over through
     // `env` (wrapping the command in `env TMPDIR=…` would also work); assigning process.env.TMPDIR here
     // would not, because a child spawned without `env` gets bun's STARTUP environment. The spread also forwards what earlier test files left
     // in process.env (measured: audit-main's DAILY_BRIEFING_STATE_DIR / XDG_CONFIG_HOME); the child's
     // own preload overrides both, so it still starts isolated.
     const innerTmp = join(parent, "tmp");
     mkdirSync(innerTmp);
-    const inner = Bun.spawnSync(["bun", "test", "test/publish-prep.test.ts"], {
+    // A DEAD earlier run's root, which only the inner run's preload sweeps: its marker is what this process
+    // writes (same host and pid namespace as the inner run) for a pid asserted dead.
+    mkdirSync(join(innerTmp, "dba-run-dead"));
+    writeFileSync(join(innerTmp, "dba-run-dead", OWNER_MARKER), ownerMarker(deadPid()));
+    // The run-tmp probe rides along to print where the inner run's TMPDIR and state baseline were.
+    const inner = Bun.spawnSync(["bun", "test", "test/publish-prep.test.ts", "./test/fixtures/run-tmp.probe.ts"], {
       cwd: target, env: { ...process.env, TMPDIR: innerTmp }, stdout: "pipe", stderr: "pipe",
     });
     const innerOut = `${text(inner.stdout)}\n${text(inner.stderr)}`;
     expect(inner.exitCode, `publish-prep.test.ts failed INSIDE the export:\n${innerOut}`).toBe(0);
-    // …and they did land there, which also shows the exported tree's own isolation is live. Missing
-    // entries mean one of two things: the redirect stopped reaching the child (the pair is back in the
-    // shared TMPDIR), or the export no longer arms its preload (bunfig.toml or the fixture dropped).
-    const armed = readdirSync(innerTmp).map((n) => /^dba-isolated-(config|state|units)-/.exec(n)?.[1]).filter(Boolean).sort();
-    expect(armed, "the inner run's isolation baselines are not in its own TMPDIR: either `env` no longer hands the child innerTmp, or the exported tree no longer loads its preload").toEqual(["config", "state", "units"]);
+    // …and its TMPDIR was innerTmp, its preload ran, and it cleaned up: the dead root is gone (swept by the
+    // exported tree's preload, which only innerTmp could have shown it) and nothing is left. A survivor means
+    // the redirect stopped reaching the child, the export no longer loads its preload (bunfig.toml or the
+    // fixture dropped), or the inner run left its own root or baselines behind.
+    expect(readdirSync(innerTmp), "the inner run's TMPDIR is not empty: either `env` no longer hands the child innerTmp, the exported tree no longer loads its preload, or its run root was not removed").toEqual([]);
+    // …and the exported tree's isolate-state ran: the state baseline was armed inside its run root.
+    const esc = (p: string): string => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const runRoot = new RegExp(`PROBE_TMPDIR=(${esc(innerTmp)}/dba-run-[^/\\s]+)\\n`).exec(innerOut)?.[1];
+    expect(runRoot, `the run-tmp probe did not report a run root inside innerTmp:\n${innerOut}`).toBeDefined();
+    expect(innerOut).toMatch(new RegExp(`PROBE_STATE=${esc(runRoot!)}/dba-isolated-state-[^/\\s]+\\n`));
     // A green exit is also what a test "fixed" by skipping it in the exported layout produces. That file
     // has no conditional tests, so any skip there is exactly that.
     expect(innerOut, `publish-prep.test.ts SKIPPED tests inside the export:\n${innerOut}`).not.toMatch(/^\s*[1-9]\d* skip\s*$/m);

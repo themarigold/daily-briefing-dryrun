@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { initConfig, configPath, validateConfig, type InitApiOptions } from "../src/config";
 import { resolveProbeHosts } from "../src/net";
 import { DEFAULT_NETWORK_PROBE_HOSTS } from "../src/config";
-import { deriveProbeHosts, endpointUrl, isLoopbackHost, portOf, ANTHROPIC_DEFAULT_BASE_URL } from "../src/providers/endpoint";
+import { cleartextRemote, deriveProbeHosts, endpointUrl, isLoopbackHost, keyOptional, portOf, ANTHROPIC_DEFAULT_BASE_URL } from "../src/providers/endpoint";
 import { init, parseInitApiFlags, dispatch } from "../src/main";
 import { doctorReport } from "../src/json";
 import type { ProviderApi } from "../src/types";
@@ -94,6 +94,66 @@ test("T9: the loopback predicate and the default-port arithmetic", () => {
   expect(portOf(new URL("http://h.test"))).toBe(80);
   expect(portOf(new URL("http://h.test:8080"))).toBe(8080);
   expect(endpointUrl({ kind: "anthropic", model: "m" })?.toString()).toBe(`${ANTHROPIC_DEFAULT_BASE_URL}/`);
+});
+
+// Follow-up 4 (2026-10-19): `keyOptional` is the ONE spelling of "this api config needs no key at all" — extracted from
+// the three places that spelled it inline (the key ladder's `localNoKey`, doctor's own `keyOptional`, the transport's
+// missing-key refusal) and reported on every `config validate` row. A PURE extract, checked against the old spellings:
+// the second loop is the key ladder's and doctor's (identical: kind, a parsed endpoint, a loopback host); the third is
+// the transport's, `!isLoopbackHost(base.hostname)` with `base = endpointUrl(api)` and NO kind check — so it is compared
+// only where the transport can run it: an `openai-compatible` api whose endpoint parsed (with no endpoint the transport
+// throws its missing-baseUrl config error first). Other kinds never reach that transport: config validation admits only
+// "anthropic" and "openai-compatible" (src/config.ts `validateProviderApi`), and the factory builds
+// `OpenAiCompatibleProvider` only for a non-anthropic api (src/providerFactory.ts), so there its kind is always
+// openai-compatible and the extract's added kind check is always true.
+test("follow-up 4: keyOptional — a loopback openai-compatible endpoint, and nothing else", () => {
+  const o = (baseUrl?: string): ProviderApi => ({ kind: "openai-compatible", model: "m", ...(baseUrl !== undefined ? { baseUrl } : {}) });
+  const a = (baseUrl?: string): ProviderApi => ({ kind: "anthropic", model: "m", ...(baseUrl !== undefined ? { baseUrl } : {}) });
+  const cases: [string, ProviderApi, boolean][] = [
+    ["openai-compatible at 127.0.0.1", o("http://127.0.0.1:11434/v1"), true],
+    ["openai-compatible at 127.0.1.1", o("http://127.0.1.1:11434/v1"), true],
+    ["openai-compatible at [::1]", o("http://[::1]:8080/v1"), true],
+    ["openai-compatible at LOCALHOST over https", o("https://LOCALHOST:8443/v1"), true],
+    ["openai-compatible at *.localhost", o("http://models.localhost:8080/v1"), true],
+    ["openai-compatible at a LAN IP", o("http://192.168.1.5:11434/v1"), false],
+    ["openai-compatible at 0.0.0.0", o("http://0.0.0.0:11434/v1"), false],
+    ["openai-compatible at a public host", o("https://api.example.com/v1"), false],
+    ["openai-compatible at a name merely containing localhost", o("http://localhost.example.com/v1"), false],
+    ["openai-compatible with no baseUrl", o(), false],
+    ["openai-compatible with an unparseable baseUrl", o("not a url"), false],
+    ["anthropic at 127.0.0.1", a("http://127.0.0.1:8080"), false],
+    ["anthropic at localhost", a("http://localhost:8080"), false],
+    ["anthropic with no baseUrl", a(), false],
+  ];
+  for (const [name, api, want] of cases) expect({ name, keyOptional: keyOptional(api) }).toEqual({ name, keyOptional: want });
+  for (const [name, api] of cases) {
+    const u = endpointUrl(api);
+    const inline = api.kind === "openai-compatible" && u !== undefined && isLoopbackHost(u.hostname);
+    expect({ name, same: keyOptional(api) === inline }).toEqual({ name, same: true });
+  }
+  let transportCompared = 0;
+  for (const [name, api] of cases) {
+    const base = endpointUrl(api);
+    if (api.kind !== "openai-compatible" || base === undefined) continue;
+    transportCompared += 1;
+    expect({ name, refusesMissingKey: !keyOptional(api) }).toEqual({ name, refusesMissingKey: !isLoopbackHost(base.hostname) });
+  }
+  // Non-vacuous: every openai-compatible case with a parsed endpoint was compared (all but the two with none).
+  expect(transportCompared).toBe(cases.filter(([, api]) => api.kind === "openai-compatible").length - 2);
+});
+
+test("provider fallback P2-M3-T1: cleartextRemote — plain http to a host other than this machine, and nothing else", () => {
+  const c = (kind: "anthropic" | "openai-compatible", baseUrl?: string) =>
+    cleartextRemote({ kind, model: "m", ...(baseUrl !== undefined ? { baseUrl } : {}) })?.host;
+  expect(c("openai-compatible", "http://192.168.1.5/v1")).toBe("192.168.1.5");
+  expect(c("openai-compatible", "http://gpu.lan:8000/v1")).toBe("gpu.lan:8000");
+  expect(c("anthropic", "http://gw.example.invalid")).toBe("gw.example.invalid");
+  expect(c("openai-compatible", "http://0.0.0.0:9/v1")).toBe("0.0.0.0:9");        // a bind address is not loopback
+  for (const u of ["http://localhost:11434/v1", "http://127.0.0.1:1234", "http://127.0.1.1:8000", "http://[::1]:11434", "http://x.localhost/v1", "https://example.invalid/v1"]) {
+    expect(`${u} → ${c("openai-compatible", u)}`).toBe(`${u} → undefined`);
+  }
+  expect(c("anthropic")).toBeUndefined();                       // the default endpoint is https
+  expect(c("openai-compatible")).toBeUndefined();               // no endpoint at all: no opinion
 });
 
 // ── T10: init flag parsing ────────────────────────────────────────────────────────────────────────
@@ -326,7 +386,7 @@ test("⚠ A3-D: `doctor --json` NEVER SPAWNS the configured apiKeyCommand — it
   // MEASURED SIDE EFFECT. doctor called `resolveApiKey(apiCfg, process.env)` with no opts, so rung 3 ran
   // the user's configured binary — while main.ts introduces this whole block as "the read-only JSON
   // surfaces. None of them reaches run(), init(), the provider or the marker." It also reinstates the
-  // exact hazard src/apiKey.ts's header gives as the reason there is NO built-in keychain: a macOS
+  // hazard src/apiKey.ts's header records for a keychain item the app does not own: a macOS
   // keychain read for an item created by another binary raises an authorization DIALOG, so a scripted
   // or unattended `daily-briefing doctor --json` could block for the full 5 s ceiling or pop a prompt.
   //

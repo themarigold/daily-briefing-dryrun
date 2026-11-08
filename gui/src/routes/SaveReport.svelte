@@ -35,7 +35,7 @@
       <p>Not saved — the engine refused this config:</p>
       <ul>
         {#each outcome.errors as note, i (i)}
-          <li>{#if note.field !== ""}<code>{note.field}</code> {/if}{note.message}</li>
+          <li>{#if note.field !== ""}<code>{note.field}</code>{" "}{/if}{note.message}</li>
         {/each}
       </ul>
     </div>
@@ -45,7 +45,7 @@
       <p>{outcome.kind === "saved" ? "Saved with warnings" : "Warnings"} — these do not block saving:</p>
       <ul>
         {#each warnings as note, i (i)}
-          <li>{#if note.field !== ""}<code>{note.field}</code> {/if}{note.message}</li>
+          <li>{#if note.field !== ""}<code>{note.field}</code>{" "}{/if}{note.message}</li>
         {/each}
       </ul>
     </div>

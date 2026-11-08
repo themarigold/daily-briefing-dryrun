@@ -31,11 +31,13 @@
  * `coexistence.check.ts` asserts all of it. The backstop covers THIS process, and a child handed an env
  * that carries the value (`{ ...process.env, … }`); a child spawned with NO env gets bun's startup
  * environment, without it (measured, bun 1.3.14; `test/fixtures/isolate-state.ts` says the same of the
- * engine's). That suite's sandbox builds its own env, with its own value. Like the engine fixture's
- * baselines, the directory is not removed afterwards (`process` "exit" handlers never fire under
- * `bun test`, `test/preload.ts`): one empty temp directory per run.
+ * engine's). That suite's sandbox builds its own env, with its own value. The directory is removed by
+ * a run-wide `afterAll` below (a hook registered in a preload scopes to the whole run, `test/preload.ts`;
+ * `process` "exit" handlers never fire under `bun test`); the variable keeps its value, so the refusal
+ * stays armed to the end. An interrupted run still leaves that one empty directory.
  */
-import { mkdtempSync } from "node:fs";
+import { afterAll } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { plugin } from "bun";
@@ -53,6 +55,10 @@ Object.defineProperty(process.env, "DBA_TEST_UNIT_DIR", {
     );
   },
 });
+
+// Run end: the directory is empty — it only ARMS the refusal, which reads whether the variable is set — and
+// the variable keeps its value, so removing the directory re-opens nothing.
+afterAll(() => rmSync(UNITS, { recursive: true, force: true }));
 
 plugin({
   name: "svelte-ssr",

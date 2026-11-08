@@ -9,20 +9,29 @@
 // result. A throw from key resolution would land at main.ts's `Config error:` + exit 2 on every 600s
 // tick, which is total non-delivery for a condition (a key that is not there yet) the user can fix.
 //
-// WHY THERE IS NO BUILT-IN OS KEYCHAIN, since this is where a reader will look for one. It is not a
-// punt; it is a measured cross-platform assessment:
-//   • macOS: the first-party keychain reader does print a secret to stdout, but it needs an unlocked
-//     login keychain and, for an item created by a different binary, raises an authorization DIALOG. A
-//     background agent at 07:20 with nobody at the machine cannot answer that dialog, so the failure
-//     mode is SILENT NON-DELIVERY — the single worst outcome for this product. This project has already
-//     been burned by precisely this class and carries a standing do-not-re-attempt ruling.
-//   • Linux: the libsecret reader needs a live D-Bus session and an unlocked keyring, neither of which
-//     a systemd user timer or a headless box reliably has.
-//   • Windows: there is NO first-party CLI that prints a stored secret to stdout at all.
-// So a built-in keychain would be one platform that works with a prompt hazard, one that works only in
-// a desktop session, and one that cannot be built. `apiKeyCommand` (rung 3) delegates to whichever of
-// those the USER already trusts, costs zero platform code and zero new dependencies, and is the same
-// escape-hatch shape `claude`'s own key helper uses.
+// THE APP-OWNED KEY STORE, and why it is the only built-in one (provider fallback PR 2, spec r9 §6, §9 —
+// this replaces the old "no built-in OS keychain" ruling, which src/calendar/link-url.ts and
+// docs/PROVIDERS.md also cite). An app-owned key is stored by the engine (`provider key set` / `key migrate`,
+// src/keyStore.ts — the desktop app's key settings, which will paste keys into these commands, ship later, P3)
+// and the config gets a REFERENCE to it, read through the ordinary rungs below:
+//   • macOS: the login Keychain, service `daily-briefing.app-key`, one item per key id. The item is
+//     created by `/usr/bin/security` and read back by the same binary (an `apiKeyCommand`, rung 3), so the
+//     cross-binary authorization DIALOG that stood behind the old ruling does not arise: the day-0 spike
+//     (2026-10-16) read such an item from a launchd-spawned process with no dialog. What remains is a
+//     LOCKED keychain, whose read blocks on an unlock dialog (measured: 40 s+); the 5 s command bound kills
+//     it and the entry is `key-unavailable` ("key couldn't be read"), the walk moving on — but the dialog
+//     stays on screen for the user to find. An item created by ANY OTHER binary still carries the old
+//     hazard, which is why `doctor --json` never runs a key command.
+//   • Linux (any platform but darwin and win32): a 0600 file `<state>/keys/k-<12 hex>.key` in a 0700 folder
+//     (an `apiKeyFile`, rung 2), read by the strict reader below. libsecret is still not used: it needs a
+//     live D-Bus session and an unlocked keyring, which a systemd user timer or a headless box does not
+//     reliably have.
+//   • Windows: nothing built in. No first-party CLI prints a stored secret, and the file store refuses it
+//     (`unsupported-platform`: the strict reader needs POSIX owners and modes).
+// A key the user keeps elsewhere still goes through `apiKeyCommand` (rung 3), which delegates to whichever
+// helper the USER already trusts, costs zero platform code and zero new dependencies, and is the same
+// escape-hatch shape `claude`'s own key helper uses. An app-owned key is never sent over plain `http:` to
+// another machine (`insecureEndpoint`, src/core.ts; `config validate`).
 //
 // THREAT MODEL, for the reviewer who will raise it: rung 3 executes a command named in the config. But
 // `provider.cli` is ALREADY an arbitrary config-named binary that this tool spawns every morning — the
@@ -30,7 +39,10 @@
 import { stat } from "node:fs/promises";
 import type { ProviderApi } from "./types";
 import { run } from "./proc";
-import { endpointUrl, isLoopbackHost } from "./providers/endpoint";
+import { keyOptional } from "./providers/endpoint";
+import { readStrictFile, type AsyncFsOps, type StrictReadOpts } from "./strictFile";
+import { isAppKeyFileName, keyFileReadOpts, readsAsAppKeyFile, strictReadFolder } from "./keyFile";
+import { keysDir } from "./marker";
 
 /** Which rung answered. A short stable token, safe to print — it names a SOURCE, never a value. */
 export type ApiKeySource = "env" | "file" | "command" | "config" | "none";
@@ -69,19 +81,29 @@ export const KEY_COMMAND_TIMEOUT_MS = 5_000;
 export const PLAINTEXT_KEY_SENTINEL = "api key is stored in PLAINTEXT in the config file";
 
 export type ResolveApiKeyOpts = {
-  /** Injected so the file rung is testable without a real stat. */
+  /** Injected so the file rung is testable without a real stat. The LAX check only: a file in the app's key folder
+   *  never reaches it (P2-M5-T1). */
   statFile?: (p: string) => Promise<{ mode: number } | undefined>;
+  /** The app's key folder an `apiKeyFile` is judged against (P2-M5-T1). Defaults to `keysDir()`; injected by tests. */
+  keysDir?: string;
+  /** The strict reader's owner test for a key-folder file (`StrictReadOpts.ownerCheck`). Injected ONLY by tests,
+   *  which cannot chown a file to another user. */
+  keyFileOwnerCheck?: StrictReadOpts["ownerCheck"];
+  /** The filesystem the key-folder test runs on (`readsAsAppKeyFile` and its two siblings, src/keyFile.ts — async since
+   *  PR 2 final harden round 3, M1). Injected ONLY by tests (a stalled mount); production uses `fs/promises`. */
+  keyFileFs?: AsyncFsOps;
   /** Injected so the command rung is testable without spawning. */
   exec?: typeof run;
-  /** Overrides KEY_COMMAND_TIMEOUT_MS. Injected ONLY by tests, which must exercise the real timeout
-   *  path against a real child without waiting the production 5 s. */
+  /** Overrides KEY_COMMAND_TIMEOUT_MS for bounded callers (the summary uses the smaller of its remaining
+   *  work allowance and KEY_COMMAND_TIMEOUT_MS), and tests exercising the real timeout with a shorter wait.
+   *  Absent keeps the morning command rung at its existing 5 s ceiling. */
   commandTimeoutMs?: number;
   /** ⚠ READ-ONLY MODE FOR RUNG 3. Set by callers that DIAGNOSE a config rather than run it — today
    *  exactly one, `doctor --json`. Reporting a configured `apiKeyCommand` must not SPAWN it: `doctor`
    *  is documented as a read-only surface, it is the thing people run in scripts and CI, and a keychain
    *  helper is the one config-named binary in this project that can block for its whole 5 s ceiling or
-   *  pop an authorization DIALOG (the exact hazard the module header above gives as the reason there is
-   *  no built-in keychain). With this set, rung 3 reports `{ source: "command", detail: argv[0],
+   *  pop an authorization or unlock DIALOG (the hazards the module header above records: an item another
+   *  binary created, or a locked keychain). With this set, rung 3 reports `{ source: "command", detail: argv[0],
    *  executed: false }` and no key — argv[0] ONLY, because later argv elements routinely name the
    *  keychain item being fetched. */
   skipCommand?: boolean;
@@ -101,7 +123,8 @@ async function defaultStat(p: string): Promise<{ mode: number } | undefined> {
  * Resolve the API key. FIRST HIT WINS over the configured rungs, in this order:
  *
  *   1. `apiKeyEnv`      — a NAMED environment variable.
- *   2. `apiKeyFile`     — a path. Group/world-readable ⇒ REFUSED with a warning, never silently read.
+ *   2. `apiKeyFile`     — a path. Group/world-readable ⇒ REFUSED with a warning, never silently read. A file in the
+ *                         app's key folder (`<state>/keys/`) is read ONLY by the strict reader (P2-M5-T1).
  *   3. `apiKeyCommand`  — an argv whose stdout is the key (the keychain story).
  *   4. `apiKey`         — literal plaintext in config.json. Supported, warned about on every run.
  *
@@ -147,7 +170,41 @@ export async function resolveApiKey(
   }
 
   // ── rung 2: a file ──────────────────────────────────────────────────────────────────────────────
-  if (api.apiKeyFile !== undefined) {
+  // ⚠ A FILE IN THE APP'S KEY FOLDER (provider-fallback P2-M5-T1, spec r9 §6 "Strict reader") is one the app wrote, so
+  // it is read only as the app writes it — `k-<12 hex>.key`, 0600, one link, directly in the 0700 `<state>/keys/` —
+  // through the strict reader, opening the path AS CONFIGURED (the canonical form is case-folded on darwin and is for
+  // comparison only). Which paths count is src/keyFile.ts's `readsAsAppKeyFile`, built on the same relation as
+  // `isAppOwnedKey`. Anything else there is REFUSED and never handed to the lax check below. A refusal is warned and
+  // the ladder moves on exactly as after today's failed file rung; with no later rung the provider raises the named
+  // `key-unavailable` skip (`missingKey`). The warnings name the path as configured, as today's do, and nothing it
+  // resolves to. The folder the strict reader checks is the configured path's own parent when that is canonically
+  // `keys/` (`strictReadFolder`: a different symlinked ancestor is not a different folder), else `keys/`. Every other
+  // `apiKeyFile` keeps today's mode-only check, unchanged.
+  // ⚠ ASYNC (final harden round 3, M1): the key-folder test stats and walks, on EVERY `apiKeyFile` — a user's own file on
+  // a dead mount included — so it runs on `fs/promises`: a stall there must not block the event loop, or the attempt
+  // deadline that exists for exactly that case (src/core.ts `attemptDeadlineMs`) could not fire.
+  const keys = opts.keysDir ?? keysDir();
+  if (api.apiKeyFile !== undefined && await readsAsAppKeyFile(api.apiKeyFile, keys, opts.keyFileFs)) {
+    const path = api.apiKeyFile;
+    if (!(await isAppKeyFileName(path, opts.keyFileFs))) {
+      warnings.push(`api key: refusing to read provider.api.apiKeyFile ${path} — it is, or may name, a file in the app's key folder but is not an app key file (k-<12 hex>.key)`);
+    } else {
+      const read = await readStrictFile(path, {
+        ...keyFileReadOpts(await strictReadFolder(path, keys, opts.keyFileFs)),
+        ...(opts.keyFileOwnerCheck !== undefined ? { ownerCheck: opts.keyFileOwnerCheck } : {}),
+      });
+      if (read.status === "ok") {
+        const v = read.text.trim();
+        if (v !== "") return { key: v, source: "file", detail: path, warnings };
+        warnings.push(`api key: provider.api.apiKeyFile ${path} is empty`);
+      } else if (read.status === "refused") {
+        // The reason is a fixed token (`StrictRefusedReason`): it carries no path and no byte of the file.
+        warnings.push(`api key: refusing to read provider.api.apiKeyFile ${path} — it is, or may name, a file in the app's key folder, and such a file is read only as the app wrote it: a private, single-link regular file directly in that private folder (${read.reason})`);
+      } else {
+        warnings.push(`api key: provider.api.apiKeyFile ${path} could not be read`);
+      }
+    }
+  } else if (api.apiKeyFile !== undefined) {
     const path = api.apiKeyFile;
     const st = await (opts.statFile ?? defaultStat)(path);
     if (st === undefined) {
@@ -206,8 +263,7 @@ export async function resolveApiKey(
   // A LOOPBACK openai-compatible endpoint needs no key at all (Ollama, LM Studio, a local vLLM), so its
   // absence is not a defect and must not warn — a daily warning for a correct configuration is how
   // users learn to ignore warnings.
-  const u = endpointUrl(api);
-  const localNoKey = api.kind === "openai-compatible" && u !== undefined && isLoopbackHost(u.hostname);
+  const localNoKey = keyOptional(api);
   if (!localNoKey && !configured) {
     warnings.push(`api key: no key found — $${DEFAULT_KEY_ENV[api.kind]} is unset and no apiKeyEnv/apiKeyFile/apiKeyCommand/apiKey is configured in provider.api`);
   }

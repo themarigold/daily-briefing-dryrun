@@ -34,3 +34,11 @@ export function osFromUserAgent(ua: string): Os {
   if (ua.includes("Linux")) return "linux";
   return "other";
 }
+
+/** "on this Mac", or "on this computer" off macOS. An unknown platform keeps the macOS wording, as `keyStoreName`
+ *  does. It lives here, not in `settings-model.ts` (which re-exports it), so the git model can use it without
+ *  loading the settings model's Tauri wrappers: an engine test loads `calendar-detail.ts` → `deck.ts` →
+ *  `git-detail.ts` at run time with no GUI packages installed (CI, PR #674's first run). */
+export function hereWords(os: Os | undefined): string {
+  return os === undefined || os === "macos" ? "on this Mac" : "on this computer";
+}

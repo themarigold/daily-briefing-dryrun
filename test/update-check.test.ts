@@ -50,7 +50,7 @@ afterAll(() => {
 
 // ── fakes ───────────────────────────────────────────────────────────────────────────────────────
 
-const RELEASE_HTML = "https://github.com/themarigold/daily-briefing/releases/tag/v0.2.0";
+const RELEASE_HTML = "https://github.com/norn-app/daily-briefing/releases/tag/v0.2.0";
 type Call = { url: string; init: RequestInit };
 
 /** A fetch stand-in that records every call and answers with `respond`. */
@@ -201,7 +201,7 @@ describe("checkForUpdate: one request, every answer mapped, silent, never throws
     expect(f.calls.length).toBe(1);
     const call = f.calls[0]!;
     expect(call.url).toBe(UPDATE_CHECK_URL);
-    expect(call.url).toBe("https://api.github.com/repos/themarigold/daily-briefing/releases/latest");
+    expect(call.url).toBe("https://api.github.com/repos/norn-app/daily-briefing/releases/latest");
     expect(new URL(call.url).search).toBe("");
     expect(call.init.method).toBe("GET");
     expect(call.init.headers).toEqual({ Accept: "application/vnd.github+json", "User-Agent": `daily-briefing/${V}` });

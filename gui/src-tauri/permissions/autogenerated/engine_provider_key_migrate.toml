@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-engine-provider-key-migrate"
+description = "Enables the engine_provider_key_migrate command without any pre-configured scope."
+commands.allow = ["engine_provider_key_migrate"]
+
+[[permission]]
+identifier = "deny-engine-provider-key-migrate"
+description = "Denies the engine_provider_key_migrate command without any pre-configured scope."
+commands.deny = ["engine_provider_key_migrate"]

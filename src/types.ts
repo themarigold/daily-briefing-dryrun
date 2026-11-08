@@ -1,6 +1,8 @@
 // src/types.ts — FROZEN CONTRACTS. Only ADDITIVE, optional fields may be appended (e.g. BriefingStruct.today);
 // never rename/remove/retype an existing field or change required-ness — later-slice consumers depend on the shape.
 
+import type { CalendarStruct } from "./calendar/types";
+
 export type ActivityMeta = {
   /** `renamedFrom` (additive, defect C — EVAL day 32): the OLD path of a rename row, so evidence
    *  renderers can show the delete half; `file` stays the new-path side and remains the attribution
@@ -113,6 +115,11 @@ export type BriefingStruct = {
    *  window-shaped half of the day-9 fix (`mergedToday` covers only the same-day half). Never sent
    *  to the LLM; like `today`, it cannot be hallucinated. */
   windowMerges?: { repo: string; text: string }[];
+  /** Provider fallback (P1-M7-T2; spec r9 §5 "Reporting"): the lines above the title — one per entry the walk skipped
+   *  or could not try, then the cost line — each starting `NOTICE_PREFIX`. Set ONLY for a combined list of two or more
+   *  with at least one line, so it is ABSENT (never `[]`) for a single-entry config: `envelopeFrom` copies the struct
+   *  whole, and the calendar-off goldens pin it byte for byte. Rendered in P1-M9-T3. */
+  notices?: string[];
   warnings?: string[];
   stateAsOf?: string;      // additive: local HH:MM the working-tree state was captured (volatile facts get a timestamp)
   /** Additive (day-23): the configured morning floor as "HH:MM", printed beside `stateAsOf` so a
@@ -171,6 +178,15 @@ export type BriefingStruct = {
    *  against `textSha` instead of requiring it to parse a frame back off, and keeps the app-owned
    *  frame out of the emittable set. */
   whys?: Record<string, string>;
+  /** Additive (v0.3.0 calendar, plan M0 — spec r4 §7): TODAY'S CALENDAR as the briefing stores it — event
+   *  titles, times, locations and attendee counts, each source's read status, and whether the read was
+   *  incomplete. Never attendee names or emails, never descriptions. To be code-rendered (plan M4) as the
+   *  `▶ Today's calendar` section; the shape and its rules are in `src/calendar/types.ts`, the frozen
+   *  rendered form in `test/fixtures/calendar/rendered-section.txt`.
+   *
+   *  ABSENT whenever calendar is off — the default — so every existing struct, envelope, render, prompt and
+   *  eval is byte-identical to before (pinned by `test/calendar-off.golden.test.ts`). */
+  calendar?: CalendarStruct;
 };
 
 export type TokenBudget = { maxChars: number };
@@ -186,6 +202,21 @@ export type TokenBudget = { maxChars: number };
  *  property of the LITERAL, not of any code, so it is pinned by a test rather than left to reading. */
 export const API_LABEL_ANTHROPIC = "anthropic-api";
 export const API_LABEL_OPENAI = "openai-compatible";
+
+/** One `fallbacks` entry AS WRITTEN: a provider block (a CLI triple, or `api` alone — the triple is then
+ *  synthesized, as for `provider`) plus its identity. No nested `fallbacks` or `accounts`. */
+export type FallbackEntry = {
+  label: string;
+  /** A Claude CLI login directory (CLAUDE_CONFIG_DIR for that entry). Claude CLI entries only. */
+  configDir?: string;
+  cli?: string;
+  argv?: string[];
+  promptVia?: "stdin" | "arg";
+  timeoutMs?: number;
+  harden?: boolean;
+  credential?: "subscription" | "env-api-key";
+  api?: ProviderApi;
+};
 
 /** The API-transport block. PRESENCE selects the HTTP transport; it is MUTUALLY EXCLUSIVE with
  *  `cli`/`argv`/`promptVia` and `validateConfig` THROWS (naming every offending key) when both appear,
@@ -209,8 +240,8 @@ export type ProviderApi = {
   /** Anthropic: defaults to `https://api.anthropic.com`; set it to front a gateway or proxy.
    *  openai-compatible: REQUIRED in practice (there is no universal default endpoint). */
   baseUrl?: string;
-  /** Anthropic REQUIRES `max_tokens`, so an absent value means the built-in default. For the
-   *  openai-compatible kind an absent value means the key is OMITTED from the body entirely — see
+  /** Anthropic REQUIRES `max_tokens`, so an absent value means the built-in default. That is 16 000
+   *  (`ANTHROPIC_DEFAULT_MAX_TOKENS`, src/providers/anthropic.ts). For the openai-compatible kind an absent value means the key is OMITTED from the body entirely — see
    *  `src/providers/openaiCompatible.ts` for why omission is the compatible superset. */
   maxTokens?: number;
   apiKeyEnv?: string;
@@ -219,8 +250,33 @@ export type ProviderApi = {
   apiKey?: string;
 };
 
+/** Which of the two calendar prompt variants an attempt receives (v0.3.0 calendar, spec r4 §6). LOCKED — every
+ *  calendar detail — goes only to an attempt that cannot act on what it reads: an HTTP transport, or a claude
+ *  CLI spawned with `--tools=`, `--strict-mcp-config`, `--setting-sources user` and `--no-session-persistence` injected and only allow-listed
+ *  flags in the user's argv (`calendarVariantFor`, src/harden.ts; decision 18). Everything else is UNLOCKED. */
+export type PromptVariant = "locked" | "unlocked";
+
+/** Additive second argument to `Provider.generate` (v0.3.0 calendar, plan M3b — spec r4 §6).
+ *
+ *  `calendarVariants` carries the WHOLE prompt twice, differing only in the calendar block. The `prompt`
+ *  argument is always the unlocked one, so a provider that ignores this argument is safe by construction; one
+ *  that honours it picks per attempt, at spawn time, from the argv it is about to run (`src/harden.ts`), and
+ *  the HTTP transports always pick locked (`src/providers/base.ts`). Absent whenever calendar is off, so every
+ *  call is exactly the one-argument call it was before.
+ *
+ *  `onPromptSent` is told, once per attempt and immediately before it, which variant that attempt sends and
+ *  its text — the last call is what was actually sent (`runCore` records it as `promptText`). */
+export type GenerateOpts = {
+  calendarVariants?: { locked: string; unlocked: string };
+  onPromptSent?: (sent: { variant: PromptVariant; text: string }) => void;
+  /** Provider fallback (P1-M3-T5): the walk's per-attempt deadline. Once aborted, an HTTP attempt sends nothing
+   *  (checked after the key resolves and again before the POST) or aborts its POST, and a CLI attempt kills
+   *  its child; either throws `ProviderError("timeout")`. Absent ⇒ exactly today's behaviour. */
+  signal?: AbortSignal;
+};
+
 export interface Provider {
-  generate(prompt: string): Promise<string>; // throws ProviderError on failure
+  generate(prompt: string, opts?: GenerateOpts): Promise<string>; // throws ProviderError on failure
 }
 
 // `usage-limit`: the CLI reported a subscription usage wall (weekly or session) with a reset time.
@@ -228,6 +284,32 @@ export interface Provider {
 // schedule and withHardeningLadder's rungs. See provider.ts for the classification rules (shape-gated,
 // so a briefing that merely QUOTES a limit message is not mistaken for one).
 export type ProviderErrorCode = "missing-binary" | "nonzero-exit" | "empty-output" | "timeout" | "usage-limit";
+
+/** A cause TAG set at the transport boundary, before the response body is dropped (provider fallback, spec r9
+ *  §5 step 5), so the walk's classifier (`failoverReason`, src/failover.ts) can tell failures apart that share a
+ *  `code`. Not ES2022 `Error.cause`, which is the error chain (src/git.ts uses it) — hence `failCause`.
+ *  `insecure-endpoint` is set only by the walk itself, never by a transport. */
+export type FailCause = "prompt-too-long" | "key-missing" | "enoent" | "redirect-refused" | "insecure-endpoint";
+
+/** One entry's part in a walk, for reporting (spec r9 §5 Reporting). */
+export type Attempt = {
+  label: string;
+  kind: string;
+  outcome: "won" | "failed" | "skipped-by-mark" | "dropped" | "not-reached";
+  reason?: string;
+  httpStatus?: number;
+  until?: string;
+};
+
+/** The run lock was lost mid-walk (provider fallback, spec r9 §5 Run lock). A plain `Error`, never a
+ *  `ProviderError`, so no retry wrapper or classifier can read it as a provider's failure; both hardening-ladder
+ *  rungs rethrow it unconditionally, for every config (`withHardeningLadder`). */
+export class LostLockError extends Error {
+  constructor(message = "the run lock was lost to another run — stopping without delivering") {
+    super(message);
+    this.name = "LostLockError";
+  }
+}
 
 export class ProviderError extends Error {
   // `warnings`: pre-formatted, ready-to-print pipeline-warning strings (discIssues + warnings) carried
@@ -256,6 +338,21 @@ export class ProviderError extends Error {
    *  A field on the CLASS, exactly as `durationMs` and `partialRead` above are — NOT a sixth member of
    *  `ProviderErrorCode`, whose count is frozen at five and pinned by test/types.test.ts. */
   resetAt?: string;
+  /** `httpStatus` (additive, v0.3.0 calendar final harden r3): the HTTP status an HTTP transport received, so a
+   *  caller that must NOT persist the response body (`core.ts`, when the attempt carried a calendar block — an
+   *  endpoint can echo the rejected prompt) can still name the status. Never set by the CLI path. */
+  httpStatus?: number;
+  /** `failCause` (additive, provider fallback): see `FailCause`. Optional, so every existing thrower and reader
+   *  is unchanged; `ProviderErrorCode` stays at five. */
+  failCause?: FailCause;
+  /** `retryAfterMs` (additive, provider fallback): a TRANSIENT 429's parsed `retry-after`, in ms. Never set on a
+   *  wall (those carry `resetAt`). */
+  retryAfterMs?: number;
+  /** `attempts` (additive, provider fallback): every entry's part in a walk that ended in failure. */
+  attempts?: Attempt[];
+  /** `diagnostics` (additive, provider fallback P1-M7 checkpoint): on the walk's AGGREGATE error only, one line per
+   *  tried entry (`  "<label>": <code>: <its message>`) for stderr. Never persisted: `main.ts` prints it redacted. */
+  diagnostics?: string[];
   constructor(public code: ProviderErrorCode, message: string, public warnings?: string[]) {
     super(message);
     this.name = "ProviderError";
@@ -282,7 +379,17 @@ export type Config = {
   // scan root (config.ts resolveTranscripts), so exporting it would silently blank transcript evidence.
   // `api` (Slice 2/A3, additive+optional): present ⇒ the briefing is generated over HTTP by one of the
   // two native transports instead of by spawning a CLI. See ProviderApi below for the whole contract.
-  provider: { cli: string; argv: string[]; promptVia: "stdin" | "arg"; timeoutMs?: number; harden?: boolean; credential?: "subscription" | "env-api-key"; accounts?: { label: string; configDir?: string }[]; api?: ProviderApi };
+  // `label` (provider fallback, additive+optional): item 1's identity when it has no `accounts` list (an API
+  // item 1, or a CLI item 1 without logins). Absent ⇒ "default", which is what older engines use. Ignored,
+  // with a warning, beside a resolving `accounts` list, whose first label wins (src/providerList.ts).
+  provider: { cli: string; argv: string[]; promptVia: "stdin" | "arg"; timeoutMs?: number; harden?: boolean; credential?: "subscription" | "env-api-key"; accounts?: { label: string; configDir?: string }[]; api?: ProviderApi; label?: string };
+  /** Provider fallback (additive+optional): the providers to try, in order, after item 1's logins — the
+   *  combined list is `provider`'s logins, then these (src/providerList.ts `resolveProviderList`). Each is
+   *  a provider block plus a unique `label`, optionally `configDir` (Claude CLI only) and `timeoutMs`
+   *  (default by kind — TIMEOUT_MS for a CLI, API_TIMEOUT_MS for an API — not `provider.timeoutMs`). A broken entry is dropped at runtime with a warning
+   *  naming it, and `config validate` reports it as an error. Absent ⇒ today's behaviour exactly.
+   *  `validateConfig` passes it through RAW (no `~` expansion); `resolveProviderList` normalizes each entry. */
+  fallbacks?: FallbackEntry[];
   /** Extra argv for the AUDIT JUDGE only — the briefing generator never sees it.
    *
    *  ⚠ The judge is the INSTRUMENT; the briefing is what it measures. You want the instrument at
@@ -293,7 +400,7 @@ export type Config = {
    *
    *  Typical use: `["--model", "opus"]` while `provider.argv` pins a cheaper model for the daily run.
    *  Appended AFTER `provider.argv`, so it wins on a repeated flag. */
-  auditJudgeArgv?: string[]; // timeoutMs: per-provider-call timeout (default 120s) — raise for a slow local model / big multi-repo window
+  auditJudgeArgv?: string[]; // timeoutMs: per-provider-call timeout (default 120s for a CLI provider, 300s for an API provider) — raise for a slow local model / big multi-repo window
   tokenBudget?: TokenBudget;
   lookbackCapDays?: number;
   excludeCommitPatterns?: string[]; // subjects matching any (regex) are tagged `meta.excluded` as bot/auto noise (#3)
@@ -378,6 +485,26 @@ export type Config = {
    *  notify-only feature must not cost the morning its briefing (B1 style — `src/updateCheck.ts`,
    *  `resolveUpdateCheck`). */
   updateCheck?: { enabled?: boolean; intervalHours?: number };
+  /** v0.3.0 (calendar connection, spec r4 §2) — today's calendar in the briefing. ADDITIVE-OPTIONAL,
+   *  default OFF.
+   *
+   *  The documented shape is `{ enabled?: boolean, emails?: string[], macos?: { calendars?: "editable" |
+   *  "all" | [{ id, title, account }] }, links?: [{ id, name?, owner?, confirmedOwner?, urlEnv?,
+   *  urlCommand? }] }`, but it is declared `unknown` ON PURPOSE, for `recapCampaigns`' reason: the ONE
+   *  reader is `resolveCalendar(raw)` (src/calendar/config.ts) — absent (`undefined`/`null`) ⇒ off with no
+   *  warning; malformed ⇒ off plus one fixed-text warning that never quotes a configured value; never a
+   *  throw. `validateConfig` does not look at it (unknown keys spread through).
+   *
+   *  A link's URL is a secret and is NEVER a field here: a literal `url` is refused and that link skipped.
+   *  The URL lives in `<state>/calendar/links/<id>.url`, or comes from `urlEnv` / `urlCommand`
+   *  (src/calendar/link-url.ts). Absent ⇒ the briefing, prompt, envelope, eval and audit are byte-identical
+   *  to before the feature (test/calendar-off.golden.test.ts). */
+  calendar?: unknown;
+  /** Optional post-delivery AI summary, off by absence. Resolved only by
+   *  `resolveAiSummary` (src/summary/config.ts): `{ enabled?: boolean }`;
+   *  malformed blocks disable it with a private/status diagnostic code.
+   *  `validateConfig` passes the raw value through without reading it. */
+  aiSummary?: unknown;
 };
 
 /**

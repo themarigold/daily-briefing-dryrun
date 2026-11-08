@@ -122,6 +122,7 @@ fn one_per_phase() -> Vec<(&'static str, ScheduleState)> {
         local_date: TODAY.into(),
         reason: reason.into(),
         detail: Some("the engine's own line".into()),
+        all_out_of_usage: false,
     };
     vec![
         (
@@ -1206,13 +1207,19 @@ fn the_plugins_the_menu_and_the_run_callback_are_wired() {
     // A second launch raises the window through the same command the webview may call.
     assert!(lib.contains("shell::open_today(app.clone())"));
 
-    // The shell's setup runs, and the state it and the commands resolve is managed — `State<'_, T>`
-    // PANICS if nothing of that type is managed.
+    // The shell's setup runs, and the state it and the commands resolve is managed — on the pinned
+    // tauri 2.11.5 a command whose `State<'_, T>` is not managed fails with "state not managed"
+    // (`tauri/src/state.rs`, `from_command`) instead of running.
     assert!(lib.contains("shell::setup(app.handle())"));
     assert!(lib.contains(".manage(snapshots)"));
     assert!(
         lib.contains(".manage(shell::ShellState::default())"),
         "the quit latch is not managed: every Quit would exit with no notice"
+    );
+    assert!(
+        lib.contains(".manage(app_prefs::AppPrefs::default())"),
+        "the app-preference store is not managed: both app_prefs commands would fail, and the \
+         first name and the slides switch would silently read as the defaults"
     );
 
     // ⚠ THE RUN-LOOP CALLBACK. Without it there is no macOS Reopen (a Dock click on a hidden
@@ -1903,6 +1910,67 @@ fn a_refresh_after_the_watcher_stopped_still_says_so() {
             "refresh {refresh}"
         );
     }
+}
+
+/// Provider fallback (P3-M6-T2): the older-background-engine warning and the MEASURED engine
+/// version reach the webview through real IPC, from the engine's own envelopes — `status --json`'s
+/// `providers` (two valid entries and a dropped one) and `schedule status --json`'s
+/// `scheduledEngineVersion` — for a CLI-owned schedule, whose install-time record says otherwise.
+#[test]
+fn the_older_engine_warning_reaches_the_webview_with_the_measured_version() {
+    let scratch = ScratchDir::new("older-engine");
+    let status = serde_json::json!({
+        "schemaVersion": 1,
+        "engineVersion": "0.2.1",
+        "configExists": true,
+        "configError": null,
+        "morningTime": { "value": "07:20", "minutes": 440, "warning": null },
+        "providers": [
+            { "index": 0, "source": "provider", "label": "work", "kind": "claude-cli", "status": { "kind": "ok" } },
+            { "index": 1, "source": "fallback", "fallbackIndex": 0, "label": "bad", "kind": "invalid", "status": { "kind": "invalid", "reason": "x" } },
+            { "index": 2, "source": "fallback", "fallbackIndex": 1, "label": "api", "kind": "anthropic", "status": { "kind": "ok" } }
+        ]
+    });
+    let schedule = serde_json::json!({
+        "schemaVersion": 1,
+        "engineVersion": "0.2.1",
+        "registered": true,
+        "recordPresent": true,
+        "unitPresent": true,
+        "owner": "cli",
+        "invoker": "cli",
+        "installedEngineVersion": "0.2.1",
+        "scheduledEngineVersion": "0.0.1",
+        "lastTickState": "absent",
+        "intervalSec": 600
+    });
+    let program = fake_sidecar(
+        &scratch.path,
+        "engine.sh",
+        &format!(
+            "case \"$1:$2\" in\n  status:--json) printf '%s' '{status}' ;;\n  schedule:status) printf '%s' '{schedule}' ;;\n  *) exit 1 ;;\nesac"
+        ),
+    );
+    let client = Ok(EngineClient::with_program(program));
+    let app = mock_builder()
+        .manage(Engine(client.clone()))
+        .manage(Arc::new(EngineSnapshots::new(client)))
+        .manage(ShellState::default())
+        .invoke_handler(daily_briefing_gui_lib::handler())
+        .build(ctx())
+        .expect("mock app");
+    let w = WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .expect("main webview");
+
+    let snapshot = invoke_state_snapshot(&w);
+    let state = &snapshot["scheduleState"];
+    assert_eq!(state["owner"], "cli", "{snapshot}");
+    assert_eq!(state["olderEngineWarning"], true, "{snapshot}");
+    assert_eq!(state["scheduledEngineVersion"], "0.0.1", "{snapshot}");
+    assert_eq!(state["installedEngineVersion"], "0.2.1", "{snapshot}");
+    // The existing update prompt is app-owned only, and stays so.
+    assert_eq!(state["engineUpdateAvailable"], false, "{snapshot}");
 }
 
 /// A fake engine whose first `fail_first` `status --json` calls fail, then answers like

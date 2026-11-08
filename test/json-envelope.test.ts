@@ -6,7 +6,7 @@ import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off 
 // for `--json-out`, the same stdout byte for byte, because briefing.log is launchd's StandardOutPath
 // and `audit.lastBriefing` grades whatever sits after the last `☀️ … briefing —` header in it.
 import { test, expect, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildRepo } from "./fixtures/build-repo";
@@ -110,7 +110,8 @@ describe("envelopeFrom", () => {
   });
 
   test("limited: the account payload rides along so the GUI can say WHICH account and until when", () => {
-    const limited = { label: "work", until: "3pm", isProbe: false, exhausted: false };
+    // P1-M7-T2: `exhausted` is always true now (spec r9 §5 "Retired"), and row 1's `allOutOfUsage` rides inside.
+    const limited = { label: "work", until: "3pm", isProbe: false, exhausted: true as const, allOutOfUsage: true as const };
     const e = envelopeFrom(coreResult({ offlineSkipped: true, skipReason: "limited", limited, net: null }), "", 0);
     expect([e.delivered, e.skipReason]).toEqual([false, "limited"]);
     expect(e.limited).toEqual(limited);
@@ -238,6 +239,68 @@ describe("resolveJsonOutPath", () => {
         // …and an archived briefing inside it, which a `--json-out briefings/2026-01-01.md` would clobber.
         expect(() => resolveJsonOutPath("briefings/2026-01-01.md")).toThrow();
         expect(() => resolveJsonOutPath(join(sp.briefingsDir, "2026-01-01.md"))).toThrow();
+      } finally { env.cleanup(); }
+    });
+
+    test("v0.3.0 calendar: any path under <state>/calendar/ is refused (a link file could be overwritten)", () => {
+      const env = withEnv();
+      try {
+        const sp = statePaths();
+        for (const target of ["calendar", "calendar/links/work.url", "calendar/health.json", "calendar/x/y.json",
+          join(sp.stateDir, "calendar"), join(sp.stateDir, "calendar", "links", "work.url")]) {
+          expect(() => resolveJsonOutPath(target)).toThrow("calendar state");
+        }
+        // A sibling that merely starts with the name is not inside it.
+        expect(resolveJsonOutPath("calendarX.json")).toBe(join(sp.stateDir, "calendarX.json"));
+      } finally { env.cleanup(); }
+    });
+
+    test("P1-M10-T2: provider-status.json, last-failure.json and anything under keys/ are refused, relative and absolute", async () => {
+      const env = withEnv();
+      try {
+        const sp = statePaths();
+        const { engineOwnedPaths } = await import("../src/json");
+        for (const [target, what] of [
+          ["provider-status.json", "provider status"], [join(sp.stateDir, "provider-status.json"), "provider status"],
+          ["last-failure.json", "last-failure record"], [join(sp.stateDir, "last-failure.json"), "last-failure record"],
+          ["keys", "app-owned key folder"], ["keys/k-0123456789ab", "app-owned key folder"], [join(sp.stateDir, "keys", "x", "y"), "app-owned key folder"],
+          ["run-record.json", "run record"], [join(sp.stateDir, "run-record.json"), "run record"],   // B1-M1-T3
+        ] as const) expect(() => resolveJsonOutPath(target), target).toThrow(what);
+        expect(resolveJsonOutPath("keysX.json")).toBe(join(sp.stateDir, "keysX.json"));
+        // statePaths() is unchanged (the calendar-off goldens pin the envelope's paths); the new list is a superset.
+        expect(Object.keys(sp).sort()).toEqual(["accountStatePath", "briefingsDir", "configPath", "lastSkipPath", "latestBriefingPath",
+          "logPath", "markerPath", "recapCampaignsPath", "runLockPath", "schedulePath", "stateDir", "tickPath", "updateCheckPath"]);
+        const owned = engineOwnedPaths();
+        expect(Object.keys(owned).sort()).toEqual([...Object.keys(sp), "keysDir", "lastFailurePath", "providerStatusPath", "runRecordPath"].sort());
+        for (const [k, v] of Object.entries(sp)) expect((owned as Record<string, string>)[k]).toBe(v);
+      } finally { env.cleanup(); }
+    });
+
+    test("final harden r2: every SPELLING of an engine-owned path is refused — `//`, `/./`, letter case, a symlinked root", () => {
+      const env = withEnv();
+      try {
+        const sp = statePaths();
+        mkdirSync(join(sp.stateDir, "calendar", "links"), { recursive: true });
+        const spellings = [
+          `${sp.stateDir}//calendar/links/work.url`, `${sp.stateDir}/./calendar/links/work.url`, `${sp.stateDir}/calendar//links/./work.url`,
+          "./calendar/links/work.url", ".//calendar/health.json",
+        ];
+        // APFS (and NTFS) are case-insensitive by default: there `Calendar` IS `calendar`.
+        if (process.platform === "darwin" || process.platform === "win32") {
+          spellings.push(`${sp.stateDir}/Calendar/links/work.url`, "CALENDAR/links/work.url", `${sp.stateDir}/calendar/LINKS/Work.URL`);
+        }
+        for (const target of spellings) expect(() => resolveJsonOutPath(target), target).toThrow("calendar state");
+        // A root reached through a symlink is the same root.
+        const alias = join(removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-alias-"))), "state-link");
+        symlinkSync(sp.stateDir, alias);
+        expect(() => resolveJsonOutPath(join(alias, "calendar", "links", "work.url"))).toThrow("calendar state");
+        expect(() => resolveJsonOutPath(join(alias, "last-run"))).toThrow("day marker");
+        // The owned FILES too, not only the calendar tree.
+        expect(() => resolveJsonOutPath(`${sp.stateDir}//briefing.log`)).toThrow("launchd briefing log");
+        expect(() => resolveJsonOutPath("./last-run")).toThrow("day marker");
+        if (process.platform === "darwin") expect(() => resolveJsonOutPath("Last-Run")).toThrow("day marker");
+        // …and an ordinary name is still allowed in every spelling.
+        expect(resolveJsonOutPath("./envelope.json")).toBe(join(sp.stateDir, "./envelope.json"));
       } finally { env.cleanup(); }
     });
 
@@ -497,5 +560,19 @@ describe("run --json / --json-out on a real fixture repo", () => {
           .toBe(`${target} wrote a heartbeat: false`);
       } finally { cap.restore(); env.cleanup(); }
     }
+  });
+});
+
+describe("PR 1 final review round 1 M3: the envelope's account and limited.label are safe labels", () => {
+  const KEY = "sk-ant-api03-Zq9xR2bT7mVwK4pLs8NcYf3HjA6uDe1GiO5rQ0tXzBnMvCwEkPaLyJhUgSdFo2Ii-AbCdEfGhAA";
+  test("a key- or link-shaped label is masked; an ordinary one is byte-identical", () => {
+    const limited = { label: `Main ${KEY}`, until: "3pm", isProbe: false, exhausted: true as const, allOutOfUsage: true as const };
+    const e = envelopeFrom(coreResult({ offlineSkipped: true, skipReason: "limited", limited, account: `Cal https://calendar.google.com/calendar/ical/x/private-abc/basic.ics`, net: null }), "", 0);
+    expect(JSON.stringify([e.account, e.limited])).not.toContain("Zq9xR2bT7mVw");
+    expect(JSON.stringify([e.account, e.limited])).not.toContain("calendar.google");
+    const plain = { label: "work", until: "3pm", isProbe: false, exhausted: true as const };
+    const p = envelopeFrom(coreResult({ offlineSkipped: true, skipReason: "limited", limited: plain, account: "work", net: null }), "", 0);
+    expect(JSON.stringify(p.limited)).toBe(JSON.stringify(plain));
+    expect(p.account).toBe("work");
   });
 });

@@ -18,16 +18,19 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{RecordingNotifySink, ScratchDir};
 use daily_briefing_gui_lib::notifications::{
     build_notification, classify_notify, engine_will_notify, facts_of, first_resume_line,
-    notification_line, read_record, skip_notify_class, strip_control, strip_markdown_markers,
-    write_record, Facts, Firing, NotifyClass, NotifyRecord, NotifyState, Observation, SkipFact,
+    notification_line, read_notified_dates, read_record, skip_notify_class, strip_control,
+    strip_markdown_markers, write_notified_dates, write_record, Facts, Firing, NotifyClass,
+    NotifyRecord, NotifyState, Observation, SkipFact, NOTIFIED_DATES_FILE,
+    OUT_OF_USAGE_FALLBACK_BODY,
 };
-use daily_briefing_gui_lib::schedule_state::{Phase, SkipReason, SKIP_REASONS};
+use daily_briefing_gui_lib::schedule_state::{now_local, LastSkip, Now, Phase, SKIP_REASONS};
 use daily_briefing_gui_lib::shell::{AppState, ShellState};
 use daily_briefing_gui_lib::watcher::{Snapshot, StateSink};
 use serde_json::json;
@@ -138,6 +141,36 @@ fn skipped_snapshot_with_config(
     )
 }
 
+/// A skip RECORD as `skip_notify_class` takes it (spec r9 §5: the class reads the record, not only
+/// its reason, because `allOutOfUsage` decides `limited`'s class).
+fn skip_record(reason: &str, all_out_of_usage: bool) -> LastSkip {
+    LastSkip {
+        iso: "2026-09-17T07:20:00.000Z".into(),
+        local_date: "2026-09-17".into(),
+        reason: reason.into(),
+        detail: None,
+        all_out_of_usage,
+    }
+}
+
+/// The engine's two-line detail for an all-out-of-usage skip (`src/main.ts`, P1-M9-T2): the
+/// notification body first, `limitedSkipMessage` second (the `briefing.log` line).
+const OUT_OF_USAGE_DETAIL: &str =
+    "No briefing yet today — every provider is out of usage until 09:00. It will arrive once one \
+     resets, if your Mac is awake.\nskipped: account \"work\" is at its usage limit until 09:00 — no \
+     other account is available; will retry next interval";
+const OUT_OF_USAGE_BODY: &str =
+    "No briefing yet today — every provider is out of usage until 09:00. It will arrive once one \
+     resets, if your Mac is awake.";
+
+/// A `limited` skip snapshot for `date` carrying the engine's `allOutOfUsage: true` ON THE WIRE —
+/// the `status --json` `lastSkip` field — so `facts_of` reads it through the real deserializer.
+fn out_of_usage_snapshot(date: &str, detail: Option<&str>) -> Snapshot {
+    let mut status = status_payload(None, None, Some(("limited", date, detail)), None, None);
+    status["lastSkip"]["allOutOfUsage"] = json!(true);
+    snapshot(date, status)
+}
+
 fn waiting_snapshot(date: &str, mtime: Option<&str>) -> Snapshot {
     snapshot(date, status_payload(None, mtime, None, None, None))
 }
@@ -163,6 +196,24 @@ fn broken_scheduler_snapshot(now_date: &str, status: serde_json::Value) -> Snaps
     Snapshot::build(Some(status), Some(schedule), &now, None)
 }
 
+/// [`facts_of`], observed by an app whose clock says `today` — what `on_snapshot` hands the
+/// machine (P3-M5-T2: FAILED and `OutOfUsage` escape start-up absorption for TODAY's date only,
+/// so the machine has to know which date that is). `today` may differ from the snapshot's own
+/// derivation date on purpose: that is how an EARLIER-dated record is built.
+fn on(today: &str, snapshot: &Snapshot) -> Facts {
+    let mut facts = facts_of(snapshot);
+    facts.today = Some(today.to_string());
+    facts
+}
+
+/// A persisted / seeded dedupe map, written out.
+fn dates(entries: &[(NotifyClass, &str)]) -> BTreeMap<NotifyClass, String> {
+    entries
+        .iter()
+        .map(|(class, date)| (*class, date.to_string()))
+        .collect()
+}
+
 /* ── the never-notify table, over the ENGINE's whole vocabulary ───────────────────────────────── */
 
 /// Every member of the engine's `SKIP_REASONS` (pinned against `src/json.ts` by
@@ -184,6 +235,7 @@ fn every_skip_reason_has_the_documented_notify_decision() {
         ("provider-fail", Some(NotifyClass::Failed)),
         ("parse-empty", Some(NotifyClass::Failed)),
         ("marker-fail", Some(NotifyClass::Failed)),
+        ("write-fail", Some(NotifyClass::Failed)),
         ("crashed", Some(NotifyClass::Failed)),
     ];
     assert_eq!(
@@ -194,17 +246,209 @@ fn every_skip_reason_has_the_documented_notify_decision() {
     );
     for (reason, class) in expected {
         assert_eq!(
-            skip_notify_class(&SkipReason::parse(reason)),
+            skip_notify_class(&skip_record(reason, false)),
             *class,
             "{reason}"
         );
     }
     // The additive rule: an unknown reason is SILENCE, never a guessed banner.
     assert_eq!(
-        skip_notify_class(&SkipReason::parse("something-new")),
+        skip_notify_class(&skip_record("something-new", false)),
         None,
         "an unknown skip reason must choose silence"
     );
+    // Requirement 11 (spec r9 §5): the ONE row the record's `allOutOfUsage` changes. A plain
+    // `limited` stays silent above; a `limited` skip where every provider is out of usage is the
+    // once-a-day out-of-usage notification.
+    assert_eq!(
+        skip_notify_class(&skip_record("limited", true)),
+        Some(NotifyClass::OutOfUsage),
+        "an all-out-of-usage limited skip must notify as out of usage"
+    );
+    // And it changes ONLY that row: the engine writes the field on `limited` alone, and a stray
+    // flag on any other reason (or an unknown one) must not re-class it.
+    for (reason, class) in expected.iter().filter(|(r, _)| *r != "limited") {
+        assert_eq!(
+            skip_notify_class(&skip_record(reason, true)),
+            *class,
+            "allOutOfUsage re-classed {reason}"
+        );
+    }
+    assert_eq!(skip_notify_class(&skip_record("something-new", true)), None);
+}
+
+/// The new class's metadata: the Today route (the screen that shows the engine's out-of-usage
+/// line), its wire spelling for `notify_status`'s suppression record, and the same spelling from
+/// serde (the suppression log and `Notification` both serialise the class).
+#[test]
+fn the_out_of_usage_class_routes_to_today_and_is_spelled_out_of_usage() {
+    assert_eq!(NotifyClass::OutOfUsage.route(), "today");
+    assert_eq!(NotifyClass::OutOfUsage.as_str(), "out-of-usage");
+    assert_eq!(
+        serde_json::to_value(NotifyClass::OutOfUsage).expect("serialises"),
+        json!("out-of-usage")
+    );
+}
+
+/// Through the machine, from the WIRE: `status --json`'s `lastSkip.allOutOfUsage` reaches both
+/// `facts_of` sites (the phase-derived skip fact and the raw priming key) as the out-of-usage
+/// class, and a fresh transition fires exactly one `OutOfUsage` firing carrying the engine's
+/// detail. A plain `limited` (no field — every older engine, whose `limited` includes the "next
+/// tick uses another account" case) yields no fact and no firing.
+#[test]
+fn an_all_out_of_usage_skip_fires_out_of_usage_and_a_plain_limited_stays_silent() {
+    let facts = facts_of(&out_of_usage_snapshot(
+        "2026-09-17",
+        Some(OUT_OF_USAGE_DETAIL),
+    ));
+    assert_eq!(
+        facts.skip.as_ref().map(|s| s.class),
+        Some(NotifyClass::OutOfUsage),
+        "{facts:?}"
+    );
+    assert_eq!(
+        facts.raw_skip_key,
+        Some((NotifyClass::OutOfUsage, "2026-09-17".to_string()))
+    );
+
+    let mut machine = Observation::default();
+    assert_eq!(
+        machine.observe(&facts_of(&waiting_snapshot("2026-09-17", None))),
+        vec![]
+    );
+    let firings = machine.observe(&facts);
+    assert_eq!(
+        firings,
+        vec![Firing::Skip {
+            class: NotifyClass::OutOfUsage,
+            date: "2026-09-17".into(),
+            detail: Some(OUT_OF_USAGE_DETAIL.into()),
+            reason: "limited".into(),
+        }]
+    );
+    // Repeated ticks on the same date: the per-(class, date) dedupe holds.
+    for _ in 0..3 {
+        assert_eq!(
+            machine.observe(&facts),
+            vec![],
+            "a repeated all-out tick fired"
+        );
+    }
+
+    // A plain `limited`, same day, same detail text: silence at both sites.
+    let plain = facts_of(&skipped_snapshot(
+        "2026-09-17",
+        "limited",
+        Some(OUT_OF_USAGE_DETAIL),
+        None,
+    ));
+    assert_eq!(plain.skip, None, "{plain:?}");
+    assert_eq!(plain.raw_skip_key, None, "{plain:?}");
+    let mut machine = Observation::default();
+    machine.observe(&facts_of(&waiting_snapshot("2026-09-17", None)));
+    assert_eq!(machine.observe(&plain), vec![]);
+}
+
+/// The body is the engine's detail's FIRST line (`notification_line`), the title is the fixed
+/// "No briefing yet today", and the click lands on Today. With no detail at all (no engine writes
+/// that, but the record's `detail` is optional) the body still says out of usage — never that the
+/// run failed.
+#[test]
+fn the_out_of_usage_body_is_the_details_first_line() {
+    let n = build_notification(
+        &Firing::Skip {
+            class: NotifyClass::OutOfUsage,
+            date: "2026-09-17".into(),
+            detail: Some(OUT_OF_USAGE_DETAIL.into()),
+            reason: "limited".into(),
+        },
+        None,
+    );
+    assert_eq!(n.class, NotifyClass::OutOfUsage);
+    assert_eq!(n.title, "No briefing yet today");
+    assert_eq!(n.body, OUT_OF_USAGE_BODY, "first line only");
+    assert_eq!(n.route, "today");
+
+    for detail in [None, Some(""), Some("\nsecond line only")] {
+        let n = build_notification(
+            &Firing::Skip {
+                class: NotifyClass::OutOfUsage,
+                date: "2026-09-17".into(),
+                detail: detail.map(str::to_string),
+                reason: "limited".into(),
+            },
+            None,
+        );
+        assert_eq!(n.title, "No briefing yet today");
+        // EXACTLY the engine's no-time line (pinned against `src/failover.ts` below), so the
+        // fallback can neither name a time nor drift into "tomorrow" or "failed" (carried L2).
+        assert_eq!(n.body, OUT_OF_USAGE_FALLBACK_BODY, "detail={detail:?}");
+    }
+    assert!(
+        OUT_OF_USAGE_FALLBACK_BODY.contains("out of usage")
+            && !OUT_OF_USAGE_FALLBACK_BODY.to_lowercase().contains("fail")
+    );
+}
+
+/// The no-detail fallback is the ENGINE's `outOfUsageLine` with no reset time
+/// (`src/failover.ts`): read as text, the template's one `${when}` substituted with "" — the
+/// engine drops "until <time>" exactly that way when it parsed none. A change to the engine's
+/// wording fails here until the app's copy follows.
+#[test]
+fn the_out_of_usage_fallback_is_the_engines_line_without_a_time() {
+    let failover = std::fs::read_to_string(engine_root().join("src/failover.ts"))
+        .expect("src/failover.ts is readable");
+    let start = failover
+        .find("export function outOfUsageLine(")
+        .expect("the engine's outOfUsageLine moved or was renamed — re-pin the fallback");
+    let body = &failover[start..];
+    let open = body
+        .find("return `")
+        .expect("outOfUsageLine returns a template")
+        + "return `".len();
+    let close = open + body[open..].find('`').expect("the template closes");
+    let template = &body[open..close];
+    assert_eq!(
+        template.matches("${").count(),
+        1,
+        "the template gained an interpolation — {template}"
+    );
+    assert_eq!(template.replace("${when}", ""), OUT_OF_USAGE_FALLBACK_BODY);
+}
+
+/// End to end through `AppState::changed` (the literal shipping sink), opted in: one banner for
+/// the day's all-out-of-usage skip, however many ticks rewrite the record.
+#[test]
+fn an_all_out_of_usage_skip_posts_once_through_the_shipping_sink() {
+    let scratch = ScratchDir::new("notify-out-of-usage");
+    let store = scratch.join("app-data");
+    write_record(
+        &store,
+        &NotifyRecord {
+            enabled: Some(true),
+        },
+    )
+    .expect("record written");
+    let recorder = Arc::new(RecordingNotifySink::default());
+    let app = mock_app(Some(
+        NotifyState::default()
+            .with_sink(recorder.clone())
+            .with_store_dir(&store),
+    ));
+    let sink = AppState::new(app.handle().clone());
+    sink.changed(&waiting_snapshot("2026-09-17", None));
+    for _ in 0..3 {
+        sink.changed(&out_of_usage_snapshot(
+            "2026-09-17",
+            Some(OUT_OF_USAGE_DETAIL),
+        ));
+    }
+    let posted = recorder.posted();
+    assert_eq!(posted.len(), 1, "one banner per (class, date): {posted:?}");
+    assert_eq!(posted[0].class, NotifyClass::OutOfUsage);
+    assert_eq!(posted[0].title, "No briefing yet today");
+    assert_eq!(posted[0].body, OUT_OF_USAGE_BODY);
+    assert_eq!(posted[0].route, "today");
 }
 
 /// And through the whole machine: a never-notify skip produces NO firing even as a fresh
@@ -296,16 +540,16 @@ fn a_degraded_first_snapshot_never_primes_the_machine() {
         "the machine must still be primed by the first status-bearing snapshot"
     );
 
-    // A skip already on file behind a degraded first read is absorbed the same way.
+    // A skip already on file behind a degraded first read is absorbed the same way. The app's
+    // clock is a day past the record: since P3-M5-T2 only an EARLIER day's FAILED record is
+    // absorbed (today's, unannounced, fires — `a_failure_fires_once_per_day_and_…`).
     let mut machine = Observation::default();
-    machine.observe(&facts_of(&Snapshot::unavailable("boom")));
+    machine.observe(&on("2026-09-18", &Snapshot::unavailable("boom")));
     assert_eq!(
-        machine.observe(&facts_of(&skipped_snapshot(
-            "2026-09-17",
-            "provider-fail",
-            Some("E529"),
-            None,
-        ))),
+        machine.observe(&on(
+            "2026-09-18",
+            &skipped_snapshot("2026-09-17", "provider-fail", Some("E529"), None),
+        )),
         vec![],
         "a stale FAILED banner fired through the degraded primer"
     );
@@ -515,12 +759,15 @@ fn a_content_free_status_object_cannot_prime() {
     );
 }
 
-/// The FAILED half of the same round-2 hole: `Phase::Skipped` is shadowed by the same
-/// scheduler-trouble phases, so a primer with today's failure ON FILE but a broken scheduler
-/// absorbed no skip key, and the next good snapshot fired a FAILED banner for a failure that
-/// predates the app. Absorption must read the RAW `last-skip` record.
+/// The FAILED half of the same round-2 hole, INVERTED for today's date by P3-M5-T2 (spec r9 §5,
+/// requirement 11). `Phase::Skipped` is shadowed by the scheduler-trouble phases, so priming
+/// reads the RAW `last-skip` record — and since FAILED is exempt from start-up absorption for
+/// TODAY's local date, a primer carrying today's failure leaves it UNABSORBED: once the scheduler
+/// is repaired and the record surfaces as `Phase::Skipped`, the failure fires once (opening the
+/// app late must not miss the day's failure). A record from an EARLIER day is still absorbed
+/// from the raw evidence, whatever the derived phase says.
 #[test]
-fn a_shadowed_phase_primer_absorbs_todays_skip_record() {
+fn a_shadowed_phase_primer_absorbs_only_an_earlier_days_failure() {
     let primer = broken_scheduler_snapshot(
         "2026-09-17",
         status_payload(
@@ -536,7 +783,7 @@ fn a_shadowed_phase_primer_absorbs_todays_skip_record() {
         Some(&Phase::SchedulerBroken),
         "the fixture no longer derives the shadowed phase — this pin would be vacuous"
     );
-    let facts = facts_of(&primer);
+    let facts = on("2026-09-17", &primer);
     assert_eq!(
         facts.skip, None,
         "the phase-gated skip must be shadowed for this pin to mean anything"
@@ -546,27 +793,41 @@ fn a_shadowed_phase_primer_absorbs_todays_skip_record() {
         Some((NotifyClass::Failed, "2026-09-17".to_string()))
     );
 
+    // TODAY's failure behind a shadowed primer: not absorbed; it fires once the phase surfaces.
     let mut machine = Observation::default();
     assert_eq!(machine.observe(&facts), vec![]);
-    // The scheduler is repaired; the SAME day's failure record now surfaces as `Phase::Skipped`
-    // — absorbed, not news.
+    let repaired = on(
+        "2026-09-17",
+        &skipped_snapshot("2026-09-17", "provider-fail", Some("E529"), None),
+    );
     assert_eq!(
-        machine.observe(&facts_of(&skipped_snapshot(
-            "2026-09-17",
-            "provider-fail",
-            Some("E529"),
-            None,
-        ))),
+        machine.observe(&repaired),
+        vec![Firing::Skip {
+            class: NotifyClass::Failed,
+            date: "2026-09-17".into(),
+            detail: Some("E529".into()),
+            reason: "provider-fail".into(),
+        }],
+        "today's unannounced failure was absorbed by a shadowed-phase primer"
+    );
+    assert_eq!(machine.observe(&repaired), vec![], "once per day");
+
+    // An EARLIER day's failure (the app's clock already says 09-18): absorbed from the raw key.
+    let mut machine = Observation::default();
+    assert_eq!(machine.observe(&on("2026-09-18", &primer)), vec![]);
+    assert_eq!(
+        machine.observe(&on(
+            "2026-09-18",
+            &skipped_snapshot("2026-09-17", "provider-fail", Some("E529"), None),
+        )),
         vec![],
-        "a failure that predates the app fired through the shadowed-phase primer"
+        "an earlier day's failure fired through the shadowed-phase primer"
     );
     // A NEW day's failure still fires.
-    let firings = machine.observe(&facts_of(&skipped_snapshot(
+    let firings = machine.observe(&on(
         "2026-09-18",
-        "provider-fail",
-        Some("E530"),
-        None,
-    )));
+        &skipped_snapshot("2026-09-18", "provider-fail", Some("E530"), None),
+    ));
     assert_eq!(firings.len(), 1, "{firings:?}");
     assert_eq!(firings[0].class(), NotifyClass::Failed);
 }
@@ -720,9 +981,11 @@ fn the_next_day_fires_again() {
 
 /// A failure skip fires once per (class, date): the engine rewrites `last-skip.json` on every
 /// tick of a failing morning (a new `iso` each time), and 144 banners a day is the thing the
-/// dedupe exists to prevent. A skip already on file at startup is absorbed.
+/// dedupe exists to prevent. At startup (INVERTED by P3-M5-T2, spec r9 §5 requirement 11), a
+/// failure already on file for TODAY with no persisted firing fires once — FAILED is exempt from
+/// start-up absorption for today's date — while an EARLIER day's record is absorbed.
 #[test]
-fn a_failure_fires_once_per_day_and_startup_absorbs_an_existing_one() {
+fn a_failure_fires_once_per_day_and_startup_fires_only_todays_unannounced_one() {
     let mut machine = Observation::default();
     machine.observe(&facts_of(&waiting_snapshot("2026-09-17", None)));
     let firings = machine.observe(&facts_of(&skipped_snapshot(
@@ -764,10 +1027,49 @@ fn a_failure_fires_once_per_day_and_startup_absorbs_an_existing_one() {
     assert_eq!(firings.len(), 1, "{firings:?}");
     assert_eq!(firings[0].class(), NotifyClass::Blocked);
 
-    // Startup absorption: a fresh machine over an existing failure says nothing.
+    // Startup on the SAME day: a fresh machine over today's failure fires it, once.
+    let todays = on(
+        "2026-09-17",
+        &skipped_snapshot(
+            "2026-09-17",
+            "provider-fail",
+            Some("E529: overloaded"),
+            None,
+        ),
+    );
     let mut fresh = Observation::default();
     assert_eq!(
-        fresh.observe(&facts_of(&skipped_snapshot(
+        fresh.observe(&todays),
+        vec![Firing::Skip {
+            class: NotifyClass::Failed,
+            date: "2026-09-17".into(),
+            detail: Some("E529: overloaded".into()),
+            reason: "provider-fail".into(),
+        }],
+        "opening the app after today's failure must announce it"
+    );
+    for _ in 0..3 {
+        assert_eq!(fresh.observe(&todays), vec![], "re-fired within the day");
+    }
+
+    // An EARLIER day's record (the app's clock is a day past the snapshot's) is absorbed.
+    let mut later = Observation::default();
+    let earlier = on(
+        "2026-09-18",
+        &skipped_snapshot(
+            "2026-09-17",
+            "provider-fail",
+            Some("E529: overloaded"),
+            None,
+        ),
+    );
+    assert_eq!(later.observe(&earlier), vec![]);
+    assert_eq!(later.observe(&earlier), vec![]);
+
+    // No clock at all (an empty local date): nothing can be called today, so it absorbs.
+    let mut unclocked = Observation::default();
+    assert_eq!(
+        unclocked.observe(&facts_of(&skipped_snapshot(
             "2026-09-17",
             "provider-fail",
             Some("E529: overloaded"),
@@ -809,6 +1111,353 @@ fn a_failure_then_a_delivery_both_fire() {
             date: "2026-09-17".into()
         }]
     );
+}
+
+/* ── once a day, across restarts (P3-M5-T2, spec r9 §5 requirement 11) ──────────────────────── */
+
+/// Requirement 11: "one notification per state per day … when the app opens after the state
+/// began". Opening the app after today's first all-out-of-usage tick fires `OutOfUsage` ONCE, and
+/// opening it after today's first mixed-state tick (out of usage plus paused after failures — the
+/// engine's `provider-fail`, step 7 row 3) fires FAILED once: both classes skip start-up
+/// absorption for today's date. Behind a shadowed primer too. An earlier day's record is absorbed.
+#[test]
+fn opening_the_app_after_todays_first_all_out_or_mixed_state_tick_fires_once() {
+    let all_out = on(
+        "2026-09-17",
+        &out_of_usage_snapshot("2026-09-17", Some(OUT_OF_USAGE_DETAIL)),
+    );
+    let mut machine = Observation::default();
+    assert_eq!(
+        machine.observe(&all_out),
+        vec![Firing::Skip {
+            class: NotifyClass::OutOfUsage,
+            date: "2026-09-17".into(),
+            detail: Some(OUT_OF_USAGE_DETAIL.into()),
+            reason: "limited".into(),
+        }],
+        "the app opened after today's first all-out tick and stayed silent"
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            machine.observe(&all_out),
+            vec![],
+            "a repeated all-out tick fired"
+        );
+    }
+
+    let mixed = on(
+        "2026-09-17",
+        &skipped_snapshot(
+            "2026-09-17",
+            "provider-fail",
+            Some("every provider failed or is out of usage"),
+            None,
+        ),
+    );
+    let mut machine = Observation::default();
+    let firings = machine.observe(&mixed);
+    assert_eq!(firings.len(), 1, "{firings:?}");
+    assert_eq!(firings[0].class(), NotifyClass::Failed);
+    assert_eq!(machine.observe(&mixed), vec![]);
+
+    // A shadowed-phase primer carrying today's all-out record leaves it unabsorbed too.
+    let mut status = status_payload(
+        None,
+        None,
+        Some(("limited", "2026-09-17", Some(OUT_OF_USAGE_DETAIL))),
+        None,
+        None,
+    );
+    status["lastSkip"]["allOutOfUsage"] = json!(true);
+    let primer = on(
+        "2026-09-17",
+        &broken_scheduler_snapshot("2026-09-17", status),
+    );
+    assert_eq!(
+        primer.raw_skip_key,
+        Some((NotifyClass::OutOfUsage, "2026-09-17".to_string()))
+    );
+    let mut machine = Observation::default();
+    assert_eq!(machine.observe(&primer), vec![]);
+    assert_eq!(
+        machine.observe(&all_out).len(),
+        1,
+        "fires once the phase surfaces"
+    );
+
+    // An EARLIER day's all-out record is absorbed, as every class's is.
+    let earlier = on(
+        "2026-09-18",
+        &out_of_usage_snapshot("2026-09-17", Some(OUT_OF_USAGE_DETAIL)),
+    );
+    let mut machine = Observation::default();
+    assert_eq!(machine.observe(&earlier), vec![]);
+    assert_eq!(machine.observe(&earlier), vec![]);
+}
+
+/// DELIVERED and BLOCKED keep today's start-up absorption: a briefing delivered before the app
+/// opened, or a run blocked before it, is furniture, not news — even with the app's clock on that
+/// very day, and even behind a shadowed primer.
+#[test]
+fn delivered_and_blocked_keep_todays_startup_absorption() {
+    let mut machine = Observation::default();
+    assert_eq!(
+        machine.observe(&on(
+            "2026-09-17",
+            &delivered_snapshot("2026-09-17", "2026-09-17T07:24:00Z", None, None),
+        )),
+        vec![]
+    );
+    assert_eq!(
+        machine.observe(&on(
+            "2026-09-17",
+            &delivered_snapshot("2026-09-17", "2026-09-17T09:00:00Z", None, None),
+        )),
+        vec![],
+        "today's absorbed delivery fired on a same-day regenerate"
+    );
+
+    let blocked = on(
+        "2026-09-17",
+        &skipped_snapshot("2026-09-17", "blocked", None, None),
+    );
+    let mut machine = Observation::default();
+    assert_eq!(
+        machine.observe(&blocked),
+        vec![],
+        "today's BLOCKED escaped absorption"
+    );
+    assert_eq!(machine.observe(&blocked), vec![]);
+
+    let mut machine = Observation::default();
+    machine.observe(&on(
+        "2026-09-17",
+        &broken_scheduler_snapshot(
+            "2026-09-17",
+            status_payload(
+                None,
+                None,
+                Some(("blocked", "2026-09-17", None)),
+                None,
+                None,
+            ),
+        ),
+    ));
+    assert_eq!(
+        machine.observe(&blocked),
+        vec![],
+        "a shadowed BLOCKED primer was not absorbed"
+    );
+}
+
+/// The persisted map seeds the machine: a persisted date blocks a second firing of that class
+/// for that date (FAILED and `OutOfUsage` would otherwise escape absorption at start), an EARLIER
+/// persisted date blocks nothing, and at load the LATER of the persisted and the primer's absorbed
+/// date wins, per class, in both directions.
+#[test]
+fn a_seeded_date_blocks_its_class_and_the_later_date_wins_at_load() {
+    let mut machine = Observation::default();
+    assert!(!machine.is_seeded());
+    machine.seed(dates(&[
+        (NotifyClass::Failed, "2026-09-17"),
+        (NotifyClass::OutOfUsage, "2026-09-17"),
+    ]));
+    assert!(machine.is_seeded());
+    assert_eq!(
+        machine.observe(&on(
+            "2026-09-17",
+            &skipped_snapshot("2026-09-17", "provider-fail", Some("E529"), None),
+        )),
+        vec![],
+        "a persisted FAILED firing repeated after the restart"
+    );
+    assert_eq!(
+        machine.observe(&on(
+            "2026-09-17",
+            &out_of_usage_snapshot("2026-09-17", Some(OUT_OF_USAGE_DETAIL)),
+        )),
+        vec![],
+        "a persisted OutOfUsage firing repeated after the restart"
+    );
+
+    let mut machine = Observation::default();
+    machine.seed(dates(&[(NotifyClass::Failed, "2026-09-16")]));
+    assert_eq!(
+        machine
+            .observe(&on(
+                "2026-09-17",
+                &skipped_snapshot("2026-09-17", "provider-fail", Some("E529"), None),
+            ))
+            .len(),
+        1,
+        "yesterday's persisted firing blocked today's"
+    );
+
+    // Later wins at load: persisted DELIVERED (today's, so not a future date the load discards)
+    // is later than the primer's run date; persisted BLOCKED is earlier than the primer's record.
+    let mut machine = Observation::default();
+    machine.seed(dates(&[
+        (NotifyClass::Delivered, "2026-09-18"),
+        (NotifyClass::Blocked, "2026-09-16"),
+    ]));
+    machine.observe(&on(
+        "2026-09-18",
+        &snapshot(
+            "2026-09-18",
+            status_payload(
+                Some("2026-09-17"),
+                Some("2026-09-17T07:24:00Z"),
+                Some(("blocked", "2026-09-17", None)),
+                None,
+                None,
+            ),
+        ),
+    ));
+    assert_eq!(
+        machine.fired(),
+        &dates(&[
+            (NotifyClass::Delivered, "2026-09-18"),
+            (NotifyClass::Blocked, "2026-09-17"),
+        ]),
+        "at load the later of the persisted and the absorbed date must win per class"
+    );
+    // And for the raw SKIP key too: a persisted BLOCKED date (today's) later than the primer's
+    // record holds.
+    let mut machine = Observation::default();
+    machine.seed(dates(&[(NotifyClass::Blocked, "2026-09-18")]));
+    machine.observe(&on(
+        "2026-09-18",
+        &skipped_snapshot("2026-09-17", "blocked", None, None),
+    ));
+    assert_eq!(
+        machine.fired(),
+        &dates(&[(NotifyClass::Blocked, "2026-09-18")]),
+        "the primer's earlier skip key overwrote a later persisted date"
+    );
+}
+
+/// P3-M5 checkpoint L2 (hub, 2026-10-18): at load, a persisted date LATER than the app's today
+/// is discarded before "later wins" runs — dates only increase in normal running, so a future
+/// date means the clock or the time zone moved backwards. Kept, it knocked out today's start-up
+/// absorption for BLOCKED and DELIVERED (the reviewer's probe: a block that predates the app
+/// fired once a shadowed phase surfaced it). A future FAILED date does not suppress today's
+/// FAILED, a non-future persisted date still wins (the test above), and with no today nothing
+/// is discarded.
+#[test]
+fn a_future_persisted_date_is_discarded_at_load() {
+    let d = "2026-09-17";
+    let blocked_primer = on(
+        d,
+        &broken_scheduler_snapshot(
+            d,
+            status_payload(None, None, Some(("blocked", d, None)), None, None),
+        ),
+    );
+    let blocked = on(d, &skipped_snapshot(d, "blocked", None, None));
+
+    // The reviewer's probe.
+    let mut machine = Observation::default();
+    machine.seed(dates(&[(NotifyClass::Blocked, "2026-09-18")]));
+    assert_eq!(machine.observe(&blocked_primer), vec![]);
+    assert_eq!(
+        machine.observe(&blocked),
+        vec![],
+        "a future persisted BLOCKED date let a block that predates the app fire"
+    );
+    assert_eq!(machine.fired(), &dates(&[(NotifyClass::Blocked, d)]));
+
+    // DELIVERED, on a same-day regenerate.
+    let mut machine = Observation::default();
+    machine.seed(dates(&[(NotifyClass::Delivered, "2026-09-18")]));
+    assert_eq!(
+        machine.observe(&on(
+            d,
+            &delivered_snapshot(d, "2026-09-17T07:24:00Z", None, None)
+        )),
+        vec![]
+    );
+    assert_eq!(
+        machine.observe(&on(
+            d,
+            &delivered_snapshot(d, "2026-09-17T09:00:00Z", None, None)
+        )),
+        vec![],
+        "a future persisted DELIVERED date let a delivery that predates the app fire"
+    );
+
+    // A future FAILED date does not suppress today's FAILED: it fires once.
+    let failed = on(d, &skipped_snapshot(d, "provider-fail", Some("E529"), None));
+    let mut machine = Observation::default();
+    machine.seed(dates(&[(NotifyClass::Failed, "2026-09-18")]));
+    assert_eq!(
+        machine.observe(&failed).len(),
+        1,
+        "today's FAILED did not fire"
+    );
+    assert_eq!(
+        machine.observe(&failed),
+        vec![],
+        "today's FAILED fired twice"
+    );
+
+    // No today: nothing is discarded (the behaviour before the rule).
+    let mut machine = Observation::default();
+    machine.seed(dates(&[(NotifyClass::Blocked, "2026-09-18")]));
+    let mut undated = blocked_primer.clone();
+    undated.today = None;
+    machine.observe(&undated);
+    assert_eq!(
+        machine.fired(),
+        &dates(&[(NotifyClass::Blocked, "2026-09-18")]),
+        "with no today a persisted date was discarded"
+    );
+}
+
+/// Carried L3 (requirement 11's mixed state): `OutOfUsage` and FAILED are SEPARATE dedupe slots on
+/// the same day. An all-out firing followed by a `provider-fail` skip on that date is two
+/// firings — with no restart between them, and with a restart between them that carries the
+/// persisted map. Once both are persisted, neither repeats after another restart.
+#[test]
+fn out_of_usage_and_failed_keep_separate_slots_on_one_day() {
+    let d = "2026-09-17";
+    let all_out = on(d, &out_of_usage_snapshot(d, Some(OUT_OF_USAGE_DETAIL)));
+    let failed = on(d, &skipped_snapshot(d, "provider-fail", Some("E529"), None));
+
+    // No restart.
+    let mut machine = Observation::default();
+    machine.observe(&on(d, &waiting_snapshot(d, None)));
+    let first = machine.observe(&all_out);
+    let second = machine.observe(&failed);
+    assert_eq!((first.len(), second.len()), (1, 1), "{first:?} {second:?}");
+    assert_eq!(first[0].class(), NotifyClass::OutOfUsage);
+    assert_eq!(second[0].class(), NotifyClass::Failed);
+    assert_eq!(machine.observe(&all_out), vec![]);
+    assert_eq!(machine.observe(&failed), vec![]);
+
+    // A restart between them, carrying the persisted map.
+    let mut before = Observation::default();
+    before.observe(&on(d, &waiting_snapshot(d, None)));
+    assert_eq!(before.observe(&all_out).len(), 1);
+    let mut after = Observation::default();
+    after.seed(before.fired().clone());
+    let firings = after.observe(&failed);
+    assert_eq!(
+        firings.len(),
+        1,
+        "the persisted OutOfUsage slot blocked FAILED: {firings:?}"
+    );
+    assert_eq!(firings[0].class(), NotifyClass::Failed);
+    assert_eq!(
+        after.observe(&all_out),
+        vec![],
+        "OutOfUsage repeated after the restart"
+    );
+
+    // Both persisted: another restart says nothing for either.
+    let mut again = Observation::default();
+    again.seed(after.fired().clone());
+    assert_eq!(again.observe(&all_out), vec![]);
+    assert_eq!(again.observe(&failed), vec![]);
 }
 
 /* ── the bodies, and §5's boundary ────────────────────────────────────────────────────────────── */
@@ -865,6 +1514,20 @@ fn the_first_resume_line_is_extracted_or_the_fallback_is_used() {
                  \x20\x20\x20• [other] later section\n";
     assert_eq!(first_resume_line(quiet), None);
     assert_eq!(first_resume_line(""), None);
+
+    // Provider fallback P1-M9-T4: a briefing that OPENS with notice lines (above its title) still yields the resume
+    // bullet — the notices start with `ℹ︎ `, never with the `▶ ` heading prefix.
+    let with_notices = "ℹ︎ Skipped \"Local\": unreachable — used \"Claude login 2\"\n\
+                        ℹ︎ Generated using \"Claude login 2\" — API charges may apply.\n\
+                        \n\
+                        ☀️  Daily briefing — 2026-10-16  (this machine: all)\n\
+                        \n\
+                        ▶ Where you left off\n\
+                        \x20\x20\x20• [app] resume the walk\n";
+    assert_eq!(
+        first_resume_line(with_notices).as_deref(),
+        Some("[app] resume the walk")
+    );
 
     let n = build_notification(
         &Firing::Delivered {
@@ -1462,4 +2125,381 @@ fn the_record_and_the_facts_degrade_safely() {
         detail: None,
         reason: String::new(),
     };
+}
+
+/* ── `notified-dates.json`, through the SHIPPING sink ─────────────────────────────────────────── */
+
+/// A `NotifyState` for the shipping sink whose clock says `today` (the exemption is for TODAY's
+/// local date, and the fixtures' day is not the real one).
+fn clocked_state(store: &Path, recorder: Arc<RecordingNotifySink>, today: &str) -> NotifyState {
+    let today = today.to_string();
+    NotifyState::default()
+        .with_sink(recorder)
+        .with_store_dir(store)
+        .with_clock(Arc::new(move || Now {
+            local_date: today.clone(),
+            minutes: 480,
+            epoch_secs: 1_790_000_000,
+        }))
+}
+
+/// One app session over `store`: a fresh `NotifyState` (as at app start), every snapshot through
+/// `AppState::changed`, and what it posted and withheld.
+fn session(
+    store: &Path,
+    today: &str,
+    snapshots: &[Snapshot],
+) -> (
+    Vec<daily_briefing_gui_lib::notifications::Notification>,
+    Vec<(String, String, String)>,
+) {
+    let recorder = Arc::new(RecordingNotifySink::default());
+    let app = mock_app(Some(clocked_state(store, recorder.clone(), today)));
+    let sink = AppState::new(app.handle().clone());
+    for snapshot in snapshots {
+        sink.changed(snapshot);
+    }
+    let withheld = app
+        .state::<NotifyState>()
+        .suppressed()
+        .into_iter()
+        .map(|s| (s.class.to_string(), s.date, s.reason.to_string()))
+        .collect();
+    (recorder.posted(), withheld)
+}
+
+fn opted_in_store(scratch: &ScratchDir) -> PathBuf {
+    let store = scratch.join("app-data");
+    write_record(
+        &store,
+        &NotifyRecord {
+            enabled: Some(true),
+        },
+    )
+    .expect("record written");
+    store
+}
+
+/// A FAILED firing is not repeated after a restart: without the persisted date, today's failure
+/// would escape start-up absorption and post again. And the spec's own double-fire: an all-out
+/// banner, a quiet `offline` skip overwriting the record, a restart, the next all-out tick —
+/// silent, because the date was persisted.
+#[test]
+fn a_failed_firing_is_not_repeated_after_a_restart() {
+    let d = "2026-09-17";
+    let scratch = ScratchDir::new("notify-dates-restart");
+    let store = opted_in_store(&scratch);
+    let failed = skipped_snapshot(d, "provider-fail", Some("E529"), None);
+
+    let (posted, _) = session(&store, d, &[waiting_snapshot(d, None), failed.clone()]);
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(posted[0].class, NotifyClass::Failed);
+    assert_eq!(
+        read_notified_dates(&store)
+            .get(&NotifyClass::Failed)
+            .map(String::as_str),
+        Some(d),
+        "the firing was not persisted"
+    );
+    let (posted, _) = session(&store, d, &[failed.clone(), failed.clone(), failed]);
+    assert_eq!(
+        posted,
+        vec![],
+        "the FAILED banner repeated after the restart"
+    );
+
+    let scratch = ScratchDir::new("notify-dates-offline-interleave");
+    let store = opted_in_store(&scratch);
+    let all_out = out_of_usage_snapshot(d, Some(OUT_OF_USAGE_DETAIL));
+    let (posted, _) = session(
+        &store,
+        d,
+        &[
+            waiting_snapshot(d, None),
+            all_out.clone(),
+            skipped_snapshot(d, "offline", None, None),
+        ],
+    );
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    let (posted, _) = session(&store, d, &[all_out.clone(), all_out]);
+    assert_eq!(
+        posted,
+        vec![],
+        "the all-out banner repeated after an offline skip and a restart"
+    );
+}
+
+/// Carried L3 through the file: an all-out banner, a restart, then the day's `provider-fail` —
+/// FAILED still posts (its own slot), the all-out tick after it does not, and a third session
+/// posts nothing. Two banners for the day, one per state.
+#[test]
+fn out_of_usage_then_failed_on_one_day_post_twice_across_a_restart() {
+    let d = "2026-09-17";
+    let scratch = ScratchDir::new("notify-dates-two-slots");
+    let store = opted_in_store(&scratch);
+    let all_out = out_of_usage_snapshot(d, Some(OUT_OF_USAGE_DETAIL));
+    let failed = skipped_snapshot(d, "provider-fail", Some("E529"), None);
+
+    let (posted, _) = session(&store, d, &[waiting_snapshot(d, None), all_out.clone()]);
+    assert_eq!(
+        posted.iter().map(|n| n.class).collect::<Vec<_>>(),
+        vec![NotifyClass::OutOfUsage]
+    );
+    let (posted, _) = session(&store, d, &[failed.clone(), all_out.clone()]);
+    assert_eq!(
+        posted.iter().map(|n| n.class).collect::<Vec<_>>(),
+        vec![NotifyClass::Failed],
+        "after the restart FAILED must post once and OutOfUsage not again"
+    );
+    let (posted, _) = session(&store, d, &[failed, all_out]);
+    assert_eq!(posted, vec![]);
+    assert_eq!(
+        read_notified_dates(&store),
+        dates(&[(NotifyClass::Failed, d), (NotifyClass::OutOfUsage, d)])
+    );
+}
+
+/// A firing WITHHELD because notifications are off or never asked is persisted all the same, so a
+/// restart does not decide it again (no second suppression entry, and nothing posts if the user
+/// opts in later that day).
+#[test]
+fn a_withheld_firing_is_persisted() {
+    let d = "2026-09-17";
+    for (enabled, reason) in [(None, "never-asked"), (Some(false), "disabled")] {
+        let scratch = ScratchDir::new("notify-dates-withheld");
+        let store = scratch.join("app-data");
+        if enabled.is_some() {
+            write_record(&store, &NotifyRecord { enabled }).expect("record written");
+        }
+        let all_out = out_of_usage_snapshot(d, Some(OUT_OF_USAGE_DETAIL));
+        let failed = skipped_snapshot(d, "provider-fail", Some("E529"), None);
+        let (posted, withheld) = session(
+            &store,
+            d,
+            &[waiting_snapshot(d, None), all_out.clone(), failed.clone()],
+        );
+        assert_eq!(posted, vec![]);
+        assert_eq!(
+            withheld,
+            vec![
+                (
+                    "out-of-usage".to_string(),
+                    d.to_string(),
+                    reason.to_string()
+                ),
+                ("failed".to_string(), d.to_string(), reason.to_string()),
+            ]
+        );
+        assert_eq!(
+            read_notified_dates(&store),
+            dates(&[(NotifyClass::Failed, d), (NotifyClass::OutOfUsage, d)]),
+            "{reason}: a withheld firing was not persisted"
+        );
+        // Restart, now opted in: the day's two states were already decided.
+        write_record(
+            &store,
+            &NotifyRecord {
+                enabled: Some(true),
+            },
+        )
+        .expect("record written");
+        let (posted, withheld) = session(&store, d, &[all_out, failed]);
+        assert_eq!((posted, withheld), (vec![], vec![]), "{reason}");
+    }
+}
+
+/// At load the later date wins, per class, through the FILE: a planted map whose DELIVERED date is
+/// later than the primer's run date keeps it, and whose BLOCKED and FAILED dates are earlier
+/// gives way — to the primer's absorbed BLOCKED, and to the FAILED firing that rewrites the file.
+#[test]
+fn the_later_date_wins_at_load_through_the_file() {
+    let d = "2026-09-17";
+    let scratch = ScratchDir::new("notify-dates-later-wins");
+    let store = opted_in_store(&scratch);
+    std::fs::write(
+        store.join(NOTIFIED_DATES_FILE),
+        r#"{"delivered":"2026-09-17","blocked":"2026-09-16","failed":"2026-09-16"}"#,
+    )
+    .expect("planted");
+    let primer = snapshot(
+        d,
+        status_payload(
+            Some("2026-09-16"),
+            Some("2026-09-17T07:24:00Z"),
+            Some(("blocked", d, None)),
+            None,
+            None,
+        ),
+    );
+    let (posted, _) = session(
+        &store,
+        d,
+        &[
+            primer,
+            skipped_snapshot(d, "provider-fail", Some("E529"), None),
+        ],
+    );
+    assert_eq!(
+        posted.iter().map(|n| n.class).collect::<Vec<_>>(),
+        vec![NotifyClass::Failed],
+        "an earlier persisted FAILED date blocked today's firing"
+    );
+    assert_eq!(
+        read_notified_dates(&store),
+        dates(&[
+            (NotifyClass::Delivered, d),
+            (NotifyClass::Blocked, d),
+            (NotifyClass::Failed, d),
+        ])
+    );
+}
+
+/// P3-M5 checkpoint L1: the PRODUCTION clock path — a `NotifyState` with NO `with_clock`, so
+/// `today` is `schedule_state::now_local()` (the store is still a scratch dir, never the real
+/// app data dir). Today's FAILED fires at start-up: an always-empty clock would absorb it.
+#[test]
+fn the_production_clock_decides_today_at_start_up() {
+    let today = now_local().local_date;
+    assert!(!today.is_empty(), "this machine has no local date");
+    let scratch = ScratchDir::new("notify-dates-real-clock");
+    let store = opted_in_store(&scratch);
+    let recorder = Arc::new(RecordingNotifySink::default());
+    let app = mock_app(Some(
+        NotifyState::default()
+            .with_sink(recorder.clone())
+            .with_store_dir(&store),
+    ));
+    let sink = AppState::new(app.handle().clone());
+    sink.changed(&skipped_snapshot(
+        &today,
+        "provider-fail",
+        Some("E529"),
+        None,
+    ));
+    if now_local().local_date != today {
+        eprintln!("the local date rolled over mid-test; nothing to assert");
+        return;
+    }
+    let posted = recorder.posted();
+    assert_eq!(
+        posted.len(),
+        1,
+        "today's FAILED did not fire at start-up: {posted:?}"
+    );
+    assert_eq!(posted[0].class, NotifyClass::Failed);
+}
+
+/// A write failure of `notified-dates.json` falls back to the in-memory dedupe: with a DIRECTORY
+/// where the file belongs (unreadable as a map, unwritable as a file), each class still posts
+/// exactly once for the day and nothing panics.
+#[test]
+fn a_write_failure_falls_back_to_in_memory_dedupe() {
+    let d = "2026-09-17";
+    let scratch = ScratchDir::new("notify-dates-write-fails");
+    let store = opted_in_store(&scratch);
+    std::fs::create_dir(store.join(NOTIFIED_DATES_FILE)).expect("a directory in the file's place");
+    let failed = skipped_snapshot(d, "provider-fail", Some("E529"), None);
+    let all_out = out_of_usage_snapshot(d, Some(OUT_OF_USAGE_DETAIL));
+    let (posted, _) = session(
+        &store,
+        d,
+        &[
+            waiting_snapshot(d, None),
+            failed.clone(),
+            failed.clone(),
+            all_out.clone(),
+            all_out,
+            failed,
+        ],
+    );
+    assert_eq!(
+        posted.iter().map(|n| n.class).collect::<Vec<_>>(),
+        vec![NotifyClass::Failed, NotifyClass::OutOfUsage]
+    );
+    assert!(store.join(NOTIFIED_DATES_FILE).is_dir());
+    assert_eq!(read_notified_dates(&store), BTreeMap::new());
+}
+
+/// The file round-trips as one JSON object keyed by the wire spelling, and degrades to an EMPTY
+/// map — today's in-memory behaviour — when it is missing or garbage; an unknown class or a value
+/// that is not a `YYYY-MM-DD` date is ignored, never guessed at.
+#[test]
+fn the_notified_dates_file_round_trips_and_degrades_to_empty() {
+    let scratch = ScratchDir::new("notify-dates-file");
+    let dir = scratch.join("app-data");
+    assert_eq!(
+        read_notified_dates(&dir),
+        BTreeMap::new(),
+        "missing = nothing persisted"
+    );
+    let map = dates(&[
+        (NotifyClass::Failed, "2026-09-17"),
+        (NotifyClass::OutOfUsage, "2026-09-17"),
+    ]);
+    write_notified_dates(&dir, &map).expect("written");
+    assert_eq!(read_notified_dates(&dir), map);
+    let on_disk: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(NOTIFIED_DATES_FILE)).expect("readable"),
+    )
+    .expect("JSON");
+    assert_eq!(
+        on_disk,
+        json!({ "failed": "2026-09-17", "out-of-usage": "2026-09-17" })
+    );
+
+    std::fs::write(dir.join(NOTIFIED_DATES_FILE), "{ not json").expect("clobbered");
+    assert_eq!(
+        read_notified_dates(&dir),
+        BTreeMap::new(),
+        "garbage = nothing persisted"
+    );
+    std::fs::write(
+        dir.join(NOTIFIED_DATES_FILE),
+        r#"{"failed":"2026-09-17","mystery":"2026-09-17","blocked":"yesterday","delivered":7,"out-of-usage":"2026-9-17"}"#,
+    )
+    .expect("written");
+    assert_eq!(
+        read_notified_dates(&dir),
+        dates(&[(NotifyClass::Failed, "2026-09-17")])
+    );
+
+    // P3-M5 checkpoint L3: every class round-trips, keyed by its wire spelling. (The read and the
+    // write are keyed through `NotifyClass`'s derived serde, so a new variant needs no list.)
+    let every = [
+        NotifyClass::Delivered,
+        NotifyClass::Failed,
+        NotifyClass::Blocked,
+        NotifyClass::OutOfUsage,
+    ];
+    let map: BTreeMap<NotifyClass, String> = every
+        .iter()
+        .map(|c| (*c, "2026-09-17".to_string()))
+        .collect();
+    write_notified_dates(&dir, &map).expect("written");
+    assert_eq!(read_notified_dates(&dir), map);
+    let on_disk: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(NOTIFIED_DATES_FILE)).expect("readable"),
+    )
+    .expect("JSON");
+    for class in every {
+        assert_eq!(
+            on_disk[class.as_str()],
+            json!("2026-09-17"),
+            "{class:?} is not keyed by its wire spelling"
+        );
+    }
+}
+
+/// The dates file's temp is CREATED, never opened through a planted link — the record's own test
+/// (`a_planted_temp_name_is_never_written_through`), for `write_notified_dates`.
+#[cfg(unix)]
+#[test]
+fn a_planted_notified_dates_temp_name_is_never_written_through() {
+    let scratch = ScratchDir::new("notify-dates-temp-plant");
+    let seeded = dates(&[(NotifyClass::Failed, "2026-09-17")]);
+    write_notified_dates(&scratch.path, &seeded).expect("seed the file");
+    common::assert_planted_temp_names_refused(&scratch.path, NOTIFIED_DATES_FILE, || {
+        write_notified_dates(&scratch.path, &BTreeMap::new())
+    });
+    assert_eq!(read_notified_dates(&scratch.path), seeded);
 }

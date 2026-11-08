@@ -26,16 +26,18 @@
 //! Every path a fake reports is under its `ScratchDir`, the test `ConfigSaver` stages under scratch
 //! too (`app_managing`), and the tests whose scheduler step asks the engine to REMOVE take
 //! `common::serialise()`'s turn, because the in-flight guard the removal takes is process-global.
-//! The `keep` tests, the unanswerable-engine test and `removeOwn`'s refusals spawn nothing
-//! mutating, so they take none.
+//! So does every test that ticks the settings box and can reach the key leg, whose `delete-all` takes
+//! the same guard (PR 3; `keep_refuses_nothing_when_no_scheduler_is_detected` among them). The other
+//! `keep` tests, the unanswerable-engine test and `removeOwn`'s refusals spawn nothing mutating, so
+//! they take none.
 //!
 //! ## The parity pin (the T9 pattern)
 //!
 //! [`ENGINE_STATE_REMOVALS`] must be `scripts/uninstall.sh`'s `$SUPPORT`-rooted list, token for
 //! token. The test PARSES the script at test time — the same anti-drift shape as
-//! `tests/engine_env.rs`'s `pathEnv` parse — so editing either side alone goes red. The one line the
-//! parse allows by exact text is the printed manual step (`PARSE_ALLOW_LIST`, M9 round 3); the
-//! script's old `$DBA_TEST_DIR/sentinel` test-mode removal, which no test seeded or asserted, is gone
+//! `tests/engine_env.rs`'s `pathEnv` parse — so editing either side alone goes red. The lines the
+//! parse allows by exact text are the printed manual step (`PARSE_ALLOW_LIST`, M9 round 3) and the
+//! `--remove-keys` leg's key-folder removal (provider fallback P2-M5-T4); the script's old `$DBA_TEST_DIR/sentinel` test-mode removal, which no test seeded or asserted, is gone
 //! (M9 LOW pass, L9), and its allow-list entry with it. The launchd unit (`$PLIST`) is not removed by
 //! the script at all since Batch 2 (spec 3.6.6): it is `schedule uninstall`'s territory.
 
@@ -49,6 +51,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use common::{fake_sidecar, serialise, sq, RecordingAutostartSink, ScratchDir};
+use daily_briefing_gui_lib::app_prefs::{
+    app_prefs_get, app_prefs_set, AppPrefs, AppPrefsError, APP_PREFS_CLOSED_BY_UNINSTALL,
+    APP_PREFS_FILE, APP_PREFS_TEMP_PREFIX,
+};
 use daily_briefing_gui_lib::autostart::AutostartState;
 use daily_briefing_gui_lib::config_save::{
     config_create, config_offer_notify_auto, config_save, ConfigSaver, SaveError,
@@ -56,16 +62,23 @@ use daily_briefing_gui_lib::config_save::{
 };
 use daily_briefing_gui_lib::engine::{Engine, EngineClient, EngineError, NoProgress, Operation};
 use daily_briefing_gui_lib::briefing_files::ReadRefusal;
+use daily_briefing_gui_lib::notifications::NOTIFIED_DATES_FILE;
+use daily_briefing_gui_lib::pending_resets::{
+    provider_pending_reset_add, PendingError, PendingResets, PENDING_RESETS_FILE,
+    PENDING_RESETS_TEMP_PREFIX, STORE_CLOSED_BY_UNINSTALL,
+};
 use daily_briefing_gui_lib::uninstall::{
-    config_link_note, config_other_link_note, engine_copy_leg, handled_with, leftover_commands,
-    managed_engine_copies, refused_for_unit, relative_key_reason, remove_app_files,
-    remove_engine_state, schedule_unit_files, settings_folder_link, settings_leg,
-    staged_copies_note, uninstall_execute, uninstall_preview, unit_command_note,
-    unit_uninstall_command, ActionReport, EngineEntry, EntryKind, Lstat, LstatKind, Outcome,
-    PathOutcome, PathReport, ScheduleSeen, SchedulerChoice, SchedulerOutcome, SettingsReport,
-    SystemFs, UninstallError, UninstallFs, UninstallPreview, UninstallReport, UninstallState,
-    APP_CONFIG_FILES, APP_DATA_DIRS, APP_DATA_FILES, COPY_NOT_ASKED, ENGINE_STATE_REMOVALS,
-    LAUNCHD_UNIT, OTHER_LINK_NOTE, REFUSED_FOR_KEPT_SCHEDULER, REFUSED_FOR_SCHEDULE,
+    config_link_note, config_other_link_note, engine_copy_leg, handled_with,
+    kept_config_key_refusal, leftover_commands, managed_engine_copies, refused_for_unit,
+    relative_key_reason, remove_app_files, remove_engine_state, schedule_unit_files,
+    scrub_staged_prefix, settings_folder_link, settings_leg, staged_copies_note, uninstall_execute,
+    uninstall_preview,
+    unit_command_note, unit_uninstall_command, ActionReport, EngineEntry, EntryKind, KeysReport,
+    Lstat, LstatKind, Outcome, PathOutcome, PathReport, ScheduleSeen, SchedulerChoice,
+    SchedulerOutcome, SettingsReport, SystemFs, UninstallError, UninstallFs, UninstallPreview,
+    UninstallReport, UninstallState, APP_CONFIG_FILES, APP_DATA_DIRS, APP_DATA_FILES,
+    APP_DATA_GLOBS, COPY_NOT_ASKED, ENGINE_STATE_REMOVALS, KEYS_KEPT_FOR_SCHEDULE,
+    KEYS_KEPT_SETTINGS_UNKNOWN, KEYS_KEPT_UNVERIFIED, LAUNCHD_UNIT, OTHER_LINK_NOTE, REFUSED_FOR_KEPT_SCHEDULER, REFUSED_FOR_SCHEDULE,
     REFUSED_FOR_UNIT_RULE, SCHEDULE_RECORD, SCHEDULE_STATUS_UNREADABLE, SETTINGS_BACKUP,
     SETTINGS_CONFIG, SYSTEMD_UNITS,
 };
@@ -172,11 +185,12 @@ struct Allowed {
     here_doc_of: Option<&'static str>,
 }
 
-/// The script's lines that name a deleter and are not SUPPORT removals. The parity test requires each to be
-/// found EXACTLY ONCE in the real script, so an entry left unused or matched twice fails as loudly as a line
-/// missing from it. (M9 LOW pass, L9: the test-mode sentinel's line, the other entry since round 3, is gone
-/// from the script — no test seeded or asserted the sentinel — and so from here.)
-const PARSE_ALLOW_LIST: [Allowed; 1] = [
+/// The script's lines that name a deleter and are not state-leg SUPPORT removals. The parity test requires each
+/// to be found EXACTLY ONCE in the real script, so an entry left unused or matched twice fails as loudly as a
+/// line missing from it. (M9 LOW pass, L9: the test-mode sentinel's line, the other entry since round 3, is gone
+/// from the script — no test seeded or asserted the sentinel — and so from here.) The tests that feed the parse
+/// crafted text find the manual step by its `here_doc_of` ([`manual_step`]), never by its position.
+const PARSE_ALLOW_LIST: [Allowed; 2] = [
     // Step 4 of the printed manual steps: text inside the QUOTED here-document `manual_steps` prints with
     // builtins, for the user's own terminal — never run here.
     Allowed {
@@ -185,7 +199,41 @@ const PARSE_ALLOW_LIST: [Allowed; 1] = [
             r#"while IFS= read -r line; do printf '%s\n' "$line" >&2; done <<'EOF_STEPS'"#,
         ),
     },
+    // Provider fallback P2-M5-T4: the `--remove-keys` leg's removal of the app-owned key folder, as code. It IS
+    // a removal under SUPPORT, but the KEY leg's, on that flag's consent only (spec r9 §6 Uninstall): it is not a
+    // state-leg token, so it must not reach the parity comparison — ENGINE_STATE_REMOVALS does not hold `keys`
+    // (the app's own key leg empties it through `provider key delete-all`), and the state leg never touches it.
+    // test/uninstall.test.ts runs both sides: `keys/` survives every run without the flag and goes with it.
+    Allowed {
+        line: r#"if ! rm -rf "$SUPPORT"/keys; then"#,
+        here_doc_of: None,
+    },
 ];
+
+/// [`PARSE_ALLOW_LIST`]'s manual step, found by its here-document opener — the one entry that has one — with
+/// its index: the list holds more than that entry since P2-M5-T4, so the tests below never destructure it.
+fn manual_step() -> (usize, &'static Allowed) {
+    let mut bodies = PARSE_ALLOW_LIST
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.here_doc_of.is_some());
+    let found = bodies
+        .next()
+        .expect("PARSE_ALLOW_LIST has no here-document entry: the manual step is gone");
+    assert!(
+        bodies.next().is_none(),
+        "PARSE_ALLOW_LIST has more than one here-document entry; find the manual step by its line instead"
+    );
+    found
+}
+
+/// The `allowed_hits` a crafted text meets when only the manual step's slot holds hits: `n` there, 0 in every
+/// other slot (P2-M5-T4: built from the list's length, not a one-entry literal).
+fn manual_step_hits(n: usize) -> [usize; PARSE_ALLOW_LIST.len()] {
+    let mut hits = [0; PARSE_ALLOW_LIST.len()];
+    hits[manual_step().0] = n;
+    hits
+}
 
 /// What the parse reads from a script: its SUPPORT removals, `(token, recursive)` per operand, and how many
 /// times each [`PARSE_ALLOW_LIST`] entry was met (by index).
@@ -1087,18 +1135,53 @@ fn a_deleter_line_that_is_not_a_parsed_support_rm_line_is_refused() {
 /// "found exactly once" reads — so an entry matched twice, or in the wrong place, cannot pass unseen.
 #[test]
 fn the_allow_list_counts_each_line_in_its_place() {
-    let [steps] = &PARSE_ALLOW_LIST;
+    let (_, steps) = manual_step();
     let opener = steps.here_doc_of.expect("the manual step is a here-document body line");
     let body = |line: &str| format!("{opener}\n   {line}\nEOF_STEPS\n");
-    assert_eq!(parse_script(&body(steps.line)).allowed_hits, [1]);
+    assert_eq!(parse_script(&body(steps.line)).allowed_hits, manual_step_hits(1));
     assert_eq!(
         parse_script(&format!("{}{}", body(steps.line), body(steps.line))).allowed_hits,
-        [2]
+        manual_step_hits(2)
     );
     // It lets nothing else through beside it.
     let beside = format!("{}rm -f \"$SUPPORT\"/extra\n", body(steps.line));
     let parsed = parse_script(&beside);
-    assert_eq!((parsed.allowed_hits, parsed.removals), ([1], extra()));
+    assert_eq!((parsed.allowed_hits, parsed.removals), (manual_step_hits(1), extra()));
+}
+
+/// Provider fallback P2-M5-T4: the key leg's folder removal is allowed as CODE only, in its own slot, counted;
+/// it is never read as a state-leg removal (so `keys` never reaches the parity comparison), a spelling of it the
+/// list does not hold is read as one — which the parity test then refuses, since ENGINE_STATE_REMOVALS lacks
+/// `keys` — and the exact line inside a here-document body is refused like any other body line.
+#[test]
+fn the_key_leg_folder_line_is_allowed_as_code_only() {
+    let (i, keys) = PARSE_ALLOW_LIST
+        .iter()
+        .enumerate()
+        .find(|(_, a)| a.line.contains("/keys"))
+        .expect("PARSE_ALLOW_LIST has no key-folder entry");
+    assert_eq!(keys.here_doc_of, None, "the key-folder line is code, not a here-document body line");
+    let mut expected = [0; PARSE_ALLOW_LIST.len()];
+    expected[i] = 1;
+    let parsed = parse_script(&format!("{}\n  true\nfi\n", keys.line));
+    assert_eq!((parsed.allowed_hits, parsed.removals), (expected, vec![]));
+    // Beside the manual step, each in its own slot.
+    let (_, steps) = manual_step();
+    let opener = steps.here_doc_of.expect("the manual step is a here-document body line");
+    let both = format!("{opener}\n   {}\nEOF_STEPS\n{}\n  true\nfi\n", steps.line, keys.line);
+    let mut both_hits = manual_step_hits(1);
+    both_hits[i] = 1;
+    assert_eq!(parse_script(&both).allowed_hits, both_hits);
+    // The plain spelling is not the allowed line: it parses as a recursive `keys` removal.
+    assert_eq!(
+        support_removals_in("rm -rf \"$SUPPORT\"/keys 2>/dev/null || true\n"),
+        vec![("keys".to_string(), true)]
+    );
+    // And the exact line in a here-document body is refused, whatever the body's command.
+    let text = format!("cat <<'EOF'\n{}\nEOF\n", keys.line);
+    let refusal = parse_refusal(&text)
+        .unwrap_or_else(|| panic!("{text:?} parsed silently to {:?}", support_removals_in(&text)));
+    assert!(refusal.contains("here-document body"), "{text:?} was refused for another reason: {refusal}");
 }
 
 /// M9 ROUND 3: the comment rule shares the code rule's ONE deleter matcher, so `shred`, an escaped or quoted
@@ -1216,10 +1299,10 @@ fn a_deleter_line_in_a_here_document_body_is_refused_unless_allow_listed() {
     }
     // The manual step under its exact opener is still the one body line allowed, and a body line that names
     // no deleter is text, passed over.
-    let [steps] = &PARSE_ALLOW_LIST;
+    let (_, steps) = manual_step();
     let opener = steps.here_doc_of.expect("the manual step is a here-document body line");
     let parsed = parse_script(&format!("{opener}\n   {}\nwait a few seconds\nEOF_STEPS\n", steps.line));
-    assert_eq!((parsed.allowed_hits, parsed.removals), ([1], vec![]));
+    assert_eq!((parsed.allowed_hits, parsed.removals), (manual_step_hits(1), vec![]));
 }
 
 /// M9 ROUND 3 (GPT): any whitespace other than space, tab and newline fails the parse, like the carriage
@@ -1610,10 +1693,18 @@ const BATCH2_ENGINE_FILES: [&str; 6] = [
     "recap-campaigns.jsonl",
 ];
 
+/// Provider fallback (P1-M10-T3): the per-provider status record and the unresolved-failure record, seeded
+/// beside the Batch 2 files wherever the fixtures enumerate the bounded list.
+const PROVIDER_FALLBACK_ENGINE_FILES: [&str; 2] = ["provider-status.json", "last-failure.json"];
+
+/// B1-M1-T3 (wave 2): the morning run's record for the live git check, seeded beside the others wherever the
+/// fixtures enumerate the bounded list.
+const RUN_RECORD_ENGINE_FILES: [&str; 1] = ["run-record.json"];
+
 /// The consented leg removes exactly the bounded list — and the survivors PROVE the rule that
 /// matters most: never a recursive delete of the state dir. A file this module has never heard of
 /// (and the audit glob's near-misses) all outlive the uninstall; the only directories removed with
-/// their contents are the two the list names, `briefings` and `provider-cwd`.
+/// their contents are the three the list names, `briefings`, `provider-cwd` and (v0.3.0) `calendar`.
 #[test]
 fn a_consented_removal_touches_exactly_the_bounded_list() {
     let scratch = ScratchDir::new("uninstall-engine");
@@ -1632,6 +1723,8 @@ fn a_consented_removal_touches_exactly_the_bounded_list() {
         "update-check.json",
     ];
     targets.extend(BATCH2_ENGINE_FILES);
+    targets.extend(PROVIDER_FALLBACK_ENGINE_FILES);
+    targets.extend(RUN_RECORD_ENGINE_FILES);
     for name in &targets {
         write(&state.join(name), name);
     }
@@ -1639,6 +1732,14 @@ fn a_consented_removal_touches_exactly_the_bounded_list() {
     write(&state.join("briefings").join("2026-09-02.md"), "archived");
     // Batch 2 (spec 3.5.1): the provider's scratch working folder, with something in it.
     write(&state.join("provider-cwd").join("scratch.txt"), "provider");
+    // v0.3.0 (spec r4 §8): the calendar folder — a secret link file, the helper copy's run folder,
+    // the health file.
+    write(
+        &state.join("calendar/links/work.url"),
+        "https://x.invalid/s",
+    );
+    write(&state.join("calendar/reader/run/stale-fifo"), "");
+    write(&state.join("calendar/health.json"), "{}");
     // ⚠ NO `schedule.json` HERE (Phase E final harden, round 2): a schedule record REFUSES the
     // whole leg, so this — the list removed in full — is the NO-record case. The record's case is
     // `a_schedule_record_refuses_the_whole_engine_leg_whoever_owns_it`.
@@ -1672,6 +1773,10 @@ fn a_consented_removal_touches_exactly_the_bounded_list() {
     assert!(
         !state.join("provider-cwd").exists(),
         "the provider's scratch working folder must be gone, with its contents"
+    );
+    assert!(
+        !state.join("calendar").exists(),
+        "the calendar folder — secret link files included — must be gone, with its contents"
     );
     for name in survivors {
         assert!(
@@ -1732,11 +1837,17 @@ fn a_schedule_record_refuses_the_whole_engine_leg_whoever_owns_it() {
             "update-check.json",
         ];
         targets.extend(BATCH2_ENGINE_FILES);
+        targets.extend(PROVIDER_FALLBACK_ENGINE_FILES);
+        targets.extend(RUN_RECORD_ENGINE_FILES);
         for name in &targets {
             write(&state.join(name), name);
         }
         write(&state.join("briefings").join("2026-09-01.md"), "archived");
         write(&state.join("provider-cwd").join("scratch.txt"), "provider");
+        write(
+            &state.join("calendar/links/work.url"),
+            "https://x.invalid/s",
+        );
         write(&state.join("somebody-elses-notes.txt"), "not the engine's");
         let record = |owner: &str| {
             format!(
@@ -1796,6 +1907,10 @@ fn a_schedule_record_refuses_the_whole_engine_leg_whoever_owns_it() {
         assert!(
             !state.join("provider-cwd").exists(),
             "{record_kind}: provider-cwd must be gone once the record is"
+        );
+        assert!(
+            !state.join("calendar").exists(),
+            "{record_kind}: the calendar folder must be gone once the record is"
         );
         assert!(
             state.join("somebody-elses-notes.txt").exists(),
@@ -2490,15 +2605,36 @@ fn app_managing(
     autostart: Arc<RecordingAutostartSink>,
     uninstall_state: UninstallState,
 ) -> App<MockRuntime> {
-    mock_builder()
+    app_managing_store(engine, scratch, autostart, uninstall_state, None, None)
+}
+
+/// [`app_managing`], optionally managing the pending-reset store (P3-M6-T4's race test) and the
+/// app-preference store (A-M1's) too — ALWAYS with a scratch store dir: either store's `default()`
+/// would resolve the developer's real `app_data_dir()` on `MockRuntime`.
+fn app_managing_store(
+    engine: Engine,
+    scratch: &ScratchDir,
+    autostart: Arc<RecordingAutostartSink>,
+    uninstall_state: UninstallState,
+    pending: Option<PendingResets>,
+    prefs: Option<AppPrefs>,
+) -> App<MockRuntime> {
+    let builder = mock_builder()
         .manage(engine)
         .manage(AutostartState::default().with_sink(autostart))
         .manage(uninstall_state)
         .manage(ConfigSaver::with_candidate_dir(
             scratch.join("config-candidates"),
-        ))
-        .build(tauri::generate_context!())
-        .expect("mock app")
+        ));
+    let builder = match pending {
+        Some(pending) => builder.manage(pending),
+        None => builder,
+    };
+    let builder = match prefs {
+        Some(prefs) => builder.manage(prefs),
+        None => builder,
+    };
+    builder.build(tauri::generate_context!()).expect("mock app")
 }
 
 /// The usual app: `program` (a fake under `scratch`) as the engine. `fs`: `None` = the real
@@ -2551,10 +2687,19 @@ async fn execute_with(
 }
 
 fn fixture(scratch: ScratchDir, autostart: Arc<RecordingAutostartSink>) -> Fixture {
+    fixture_on(scratch, autostart, None)
+}
+
+/// [`fixture`] with [`app_with`]'s `fs`.
+fn fixture_on(
+    scratch: ScratchDir,
+    autostart: Arc<RecordingAutostartSink>,
+    fs: Option<Arc<dyn UninstallFs>>,
+) -> Fixture {
     let state_dir = scratch.join("state");
     std::fs::create_dir_all(&state_dir).expect("state dir");
     let program = status_sidecar(&scratch.path, &state_dir);
-    let app = app_with(program, &scratch, autostart.clone(), None);
+    let app = app_with(program, &scratch, autostart.clone(), fs);
     Fixture {
         app,
         autostart,
@@ -3788,15 +3933,21 @@ struct Planted {
 }
 
 fn planted(tag: &str) -> Planted {
+    planted_on(tag, None)
+}
+
+/// [`planted`], its removals through `fs` (`None`: the real `SystemFs`, as [`app_with`] says).
+fn planted_on(tag: &str, fs: Option<Arc<dyn UninstallFs>>) -> Planted {
     let scratch = ScratchDir::new(tag);
     let state = scratch.join("state");
     write(&state.join("daily-briefing"), "#!/bin/sh\n");
     write(&state.join("briefing.log"), "log");
     write(&state.join("briefings").join("2026-09-01.md"), "archived");
     write(&scratch.join("app-data").join(APP_DATA_FILES[0]), "{}");
-    let f = fixture(
+    let f = fixture_on(
         scratch,
         Arc::new(RecordingAutostartSink::reporting_enabled(true)),
+        fs,
     );
     let state = f._scratch.join("state");
     let before = tree(&state);
@@ -4230,6 +4381,7 @@ async fn busy_and_an_unresolved_sidecar_are_errors_that_remove_nothing() {
     let mut run = Box::pin(client.invoke(
         Operation::Run {
             force: false,
+            now: false,
             json_out: None,
         },
         &NoProgress,
@@ -4583,6 +4735,10 @@ async fn keep_refuses_the_engine_leg_for_a_detected_scheduler_and_never_calls_th
 /// way, and the engine is never asked to remove anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn keep_refuses_nothing_when_no_scheduler_is_detected() {
+    // The settings box is ticked and nothing is detected, so the key leg runs `delete-all`, which takes
+    // the process-global in-flight guard: this test takes its turn (a trial-merge run, PR 3 final, saw a
+    // sibling answer Busy without it).
+    let _turn = serialise().await;
     for (name, schedule_answer, outcome, steps) in [
         (
             "a check that ran",
@@ -4755,7 +4911,9 @@ async fn a_settings_removal_takes_the_save_lock_before_the_scheduler_step_and_th
             "status --json",
             "schedule status --json",
             REMOVE_OWN_CALL,
-            // the save went on (its read answered) and found no config; the uninstall then ran
+            // the save went on (its read answered) and found no config; the uninstall then ran,
+            // its key leg last (P3-M6-T4: the settings box was ticked)
+            DELETE_ALL_CALL,
         ],
     );
 
@@ -4875,8 +5033,13 @@ async fn the_save_lock_is_held_through_the_scheduler_step() {
     );
     assert_eq!(
         engine_calls(&dir),
-        ["status --json", "schedule status --json", REMOVE_OWN_CALL],
-        "the queued save refused before it read the engine"
+        [
+            "status --json",
+            "schedule status --json",
+            REMOVE_OWN_CALL,
+            DELETE_ALL_CALL
+        ],
+        "the queued save refused before it read the engine (the last call is the key leg's)"
     );
 }
 
@@ -5041,6 +5204,33 @@ fn a_provider_cwd_symlink_is_removed_without_following_it() {
     );
     assert!(
         outside.join("not-the-engines.txt").exists(),
+        "what the link pointed at must be untouched"
+    );
+}
+
+/// v0.3.0 (spec r4 §8): `calendar` AS A SYMLINK IS REMOVED WITHOUT FOLLOWING IT — the same
+/// `EntryKind::Dir` path as `provider-cwd` above. It matters more here: the folder holds the secret
+/// link files, and a removal that followed a planted link would delete whatever it pointed at.
+#[cfg(unix)]
+#[test]
+fn a_calendar_symlink_is_removed_without_following_it() {
+    let scratch = ScratchDir::new("uninstall-calendar-link");
+    let state = scratch.join("state");
+    let outside = scratch.join("outside");
+    write(&outside.join("links/not-the-engines.url"), "keep me");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::os::unix::fs::symlink(&outside, state.join("calendar")).expect("a linked calendar dir");
+
+    let report =
+        remove_engine_state(&SystemFs, &state, &[]).expect("no schedule record: the leg runs");
+
+    assert_eq!(outcome_of(&report, "calendar"), &Outcome::Removed);
+    assert!(
+        std::fs::symlink_metadata(state.join("calendar")).is_err(),
+        "the link itself must be gone"
+    );
+    assert!(
+        outside.join("links/not-the-engines.url").exists(),
         "what the link pointed at must be untouched"
     );
 }
@@ -6450,6 +6640,59 @@ fn staged_copies_of_earlier_settings_are_named_not_removed() {
     assert!(staged.iter().all(|name| s.folder.join(name).exists()) && latch);
 }
 
+/// Checkpoint P3-M6 (hub, P2-M3 milestone checkpoint item 2): the engine's `key scrub-backup`
+/// stages its scrubbed `.bak` as `.config.json.bak.scrub-<pid>-<rand>`, and a scrub that crashed
+/// leaves that copy holding the very literals it was removing. It is NAMED exactly as a killed
+/// save's `.config.json.save-*` copy is — listed, described, never removed — and a name that only
+/// looks alike is not.
+#[test]
+fn a_crashed_scrubs_staged_copy_is_named_not_removed() {
+    let s = settings("settings-scrub-staged");
+    write(&s.config(), "{}");
+    let scrub = ".config.json.bak.scrub-4242-k3x9a0qz";
+    write(
+        &s.folder.join(scrub),
+        r#"{"provider":{"api":{"kind":"anthropic","apiKey":"sk-inline"}}}"#,
+    );
+    // Not the scrub's prefix: another file's backup's scrub, and a near miss.
+    let others = [".other.json.bak.scrub-1-a", ".config.json.bak.scrubbed"];
+    for name in others {
+        write(&s.folder.join(name), "{}");
+    }
+
+    let (report, latch) = s.run(&SettingsFs::default());
+
+    assert_eq!(report.removed, [SETTINGS_CONFIG], "{report:?}");
+    assert!(report.remaining.iter().any(|n| n == scrub), "{report:?}");
+    assert_eq!(
+        report.notes,
+        [staged_copies_note(&[scrub.to_string()])],
+        "{report:?}"
+    );
+    assert!(s.folder.join(scrub).exists() && latch);
+    assert!(others.iter().all(|name| s.folder.join(name).exists()));
+}
+
+/// The scrub's prefix is the ENGINE's (`src/providerCli.ts`): Rust cannot import it, so its spelling
+/// is pinned against the engine source here — the `.bak` it scrubs, and the staged name beside it.
+#[test]
+fn the_scrub_prefix_is_the_engines() {
+    let engine = include_str!("../../../src/providerCli.ts");
+    assert!(
+        engine.contains("const bak = `${c.configFile}.bak`;"),
+        "the engine scrubs `<config>.bak`"
+    );
+    assert!(
+        engine.contains("`.${basename(bak)}.scrub-${process.pid}-"),
+        "the engine stages `.<bak>.scrub-<pid>-…` beside it"
+    );
+    assert_eq!(SETTINGS_BACKUP, format!("{SETTINGS_CONFIG}.bak"));
+    assert_eq!(
+        scrub_staged_prefix(SETTINGS_BACKUP),
+        ".config.json.bak.scrub-"
+    );
+}
+
 /// Spec 3.3.7, 3.5.3: unticked (`removeSettings` missing or false) the leg does not run, and the
 /// report only names the folder that stays — `configPath`'s parent, as the preview names it — on
 /// the wire in the shape `lib/app-uninstall.ts` mirrors. Nothing in the folder is touched; no latch.
@@ -6681,8 +6924,13 @@ async fn after_the_settings_leg_every_settings_write_refuses_and_uninstall_does_
     assert!(!folder.exists(), "nothing re-created the settings");
     assert_eq!(
         engine_calls(&dir),
-        ["status --json", "schedule status --json", REMOVE_OWN_CALL],
-        "no refused write read the engine"
+        [
+            "status --json",
+            "schedule status --json",
+            REMOVE_OWN_CALL,
+            DELETE_ALL_CALL
+        ],
+        "no refused write read the engine (the last call is the uninstall's key leg)"
     );
 
     // A second Uninstall is NOT refused by the latch: it finishes what the first left.
@@ -6837,5 +7085,900 @@ async fn a_config_json_that_will_not_unlink_sets_no_latch() {
         std::fs::read_to_string(&config).expect("still there"),
         before,
         "nothing written"
+    );
+}
+
+/* ── P3-M6-T4: the key leg, the kept-schedule refusal, and the app data files ───────────────────── */
+
+// ⚠ THE KEY LEG IS ONE ENGINE CALL, `provider key delete-all --json`, and every one of these tests
+// runs it against the FAKE engine (`status_sidecar`), never the bundled sidecar: the real one, from a
+// test, would empty the developer's own `daily-briefing.app-key` Keychain service (Q27: no test runs
+// the real `security`). The fake logs the call; whether the keys go is the engine's half, pinned by
+// the engine's own `provider key delete-all` tests.
+
+/// The call the key leg makes, as [`engine_calls`] logs it.
+const DELETE_ALL_CALL: &str = "provider key delete-all --json";
+
+/// A scripted `provider key …` answer: `delete-all` succeeded, having removed `deleted` keys.
+fn delete_all_answer(deleted: u64) -> String {
+    format!(
+        "printf '%s\\n' {}\nexit 0\n",
+        sq(&json!({ "schemaVersion": 1, "ok": true, "deleted": deleted }).to_string())
+    )
+}
+
+/// A scripted `config validate --json --file …` answer: exit 0 with `report`.
+fn validate_answer(report: serde_json::Value) -> String {
+    format!("printf '%s' {}\nexit 0\n", sq(&report.to_string()))
+}
+
+/// A valid report over a one-entry config, its one row `row` (laid over `{index: 0}`).
+fn one_row_report(row: serde_json::Value) -> serde_json::Value {
+    let mut r = json!({ "index": 0, "testTimeoutMs": 80000, "loopback": false, "keyMoved": false });
+    for (k, v) in row.as_object().expect("row facts") {
+        r[k] = v.clone();
+    }
+    json!({ "valid": true, "errors": [], "warnings": [], "providers": [r] })
+}
+
+fn delete_all_called(dir: &Path) -> bool {
+    engine_calls(dir).iter().any(|c| c == DELETE_ALL_CALL)
+}
+
+/// Spec r9 §6 "Uninstall" and §8 PR 3, and the briefing redesign's A spec ("The app preference
+/// store"): `APP_DATA_FILES` names every app record added since B25 — the notify dedupe dates
+/// (P3-M5-T2), the pending-reset store (P3-M4-T3) and the app-preference store (A-M1) — by the
+/// LITERAL names, so a list that drops one goes red even though the generic loops would still pass;
+/// and `APP_DATA_GLOBS` is exactly each store's temp siblings, each spelled from its writer's own
+/// prefix.
+#[test]
+fn the_app_data_lists_name_each_new_record_and_each_stores_temp_siblings() {
+    assert_eq!(NOTIFIED_DATES_FILE, "notified-dates.json");
+    assert_eq!(PENDING_RESETS_FILE, "pending-resets.json");
+    assert_eq!(APP_PREFS_FILE, "app-prefs.json");
+    for name in [
+        "notified-dates.json",
+        "pending-resets.json",
+        "app-prefs.json",
+    ] {
+        assert!(
+            APP_DATA_FILES.contains(&name),
+            "{name} is not in APP_DATA_FILES: {APP_DATA_FILES:?}"
+        );
+    }
+    assert_eq!(
+        PENDING_RESETS_TEMP_PREFIX,
+        format!("{PENDING_RESETS_FILE}.tmp-")
+    );
+    assert_eq!(APP_PREFS_TEMP_PREFIX, format!("{APP_PREFS_FILE}.tmp-"));
+    assert_eq!(
+        APP_DATA_GLOBS,
+        [
+            format!("{PENDING_RESETS_TEMP_PREFIX}*").as_str(),
+            format!("{APP_PREFS_TEMP_PREFIX}*").as_str(),
+        ]
+    );
+}
+
+/// The app leg removes the app-preference store (A-M1) and its stale temp siblings — any pid, any
+/// seq, as a crash between its write and its rename leaves them (0600, holding the first name) —
+/// and nothing that merely looks like one. The pending-reset store's temp in the same folder goes
+/// in the same leg, by its own glob: both globs are active together.
+#[test]
+fn the_app_leg_removes_the_app_prefs_store_and_its_temp_siblings_and_nothing_like_them() {
+    let scratch = ScratchDir::new("uninstall-app-prefs");
+    let data = scratch.join("app-data");
+    let config = scratch.join("app-config");
+    let temps = [
+        "app-prefs.json.tmp-123-4",
+        "app-prefs.json.tmp-99999-0",
+        "pending-resets.json.tmp-1-2",
+    ];
+    let lookalikes = [
+        "app-prefs.json.tmp",
+        "app-prefs.json.bak",
+        "app-prefs.jsonx",
+        "my-app-prefs.json.tmp-1-2",
+    ];
+    for name in temps.iter().chain(&lookalikes) {
+        write(&data.join(name), "{\"firstName\":\"Sam\"}");
+    }
+    write(&data.join(APP_PREFS_FILE), "{\"firstName\":\"Sam\"}");
+
+    let report = remove_app_files(&SystemFs, &data, &config);
+
+    assert!(!data.join(APP_PREFS_FILE).exists(), "{report:?}");
+    for name in temps {
+        assert!(
+            !data.join(name).exists(),
+            "{name} was left behind: {report:?}"
+        );
+    }
+    for name in lookalikes {
+        assert!(
+            data.join(name).exists(),
+            "{name} is not the store's temp, and went"
+        );
+    }
+    assert_eq!(outcome_of(&report, APP_PREFS_FILE), &Outcome::Removed);
+    assert_eq!(
+        outcome_of(&report, "app-prefs.json.tmp-*"),
+        &Outcome::Removed
+    );
+    assert_eq!(
+        outcome_of(&report, "pending-resets.json.tmp-*"),
+        &Outcome::Removed
+    );
+}
+
+/// The app leg removes the pending-reset store's stale temp siblings — any pid, any seq, as a crash
+/// between write and rename leaves them (they hold labels) — and nothing that merely looks like one.
+#[test]
+fn the_app_leg_removes_the_pending_reset_temp_siblings_and_nothing_like_them() {
+    let scratch = ScratchDir::new("uninstall-app-temps");
+    let data = scratch.join("app-data");
+    let config = scratch.join("app-config");
+    let temps = [
+        "pending-resets.json.tmp-123-4",
+        "pending-resets.json.tmp-99999-0",
+    ];
+    let lookalikes = [
+        "pending-resets.json.tmp",
+        "pending-resets.json.bak",
+        "notify-state.json.tmp-1-2",
+    ];
+    for name in temps.iter().chain(&lookalikes) {
+        write(&data.join(name), "[]");
+    }
+    write(&data.join(PENDING_RESETS_FILE), "[]");
+    write(&data.join(NOTIFIED_DATES_FILE), "{}");
+
+    let report = remove_app_files(&SystemFs, &data, &config);
+
+    for name in temps {
+        assert!(
+            !data.join(name).exists(),
+            "{name} was left behind: {report:?}"
+        );
+    }
+    for name in lookalikes {
+        assert!(
+            data.join(name).exists(),
+            "{name} is not the store's temp, and went"
+        );
+    }
+    assert!(!data.join(PENDING_RESETS_FILE).exists());
+    assert!(!data.join(NOTIFIED_DATES_FILE).exists());
+    assert_eq!(outcome_of(&report, PENDING_RESETS_FILE), &Outcome::Removed);
+    assert_eq!(outcome_of(&report, NOTIFIED_DATES_FILE), &Outcome::Removed);
+    assert_eq!(
+        outcome_of(&report, "pending-resets.json.tmp-*"),
+        &Outcome::Removed
+    );
+}
+
+/// The settings leg's key files are every entry's `api.apiKeyFile` (generalized from item 1's,
+/// through the enumeration `key_refs` shares): item 1's user-placed key file and a fallback's, both
+/// in the settings folder, are removed — `key_ref_in` keeps its "any `apiKeyFile`" semantics, so a
+/// file not under `keys/` goes too, as today — while a fallback's OUTSIDE the folder is kept
+/// (`key_verdict` unchanged) and a fallback whose `apiKeyFile` is not a string makes the reference
+/// unknown.
+#[test]
+fn every_entrys_key_file_in_the_settings_folder_is_removed_and_one_outside_is_kept() {
+    let s = settings("settings-fallback-keys");
+    let item1 = s.folder.join("my-own-key.txt");
+    let fallback = s.folder.join("fallback-key");
+    let outside = s.elsewhere("outside-key");
+    for path in [&item1, &fallback, &outside] {
+        write(path, "sk-test");
+    }
+    let config = json!({
+        "provider": { "api": { "kind": "anthropic", "model": "m", "apiKeyFile": shown(&item1) } },
+        "fallbacks": [
+            { "label": "b", "api": { "kind": "anthropic", "model": "m", "apiKeyFile": shown(&fallback) } },
+            { "label": "c", "api": { "kind": "openai-compatible", "model": "m", "apiKeyFile": shown(&outside) } },
+            { "label": "d", "cli": "claude" },
+        ],
+    });
+    write(&s.config(), &config.to_string());
+    let fs = SettingsFs::default();
+
+    let (report, _) = s.run(&fs);
+
+    let outcome = |path: &Path| {
+        report
+            .key_files
+            .iter()
+            .find(|k| k.path == shown(path))
+            .map(|k| (k.outcome, k.reason.clone()))
+    };
+    assert_eq!(
+        outcome(&item1),
+        Some((PathOutcome::Removed, None)),
+        "{report:?}"
+    );
+    assert_eq!(
+        outcome(&fallback),
+        Some((PathOutcome::Removed, None)),
+        "{report:?}"
+    );
+    assert_eq!(
+        outcome(&outside),
+        Some((
+            PathOutcome::Kept,
+            Some("it isn't in the settings folder (a key the app stored is removed with the app's stored keys instead)".into())
+        )),
+        "{report:?}"
+    );
+    assert!(!item1.exists() && !fallback.exists() && outside.exists());
+    assert!(!report.key_refs_unknown, "{report:?}");
+
+    // A fallback's non-string `apiKeyFile`: unknown, and the readable ones still go.
+    let s = settings("settings-fallback-keys-unknown");
+    let key = s.folder.join("k1");
+    write(&key, "sk-test");
+    write(
+        &s.config(),
+        &json!({
+            "provider": { "api": { "kind": "anthropic", "model": "m", "apiKeyFile": shown(&key) } },
+            "fallbacks": [{ "label": "b", "api": { "kind": "anthropic", "model": "m", "apiKeyFile": 7 } }],
+        })
+        .to_string(),
+    );
+    let (report, _) = s.run(&SettingsFs::default());
+    assert!(report.key_refs_unknown, "{report:?}");
+    assert!(!key.exists(), "{report:?}");
+}
+
+/// The kept-schedule refusal, decided from the ENGINE's rows only (the PR 3 start decision): a row
+/// naming an app key id, a row `appOwnedKey` with no id, rows that do not cover every entry, a
+/// malformed row, an invalid config and a report with no rows all REFUSE; only a valid config whose
+/// rows cover every entry and name no app key lets the key leg run.
+#[test]
+fn the_kept_schedule_refusal_reads_the_engines_rows_and_fails_closed() {
+    let one =
+        json!({ "provider": { "api": { "kind": "anthropic", "model": "m", "apiKeyFile": "/k" } } });
+    let two = json!({
+        "provider": { "api": { "kind": "anthropic", "model": "m" } },
+        "fallbacks": [{ "label": "b", "api": { "kind": "anthropic", "model": "m" } }],
+    });
+    let cases: Vec<(&str, &serde_json::Value, serde_json::Value, Option<&str>)> = vec![
+        ("no app key", &one, one_row_report(json!({})), None),
+        (
+            "appOwnedKey false",
+            &one,
+            one_row_report(json!({ "appOwnedKey": false })),
+            None,
+        ),
+        (
+            "an app key id",
+            &one,
+            one_row_report(json!({ "appOwnedKey": true, "appKeyId": "k-0123456789ab" })),
+            Some(KEYS_KEPT_FOR_SCHEDULE),
+        ),
+        (
+            "appOwnedKey with no id",
+            &one,
+            one_row_report(json!({ "appOwnedKey": true })),
+            Some(KEYS_KEPT_FOR_SCHEDULE),
+        ),
+        (
+            "an id with no appOwnedKey",
+            &one,
+            one_row_report(json!({ "appKeyId": "k-0123456789ab" })),
+            Some(KEYS_KEPT_FOR_SCHEDULE),
+        ),
+        (
+            "a malformed appOwnedKey",
+            &one,
+            one_row_report(json!({ "appOwnedKey": "yes" })),
+            Some(KEYS_KEPT_FOR_SCHEDULE),
+        ),
+        (
+            "rows that miss an entry",
+            &two,
+            one_row_report(json!({})),
+            Some(KEYS_KEPT_UNVERIFIED),
+        ),
+        (
+            "no rows",
+            &one,
+            json!({ "valid": true, "providers": [] }),
+            Some(KEYS_KEPT_UNVERIFIED),
+        ),
+        (
+            "no providers at all",
+            &one,
+            json!({ "valid": true }),
+            Some(KEYS_KEPT_UNVERIFIED),
+        ),
+        (
+            "a row with no index",
+            &one,
+            json!({ "valid": true, "providers": [{ "testTimeoutMs": 80000 }] }),
+            Some(KEYS_KEPT_UNVERIFIED),
+        ),
+        (
+            "an invalid config",
+            &one,
+            json!({ "valid": false, "errors": [], "providers": [{ "index": 0 }] }),
+            Some(KEYS_KEPT_UNVERIFIED),
+        ),
+    ];
+    for (name, config, report, want) in cases {
+        assert_eq!(kept_config_key_refusal(config, &report), want, "{name}");
+    }
+}
+
+/// Spec r9 §6 "Uninstall" / §8 PR 3: the key leg calls `provider key delete-all`, ONLY behind the
+/// settings box (the existing consent), never behind the engine-data box alone — which also never
+/// touches `<state>/keys/` itself (the folder is the key leg's, removed by the engine's delete-all).
+/// The report says what the engine answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_key_leg_calls_delete_all_only_behind_the_settings_consent() {
+    let _turn = serialise().await;
+    let key = "keys/k-0123456789ab.key";
+    // ── Engine data ticked, settings not: no delete-all, and keys/ stays.
+    for remove_settings in [None, Some(false)] {
+        let p = planted("uninstall-keys-unasked");
+        write(&p.state.join(key), "sk-test");
+        script_answer(p.dir(), "provider key", &delete_all_answer(2));
+        let report = execute_with(&p.f.app, true, remove_settings, None)
+            .await
+            .expect("answers");
+        assert!(
+            !delete_all_called(p.dir()),
+            "{remove_settings:?}: {:?}",
+            engine_calls(p.dir())
+        );
+        assert!(
+            p.state.join(key).exists(),
+            "the engine-data leg removed keys/"
+        );
+        assert_eq!(report.keys, KeysReport::default(), "{report:?}");
+    }
+    // ── Settings ticked: delete-all runs, once, and its count is reported.
+    let p = planted("uninstall-keys-asked");
+    plant_settings(p.dir());
+    script_answer(p.dir(), "provider key", &delete_all_answer(2));
+    let report = execute_with(&p.f.app, false, Some(true), None)
+        .await
+        .expect("answers");
+    assert_eq!(
+        engine_calls(p.dir())
+            .iter()
+            .filter(|c| *c == DELETE_ALL_CALL)
+            .count(),
+        1,
+        "{:?}",
+        engine_calls(p.dir())
+    );
+    assert_eq!(
+        report.keys,
+        KeysReport {
+            asked: true,
+            deleted: Some(2),
+            ..KeysReport::default()
+        },
+        "{report:?}"
+    );
+    let wire = serde_json::to_value(&report).expect("JSON");
+    assert_eq!(
+        wire["keys"],
+        json!({ "asked": true, "deleted": 2, "kept": null, "refused": null, "error": null }),
+        "{wire}"
+    );
+}
+
+/// A delete-all that fails is reported, never thrown: a refusal's `error` (and its lower-bound
+/// `deleted`), and an engine that printed no JSON line (a crash).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_delete_all_is_reported() {
+    let _turn = serialise().await;
+    let p = planted("uninstall-keys-failed");
+    plant_settings(p.dir());
+    let refusal = json!({
+        "schemaVersion": 1, "ok": false, "code": "write-failed", "reason": "timeout", "deleted": 1,
+        "error": "key delete-all: the keychain did not answer in time",
+    });
+    script_answer(
+        p.dir(),
+        "provider key",
+        &format!("printf '%s\\n' {}\nexit 1\n", sq(&refusal.to_string())),
+    );
+    let report = execute_with(&p.f.app, false, Some(true), None)
+        .await
+        .expect("answers");
+    assert_eq!(report.keys.deleted, Some(1), "{report:?}");
+    assert!(
+        report
+            .keys
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("the keychain did not answer in time")),
+        "{report:?}"
+    );
+
+    let p = planted("uninstall-keys-crashed");
+    plant_settings(p.dir());
+    script_answer(p.dir(), "provider key", "printf 'boom\\n' >&2\nexit 1\n");
+    let report = execute_with(&p.f.app, false, Some(true), None)
+        .await
+        .expect("answers");
+    assert_eq!(report.keys.deleted, None, "{report:?}");
+    assert!(report.keys.error.is_some(), "{report:?}");
+}
+
+/// Spec r9 §6 "Consent — App": the key leg is refused while a KEPT schedule's config still
+/// references app-owned keys — decided by `config validate --file` over that config (the engine's
+/// rows), never by Rust matching shapes. "Uninstall anyway" with nothing detected sends `keep` with
+/// the settings box ticked, so the settings leg runs while a scheduler may still exist.
+///
+/// Checkpoint P3-M6: the refusal is judged on the config the settings leg removes in the same run,
+/// so it holds only while that config is still THERE. Each case runs twice: once with the settings
+/// leg removing `config.json` — then no scheduled run can read a key, and `delete-all` runs whatever
+/// the rows said — and once with `config.json` refusing to unlink, when an app key in the rows, an
+/// unreadable config, an invalid one and a validate that fails each keep the keys (delete-all never
+/// called) and clean rows let it run. No config at all lets it run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_schedule_whose_config_may_use_app_keys_refuses_the_key_leg() {
+    let _turn = serialise().await;
+    let referenced = one_row_report(json!({ "appOwnedKey": true, "appKeyId": "k-0123456789ab" }));
+    let cases: Vec<(&str, Option<&str>, Option<String>, Option<&str>)> = vec![
+        (
+            "an app key in the rows",
+            None,
+            Some(validate_answer(referenced)),
+            Some(KEYS_KEPT_FOR_SCHEDULE),
+        ),
+        (
+            "no id, but app-owned",
+            None,
+            Some(validate_answer(one_row_report(
+                json!({ "appOwnedKey": true }),
+            ))),
+            Some(KEYS_KEPT_FOR_SCHEDULE),
+        ),
+        (
+            "an unreadable config",
+            Some("{ not json"),
+            None,
+            Some(KEYS_KEPT_UNVERIFIED),
+        ),
+        (
+            "an invalid config",
+            None,
+            Some(validate_answer(
+                json!({ "valid": false, "errors": [], "providers": [] }),
+            )),
+            Some(KEYS_KEPT_UNVERIFIED),
+        ),
+        (
+            "a validate that fails",
+            None,
+            Some(exit_answer(1, "", "validate exploded")),
+            Some(KEYS_KEPT_UNVERIFIED),
+        ),
+        (
+            "clean rows",
+            None,
+            Some(validate_answer(one_row_report(json!({})))),
+            None,
+        ),
+    ];
+    for (name, text, validate, refused_while_kept) in cases {
+        for config_stays in [false, true] {
+            let fs: Option<Arc<dyn UninstallFs>> =
+                config_stays.then(|| Arc::new(WontUnlink(SETTINGS_CONFIG)) as Arc<dyn UninstallFs>);
+            // A short tag: the staged candidate's path keeps every segment within 64 characters.
+            let p = planted_on("u-kk", fs);
+            let folder = plant_settings(p.dir());
+            if let Some(text) = text {
+                write(&folder.join(SETTINGS_CONFIG), text);
+            }
+            if let Some(answer) = &validate {
+                script_answer(p.dir(), "config validate", answer);
+            }
+            script_answer(p.dir(), "provider key", &delete_all_answer(3));
+            let report = execute_with(&p.f.app, false, Some(true), Some(SchedulerChoice::Keep))
+                .await
+                .expect("answers");
+            let at = format!("{name}, config.json stays: {config_stays}");
+            assert_eq!(
+                report.settings.refused, None,
+                "{at}: premise, the settings leg ran: {report:?}"
+            );
+            assert_eq!(
+                folder.join(SETTINGS_CONFIG).exists(),
+                config_stays,
+                "{at}: premise: {report:?}"
+            );
+            let want = if config_stays {
+                refused_while_kept
+            } else {
+                None
+            };
+            assert_eq!(
+                report.keys.refused.as_deref(),
+                want,
+                "{at}: {:?}",
+                engine_calls(p.dir())
+            );
+            assert_eq!(
+                delete_all_called(p.dir()),
+                want.is_none(),
+                "{at}: {:?}",
+                engine_calls(p.dir())
+            );
+            assert_eq!(
+                report.keys.deleted,
+                want.is_none().then_some(3),
+                "{at}: {report:?}"
+            );
+        }
+    }
+    // No config at all: a scheduled run reads no key (the engine refuses `no-config`) — delete-all runs.
+    let p = planted("u-kkn");
+    script_answer(p.dir(), "provider key", &delete_all_answer(0));
+    let report = execute_with(&p.f.app, false, Some(true), Some(SchedulerChoice::Keep))
+        .await
+        .expect("answers");
+    assert_eq!(report.keys.refused, None, "{report:?}");
+    assert!(delete_all_called(p.dir()));
+}
+
+/// PR 3 final r1 (the known LOW): "Uninstall anyway" + keep lifts the kept-schedule refusal only
+/// once BOTH settings files are gone — `config.json` and `config.json.bak` (or a backup that was
+/// never there, the case above). A backup the leg could not remove holds the same settings and
+/// can be restored by hand, and a restored one would read the very keys `delete-all` removes; so
+/// with `config.json` removed but `.bak` left, the rows' refusal stands and delete-all is never
+/// called. With both removed it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backup_the_leg_could_not_remove_keeps_the_kept_schedule_refusal() {
+    let _turn = serialise().await;
+    let referenced = one_row_report(json!({ "appOwnedKey": true, "appKeyId": "k-0123456789ab" }));
+    for backup_stays in [false, true] {
+        let fs: Option<Arc<dyn UninstallFs>> =
+            backup_stays.then(|| Arc::new(WontUnlink(SETTINGS_BACKUP)) as Arc<dyn UninstallFs>);
+        let p = planted_on("u-kb", fs);
+        let folder = plant_settings(p.dir());
+        let config = std::fs::read_to_string(folder.join(SETTINGS_CONFIG)).expect("planted");
+        write(&folder.join(SETTINGS_BACKUP), &config);
+        script_answer(
+            p.dir(),
+            "config validate",
+            &validate_answer(referenced.clone()),
+        );
+        script_answer(p.dir(), "provider key", &delete_all_answer(3));
+        let report = execute_with(&p.f.app, false, Some(true), Some(SchedulerChoice::Keep))
+            .await
+            .expect("answers");
+        let at = format!("config.json.bak stays: {backup_stays}");
+        assert_eq!(
+            report.settings.refused, None,
+            "{at}: premise, the settings leg ran: {report:?}"
+        );
+        assert!(
+            !folder.join(SETTINGS_CONFIG).exists(),
+            "{at}: premise, config.json removed: {report:?}"
+        );
+        assert_eq!(
+            folder.join(SETTINGS_BACKUP).exists(),
+            backup_stays,
+            "{at}: premise: {report:?}"
+        );
+        let want = backup_stays.then_some(KEYS_KEPT_FOR_SCHEDULE);
+        assert_eq!(
+            report.keys.refused.as_deref(),
+            want,
+            "{at}: {:?}",
+            engine_calls(p.dir())
+        );
+        assert_eq!(
+            delete_all_called(p.dir()),
+            !backup_stays,
+            "{at}: {:?}",
+            engine_calls(p.dir())
+        );
+    }
+}
+
+/// PR 3 final r2 (finding 3, mutant R5): the key leg's look at `config.json.bak` counts only NotFound
+/// or NotADirectory as gone. A look that is REFUSED (PermissionDenied) says nothing about whether the
+/// backup is there, so the kept-schedule refusal stands and delete-all is never called — with the
+/// same leg and no refused look as the control, where delete-all runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_look_at_the_backup_keeps_the_kept_schedule_refusal() {
+    let _turn = serialise().await;
+    let referenced = one_row_report(json!({ "appOwnedKey": true, "appKeyId": "k-0123456789ab" }));
+    for look_refused in [false, true] {
+        let fs: Option<Arc<dyn UninstallFs>> =
+            look_refused.then(|| Arc::new(BakLookRefused) as Arc<dyn UninstallFs>);
+        let p = planted_on("u-kl", fs);
+        let folder = plant_settings(p.dir());
+        script_answer(
+            p.dir(),
+            "config validate",
+            &validate_answer(referenced.clone()),
+        );
+        script_answer(p.dir(), "provider key", &delete_all_answer(3));
+        let report = execute_with(&p.f.app, false, Some(true), Some(SchedulerChoice::Keep))
+            .await
+            .expect("answers");
+        let at = format!("the backup look refused: {look_refused}");
+        assert_eq!(
+            report.settings.refused, None,
+            "{at}: premise, the settings leg ran: {report:?}"
+        );
+        assert!(
+            !folder.join(SETTINGS_CONFIG).exists() && !folder.join(SETTINGS_BACKUP).exists(),
+            "{at}: premise, neither settings file is there: {report:?}"
+        );
+        let want = look_refused.then_some(KEYS_KEPT_FOR_SCHEDULE);
+        assert_eq!(
+            report.keys.refused.as_deref(),
+            want,
+            "{at}: {:?}",
+            engine_calls(p.dir())
+        );
+        assert_eq!(
+            delete_all_called(p.dir()),
+            !look_refused,
+            "{at}: {:?}",
+            engine_calls(p.dir())
+        );
+    }
+}
+
+/// The real filesystem, except that a look (`kind`) at `config.json.bak` is refused
+/// (PermissionDenied) once `config.json` beside it is gone — so the settings leg's own looks (taken
+/// while `config.json` is there) are the real ones, and only the key leg's look after it is refused.
+struct BakLookRefused;
+
+impl UninstallFs for BakLookRefused {
+    fn exists(&self, path: &Path) -> bool {
+        SystemFs.exists(path)
+    }
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        SystemFs.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        SystemFs.remove_dir_all(path)
+    }
+    fn list_dir(&self, dir: &Path) -> std::io::Result<Vec<String>> {
+        SystemFs.list_dir(dir)
+    }
+    fn kind(&self, path: &Path) -> std::io::Result<Lstat> {
+        if path.file_name().is_some_and(|name| name == SETTINGS_BACKUP)
+            && !SystemFs.exists(&path.with_file_name(SETTINGS_CONFIG))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied",
+            ));
+        }
+        SystemFs.kind(path)
+    }
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        SystemFs.canonicalize(path)
+    }
+    fn read_small(&self, path: &Path, max_bytes: u64) -> Result<String, ReadRefusal> {
+        SystemFs.read_small(path, max_bytes)
+    }
+    fn remove_empty_dir(&self, path: &Path) -> std::io::Result<()> {
+        SystemFs.remove_empty_dir(path)
+    }
+}
+
+/// The real filesystem, except that the settings file named `.0` (`config.json` or
+/// `config.json.bak`) will not unlink (EPERM-shaped) — a settings leg whose step 3, or step 4, does
+/// not complete.
+struct WontUnlink(&'static str);
+
+impl UninstallFs for WontUnlink {
+    fn exists(&self, path: &Path) -> bool {
+        SystemFs.exists(path)
+    }
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        if path.file_name().is_some_and(|name| name == self.0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Operation not permitted",
+            ));
+        }
+        SystemFs.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        SystemFs.remove_dir_all(path)
+    }
+    fn list_dir(&self, dir: &Path) -> std::io::Result<Vec<String>> {
+        SystemFs.list_dir(dir)
+    }
+    fn kind(&self, path: &Path) -> std::io::Result<Lstat> {
+        SystemFs.kind(path)
+    }
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        SystemFs.canonicalize(path)
+    }
+    fn read_small(&self, path: &Path, max_bytes: u64) -> Result<String, ReadRefusal> {
+        SystemFs.read_small(path, max_bytes)
+    }
+    fn remove_empty_dir(&self, path: &Path) -> std::io::Result<()> {
+        SystemFs.remove_empty_dir(path)
+    }
+}
+
+/// The key leg follows the settings leg's refusals: a kept DETECTED scheduler
+/// (`REFUSED_FOR_KEPT_SCHEDULER`) and a record the gate look still sees (`REFUSED_FOR_SCHEDULE`)
+/// refuse it too, with the same text, and delete-all is never called; with the settings folder
+/// unknown it is refused as well (nothing about the settings can be checked).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_key_leg_is_refused_with_the_settings_leg_and_when_the_settings_are_unknown() {
+    let _turn = serialise().await;
+    // Kept, detected.
+    let p = planted("uninstall-keys-kept-detected");
+    plant_settings(p.dir());
+    write(&p.state.join(SCHEDULE_RECORD), "{}");
+    script_answer(p.dir(), "provider key", &delete_all_answer(1));
+    let report = execute_with(&p.f.app, false, Some(true), Some(SchedulerChoice::Keep))
+        .await
+        .expect("answers");
+    assert_eq!(
+        report.keys.refused.as_deref(),
+        Some(REFUSED_FOR_KEPT_SCHEDULER),
+        "{report:?}"
+    );
+    assert!(!delete_all_called(p.dir()));
+    // The gate look's record (removeAny: the engine "removed" it, but the record is still there).
+    let p = planted("uninstall-keys-gate");
+    plant_settings(p.dir());
+    write(&p.state.join(SCHEDULE_RECORD), "{}");
+    script_answer(
+        p.dir(),
+        "schedule uninstall",
+        &exit_answer(0, "Removed the background scheduler.", ""),
+    );
+    script_answer(p.dir(), "provider key", &delete_all_answer(1));
+    let report = execute_with(
+        &p.f.app,
+        false,
+        Some(true),
+        Some(SchedulerChoice::RemoveAny),
+    )
+    .await
+    .expect("answers");
+    assert_eq!(
+        report.keys.refused.as_deref(),
+        Some(REFUSED_FOR_SCHEDULE),
+        "{report:?}"
+    );
+    assert!(!delete_all_called(p.dir()));
+    // The settings folder unknown.
+    let p = planted("uninstall-keys-unknown");
+    script_answer(
+        p.dir(),
+        "status --json",
+        &format!(
+            "printf '%s' {}\nexit 0\n",
+            sq(&json!({ "paths": { "stateDir": shown(&p.state) } }).to_string())
+        ),
+    );
+    script_answer(p.dir(), "provider key", &delete_all_answer(1));
+    let report = execute_with(&p.f.app, false, Some(true), None)
+        .await
+        .expect("answers");
+    assert_eq!(
+        report.keys.refused.as_deref(),
+        Some(KEYS_KEPT_SETTINGS_UNKNOWN),
+        "{report:?}"
+    );
+    assert!(!delete_all_called(p.dir()));
+}
+
+/// P3-M4-T3's known race, closed: the app-files leg removes `pending-resets.json` with the store
+/// CLOSED (its mutex held, its latch set), so nothing in this app session — the 15 s retry task, a
+/// Replace's `add` — re-creates the file afterwards: every later write refuses, writing nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_uninstall_no_pending_reset_write_re_creates_the_store() {
+    let _turn = serialise().await;
+    let scratch = ScratchDir::new("uninstall-pending-race");
+    let state = scratch.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let data = scratch.join("app-data");
+    let program = status_sidecar(&scratch.path, &state);
+    let app = app_managing_store(
+        Engine(Ok(EngineClient::with_program(program))),
+        &scratch,
+        Arc::new(RecordingAutostartSink::default()),
+        scratch_uninstall_state(&scratch),
+        Some(PendingResets::default().with_store_dir(&data)),
+        None,
+    );
+    let store = data.join(PENDING_RESETS_FILE);
+    // Premise: the store writes its file (the fake's reset answers nothing, so the record is dropped
+    // again — but the file is there).
+    let _ =
+        provider_pending_reset_add(app.handle().clone(), "b".into(), "k-0123456789ab".into()).await;
+    assert!(store.exists(), "premise: the store wrote its file");
+
+    let report = execute(&app, false, None).await.expect("answers");
+    assert_eq!(
+        outcome_of(&report.app, PENDING_RESETS_FILE),
+        &Outcome::Removed,
+        "{report:?}"
+    );
+    assert!(!store.exists());
+
+    let again =
+        provider_pending_reset_add(app.handle().clone(), "b".into(), "k-0123456789ab".into()).await;
+    assert_eq!(
+        again,
+        Err(PendingError::Store {
+            detail: STORE_CLOSED_BY_UNINSTALL.into()
+        }),
+        "a write after uninstall must refuse"
+    );
+    assert!(
+        !store.exists(),
+        "a write after uninstall re-created the store"
+    );
+}
+
+/// A-M1-T3 checkpoint review: the app stays open on Settings after Uninstall, and the first-name row
+/// saves on blur — so the app-files leg removes `app-prefs.json` with the app-preference store
+/// CLOSED (its mutex held, its latch set), and every later set refuses, writing nothing: the first
+/// name is not written back after the report said Removed. A get still answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_uninstall_no_app_prefs_set_re_creates_the_store() {
+    let _turn = serialise().await;
+    let scratch = ScratchDir::new("uninstall-app-prefs-race");
+    let state = scratch.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let data = scratch.join("app-data");
+    let program = status_sidecar(&scratch.path, &state);
+    let app = app_managing_store(
+        Engine(Ok(EngineClient::with_program(program))),
+        &scratch,
+        Arc::new(RecordingAutostartSink::default()),
+        scratch_uninstall_state(&scratch),
+        None,
+        Some(AppPrefs::default().with_store_dir(&data)),
+    );
+    let store = data.join(APP_PREFS_FILE);
+    let set_name = || {
+        app_prefs_set(
+            app.handle().clone(),
+            app.state(),
+            serde_json::from_value(json!({ "firstName": "Sam" })).expect("a patch"),
+        )
+    };
+    // Premise: the store writes its file.
+    set_name().await.expect("premise: the set lands");
+    assert!(store.exists(), "premise: the store wrote its file");
+
+    let report = execute(&app, false, None).await.expect("answers");
+    assert_eq!(
+        outcome_of(&report.app, APP_PREFS_FILE),
+        &Outcome::Removed,
+        "{report:?}"
+    );
+    assert!(!store.exists());
+
+    assert_eq!(
+        set_name().await,
+        Err(AppPrefsError::Store {
+            detail: APP_PREFS_CLOSED_BY_UNINSTALL.into()
+        }),
+        "a set after uninstall must refuse"
+    );
+    assert!(
+        !store.exists(),
+        "a set after uninstall re-created the store"
+    );
+    let got = app_prefs_get(app.handle().clone(), app.state()).await;
+    assert_eq!(
+        got.map(|v| v.values.slides),
+        Ok(true),
+        "a get after uninstall still answers"
     );
 }

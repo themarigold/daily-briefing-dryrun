@@ -53,6 +53,16 @@ export const SYSTEMD_TIMER_NAME = "daily-briefing.timer";
 /** The Windows task name. */
 export const WINDOWS_TASK_NAME = "DailyBriefing";
 
+/** ⚠ THE ONE WORDING for a LaunchAgent switched off in Login Items (spec 2026-10-11 login-items-off):
+ *  the plist is on disk, `launchctl load` exits 0, and launchd still cannot find the job (exit 113). Only
+ *  the user can flip it back, so every surface says the same thing — `schedule status` (text, and the
+ *  `registeredHint` its JSON carries), `schedule install`'s post-load warning, and the app's Schedule
+ *  banner, whose copy in gui/src/lib/login-items.ts is pinned to this one by gui/tests-web/render.check.ts.
+ *  "Probably": a job unloaded by hand gives the same signal. Here, in the pure module, because the GUI
+ *  tests may import nothing that reaches the installer. */
+export const LOGIN_ITEMS_OFF_HINT =
+  "Probably switched off in System Settings › General › Login Items & Extensions ('daily-briefing'). Switch it on to get briefings.";
+
 /** ⚠ BUN'S OWN CRASH REPORTER, turned off for every scheduled run whose environment this file writes.
  *  The engine is a `bun build --compile` binary, and Bun (v1.3.14, `src/crash_handler/crash_handler.zig`
  *  `isReportingEnabled`) uploads a crash trace to `bun.report` when the RUNTIME itself panics or
@@ -71,6 +81,13 @@ export const WINDOWS_TASK_NAME = "DailyBriefing";
  *  uploads — to an arbitrary host. An explicit empty value in the unit itself wins over both. */
 export const BUN_CRASH_REPORTING_OFF = { name: "BUN_ENABLE_CRASH_REPORTING", value: "0" } as const;
 export const BUN_CRASH_REPORT_URL_EMPTY = { name: "BUN_CRASH_REPORT_URL", value: "" } as const;
+
+/** ⚠ THE SCHEDULED RUN'S KEEP-AWAKE SWITCH, set in the LaunchAgent's environment only. `dispatch`'s `run`
+ *  branch (src/main.ts) reads it once, deletes it from `process.env`, and on darwin with exactly this value
+ *  starts `/usr/bin/caffeinate -i -w <its own pid>` (src/keep-awake.ts). It replaces the old
+ *  `caffeinate -i` wrapper in ProgramArguments — see `launchdPlist` for why. Not in the systemd or Windows
+ *  units: the guard is macOS-only, and dispatch ignores the variable off darwin. */
+export const KEEP_AWAKE_ENV = { name: "DAILY_BRIEFING_KEEP_AWAKE", value: "1" } as const;
 
 /** ⚠ THE WINDOWS ENCODING CONTRACT, pinned as a constant so a test can assert it without a Windows
  *  runtime. `schtasks /Create /XML` REJECTS a UTF-8 file — this is the classic trap — so the writer
@@ -139,22 +156,31 @@ export function assertNoMountPath(unitText: string, what: string): void {
 /**
  * The macOS LaunchAgent.
  *
- * ⚠ BYTE-COMPATIBLE WITH THE TEMPLATE IT REPLACES, and deliberately so: T2's verification seam is a
- * byte-diff of this output against a read-only capture of the author's LIVE
- * `~/Library/LaunchAgents/local.daily-briefing.plist`, whose only permitted delta is the
- * StartCalendarInterval block added by T5. That includes the first-line comment, which the old `sed`
- * mangled (`__BIN__` was substituted inside it too, so the installed file reads "<binpath> is
- * replaced by install.sh"). Reproducing the mangle verbatim keeps the diff a ONE-LINE addition and
- * therefore keeps the receipt unambiguous.
- *   ⚠ FOLLOW-UP, stated rather than silently carried: that sentence now names a file this slice
- *   DELETES and a mechanism it replaces. Refreshing it is a one-line change, but it re-baselines the
- *   byte-diff, so it belongs with the next deliberate re-baseline (Phase E's docs pass) rather than
- *   inside the change whose whole evidence is that diff.
+ * ⚠ ONCE BYTE-COMPATIBLE WITH THE TEMPLATE IT REPLACED: T2's verification seam was a byte-diff of
+ * this output against a read-only capture of the author's LIVE
+ * `~/Library/LaunchAgents/local.daily-briefing.plist`, whose only permitted delta was the
+ * StartCalendarInterval block added by T5. That is why the first-line comment still reproduces the old
+ * `sed`'s mangle (`__BIN__` was substituted inside it too, so the installed file reads "<binpath> is
+ * replaced by install.sh"). That baseline no longer holds: the background-name fix (2026-10-11)
+ * changed ProgramArguments and added `KEEP_AWAKE_ENV`, so the output is pinned by `test/plist.test.ts`
+ * and `test/schedule.units.test.ts`, not by a diff against a live file.
+ *   ⚠ FOLLOW-UP, still carried: the first-line sentence names a file Slice 4 DELETED and a mechanism
+ *   it replaced. Refreshing it is a one-line change left for a deliberate docs pass.
  *
- * ⚠ THE ARGV ORDER IS THE CONTRACT: `/usr/bin/caffeinate -i <bin> run`. `caffeinate -i` holds idle
- * sleep off for the length of the run; putting it after the binary would make it an argument TO the
- * briefing rather than a wrapper around it. `test/plist.test.ts` asserts the full ordered array for
- * exactly this reason.
+ * ⚠ THE ARGV IS THE CONTRACT: exactly `[<bin>, run]` — NOT `/usr/bin/caffeinate -i <bin> run`, as it
+ * was until 2026-10-11. macOS names a launchd job after the basename of ProgramArguments[0], so the
+ * wrapper made System Settings' App Background Activity list this job as "caffeinate" ("Item from
+ * unidentified developer"), which a user could switch off without knowing it was the briefing.
+ * Measured on a macOS 26.6 VM: linking the job to the app (`AssociatedBundleIdentifiers`) does not
+ * rename it for this ad-hoc-signed app; making the engine ProgramArguments[0] does.
+ * `test/plist.test.ts` asserts the WHOLE array, so a wrapper cannot creep back in front of the binary.
+ *
+ * ⚠ WHY NO CAFFEINATE HERE, AND WHERE KEEP-AWAKE LIVES NOW. The wrapper's job — holding idle sleep
+ * off for a 30-120s provider call — moved into the engine: EnvironmentVariables carries
+ * `KEEP_AWAKE_ENV` (DAILY_BRIEFING_KEEP_AWAKE=1), and `dispatch`'s `run` branch (src/main.ts) then
+ * starts `/usr/bin/caffeinate -i -w <its own pid>` itself (src/keep-awake.ts). Scheduled runs only,
+ * as before: nothing else sets the variable. An existing install keeps the old wrapper until its
+ * next `schedule install` (or the app's "Update background engine") rewrites this file.
  *
  * ⚠ TWO TRIGGERS, NOT ONE (T5 — the 110-minute mitigation). `StartInterval` + `RunAtLoad` are kept
  * unchanged and `StartCalendarInterval` is ADDED at the morning floor, so a withheld or coalesced
@@ -171,13 +197,13 @@ export function launchdPlist(opts: ScheduleOpts): string {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>${xmlEscape(opts.label)}</string>
-  <key>ProgramArguments</key><array><string>/usr/bin/caffeinate</string><string>-i</string><string>${bin}</string><string>run</string></array>
+  <key>ProgramArguments</key><array><string>${bin}</string><string>run</string></array>
   <key>StartInterval</key><integer>${Math.trunc(opts.intervalSec)}</integer>
   <key>RunAtLoad</key><true/>
   <key>StartCalendarInterval</key><dict><key>Hour</key><integer>${hour}</integer><key>Minute</key><integer>${minute}</integer></dict>
   <key>StandardOutPath</key><string>${log}</string>
   <key>StandardErrorPath</key><string>${log}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xmlEscape(opts.pathEnv)}</string><key>${BUN_CRASH_REPORTING_OFF.name}</key><string>${BUN_CRASH_REPORTING_OFF.value}</string><key>${BUN_CRASH_REPORT_URL_EMPTY.name}</key><string>${BUN_CRASH_REPORT_URL_EMPTY.value}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xmlEscape(opts.pathEnv)}</string><key>${BUN_CRASH_REPORTING_OFF.name}</key><string>${BUN_CRASH_REPORTING_OFF.value}</string><key>${BUN_CRASH_REPORT_URL_EMPTY.name}</key><string>${BUN_CRASH_REPORT_URL_EMPTY.value}</string><key>${KEEP_AWAKE_ENV.name}</key><string>${KEEP_AWAKE_ENV.value}</string></dict>
 </dict></plist>
 `;
 }

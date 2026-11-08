@@ -1,6 +1,7 @@
 // test/render.test.ts
 import { test, expect } from "bun:test";
-import { renderBriefing, stripControl, stripControlLines } from "../src/render";
+import { calEventLine, renderBriefing, stripControl, stripControlLines } from "../src/render";
+import type { CalendarStructEvent } from "../src/calendar/types";
 
 test("renderBriefing shows sections, provider, and machine scope", () => {
   const out = renderBriefing({
@@ -94,4 +95,48 @@ test("stripControlLines: strips control bytes per line but KEEPS newlines (multi
   expect(out.includes("\x07")).toBe(false);
   expect(out).toContain("Ground: PARTIAL[0m"); // ESC neutralized, text kept
   expect(out).toContain("- point one");        // BEL removed inline
+});
+
+// ── calendar near-duplicates (plan T6.0; spec 2026-10-31 §6): `calEventLine` renders the struct's decided `merged` ──
+
+const DAY = "2026-10-14";
+const at = (h: number, m = 0): number => new Date(2026, 9, 14, h, m).getTime();
+const timed = (over: Partial<CalendarStructEvent> = {}): CalendarStructEvent => ({
+  time: { kind: "timed", startMs: at(9), endMs: at(10) }, title: "Dentist", location: "Clinic", status: "confirmed", transparency: "busy",
+  attendeeCount: 0, ...over,
+});
+const allDay = (over: Partial<CalendarStructEvent> = {}): CalendarStructEvent =>
+  timed({ time: { kind: "allDay", startDate: DAY, endDateExclusive: "2026-10-15" }, ...over });
+const unclear = (over: Partial<CalendarStructEvent> = {}): CalendarStructEvent =>
+  timed({ time: { kind: "unclear", startDate: DAY, endDate: DAY, wallStart: "09:00", wallEnd: "10:00", tzid: "Mars/Olympus" }, ...over });
+
+test("R04 engine half: a struct without `merged` renders byte for byte as before, on every line kind and mark", () => {
+  expect(calEventLine(timed(), DAY)).toBe("09:00–10:00  Dentist (Clinic)");
+  expect(calEventLine(timed({ status: "tentative", ended: true }), DAY)).toBe("09:00–10:00  Dentist (Clinic) · tentative · ended");
+  expect(calEventLine(allDay({ location: undefined }), DAY)).toBe("all day — Dentist");
+  expect(calEventLine(unclear({ status: "tentative" }), DAY)).toBe("time unclear (09:00–10:00 Mars/Olympus)  Dentist (Clinic) · tentative");
+});
+
+test("R02 engine half: both merge marks, rendered from the decided value, before tentative and ended", () => {
+  const cal = { mark: "calendars", count: 3 } as const, copies = { mark: "copies", count: 2 } as const;
+  expect(calEventLine(timed({ merged: cal }), DAY)).toBe("09:00–10:00  Dentist (Clinic) · on 3 calendars");
+  expect(calEventLine(timed({ merged: copies }), DAY)).toBe("09:00–10:00  Dentist (Clinic) · 2 copies");
+  expect(calEventLine(timed({ merged: cal, status: "tentative" }), DAY)).toBe("09:00–10:00  Dentist (Clinic) · on 3 calendars · tentative");
+  expect(calEventLine(timed({ merged: copies, ended: true }), DAY)).toBe("09:00–10:00  Dentist (Clinic) · 2 copies · ended");
+  expect(calEventLine(timed({ merged: cal, status: "tentative", ended: true }), DAY))
+    .toBe("09:00–10:00  Dentist (Clinic) · on 3 calendars · tentative · ended");
+});
+
+test("R02 engine half: all-day, timed and unclear lines carry the mark in the same place", () => {
+  const merged = { mark: "calendars", count: 2 } as const;
+  expect(calEventLine(allDay({ merged, status: "tentative" }), DAY)).toBe("all day — Dentist (Clinic) · on 2 calendars · tentative");
+  expect(calEventLine(unclear({ merged, ended: true }), DAY)).toBe("time unclear (09:00–10:00 Mars/Olympus)  Dentist (Clinic) · on 2 calendars · ended");
+  expect(calEventLine(timed({ merged, title: "  ", location: undefined }), DAY)).toBe("09:00–10:00  (no title) · on 2 calendars");
+});
+
+test("R02 engine half: counts 2–9 and 10+ are written as given, for both marks", () => {
+  for (const count of [2, 9, 10, 11, 123]) {
+    expect(calEventLine(timed({ merged: { mark: "calendars", count } }), DAY)).toBe(`09:00–10:00  Dentist (Clinic) · on ${count} calendars`);
+    expect(calEventLine(timed({ merged: { mark: "copies", count } }), DAY)).toBe(`09:00–10:00  Dentist (Clinic) · ${count} copies`);
+  }
 });

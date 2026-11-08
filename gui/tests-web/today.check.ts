@@ -23,13 +23,15 @@ import {
   briefingDate,
   chooseSource,
   envelopeOf,
+  FAILURE_BANNER_LEAD,
   latestMtime,
   localDate,
   todayModel,
   type LatestLoad,
-  type RunEnvelope,
-} from "../src/lib/today";
+  type RunEnvelope, knownMtime } from "../src/lib/today";
 import type { BriefingStruct } from "../src/lib/briefing-struct";
+import { runResultSentence } from "../src/lib/run-result";
+import { tone } from "../src/lib/tone";
 import TodayView from "../src/routes/TodayView.svelte";
 
 const TODAY = "2026-09-16";
@@ -226,7 +228,8 @@ describe("Today's states", () => {
     expect(body).toContain("Waiting — first check after 07:20");
     // v0.2.1 §3.1: one name for the setting, "morning time".
     expect(body).toContain("on the first check after your morning time once the machine is awake");
-    expect(body).toContain("once your morning time has passed.");
+    expect(body).toContain("or when you run it now.");
+    expect(body).not.toContain("morning time has passed");
     expect(body).not.toContain("floor");
     expect(body).not.toContain('class="briefing');
   });
@@ -293,7 +296,9 @@ describe("Today's states", () => {
   });
 
   test("SNAPSHOT limited: the engine's line and nothing invented beside it", () => {
-    const detail = 'skipped: account "primary" is unavailable — no other account is available; will retry next interval';
+    // Provider fallback P1-M9-T2 (Q6): an all-out-of-usage skip's detail is two lines — the engine's notification body,
+    // then today's `limitedSkipMessage` line. Shown as the engine wrote it; nothing is invented beside it.
+    const detail = 'No briefing yet today — every provider is out of usage. It will arrive once one resets, if your Mac is awake.\nskipped: account "primary" is unavailable — no other account is available; will retry next interval';
     const m = todayModel({
       snapshot: snapshot(state({ phase: "skipped", reason: "limited", detail, iso: null }, "Usage limit — skipped")),
       latest: loaded(YESTERDAY),
@@ -301,10 +306,11 @@ describe("Today's states", () => {
       today: TODAY,
     });
     const body = view(m);
-    expect(body).toContain(detail);
+    for (const line of detail.split("\n")) expect(body).toContain(line);   // the view joins the two lines
     expect(body).toContain("Usage limit — skipped");
-    // No reset time is synthesised by this screen.
-    expect(body).not.toMatch(/resets?\b/i);
+    // No reset time is synthesised by this screen: outside the engine's own lines (whose body now says "once one
+    // resets"), nothing mentions a reset.
+    expect(detail.split("\n").reduce((b, line) => b.replace(line, ""), body)).not.toMatch(/resets?\b/i);
     expect(body).toMatchSnapshot();
   });
 
@@ -332,8 +338,23 @@ describe("Today's states", () => {
     expect(body).toContain("waiting for network…");
     expect(body).toContain("&lt;img src=x");
     expect(body).toContain(busy);
-    expect(body).toContain("Generates today's briefing if it has not been generated yet and your morning time has passed.");
+    expect(body).toContain("Generates today's briefing now, if it has not been generated yet.");
     expect(body).not.toContain("floor");
+  });
+
+  test("the classic Run now row is unchanged by Good morning's option 2 (user-directed 2026-10-22): the inline hint, no i button, no note", () => {
+    const m = todayModel({ snapshot: snapshot(delivered), latest: loaded(DELIVERED), lastRun: null, today: TODAY });
+    const body = view(m);
+    expect(body).toMatch(
+      /<div class="actions svelte-\w+"><button class="svelte-\w+">Run now<\/button> <span class="hint svelte-\w+">Generates today's briefing now, if it has not been generated yet\.<\/span><\/div>/,
+    );
+    expect(body).not.toContain("What Run now does");
+    expect(body).not.toContain('class="note');
+    // TodayView takes RunControls' default (the inline hint); only Good morning opts in to the i.
+    const todayView = readFileSync(new URL("../src/routes/TodayView.svelte", import.meta.url), "utf8");
+    expect(todayView).toMatch(/<RunControls \{running\} \{progress\} \{runResult\} \{detailsOpen\} \{onrun\} \/>/);
+    const rc = readFileSync(new URL("../src/lib/RunControls.svelte", import.meta.url), "utf8");
+    expect(rc).toMatch(/hint = "inline"/);
   });
 });
 
@@ -382,15 +403,36 @@ describe("Details: the run's engine lines, collapsed unless they explain a probl
     expect(view(m(), { progress: [], detailsOpen: true })).not.toContain("<details");
   });
 
-  test("the result line sits ABOVE the disclosure it points at (\"see Details below\")", () => {
-    const refused = "The engine refused to run — see Details below.";
-    // PREMISE: the sentence is App.svelte's own configError text, so "below" is the wording under test.
-    expect(readFileSync(new URL("../src/App.svelte", import.meta.url), "utf8")).toContain(`"${refused}"`);
+  test("the result line sits ABOVE the disclosure it points at (\"See Details.\")", () => {
+    const refused = runResultSentence({ kind: "configError", reason: null }, null, new Date(), "today");
+    // PREMISE: the sentence is run-result.ts's configError text, which App.svelte's describe() draws for Run now
+    // (wave 2 polish §6), so "See Details." is the wording under test.
+    expect(refused).toBe("Your settings file has a problem, so nothing ran. See Details.");
+    expect(readFileSync(new URL("../src/App.svelte", import.meta.url), "utf8")).toContain("runResultSentence(");
     const body = view(m(), { progress: lines, detailsOpen: true, runResult: refused });
     const result = body.indexOf(`<p class="result`);
     const details = body.indexOf("<details");
     expect([result > -1, details > -1, body.includes(refused)]).toEqual([true, true, true]);
     expect(result).toBeLessThan(details);
+  });
+
+  test("(source pin) App's describe() puts no raw code in brackets: every non-delivered outcome goes through runResultSentence", () => {
+    const app = readFileSync(new URL("../src/App.svelte", import.meta.url), "utf8");
+    const start = app.indexOf("function describe(outcome: EngineOutcome): string {");
+    const end = app.indexOf("async function runNow(", start);
+    expect([start > -1, end > start]).toEqual([true, true]);
+    const describeFn = app.slice(start, end);
+    expect(describeFn).not.toMatch(/\(\$\{outcome\.outcome\.reason/);
+    expect(describeFn).not.toMatch(/exitCode/);
+    expect(describeFn).toContain(`return "Done — today's briefing was generated.";`);
+    // Skipped and failed carry their reason; configError has none. Each reads the envelope's `limited`, on Today.
+    expect(describeFn.match(/runResultSentence\(/g)?.length).toBe(2);
+    expect(describeFn).toContain(
+      `runResultSentence({ kind: outcome.outcome.kind, reason: outcome.outcome.reason }, limitedOf(outcome.payload), new Date(), "today")`,
+    );
+    expect(describeFn).toContain(
+      `runResultSentence({ kind: "configError", reason: null }, limitedOf(outcome.payload), new Date(), "today")`,
+    );
   });
 
   /* M2 checkpoint: the disclosure follows the prop only when the PROP changes, and the user's toggle
@@ -401,10 +443,11 @@ describe("Details: the run's engine lines, collapsed unless they explain a probl
      the prop. ⚠ NOT EXECUTED HERE: no DOM is installed in this harness, so the click → `toggle` →
      state round trip, and the element actually staying open while lines stream, are not run by any
      test; Svelte 5.57.0's writable-derived semantics the fix relies on were measured outside the suite
-     (the M2 fixer's report). */
-  const VIEW_SRC = readFileSync(new URL("../src/routes/TodayView.svelte", import.meta.url), "utf8");
+     (the M2 fixer's report). The disclosure and its writable derived live in `RunControls.svelte`
+     since the briefing redesign's A-M2 (`TodayView` renders it where they were). */
+  const VIEW_SRC = readFileSync(new URL("../src/lib/RunControls.svelte", import.meta.url), "utf8");
   const clientJs = (source: string) =>
-    compile(source, { filename: "TodayView.svelte", generate: "client", runes: true }).js.code;
+    compile(source, { filename: "RunControls.svelte", generate: "client", runes: true }).js.code;
   const OPEN_WRITE = /\b\w+\.open\s*=\s*[^=\s]/;
 
   test("client build: `open` is a derived of the prop, read and written by `bind:open` alone — never by the text effect", () => {
@@ -506,5 +549,120 @@ describe("the quiet-day line (v0.2.1 §2.4.3)", () => {
     const body = view(mm);
     expect(body).not.toContain(NEW);
     expect(body).not.toContain(OLD);
+  });
+});
+
+/**
+ * Provider fallback P3-M6-T1 (spec §5 "Unresolved failure"): `status --json`'s `lastFailure` rides the
+ * snapshot's raw `status` (no Rust struct change). While it names TODAY — the `today` this model is given,
+ * never a second clock — Today shows a banner; it clears on delivery (the engine deletes the record, and a
+ * delivered phase hides one the engine could not delete). Yesterday's record never shows.
+ */
+describe("the app-open failure banner (P3-M6-T1)", () => {
+  // The module's own constant (PR 3 final r1, B7), its wording pinned here once.
+  const LEAD = FAILURE_BANNER_LEAD;
+  test("the banner's lead, as worded", () => {
+    expect(LEAD).toBe("An attempt today failed, and no briefing has been delivered since.");
+  });
+  const failure = (localDate: string, detail = `3 providers failed — open Settings → Providers\n${HOSTILE}`) => ({
+    localDate,
+    reason: "provider-fail",
+    detail,
+  });
+  const withFailure = (s: ScheduleState | null, lastFailure: unknown): Snapshot =>
+    snapshot(s, { status: { latestBriefingMtime: "2026-09-16T07:24:00.000Z", archivedDates: [], lastFailure } });
+  // A later QUIET skip (offline) overwrote last-skip.json: the failure record is all that remembers the failure.
+  const offline = state(
+    { phase: "skipped", reason: "offline", detail: "offline: the network did not come up within 90s; will retry next interval", iso: null },
+    "Offline — will retry",
+  );
+  const delivered = state({ phase: "delivered", at: "2026-09-16T07:24:00.000Z" }, "Delivered 07:24");
+  const model = (snap: Snapshot) => todayModel({ snapshot: snap, latest: loaded(YESTERDAY), lastRun: null, today: TODAY });
+
+  test("today's record shows a banner, as text, beside a later quiet skip", () => {
+    const f = failure(TODAY);
+    const m = model(withFailure(offline, f));
+    expect(m.banners).toContainEqual({ tone: "bad", text: `${LEAD}\n${f.detail}` });
+    const body = view(m);
+    expect(body).toContain(LEAD);
+    expect(body).toContain("3 providers failed — open Settings → Providers");
+    expect(body).toContain('class="banner bad');
+    expect(body).not.toContain("<img");
+  });
+
+  test("yesterday's record shows no banner", () => {
+    const m = model(withFailure(offline, failure("2026-09-15")));
+    expect(m.banners.some((b) => b.text.startsWith(LEAD))).toBe(false);
+    expect(view(m)).not.toContain(LEAD);
+  });
+
+  test("the day is the model's `today`, not a clock of its own", () => {
+    const m = todayModel({ snapshot: withFailure(offline, failure("2026-09-15")), latest: loaded(YESTERDAY), lastRun: null, today: "2026-09-15" });
+    expect(m.banners.some((b) => b.text.startsWith(LEAD))).toBe(true);
+  });
+
+  test("it clears on delivery: the engine's cleared record, and a delivered phase over a record left behind", () => {
+    // The engine deletes last-failure.json on delivery, so `status --json` says null.
+    expect(model(withFailure(delivered, null)).banners).toEqual([]);
+    // A record the engine could not delete never outlives today's delivery.
+    const left = model(withFailure(delivered, failure(TODAY)));
+    expect(left.banners).toEqual([]);
+    expect(view(left)).not.toContain(LEAD);
+    // A config error after today's delivery: still delivered, still no failure banner.
+    const configErr = state(
+      { phase: "config-error", detail: "config.json: bad", deliveredToday: true, deliveredAt: "2026-09-16T07:24:00.000Z" },
+      "Delivered 07:24 · config has an error",
+    );
+    expect(model(withFailure(configErr, failure(TODAY))).banners).toEqual([{ tone: "bad", text: "config.json: bad" }]);
+    // prove-it 3b: the same record with no delivery DOES show.
+    const notDelivered = state({ ...configErr.phase, deliveredToday: false, deliveredAt: null } as Phase, "Config has an error");
+    expect(model(withFailure(notDelivered, failure(TODAY))).banners.some((b) => b.text.startsWith(LEAD))).toBe(true);
+  });
+
+  test("the same failure is not shown twice when today's skip already says it", () => {
+    const f = failure(TODAY, "3 providers failed — open Settings → Providers");
+    const failed = state({ phase: "skipped", reason: "provider-fail", detail: f.detail, iso: "2026-09-16T07:30:00.000Z" }, "Failed");
+    expect(model(withFailure(failed, f)).banners).toEqual([{ tone: tone(failed), text: f.detail }]);
+  });
+
+  test("an empty detail names the reason; a malformed record or an older engine shows nothing", () => {
+    const m = model(withFailure(offline, { localDate: TODAY, reason: "crashed", detail: "" }));
+    expect(m.banners).toContainEqual({ tone: "bad", text: `${LEAD} (crashed)` });
+    for (const bad of [undefined, "x", { localDate: TODAY }, { localDate: 7, reason: "crashed", detail: "d" }, [failure(TODAY)]]) {
+      expect(model(withFailure(offline, bad)).banners.some((b) => b.text.startsWith(LEAD))).toBe(false);
+    }
+  });
+});
+
+/* ── PB-M3-T2: App reads the calendar status through the store at start (wave-2 polish spec §5) ─────── */
+
+describe("PB-M3-T2: App's start reads `calendar status` through the store, beside the first snapshot fetch", () => {
+  const app = readFileSync(new URL("../src/App.svelte", import.meta.url), "utf8")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/(^|\s)\/\*[\s\S]*?\*\//g, "$1")
+    .replace(/(^|[ \t])\/\/[^\n]*/gm, "$1")
+    .replace(/\s+/g, " ");
+  test("in onMount, right after the first snapshot fetch, at onMount's own top level, never waiting for Today", () => {
+    const mount = app.slice(app.indexOf("onMount(() => {"), app.indexOf("return () => {", app.indexOf("onMount(() => {")));
+    expect(mount).toContain("void Promise.allSettled(unlisteners).then(() => refresh()); void readStatusThroughStore(() => calendarStatus());");
+    const before = mount.slice(0, mount.indexOf("void readStatusThroughStore("));
+    const depth = (open: string, close: string): number => [...before].reduce((d, ch) => d + (ch === open ? 1 : ch === close ? -1 : 0), 0);
+    expect([depth("{", "}"), depth("(", ")")]).toEqual([1, 1]);
+    expect(app.match(/readStatusThroughStore\(/g)).toHaveLength(1);
+    expect(app).toContain('import { readStatusThroughStore } from "./lib/today-store";');
+    expect(app).toMatch(/import \{[^}]*\bcalendarStatus,[^}]*\} from "\.\/lib\/engine";/);
+  });
+});
+
+describe("knownMtime: a status that can't be read is not \"no briefing\"", () => {
+  const of = (status: unknown): Parameters<typeof knownMtime>[0] => ({ status } as Parameters<typeof knownMtime>[0]);
+  test("a read status gives its time, or null when there is no briefing", () => {
+    expect(knownMtime(of({ latestBriefingMtime: "2026-11-05T08:00:00Z" }))).toBe("2026-11-05T08:00:00Z");
+    expect(knownMtime(of({ latestBriefingMtime: null }))).toBeNull();
+    expect(knownMtime(of({}))).toBeNull();
+  });
+  test("no status, or no snapshot yet, is unknown", () => {
+    expect(knownMtime(of(null))).toBeUndefined();
+    expect(knownMtime(null)).toBeUndefined();
   });
 });

@@ -31,6 +31,7 @@ const TOKENS: Record<string, { token: string; secret: string }> = {
            secret: "dozjgNryP4J3jVmNHl0w5N" },
   "env-assignment": { token: "API_TOKEN=s3cr3tvalue1234", secret: "s3cr3tvalue1234" },
   "auth-header": { token: "Authorization: Bearer abcdef1234567890", secret: "abcdef1234567890" },
+  "url-userinfo": { token: "https://user:UrlPasswordMark@host/repo", secret: "UrlPasswordMark" },
 };
 const containsCI = (hay: string, needle: string) => hay.toLowerCase().includes(needle.toLowerCase());
 
@@ -118,4 +119,12 @@ describe("PR branch words carry no credential the separator strip broke apart", 
     const [it] = attachPrFacts([item({})], new Map([["a".repeat(40), { number: 7, branch: "fix/x-y" }]]));
     expect(it!.fact).toBe("merged in PR #7 (fix x y)");
   });
+});
+
+
+test("whole-record redaction preserves distinct port-URL and email array entries", () => {
+  const record = { v: 2, labels: [], campaigns: [], texts: ["https://host:8443", "ops@example.com"] };
+  const out = formatRecapRecordLine(record as unknown as RecapRecordV2);
+  expect(JSON.parse(out)).toEqual(record);
+  expect(out).toBe(JSON.stringify(record));
 });

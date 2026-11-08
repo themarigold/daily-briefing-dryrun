@@ -139,9 +139,9 @@ test("B3: an unusable stateDir FALLS BACK and warns — it must never be fatal",
   // `providerCwd` re-mkdirs it, and a live product process on that rung re-runs in its own cwd with a
   // warning (harden.ts "became unusable"). Two `bun test` runs sharing one TMPDIR share this one path too;
   // a private TMPDIR avoids that. Note what does and does not catch its ABSENCE: no assertion here does,
-  // so a single-file run stays green without it (measured). Its only detector is the run-end drain
-  // leaving only the three `dba-isolated-*` baselines in TMPDIR across a FULL run — a leak guard, not a suite
-  // assertion.
+  // so a single-file run stays green without it (measured). Its only detector WAS a full run leaving more
+  // than the `dba-isolated-*` baselines in TMPDIR; since 2026-10-19 the path is inside the run's own root
+  // (test/fixtures/run-tmp.ts), which goes at run end either way, so nothing detects its absence now.
   removeAtRunEnd(providerCwdTmpFallback());
   // …and clear it: a leftover from a run killed before the drain would satisfy the assertion below
   // without the tmp rung ever being reached. It is already registered, so run-end cleanup is unaffected.

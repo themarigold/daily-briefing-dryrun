@@ -7,6 +7,7 @@
  * the foreign-owner dialog puts KEEP-EXISTING first.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { render } from "svelte/server";
 
 import ForeignOwnerDialog from "../src/lib/ForeignOwnerDialog.svelte";
@@ -19,6 +20,8 @@ import { afterInstall, armsVerify } from "../src/lib/install-flow";
 import { afterKeep, afterUninstall, uninstallLine, type UninstallLine } from "../src/lib/uninstall-flow";
 import type { EngineOutcome } from "../src/lib/engine";
 import type { Phase, ScheduleState } from "../src/lib/state";
+import { LOGIN_ITEMS_OFF_HINT, loginItemsOffHint } from "../src/lib/login-items";
+import { LOGIN_ITEMS_OFF_HINT as ENGINE_LOGIN_ITEMS_OFF_HINT } from "../../src/schedule/units";
 
 const HOSTILE = '<img src=x onerror="alert(1)">';
 
@@ -213,6 +216,57 @@ describe("Schedule.svelte", () => {
     expect(badge(body).text).toBe("Delivered, but the day marker failed");
     expect(body).toContain("briefing was written");
     expect(body).not.toContain("did not generate a briefing");
+  });
+
+  // Wave 2 polish §6 (plan PA-M3-T2): the skipped phase says what happened in plain words — runResultSentence's
+  // Schedule sentence, typed here from the spec's table — and the engine's own detail line follows it verbatim.
+  test("a skip reads its plain sentence, then the engine's detail verbatim; Schedule never says \"See Details.\"", () => {
+    const detail = "network never came up\nwaited 90s";
+    const offline = raw(Schedule, {
+      state: state({ phase: "skipped", reason: "offline", detail, iso: null }, "Offline — nothing ran"),
+    });
+    const sentence = "You were offline, so nothing ran. Try again once you're connected.";
+    expect(readable(offline)).toContain(sentence);
+    expect(pres(offline)).toEqual([detail]);
+    // The sentence is one paragraph of its own, and it comes before the detail's <pre>.
+    const para = /<p\b[^>]*>([^<]*)<\/p>/g;
+    const own = [...offline.matchAll(para)].find((m) => readable(m[1]!).trim() === sentence);
+    expect(own).toBeDefined();
+    expect(own!.index).toBeLessThan(offline.indexOf("<pre"));
+    expect(readable(offline)).not.toContain("The engine's reason");
+    expect(readable(offline)).not.toContain("did not generate a briefing");
+    // A reason whose Today sentence points at Details: Schedule has no Details control, so it is left out.
+    for (const [reason, want] of [
+      ["provider-fail", "The AI provider didn't answer."],
+      ["blocked", "A repository couldn't be read, so nothing ran."],
+      ["crashed", "Something went wrong and the run stopped."],
+    ] as const) {
+      const body = readable(raw(Schedule, { state: state({ phase: "skipped", reason, detail: "x", iso: null }, "line") }));
+      expect([reason, body.includes(want), body.includes("See Details")]).toEqual([reason, true, false]);
+    }
+  });
+
+  test("Schedule's concurrent sentence, and the limited sentence with no invented time", () => {
+    const concurrent = readable(raw(Schedule, {
+      state: state({ phase: "skipped", reason: "concurrent", detail: null, iso: null }, "Another run held the lock"),
+    }));
+    expect(concurrent).toContain("A briefing was already being made.");
+    expect(concurrent).not.toContain("It will show here when it's done");
+    // last-skip.json carries no `limited`: the sentence names no time, and the engine's detail (which may) follows.
+    const limited = raw(Schedule, {
+      state: state({ phase: "skipped", reason: "limited", detail: "every provider is out of usage until 09:00", iso: null }, "Out of usage"),
+    });
+    expect(readable(limited)).toContain("Every AI account you set up is at its usage limit.");
+    expect(pres(limited)).toEqual(["every provider is out of usage until 09:00"]);
+  });
+
+  test("(source pin) Schedule's skipped phase draws runResultSentence's Schedule sentence and keeps the detail's <pre>", () => {
+    const source = readFileSync(new URL("../src/routes/Schedule.svelte", import.meta.url), "utf8");
+    expect(source).toContain(
+      `<p>{runResultSentence({ kind: "skipped", reason: state.phase.reason }, null, new Date(), "schedule")}</p>`,
+    );
+    expect(source).toContain("<pre>{state.phase.detail}</pre>");
+    expect(source).not.toContain("The engine's reason:");
   });
 
   test("agent-stale with no tick recorded gets its own sentence", () => {
@@ -1230,5 +1284,37 @@ describe("the install flow", () => {
     expect(withLead.replace("Another lead.", "Something else already owns the background schedule.")).toBe(
       html(ForeignOwnerDialog, props),
     );
+  });
+});
+
+/* ── spec 2026-10-11: the Login Items banner ───────────────────────────────────────────────────── */
+
+describe("Schedule.svelte — the Login Items banner (spec 2026-10-11)", () => {
+  test("the app's copy IS the engine's wording — one string on every surface", () => {
+    expect(LOGIN_ITEMS_OFF_HINT).toBe(ENGINE_LOGIN_ITEMS_OFF_HINT);
+  });
+
+  test("the hint is read from the raw envelope's registeredHint, and only its one value counts", () => {
+    expect(loginItemsOffHint({ registered: false, registeredHint: "login-items-off" })).toBe(LOGIN_ITEMS_OFF_HINT);
+    // An older engine (no field), the engine's null, another value, no envelope at all: no banner.
+    for (const env of [{ registered: false }, { registeredHint: null }, { registeredHint: "other" }, null, undefined, "login-items-off"]) {
+      expect(`${JSON.stringify(env)} → ${loginItemsOffHint(env)}`).toBe(`${JSON.stringify(env)} → null`);
+    }
+  });
+
+  test("drawn as text when set, with no button of its own; absent when null", () => {
+    const broken = state({ phase: "scheduler-broken" }, "Scheduler not running", { registered: false });
+    const on = html(Schedule, { state: broken, loginItemsHint: LOGIN_ITEMS_OFF_HINT });
+    expect(readable(on)).toContain(LOGIN_ITEMS_OFF_HINT);
+    expect(readable(on)).toContain("Repairing will not turn it back on.");
+    expect(buttons(on)).toEqual(buttons(html(Schedule, { state: broken })));
+    expect(buttons(on).some((b) => /login items/i.test(b.text))).toBe(false);
+    expect(readable(html(Schedule, { state: broken, loginItemsHint: null }))).not.toContain("Login Items");
+  });
+
+  test("App computes it from the snapshot's raw schedule envelope and passes it down", async () => {
+    const app = await Bun.file(new URL("../src/App.svelte", import.meta.url)).text();
+    const mount = app.slice(app.indexOf("<Schedule"), app.indexOf("/>", app.indexOf("<Schedule")));
+    expect(mount).toContain("loginItemsHint={loginItemsOffHint(snapshot?.schedule)}");
   });
 });

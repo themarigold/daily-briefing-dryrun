@@ -12,6 +12,8 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { render } from "svelte/server";
 
+import { copyPushCommand, editorChoiceSet, editorList, editorOpen, openGithub } from "../src/lib/engine";
+import { readLatestSummary } from "../src/lib/engine";
 import { archiveList, archivedDates, formatBytes, keepArchive, moveFrom, nextIndex } from "../src/lib/history";
 import type { Snapshot } from "../src/lib/state";
 import History from "../src/routes/History.svelte";
@@ -166,7 +168,7 @@ describe("History.svelte", () => {
 
 /* ── no delete surface anywhere in the webview ────────────────────────────────────────────────── */
 
-test("no command the webview invokes can remove or prune a briefing — except the two enumerated, argued exceptions", () => {
+test("no command the webview invokes can remove or prune a briefing — except the five enumerated, argued exceptions", () => {
   const root = new URL("../src/", import.meta.url).pathname;
   const walk = (dir: string): string[] =>
     readdirSync(dir).flatMap((n) => {
@@ -225,7 +227,29 @@ test("no command the webview invokes can remove or prune a briefing — except t
   // archive — `coexistence.check.ts` pins it). Without the flag it touches nothing of the
   // engine's. It is listed so this test's claim stays true as stated, not because the pattern
   // catches it.
-  const DELETION_SHAPED_ALLOWED = ["cli_shim_remove", "uninstall_execute"];
+  //
+  // (v0.3.0, plan M8): `calendar_link_remove` is the THIRD, and it removes no briefing either: its one
+  // operand is a link id the Rust grammar admits (`^[a-z0-9][a-z0-9-]{0,31}$`, `macos` reserved — no
+  // separator, no dot), and it removes exactly `<state>/calendar/links/<id>.url` — the secret link
+  // file the app itself wrote (a symlink there is unlinked, never followed; a folder is refused) —
+  // and that id's entry in `calendar.links`, through the config-save path. It cannot name the
+  // archive, a briefing or any other file (pinned by `src-tauri/tests/calendar.rs`). Removing a link
+  // the user asked to disconnect is the point: leaving the secret behind would be the defect.
+  //
+  // (provider fallback PR 3, P3-M1): `engine_provider_key_delete` is the FOURTH, and it removes no
+  // briefing: it deletes one of the app's own stored API KEYS. Its one operand is a key id Rust admits
+  // only as `k-` and 12 lowercase hex digits (`engine.rs` `key_id`, the engine's `KEY_ID_RE`) — no
+  // separator, no dot, no path. The engine removes only a Keychain item under the app's own service,
+  // or off macOS the app-shaped `k-<12 hex>.key` file and its temps in `<state>/keys/` — a file there
+  // that is not the app's is kept (`docs/gui-seam.md` §1d). (`engine_provider_key_delete_all` was a
+  // fifth until PR 3 final r1 dropped it: uninstall's key leg runs `delete-all` Rust-side.) Removing a key the user replaced, discarded or
+  // uninstalled is the point: leaving a secret behind would be the defect, as for the calendar link.
+  const DELETION_SHAPED_ALLOWED = [
+    "cli_shim_remove",
+    "uninstall_execute",
+    "calendar_link_remove",
+    "engine_provider_key_delete",
+  ];
   for (const name of invoked) {
     if (DELETION_SHAPED_ALLOWED.includes(name)) continue;
     expect(name).not.toMatch(/delete|prune|remove|clean|trash|unlink/);
@@ -253,4 +277,114 @@ test("no command the webview invokes can remove or prune a briefing — except t
     expect(invoked).toContain(name);
   }
   expect(new Set(invoked.filter((n) => n.includes("|")))).toEqual(new Set(["plugin:autostart|is_enabled"]));
+});
+
+test("A2-M4-T13: the summary read's closed lists match the engine's and Rust's own", () => {
+  const read = (path: string) => readFileSync(new URL(path, import.meta.url), "utf8");
+  const body = (source: string, pattern: RegExp) => {
+    const found = pattern.exec(source)?.[1];
+    if (found === undefined) throw new Error(`nothing matches ${pattern}`);
+    return found;
+  };
+  const codes = (text: string) => [...text.matchAll(/"([a-z-]+)"/g)].map((m) => m[1] ?? "").sort();
+  const variants = (text: string) => [...text.matchAll(/^    ([A-Z]\w*)\b/gm)].map((m) => m[1] ?? "");
+  const unionOf = (name: string) => new RegExp(`export type ${name} =([^;]*);`);
+
+  const wrapper = read("../src/lib/engine.ts");
+  const store = read("../../src/summary/store.ts");
+  const replyCodes = codes(body(wrapper, unionOf("SummaryWarningCode")));
+  expect(replyCodes.length).toBeGreaterThan(0);
+  expect(codes(body(store, unionOf("SummaryWarningCode")))).toEqual(replyCodes);
+  expect(codes(body(store, /const WARNINGS = new Set<SummaryWarningCode>\(\[([^\]]*)\]\)/))).toEqual(replyCodes);
+
+  // Rust's one enum also holds the config resolver's code, which appears in status only: a record
+  // carrying it is refused whole (`summary-record-vectors.json`), so a reply never holds it.
+  const statusOnly = codes(body(read("../../src/summary/config.ts"), unionOf("AiSummaryConfigWarning")));
+  expect(statusOnly.length).toBeGreaterThan(0);
+  const rust = variants(body(read("../src-tauri/src/schedule_state.rs"), /pub enum SummaryWarningCode \{([^}]*)\}/));
+  expect(rust.map((v) => v.replace(/(?!^)[A-Z]/g, (c) => `-${c}`).toLowerCase()).sort()).toEqual([...replyCodes, ...statusOnly].sort());
+
+  const kinds = [...body(wrapper, unionOf("SummaryReadError")).matchAll(/kind: "(\w+)"/g)].map((m) => m[1] ?? "");
+  const errors = variants(body(read("../src-tauri/src/summary.rs"), /pub enum SummaryReadError \{([^}]*)\}/));
+  expect(kinds.length).toBeGreaterThan(0);
+  expect(errors.map((v) => v.charAt(0).toLowerCase() + v.slice(1))).toEqual(kinds);
+});
+
+test("A2-M4-T13: readLatestSummary sends the one `request` argument Rust's command reads", async () => {
+  // `invoke` calls `window.__TAURI_INTERNALS__.invoke(cmd, args)`; a recorder stands in, as in `provider-ops.check.ts`.
+  const g = globalThis as unknown as { window?: unknown };
+  const hadWindow = "window" in g;
+  const windowBefore = g.window;
+  const calls: [string, unknown][] = [];
+  g.window = {
+    __TAURI_INTERNALS__: {
+      invoke: async (command: string, args: unknown) => {
+        calls.push([command, args]);
+        return { state: "pending", warnings: [] };
+      },
+    },
+  };
+  try {
+    await readLatestSummary("page-hash", "page-version");
+  } finally {
+    if (hadWindow) g.window = windowBefore;
+    else delete g.window;
+  }
+  expect(calls).toEqual([["read_latest_summary", { request: { pageHash: "page-hash", pageVersion: "page-version" } }]]);
+  const rust = readFileSync(new URL("../src-tauri/src/summary.rs", import.meta.url), "utf8");
+  expect(rust).toMatch(/pub async fn read_latest_summary\(\s*engine: State<'_, Engine>,\s*request: SummaryRequest,\s*\)/);
+});
+
+test("P1-M9-T4: History renders the notice lines above an archived briefing's title, as notice blocks", async () => {
+  // History draws a briefing through `renderMarkdown(file.text)` (History.svelte), so the file renderer's notice kind
+  // is what it shows; pinned on the source so a second renderer cannot slip in.
+  const src = readFileSync(join(import.meta.dir, "../src/routes/History.svelte"), "utf8");
+  expect(src).toContain("renderMarkdown(file.text)");
+  const { renderMarkdown } = await import("../src/lib/briefing-md");
+  const file = "ℹ︎ Skipped \"Local\": unreachable — used \"Claude login 2\"\n\n☀️  Daily briefing — 2026-10-16  (this machine: mac)\n\n▶ Where you left off\n   • [app] resume\n";
+  const kinds = renderMarkdown(file).map((b) => b.kind);
+  expect(kinds.slice(0, 2)).toEqual(["notice", "title"]);
+});
+
+/**
+ * B2-M4-T12: the literal wrappers beside their grants. Every caller after this one injects them, so this is the one place
+ * their wire shape is read: each sends one `request` argument, the one Rust's command takes (`tests/capability.rs` sends
+ * the same shapes through the shipped handler). The IPC is a recorder, as in `provider-ops.check.ts`; nothing opens.
+ */
+describe("the opening commands' wrappers", () => {
+  test("each invokes its own command with one `request` holding handles, a project key or a token", async () => {
+    const calls: [string, unknown][] = [];
+    const g = globalThis as { window?: unknown };
+    const hadWindow = "window" in g;
+    const before = g.window;
+    g.window = {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string, args: unknown) => {
+          calls.push([command, args]);
+          return {};
+        },
+      },
+    };
+    try {
+      await openGithub("h1");
+      await copyPushCommand(["h1", "h2"]);
+      await editorList();
+      await editorList("h1");
+      await editorOpen("h1", "zed");
+      await editorChoiceSet("k1", "zed");
+      await editorChoiceSet("k1", "ask");
+    } finally {
+      if (hadWindow) g.window = before;
+      else delete g.window;
+    }
+    expect(calls).toEqual([
+      ["open_github", { request: { handle: "h1" } }],
+      ["copy_push_command", { request: { handles: ["h1", "h2"] } }],
+      ["editor_list", { request: {} }],
+      ["editor_list", { request: { handle: "h1" } }],
+      ["editor_open", { request: { handle: "h1", editor: "zed" } }],
+      ["editor_choice_set", { request: { project: "k1", editor: "zed" } }],
+      ["editor_choice_set", { request: { project: "k1", editor: "ask" } }],
+    ]);
+  });
 });

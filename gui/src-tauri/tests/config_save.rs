@@ -48,9 +48,16 @@ fn app_over(
     client: EngineClient,
     candidates: &Path,
 ) -> (App<MockRuntime>, WebviewWindow<MockRuntime>) {
+    app_with(client, ConfigSaver::with_candidate_dir(candidates))
+}
+
+fn app_with(
+    client: EngineClient,
+    saver: ConfigSaver,
+) -> (App<MockRuntime>, WebviewWindow<MockRuntime>) {
     let app = mock_builder()
         .manage(Engine(Ok(client)))
-        .manage(ConfigSaver::with_candidate_dir(candidates))
+        .manage(saver)
         .invoke_handler(daily_briefing_gui_lib::handler())
         .build(tauri::generate_context!())
         .expect("mock app");
@@ -853,6 +860,1002 @@ fn a_literal_api_key_is_never_shown_and_cannot_be_set_from_the_app() {
         .save(&pasted, &base_of(&doc))
         .expect_err("placeholder without a key");
     assert_eq!(kind(&err), "apiKeyChanged", "{err}");
+
+    // P3-M2-T1: the same at EVERY pointer, not only `/provider/api/apiKey` — a `fallbacks` entry's
+    // key, and a literal anywhere else in the document, at any spelling.
+    let s = sandbox("cfg-apikey-all", Some(&multi_literal()));
+    let doc = s.read();
+    for (pointer, key) in LITERALS {
+        assert!(
+            !doc.to_string().contains(key),
+            "{pointer}'s key reached the webview: {doc}"
+        );
+        let shown: Value = serde_json::from_str(&text_of(&doc)).unwrap();
+        assert_eq!(
+            shown.pointer(pointer),
+            Some(&json!(REDACTED_API_KEY)),
+            "{pointer}"
+        );
+    }
+    assert_eq!(doc["apiKeyRedacted"], true);
+    // Sent back untouched with another change: every stored key is kept where it was.
+    let changed = edit(&text_of(&doc), |v| v["lookbackCapDays"] = json!(7));
+    let out = s.save(&changed, &base_of(&doc)).expect("save");
+    assert_eq!(kind(&out), "saved", "{out}");
+    assert_literals_kept(&s.on_disk());
+    assert!(
+        !s.validated(0).contains(REDACTED_API_KEY),
+        "the engine validated the placeholder"
+    );
+    // The placeholder with no key behind it, at each pointer: refused, nothing validated or written.
+    for (pointer, _) in LITERALS {
+        let doc = s.read();
+        let before = s.on_disk();
+        let removed = edit(&text_of(&doc), |v| remove_at(v, pointer));
+        let out = s
+            .save(&removed, &base_of(&doc))
+            .expect("removing a key is allowed");
+        assert_eq!(kind(&out), "saved", "{pointer}: {out}");
+        assert!(serde_json::from_str::<Value>(&s.on_disk())
+            .unwrap()
+            .pointer(pointer)
+            .is_none());
+        let doc = s.read();
+        let validations = s.validations();
+        let pasted = edit(&text_of(&doc), |v| {
+            set_at(v, pointer, json!(REDACTED_API_KEY))
+        });
+        let err = s
+            .save(&pasted, &base_of(&doc))
+            .expect_err("placeholder without a key");
+        assert_eq!(kind(&err), "apiKeyChanged", "{pointer}: {err}");
+        assert_eq!(
+            s.validations(),
+            validations,
+            "{pointer}: the engine was asked"
+        );
+        // Put the key back by hand (as a user's editor would) for the next pointer's round.
+        std::fs::write(&s.config, &before).unwrap();
+    }
+}
+
+/* ── P3-M2-T1: redaction is recursive; restore is by pointer, with the owner check ───────────────── */
+
+const FALLBACK_KEY: &str = "sk-ant-FALLBACK-SENTINEL-1111";
+const LOCAL_KEY: &str = "sk-local-SENTINEL-2222";
+const STRAY_KEY: &str = "sk-stray-SENTINEL-3333";
+
+/// Every literal in [`multi_literal`], by JSON pointer.
+const LITERALS: [(&str, &str); 4] = [
+    ("/provider/api/apiKey", SENTINEL_KEY),
+    ("/fallbacks/0/api/apiKey", FALLBACK_KEY),
+    ("/fallbacks/1/api/apiKey", LOCAL_KEY),
+    ("/x-notes/history/0/APIKEY", STRAY_KEY),
+];
+
+/// The API fixture (item 1 `"default"`, a literal key) plus two literal-key `fallbacks` entries
+/// and a literal at an odd spelling in an unknown block the engine never reads.
+fn multi_literal() -> String {
+    edit(API, |v| {
+        v["fallbacks"] = json!([
+            { "label": "backup", "api": { "kind": "anthropic", "model": "claude-haiku-5", "apiKey": FALLBACK_KEY } },
+            { "label": "local", "timeoutMs": 600000,
+              "api": { "kind": "openai-compatible", "model": "llama", "baseUrl": "http://127.0.0.1:11434/v1", "apiKey": LOCAL_KEY } }
+        ]);
+        v["x-notes"] = json!({ "history": [{ "APIKEY": STRAY_KEY }] });
+    })
+}
+
+fn assert_literals_kept(on_disk: &str) {
+    let written: Value = serde_json::from_str(on_disk).unwrap();
+    for (pointer, key) in LITERALS {
+        assert_eq!(
+            written.pointer(pointer),
+            Some(&json!(key)),
+            "the key at {pointer} was lost or moved"
+        );
+    }
+}
+
+fn parent_and_key(pointer: &str) -> (&str, &str) {
+    pointer.rsplit_once('/').expect("a pointer with a parent")
+}
+
+fn set_at(v: &mut Value, pointer: &str, value: Value) {
+    let (parent, key) = parent_and_key(pointer);
+    v.pointer_mut(parent).expect("the parent exists")[key] = value;
+}
+
+fn remove_at(v: &mut Value, pointer: &str) {
+    let (parent, key) = parent_and_key(pointer);
+    v.pointer_mut(parent)
+        .and_then(Value::as_object_mut)
+        .expect("an object parent")
+        .shift_remove(key);
+}
+
+#[test]
+fn redaction_reaches_every_literal_key_and_config_read_never_returns_one() {
+    let s = sandbox("cfg-redact-all", Some(&multi_literal()));
+    let doc = s.read();
+    let shown: Value = serde_json::from_str(&text_of(&doc)).unwrap();
+    for (pointer, key) in LITERALS {
+        assert!(
+            !doc.to_string().contains(key),
+            "{pointer}'s key reached the webview: {doc}"
+        );
+        assert_eq!(
+            shown.pointer(pointer),
+            Some(&json!(REDACTED_API_KEY)),
+            "{pointer}"
+        );
+    }
+    assert_eq!(doc["apiKeyRedacted"], true);
+    // Nothing else changed: the shown document is the file with exactly those values replaced.
+    let mut expected: Value = serde_json::from_str(&multi_literal()).unwrap();
+    for (pointer, _) in LITERALS {
+        set_at(&mut expected, pointer, json!(REDACTED_API_KEY));
+    }
+    assert_eq!(text_of(&doc), canonical_json(&expected));
+
+    // A literal ONLY in a fallback still counts as redacted (the raw tab's placeholder note).
+    let only_fallback = edit(&multi_literal(), |v| {
+        remove_at(v, "/provider/api/apiKey");
+        v["x-notes"] = json!({});
+        v["fallbacks"].as_array_mut().unwrap().truncate(1);
+    });
+    let s = sandbox("cfg-redact-fb", Some(&only_fallback));
+    let doc = s.read();
+    assert!(!doc.to_string().contains(FALLBACK_KEY), "{doc}");
+    assert_eq!(doc["apiKeyRedacted"], true);
+    // A reference is not a literal: shown as written, and no redaction is reported.
+    let reference = edit(&only_fallback, |v| {
+        remove_at(v, "/fallbacks/0/api/apiKey");
+        v["fallbacks"][0]["api"]["apiKeyEnv"] = json!("BACKUP_KEY");
+    });
+    let s = sandbox("cfg-redact-ref", Some(&reference));
+    let doc = s.read();
+    assert_eq!(text_of(&doc), reference);
+    assert_eq!(doc["apiKeyRedacted"], false);
+}
+
+#[test]
+fn a_stored_key_is_restored_at_its_own_pointer_for_item_1_and_for_a_fallback() {
+    let s = sandbox("cfg-restore-ptr", Some(&multi_literal()));
+    let doc = s.read();
+    // Edit item 1's and each fallback's block beside its key (the form's ordinary edits).
+    let changed = edit(&text_of(&doc), |v| {
+        v["provider"]["api"]["model"] = json!("claude-opus-5");
+        v["fallbacks"][0]["api"]["model"] = json!("claude-sonnet-5");
+        v["fallbacks"][1]["timeoutMs"] = json!(900000);
+    });
+    let out = s.save(&changed, &base_of(&doc)).expect("save");
+    assert_eq!(kind(&out), "saved", "{out}");
+    assert_literals_kept(&s.on_disk());
+    let written: Value = serde_json::from_str(&s.on_disk()).unwrap();
+    assert_eq!(written["provider"]["api"]["model"], "claude-opus-5");
+    assert_eq!(written["fallbacks"][0]["api"]["model"], "claude-sonnet-5");
+    assert_eq!(written["fallbacks"][1]["timeoutMs"], 900000);
+    // What the engine validated is what was written: the keys, never the placeholder.
+    let validated: Value = serde_json::from_str(&s.validated(0)).unwrap();
+    assert_eq!(validated, written);
+
+    // Item 1's label is RESOLVED: no `provider.label` and `"default"` are the same entry (the
+    // engine's rule for an API item 1), so writing the default out is not a change of owner.
+    let doc = s.read();
+    let named = edit(&text_of(&doc), |v| {
+        v["provider"]["label"] = json!("default")
+    });
+    let out = s.save(&named, &base_of(&doc)).expect("save");
+    assert_eq!(kind(&out), "saved", "{out}");
+    assert_literals_kept(&s.on_disk());
+    // And `provider.accounts` beside an API item 1 is ignored by the engine, so it never labels
+    // item 1 here either: a login list appearing beside it does not change the key's owner.
+    let doc = s.read();
+    let with_logins = edit(&text_of(&doc), |v| {
+        v["provider"]["accounts"] = json!([{ "label": "work" }, { "label": "home" }])
+    });
+    let out = s.save(&with_logins, &base_of(&doc)).expect("save");
+    assert_eq!(kind(&out), "saved", "{out}");
+    assert_literals_kept(&s.on_disk());
+}
+
+#[test]
+fn a_swap_of_two_literal_key_entries_is_refused_by_the_label_check_alone() {
+    // Each case puts a placeholder at a pointer where the file holds ANOTHER entry's literal (the
+    // first such slot in document order), so a pointer-only restore would put one entry's key into
+    // another. No editor is involved: the Rust guard alone refuses.
+    type Case = (&'static str, fn(&mut Value));
+    let cases: [Case; 6] = [
+        ("swap two fallbacks", |v| {
+            v["fallbacks"].as_array_mut().unwrap().swap(0, 1);
+        }),
+        ("swap item 1 and a fallback", |v| {
+            let item1 = v["provider"].clone();
+            let mut first = v["fallbacks"][0].clone();
+            let label = first
+                .as_object_mut()
+                .unwrap()
+                .shift_remove("label")
+                .unwrap();
+            v["provider"] = first;
+            v["provider"]["label"] = label;
+            let mut moved = json!({ "label": "default" });
+            for (k, x) in item1.as_object().unwrap() {
+                moved[k] = x.clone();
+            }
+            v["fallbacks"][0] = moved;
+        }),
+        ("remove the entry above", |v| {
+            v["fallbacks"].as_array_mut().unwrap().remove(0);
+            // The surviving entry now sits at `/fallbacks/0`, where `backup`'s key is stored.
+        }),
+        ("insert an entry above", |v| {
+            // A new entry carrying the placeholder lands on `backup`'s stored key's pointer.
+            v["fallbacks"].as_array_mut().unwrap().insert(
+                0,
+                json!({ "label": "new", "api": { "kind": "anthropic", "model": "m", "apiKey": REDACTED_API_KEY } }),
+            );
+        }),
+        ("rename the fallback that owns a key", |v| {
+            v["fallbacks"][0]["label"] = json!("renamed");
+        }),
+        ("rename item 1", |v| {
+            v["provider"]["label"] = json!("renamed");
+        }),
+    ];
+    let s = sandbox("cfg-swap", Some(&multi_literal()));
+    for (name, change) in cases {
+        let doc = s.read();
+        let candidate = edit(&text_of(&doc), change);
+        let err = s
+            .save(&candidate, &base_of(&doc))
+            .expect_err(&format!("{name}: saved a key under another entry"));
+        assert_eq!(kind(&err), "apiKeyChanged", "{name}: {err}");
+        assert_eq!(s.on_disk(), multi_literal(), "{name}: the file changed");
+        assert_eq!(s.validations(), 0, "{name}: the engine was asked");
+        assert!(s.backup().is_none(), "{name}");
+    }
+}
+
+#[test]
+fn a_placeholder_where_the_file_holds_no_literal_is_refused() {
+    let s = sandbox("cfg-ph-nokey", Some(&multi_literal()));
+    type Case = (&'static str, fn(&mut Value));
+    let cases: [Case; 4] = [
+        ("a new fallback carrying the placeholder", |v| {
+            v["fallbacks"].as_array_mut().unwrap().push(
+                json!({ "label": "third", "api": { "kind": "anthropic", "model": "m", "apiKey": REDACTED_API_KEY } }),
+            );
+        }),
+        ("the placeholder outside a fallback's api block", |v| {
+            v["fallbacks"][0]["apiKey"] = json!(REDACTED_API_KEY);
+        }),
+        (
+            "the placeholder at another spelling of the stored key's name",
+            |v| {
+                remove_at(v, "/provider/api/apiKey");
+                v["provider"]["api"]["ApiKey"] = json!(REDACTED_API_KEY);
+            },
+        ),
+        ("the placeholder nested where nothing is stored", |v| {
+            v["x-notes"]["history"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "apiKey": REDACTED_API_KEY }));
+        }),
+    ];
+    for (name, change) in cases {
+        let doc = s.read();
+        let candidate = edit(&text_of(&doc), change);
+        let err = s
+            .save(&candidate, &base_of(&doc))
+            .expect_err(&format!("{name}: saved the placeholder as a key"));
+        assert_eq!(kind(&err), "apiKeyChanged", "{name}: {err}");
+        assert_eq!(s.on_disk(), multi_literal(), "{name}: the file changed");
+        assert_eq!(s.validations(), 0, "{name}: the engine was asked");
+    }
+}
+
+/// A slot inside `provider.accounts[j]` is login `j`'s, not item 1's: reordering the logins below
+/// item 1 leaves item 1's label alone, so only the login's own label can catch the move. (The engine
+/// never reads a key there — a CLI item 1 has no `api` block — but restore must still never put
+/// one entry's key into another.)
+#[test]
+fn a_key_inside_a_login_is_owned_by_that_login() {
+    let initial = edit(API, |v| {
+        v["provider"] = json!({ "cli": "claude", "argv": ["-p"], "promptVia": "stdin",
+            "accounts": [{ "label": "a" }, { "label": "b", "apiKey": FALLBACK_KEY }, { "label": "c", "apiKey": LOCAL_KEY }] });
+    });
+    let s = sandbox("cfg-login-owner", Some(&initial));
+    let doc = s.read();
+    assert!(!doc.to_string().contains(FALLBACK_KEY), "{doc}");
+    assert!(!doc.to_string().contains(LOCAL_KEY), "{doc}");
+    // Both logins hold a key, so after the swap each placeholder sits where the OTHER's is stored.
+    let swapped = edit(&text_of(&doc), |v| {
+        v["provider"]["accounts"].as_array_mut().unwrap().swap(1, 2)
+    });
+    let err = s
+        .save(&swapped, &base_of(&doc))
+        .expect_err("b's key moved into login c");
+    assert_eq!(kind(&err), "apiKeyChanged", "{err}");
+    assert_eq!(s.on_disk(), initial);
+    let unrelated = edit(&text_of(&doc), |v| v["lookbackCapDays"] = json!(3));
+    let out = s.save(&unrelated, &base_of(&doc)).expect("save");
+    assert_eq!(kind(&out), "saved", "{out}");
+    let written: Value = serde_json::from_str(&s.on_disk()).unwrap();
+    assert_eq!(written["provider"]["accounts"][1]["apiKey"], FALLBACK_KEY);
+    assert_eq!(written["provider"]["accounts"][2]["apiKey"], LOCAL_KEY);
+}
+
+/// `gui/src/lib/wizard.ts` `providerValue`, the api path, on a re-run over a config holding a
+/// literal: it REBUILDS `provider` (the kept api keys first, then `kind`, `model`, the references,
+/// and `apiKey: REDACTED_API_KEY` last — `wizard.ts:465-479`), so key order changes; the
+/// placeholder must come back as today's literal, byte for byte, and a fallback's literal stays.
+#[test]
+fn a_wizard_re_run_round_trips_todays_literal_unchanged() {
+    for (tag, initial) in [
+        ("cfg-wizard-api", API.to_string()),
+        ("cfg-wizard-multi", multi_literal()),
+    ] {
+        let s = sandbox(tag, Some(&initial));
+        let doc = s.read();
+        let rebuilt = edit(&text_of(&doc), |v| {
+            let api = v["provider"]["api"].clone();
+            let mut out = serde_json::Map::new();
+            for (k, x) in api.as_object().unwrap() {
+                if !["kind", "model", "apiKeyFile", "apiKeyCommand", "apiKey"].contains(&k.as_str())
+                {
+                    out.insert(k.clone(), x.clone());
+                }
+            }
+            out.insert("kind".into(), json!("anthropic"));
+            out.insert("model".into(), json!("claude-opus-5"));
+            let stored = api["apiKey"] == json!(REDACTED_API_KEY);
+            assert!(stored, "{tag}: the wizard saw no placeholder to carry");
+            out.insert("apiKey".into(), json!(REDACTED_API_KEY));
+            v["provider"] = json!({ "api": Value::Object(out) });
+        });
+        let out = s.save(&rebuilt, &base_of(&doc)).expect("save");
+        assert_eq!(kind(&out), "saved", "{tag}: {out}");
+        let written: Value = serde_json::from_str(&s.on_disk()).unwrap();
+        assert_eq!(written["provider"]["api"]["apiKey"], SENTINEL_KEY, "{tag}");
+        assert_eq!(
+            written["provider"]["api"]["model"], "claude-opus-5",
+            "{tag}"
+        );
+        if tag == "cfg-wizard-multi" {
+            assert_literals_kept(&s.on_disk());
+        }
+        assert!(!s.on_disk().contains(REDACTED_API_KEY), "{tag}");
+    }
+}
+
+/* ── P3-M2-T1 checkpoint: a stored key is bound to its endpoint, and to a label no one shares ────── */
+
+/// Save `change` over what `config_read` shows.
+fn try_change(s: &Sandbox, change: impl FnOnce(&mut Value)) -> Result<Value, Value> {
+    let doc = s.read();
+    let candidate = edit(&text_of(&doc), change);
+    s.save(&candidate, &base_of(&doc))
+}
+
+/// `change` is refused as `apiKeyChanged` before the engine is asked, and the file is `initial`.
+fn assert_refused(s: &Sandbox, initial: &str, name: &str, change: impl FnOnce(&mut Value)) {
+    let validations = s.validations();
+    let err = try_change(s, change).expect_err(&format!("{name}: saved"));
+    assert_eq!(kind(&err), "apiKeyChanged", "{name}: {err}");
+    assert_eq!(s.on_disk(), initial, "{name}: the file changed");
+    assert_eq!(s.validations(), validations, "{name}: the engine was asked");
+}
+
+/// `change` saves, with the stored `key` back at `pointer`; then the file is put back to `initial`.
+fn assert_restored(
+    s: &Sandbox,
+    initial: &str,
+    name: &str,
+    pointer: &str,
+    key: &str,
+    change: impl FnOnce(&mut Value),
+) {
+    let out = try_change(s, change).unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(kind(&out), "saved", "{name}: {out}");
+    let written: Value = serde_json::from_str(&s.on_disk()).unwrap();
+    assert_eq!(written.pointer(pointer), Some(&json!(key)), "{name}");
+    assert!(!s.on_disk().contains(REDACTED_API_KEY), "{name}");
+    std::fs::write(&s.config, initial).unwrap();
+}
+
+/// The checkpoint's HIGH (reviewer probe, and P6): restore checked only the LABEL, so a block
+/// replaced under the same label — the wizard's Anthropic → local re-run, which carried the
+/// placeholder into the new `openai-compatible` block — got the stored literal, and the engine sent
+/// it as a bearer token to the new host (over plain `http:` to a LAN address). The owning block's
+/// `api.kind` and the ORIGIN of its `api.baseUrl` (scheme, host, port; absent = the kind's default)
+/// must be the same on disk and in the candidate. The Rust guard alone refuses; no editor is
+/// involved.
+#[test]
+fn a_stored_key_is_bound_to_its_endpoint_kind_and_origin() {
+    let initial = multi_literal();
+    let s = sandbox("cfg-endpoint", Some(&initial));
+    type Case = (&'static str, fn(&mut Value));
+    let refused: [Case; 9] = [
+        (
+            "the wizard repro: item 1 rebuilt as a LAN endpoint, the placeholder carried",
+            |v| {
+                // What `providerValue`'s local path built before the fix: the existing api keys it
+                // did not own (`maxTokens`, `apiKey`) first, then `kind`, `model`, `baseUrl`.
+                v["provider"]["api"] = json!({ "maxTokens": 4096, "apiKey": REDACTED_API_KEY,
+                "kind": "openai-compatible", "model": "llama3", "baseUrl": "http://192.168.1.5:8080/v1" });
+            },
+        ),
+        (
+            "P6: a fallback's block replaced under the same label",
+            |v| {
+                v["fallbacks"][0]["api"] = json!({ "kind": "openai-compatible", "model": "m",
+                "baseUrl": "http://evil.example/v1", "apiKey": REDACTED_API_KEY });
+            },
+        ),
+        (
+            "the same kind, another host (absent → the Anthropic default before)",
+            |v| {
+                v["fallbacks"][0]["api"]["baseUrl"] = json!("https://evil.example");
+            },
+        ),
+        ("item 1's host changed", |v| {
+            v["provider"]["api"]["baseUrl"] = json!("https://gateway.example.com");
+        }),
+        ("a port change", |v| {
+            v["fallbacks"][1]["api"]["baseUrl"] = json!("http://127.0.0.1:11435/v1");
+        }),
+        ("a scheme change", |v| {
+            v["fallbacks"][1]["api"]["baseUrl"] = json!("https://127.0.0.1:11434/v1");
+        }),
+        ("the kind alone changed", |v| {
+            v["fallbacks"][1]["api"]["kind"] = json!("anthropic");
+        }),
+        (
+            "an openai-compatible baseUrl removed (that kind has no default)",
+            |v| {
+                remove_at(v, "/fallbacks/1/api/baseUrl");
+            },
+        ),
+        ("a baseUrl that does not parse", |v| {
+            v["fallbacks"][1]["api"]["baseUrl"] = json!("http://[127.0.0.1:11434/v1");
+        }),
+    ];
+    for (name, change) in refused {
+        assert_refused(&s, &initial, name, change);
+    }
+    // The same origin is the same endpoint: a model change, a path change, the default port or the
+    // kind's default spelled out, and a different letter case all keep the key.
+    let restored: [(&str, &str, &str, fn(&mut Value)); 6] = [
+        (
+            "a model change",
+            "/fallbacks/1/api/apiKey",
+            LOCAL_KEY,
+            |v| {
+                v["fallbacks"][1]["api"]["model"] = json!("qwen");
+            },
+        ),
+        (
+            "a path change on the same origin",
+            "/fallbacks/1/api/apiKey",
+            LOCAL_KEY,
+            |v| {
+                v["fallbacks"][1]["api"]["baseUrl"] = json!("http://127.0.0.1:11434/api");
+            },
+        ),
+        (
+            "the letter case of the scheme and host",
+            "/fallbacks/1/api/apiKey",
+            LOCAL_KEY,
+            |v| {
+                v["fallbacks"][1]["api"]["baseUrl"] = json!("HTTP://127.0.0.1:11434/v1/");
+            },
+        ),
+        (
+            "the default port spelled out",
+            "/provider/api/apiKey",
+            SENTINEL_KEY,
+            |v| {
+                v["provider"]["api"]["baseUrl"] = json!("https://API.anthropic.com:443/v1");
+            },
+        ),
+        (
+            "the Anthropic default spelled out",
+            "/fallbacks/0/api/apiKey",
+            FALLBACK_KEY,
+            |v| {
+                v["fallbacks"][0]["api"]["baseUrl"] = json!("https://api.anthropic.com");
+            },
+        ),
+        (
+            "item 1's baseUrl removed (the kind's default is the same origin)",
+            "/provider/api/apiKey",
+            SENTINEL_KEY,
+            |v| {
+                remove_at(v, "/provider/api/baseUrl");
+            },
+        ),
+    ];
+    for (name, pointer, key, change) in restored {
+        assert_restored(&s, &initial, name, pointer, key, change);
+    }
+}
+
+/// The checkpoint's MED (probes P1, P1b): two entries sharing a label defeat the owner check, so
+/// removing the first put its key into the second. Labels are unique across the combined list
+/// (spec §4); the Rust guard refuses a restore whose owning label occurs more than once, on either
+/// side, counting item 1's resolved label (or its logins'), and every fallback's.
+#[test]
+fn a_label_two_entries_share_never_owns_a_restored_key() {
+    const K0: &str = "sk-ant-DUP-SENTINEL-0000";
+    const K1: &str = "sk-ant-DUP-SENTINEL-1111";
+    // The same kind and endpoint on both, so only the label check can tell them apart.
+    let dup = edit(API, |v| {
+        v["fallbacks"] = json!([
+            { "label": "a", "api": { "kind": "anthropic", "model": "m1", "apiKey": K0 } },
+            { "label": "a", "api": { "kind": "anthropic", "model": "m2", "apiKey": K1 } }
+        ]);
+    });
+    let s = sandbox("cfg-dup-disk", Some(&dup));
+    assert_refused(
+        &s,
+        &dup,
+        "P1: the first of two \"a\" entries removed",
+        |v| {
+            v["fallbacks"].as_array_mut().unwrap().remove(0);
+        },
+    );
+    assert_refused(&s, &dup, "P1b: the two \"a\" entries swapped", |v| {
+        v["fallbacks"].as_array_mut().unwrap().swap(0, 1);
+    });
+    // While the labels collide, the guard cannot tell whose key a placeholder is, so even an
+    // unrelated save is refused: the user renames one by hand, or moves the keys out first.
+    assert_refused(&s, &dup, "an unrelated edit beside colliding labels", |v| {
+        v["lookbackCapDays"] = json!(3);
+    });
+
+    // A collision only in the CANDIDATE is refused too.
+    const KEY: &str = "sk-ant-ONE-SENTINEL-2222";
+    let one = edit(API, |v| {
+        v["fallbacks"] =
+            json!([{ "label": "a", "api": { "kind": "anthropic", "model": "m1", "apiKey": KEY } }]);
+    });
+    let s = sandbox("cfg-dup-cand", Some(&one));
+    assert_refused(&s, &one, "a second \"a\" entry added", |v| {
+        v["fallbacks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "label": "a", "api": { "kind": "anthropic", "model": "m2" } }));
+    });
+    // Item 1's RESOLVED label counts: an API item 1 with no `provider.label` is "default".
+    assert_refused(&s, &one, "a fallback labelled like item 1", |v| {
+        v["fallbacks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "label": "default", "api": { "kind": "anthropic", "model": "m2" } }));
+    });
+    // The control: a distinct label saves, with every key where it was.
+    assert_restored(
+        &s,
+        &one,
+        "a distinct label added",
+        "/fallbacks/0/api/apiKey",
+        KEY,
+        |v| {
+            v["fallbacks"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "label": "b", "api": { "kind": "anthropic", "model": "m2" } }));
+        },
+    );
+
+    // A CLI item 1's logins count as entries of the combined list.
+    let logins = edit(API, |v| {
+        v["provider"] = json!({ "cli": "claude", "argv": ["-p"], "promptVia": "stdin",
+            "accounts": [{ "label": "a" }, { "label": "b", "apiKey": KEY }] });
+    });
+    let s = sandbox("cfg-dup-login", Some(&logins));
+    assert_refused(&s, &logins, "a fallback labelled like a login", |v| {
+        v["fallbacks"] = json!([{ "label": "b", "api": { "kind": "anthropic", "model": "m" } }]);
+    });
+}
+
+/// Checkpoint LOW: redaction covered only STRINGS, so an array, an object, a number or a boolean at
+/// an `apiKey` slot was shown verbatim. Every non-null value there is redacted now (the slots
+/// `holds_literal_api_key` refuses at create), and restore puts back exactly what the file holds
+/// at that pointer — never a value from anywhere else, and never over a `null`.
+#[test]
+fn a_non_string_value_at_a_key_slot_is_never_shown_and_round_trips() {
+    let initial = edit(API, |v| {
+        v["fallbacks"] = json!([{ "label": "backup",
+            "api": { "kind": "anthropic", "model": "m", "apiKey": ["sk-arr-SENTINEL-4444"] } }]);
+        v["x-notes"] = json!({ "apikey": { "nested": "sk-obj-SENTINEL-5555" },
+            "ApiKey": 987654321987_u64, "APIKEY": true, "apiKEY": null });
+    });
+    let slots = [
+        "/fallbacks/0/api/apiKey",
+        "/x-notes/apikey",
+        "/x-notes/ApiKey",
+        "/x-notes/APIKEY",
+    ];
+    let s = sandbox("cfg-nonstring", Some(&initial));
+    let doc = s.read();
+    for secret in [
+        "sk-arr-SENTINEL-4444",
+        "sk-obj-SENTINEL-5555",
+        "987654321987",
+        SENTINEL_KEY,
+    ] {
+        assert!(
+            !doc.to_string().contains(secret),
+            "{secret} reached the webview: {doc}"
+        );
+    }
+    let shown: Value = serde_json::from_str(&text_of(&doc)).unwrap();
+    for pointer in slots {
+        assert_eq!(
+            shown.pointer(pointer),
+            Some(&json!(REDACTED_API_KEY)),
+            "{pointer}"
+        );
+    }
+    assert_eq!(
+        shown.pointer("/x-notes/apiKEY"),
+        Some(&Value::Null),
+        "a null holds nothing"
+    );
+    // Sent back with an unrelated change: each slot gets back exactly what the file held.
+    let out = try_change(&s, |v| v["lookbackCapDays"] = json!(3)).expect("save");
+    assert_eq!(kind(&out), "saved", "{out}");
+    let written: Value = serde_json::from_str(&s.on_disk()).unwrap();
+    let original: Value = serde_json::from_str(&initial).unwrap();
+    for pointer in slots
+        .iter()
+        .copied()
+        .chain(["/x-notes/apiKEY", "/provider/api/apiKey"])
+    {
+        assert_eq!(
+            written.pointer(pointer),
+            original.pointer(pointer),
+            "{pointer}"
+        );
+    }
+    std::fs::write(&s.config, &initial).unwrap();
+    // The placeholder where the file holds `null` is a placeholder with no key behind it.
+    assert_refused(&s, &initial, "the placeholder over a null", |v| {
+        v["x-notes"]["apiKEY"] = json!(REDACTED_API_KEY);
+    });
+}
+
+/* ── P3-M2-T2: refuse only a NEW or CHANGED literal, at every pointer; 0600 for any api block ───── */
+
+/// After restore, a key slot (`apiKey` at any ASCII case, at any depth) holding any non-null value
+/// must hold what the file holds at the SAME pointer. Anything else is the app setting or changing
+/// a literal, refused before the engine is asked, with the config and its `.bak` untouched. The
+/// reviewer's probes: P4, a new `fallbacks[0].api.apiKey: "sk-NEW"` saved; P5, a changed stored
+/// fallback literal overwrote the key, which survived only in `.bak`.
+#[test]
+fn a_new_or_changed_literal_is_refused_at_every_pointer() {
+    // P4, exactly: a fallback whose key is a reference on disk gains a literal beside it.
+    let by_reference = edit(API, |v| {
+        v["fallbacks"] = json!([{ "label": "backup",
+            "api": { "kind": "anthropic", "model": "m", "apiKeyEnv": "BACKUP_KEY" } }]);
+    });
+    let s = sandbox("cfg-new-lit-ref", Some(&by_reference));
+    assert_refused(&s, &by_reference, "P4: a new fallbacks[0] literal", |v| {
+        v["fallbacks"][0]["api"]["apiKey"] = json!("sk-NEW");
+    });
+    assert_eq!(s.backup(), None, "P4: a .bak was written");
+
+    let initial = multi_literal();
+    let s = sandbox("cfg-new-lit", Some(&initial));
+    type Case = (&'static str, fn(&mut Value));
+    let refused: [Case; 11] = [
+        ("P5: a changed stored fallback literal", |v| {
+            v["fallbacks"][0]["api"]["apiKey"] = json!("sk-CHANGED");
+        }),
+        ("a changed item-1 literal", |v| {
+            v["provider"]["api"]["apiKey"] = json!("sk-CHANGED");
+        }),
+        ("a changed literal in a block the engine never reads", |v| {
+            v["x-notes"]["history"][0]["APIKEY"] = json!("sk-CHANGED");
+        }),
+        ("a new fallback carrying a literal", |v| {
+            v["fallbacks"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "label": "third",
+                "api": { "kind": "anthropic", "model": "m", "apiKey": "sk-NEW" } }));
+        }),
+        ("a case variant beside item 1's placeholder", |v| {
+            v["provider"]["api"]["APIKEY"] = json!("sk-NEW");
+        }),
+        ("a case variant beside a fallback's placeholder", |v| {
+            v["fallbacks"][1]["api"]["ApiKey"] = json!("sk-NEW");
+        }),
+        ("a literal at a new pointer outside any entry", |v| {
+            v["x-other"] = json!({ "apikey": "sk-NEW" });
+        }),
+        ("a stored key sent verbatim to ANOTHER pointer", |v| {
+            v["fallbacks"][1]["api"]["apiKey"] = json!(FALLBACK_KEY);
+        }),
+        ("a stored key sent verbatim into a new entry", |v| {
+            v["fallbacks"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "label": "third",
+                "api": { "kind": "anthropic", "model": "m", "apiKey": SENTINEL_KEY } }));
+        }),
+        ("a non-string value over a stored literal", |v| {
+            v["fallbacks"][0]["api"]["apiKey"] = json!(["sk-NEW"]);
+        }),
+        ("an empty string over a stored literal", |v| {
+            v["fallbacks"][0]["api"]["apiKey"] = json!("");
+        }),
+    ];
+    for (name, change) in refused {
+        assert_refused(&s, &initial, name, change);
+        assert_eq!(s.backup(), None, "{name}: a .bak was written");
+    }
+
+    // A placeholder-only round trip is the no-op it always was.
+    let doc = s.read();
+    let out = s.save(&text_of(&doc), &base_of(&doc)).expect("round trip");
+    assert_eq!(kind(&out), "unchanged", "{out}");
+    // An unrelated edit beside every stored literal saves (today's literal-key users), keys kept.
+    let out = try_change(&s, |v| v["lookbackCapDays"] = json!(9)).expect("save");
+    assert_eq!(kind(&out), "saved", "{out}");
+    assert_literals_kept(&s.on_disk());
+    // The other write path, whose candidate holds the literals VERBATIM (the file, parsed, plus one
+    // edit): the Quit offer over the same file saves, and every literal stays where it was.
+    let out = s
+        .call("config_offer_notify_auto", json!({}))
+        .expect("offer");
+    assert_eq!(kind(&out), "saved", "{out}");
+    assert_literals_kept(&s.on_disk());
+    // Removing a literal is allowed, at a fallback as at item 1.
+    let out = try_change(&s, |v| {
+        remove_at(v, "/fallbacks/0/api/apiKey");
+        v["fallbacks"][0]["api"]["apiKeyEnv"] = json!("BACKUP_KEY");
+    })
+    .expect("removal");
+    assert_eq!(kind(&out), "saved", "{out}");
+    assert!(!s.on_disk().contains(FALLBACK_KEY));
+    // Removing by `null` is a removal too: a `null` slot holds nothing (checkpoint P3-M2 LOW,
+    // the surviving mutant that counted `null` as a literal).
+    let out = try_change(&s, |v| v["fallbacks"][1]["api"]["apiKey"] = Value::Null)
+        .expect("removal by null");
+    assert_eq!(kind(&out), "saved", "{out}");
+    let written: Value = serde_json::from_str(&s.on_disk()).unwrap();
+    assert_eq!(
+        written.pointer("/fallbacks/1/api/apiKey"),
+        Some(&Value::Null)
+    );
+    assert!(!s.on_disk().contains(LOCAL_KEY));
+}
+
+/// Checkpoint P3-M2 LOW (reviewer probes): a literal sent back VERBATIM — the stored value itself
+/// rather than the placeholder — skipped the owner and endpoint checks a restored one passes, so an
+/// editor could keep a stored key while pointing its entry at another host, or rename the entry
+/// that owns it. A literal that survives is bound to its owner and endpoint like a restored one.
+/// The unique-label check is NOT applied to it: the Quit offer and calendar saves rebuild the
+/// candidate from the parsed file, and a hand-written config with duplicate labels must keep them
+/// working.
+#[test]
+fn a_verbatim_literal_is_bound_to_its_owner_and_endpoint_like_a_restored_one() {
+    let initial = multi_literal();
+    let s = sandbox("cfg-verbatim", Some(&initial));
+    type Case = (&'static str, fn(&mut Value));
+    let refused: [Case; 4] = [
+        (
+            "the probe: fallbacks[0]'s stored key verbatim, its baseUrl now another host",
+            |v| {
+                v["fallbacks"][0]["api"]["apiKey"] = json!(FALLBACK_KEY);
+                v["fallbacks"][0]["api"]["baseUrl"] = json!("https://evil.example/v1");
+            },
+        ),
+        (
+            "the probe: fallbacks[0] renamed, its stored key verbatim",
+            |v| {
+                v["fallbacks"][0]["label"] = json!("renamed");
+                v["fallbacks"][0]["api"]["apiKey"] = json!(FALLBACK_KEY);
+            },
+        ),
+        (
+            "item 1's stored key verbatim, its kind now openai-compatible",
+            |v| {
+                v["provider"]["api"]["apiKey"] = json!(SENTINEL_KEY);
+                v["provider"]["api"]["kind"] = json!("openai-compatible");
+                v["provider"]["api"]["baseUrl"] = json!("http://192.168.1.5:8080/v1");
+            },
+        ),
+        ("item 1 labelled, its stored key verbatim", |v| {
+            v["provider"]["label"] = json!("work");
+            v["provider"]["api"]["apiKey"] = json!(SENTINEL_KEY);
+        }),
+    ];
+    for (name, change) in refused {
+        assert_refused(&s, &initial, name, change);
+        assert_eq!(s.backup(), None, "{name}: a .bak was written");
+    }
+    // The control: an unrelated edit with EVERY stored literal sent verbatim saves, keys kept.
+    let out = try_change(&s, |v| {
+        for (pointer, key) in LITERALS {
+            set_at(v, pointer, json!(key));
+        }
+        v["lookbackCapDays"] = json!(9);
+    })
+    .expect("an unrelated edit with verbatim literals");
+    assert_eq!(kind(&out), "saved", "{out}");
+    assert_literals_kept(&s.on_disk());
+
+    // A hand-written config whose two literal-key entries share a label: the write paths that
+    // rebuild the candidate from the parsed file keep working over it.
+    const K0: &str = "sk-ant-DUPV-SENTINEL-0000";
+    const K1: &str = "sk-ant-DUPV-SENTINEL-1111";
+    let dup = edit(API, |v| {
+        v["fallbacks"] = json!([
+            { "label": "a", "api": { "kind": "anthropic", "model": "m1", "apiKey": K0 } },
+            { "label": "a", "api": { "kind": "anthropic", "model": "m2", "apiKey": K1 } }
+        ]);
+    });
+    let s = sandbox("cfg-verbatim-dup", Some(&dup));
+    let kept = |s: &Sandbox, name: &str| {
+        let written: Value = serde_json::from_str(&s.on_disk()).unwrap();
+        assert_eq!(
+            written.pointer("/fallbacks/0/api/apiKey"),
+            Some(&json!(K0)),
+            "{name}"
+        );
+        assert_eq!(
+            written.pointer("/fallbacks/1/api/apiKey"),
+            Some(&json!(K1)),
+            "{name}"
+        );
+        assert_eq!(
+            written.pointer("/provider/api/apiKey"),
+            Some(&json!(SENTINEL_KEY)),
+            "{name}"
+        );
+    };
+    let out = s
+        .call("config_offer_notify_auto", json!({}))
+        .expect("the Quit offer over duplicate labels");
+    assert_eq!(kind(&out), "saved", "{out}");
+    kept(&s, "the Quit offer");
+    let block = json!({ "enabled": false, "links": [] });
+    let out = s
+        .call("calendar_config_save", json!({ "text": block.to_string() }))
+        .expect("a calendar save over duplicate labels");
+    assert_eq!(kind(&out), "saved", "{out}");
+    kept(&s, "the calendar save");
+}
+
+/// Owner-only whenever ANY `api` block exists on either side — item 1's or a `fallbacks[i].api` —
+/// or a literal sits anywhere in the file; the `.bak`, which may carry the old key, is never wider.
+/// Before P3-M2-T2 only `/provider/api` counted, so a CLI item 1 with an API fallback holding a
+/// literal kept a 0644 file and a 0644 `.bak`.
+#[test]
+fn an_api_block_only_in_fallbacks_makes_the_file_and_its_bak_owner_only() {
+    let with_fallback = edit(FULL, |v| {
+        v["fallbacks"] = json!([{ "label": "api-backup",
+            "api": { "kind": "anthropic", "model": "m", "apiKey": FALLBACK_KEY } }]);
+    });
+    let world_readable = |s: &Sandbox| {
+        std::fs::set_permissions(
+            &s.config,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap()
+    };
+    type Case = (&'static str, String, fn(&mut Value));
+    let cases: [Case; 5] = [
+        (
+            "both sides: an unrelated edit beside the fallback's literal",
+            with_fallback.clone(),
+            |v| v["lookbackCapDays"] = json!(5),
+        ),
+        (
+            "the file side only: the API fallback removed, its literal now only in .bak",
+            with_fallback.clone(),
+            |v| {
+                v.as_object_mut().unwrap().shift_remove("fallbacks");
+            },
+        ),
+        (
+            // Checkpoint P3-M2 LOW: no literal anywhere, so only the FILE's api block can make it
+            // owner-only (the surviving mutant dropped `holds_api_block(&on_disk)`).
+            "the file side only, by reference: the API fallback removed, no literal anywhere",
+            edit(FULL, |v| {
+                v["fallbacks"] = json!([{ "label": "api-backup",
+                    "api": { "kind": "anthropic", "model": "m", "apiKeyEnv": "BACKUP_KEY" } }]);
+            }),
+            |v| {
+                v.as_object_mut().unwrap().shift_remove("fallbacks");
+            },
+        ),
+        (
+            "the candidate side only: a CLI config gains an API fallback (by reference)",
+            FULL.to_string(),
+            |v| {
+                v["fallbacks"] = json!([{ "label": "api-backup",
+                    "api": { "kind": "anthropic", "model": "m", "apiKeyEnv": "BACKUP_KEY" } }]);
+            },
+        ),
+        (
+            "no api block, a literal in a block the engine never reads",
+            edit(FULL, |v| v["x-notes"] = json!({ "apiKey": STRAY_KEY })),
+            |v| v["lookbackCapDays"] = json!(5),
+        ),
+    ];
+    for (i, (name, initial, change)) in cases.into_iter().enumerate() {
+        let s = sandbox(&format!("cfg-mode-fb-{i}"), Some(&initial));
+        world_readable(&s);
+        let out = try_change(&s, change).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(kind(&out), "saved", "{name}: {out}");
+        assert_eq!(s.backup().as_deref(), Some(initial.as_str()), "{name}");
+        assert_eq!(mode_of(&s.config), 0o600, "{name}: the config");
+        assert_eq!(mode_of(&bak_of(&s.config)), 0o600, "{name}: the .bak");
+    }
+}
+
+/// Checkpoint LOW (surviving mutants A, C, K): the label rule is the engine's `nonEmpty` — empty
+/// after JavaScript's `trim()`, which strips Unicode white space but NOT U+0085. A fallback whose
+/// label is only spaces has no label (the engine drops it), so it owns no key on either side; one
+/// labelled U+0085 is a real label and keeps its key.
+#[test]
+fn the_label_rule_is_javascripts_trim() {
+    const KEY: &str = "sk-ant-LABEL-SENTINEL-6666";
+    let with_label = |label: &str| {
+        edit(API, |v| {
+            v["fallbacks"] = json!([{ "label": label, "api": { "kind": "anthropic", "model": "m", "apiKey": KEY } }]);
+        })
+    };
+    let blank = with_label("  ");
+    let s = sandbox("cfg-label-blank", Some(&blank));
+    assert_refused(&s, &blank, "a label of spaces on both sides", |v| {
+        v["fallbacks"][0]["api"]["model"] = json!("m2");
+    });
+    let nel = with_label("\u{85}");
+    let s = sandbox("cfg-label-nel", Some(&nel));
+    assert_restored(
+        &s,
+        &nel,
+        "a label of U+0085",
+        "/fallbacks/0/api/apiKey",
+        KEY,
+        |v| {
+            v["fallbacks"][0]["api"]["model"] = json!("m2");
+        },
+    );
+}
+
+/// Checkpoint LOW (surviving mutant H): a CLI item 1 is labelled by its FIRST LOGIN, as the engine
+/// labels it — `provider.label` is ignored beside `accounts`. So relabelling `accounts[0]` changes
+/// the owner of a stray key in `provider`, even though `provider.label` stayed.
+#[test]
+fn a_cli_item_1_is_labelled_by_its_first_login() {
+    const KEY: &str = "sk-stray-CLI-SENTINEL-7777";
+    let initial = edit(API, |v| {
+        v["provider"] = json!({ "cli": "claude", "argv": ["-p"], "promptVia": "stdin",
+            "label": "P", "apiKey": KEY, "accounts": [{ "label": "a" }] });
+    });
+    let s = sandbox("cfg-cli-label", Some(&initial));
+    assert_refused(&s, &initial, "the first login relabelled", |v| {
+        v["provider"]["accounts"][0]["label"] = json!("b");
+    });
+    assert_restored(
+        &s,
+        &initial,
+        "an unrelated edit",
+        "/provider/apiKey",
+        KEY,
+        |v| {
+            v["lookbackCapDays"] = json!(3);
+        },
+    );
 }
 
 /* ── where, and from whom ─────────────────────────────────────────────────────────────────────── */
@@ -1766,6 +2769,13 @@ fn config_create_refuses_a_literal_key_at_any_spelling_or_position() {
         json!({ "provider": { "accounts": [
             { "name": "a", "apiKey": "sk-test-obvious-placeholder" }
         ] } }),
+        // P3-M2-T2: a `fallbacks` entry's block, at the engine's spelling and at another case
+        json!({ "provider": { "cli": "claude" }, "fallbacks": [{ "label": "b", "api": {
+            "kind": "anthropic", "model": "m", "apiKey": "sk-test-obvious-placeholder"
+        } }] }),
+        json!({ "provider": { "cli": "claude" }, "fallbacks": [{ "label": "b", "api": {
+            "kind": "anthropic", "model": "m", "APIKEY": "sk-test-obvious-placeholder"
+        } }] }),
     ] {
         let err = s
             .create(&candidate.to_string())
@@ -1862,6 +2872,30 @@ fn an_api_create_is_owner_only_like_init_config() {
     );
 }
 
+/// P3-M2-T2: an `api` block only in `fallbacks` makes a created file owner-only too, as one in item 1
+/// does — the same predicate the save path uses.
+#[test]
+fn a_create_with_an_api_block_only_in_fallbacks_is_owner_only() {
+    let s = sandbox("create-fb-mode", None);
+    let candidate = edit(&create_candidate(), |v| {
+        v["fallbacks"] = json!([{ "label": "backup", "api": {
+            "kind": "anthropic", "model": "m", "apiKeyEnv": "BACKUP_KEY"
+        } }]);
+    });
+    let out = s.create(&candidate).expect("create");
+    assert_eq!(kind(&out), "created", "{out}");
+    assert_eq!(
+        mode_of(&s.config),
+        0o600,
+        "an api fallback's config is world-readable"
+    );
+    // And with no api block anywhere, a create keeps 0644, as `initConfig` does.
+    let s = sandbox("create-cli-mode", None);
+    let out = s.create(&create_candidate()).expect("create");
+    assert_eq!(kind(&out), "created", "{out}");
+    assert_eq!(mode_of(&s.config), 0o644);
+}
+
 /// The link-less fallback (FAT32 and friends): still EXCLUSIVE, and the parent directory is
 /// created — a first run has no `~/.config/daily-briefing/` yet.
 #[test]
@@ -1911,4 +2945,1007 @@ fn a_config_that_appears_at_the_link_itself_is_never_clobbered() {
         "the racing config's bytes are untouched"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/* ── final harden r2: a calendar link address is refused before any candidate file exists ─────── */
+
+/// The calendar blocks that hold a link address — every one refused before anything is staged, by
+/// the save, the create and (P3-M1-T2) the candidate check alike. `SENTINEL` marks the secret.
+fn calendar_secret_blocks() -> Vec<Value> {
+    const URL: &str = "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics";
+    vec![
+        json!({ "enabled": true, "links": [{ "id": "work", "url": URL }] }),
+        json!({ "enabled": true, "links": [{ "id": "work", "urlCommand": ["echo", URL] }] }),
+        json!({ "enabled": true, "macos": { "deep": [{ "URL": "x" }] } }),
+        json!({ "links": [{ "id": "w", "urlCommand": ["printf", "%s", "webcal:\\/\\/h.example\\/x"] }] }),
+        // Final harden r3: an address in a link's name, owner or confirmedOwner, or in `emails`, in any
+        // spelling (backslash forms included) — refused BEFORE staging too, not by the engine after.
+        json!({ "links": [{ "id": "w", "name": URL }] }),
+        json!({ "links": [{ "id": "w", "owner": "https:\\\\calendar.example.invalid\\private-SENTINEL-c4l-0000" }] }),
+        json!({ "links": [{ "id": "w", "confirmedOwner": URL }] }),
+        json!({ "emails": ["me@example.com", URL] }),
+        json!({ "links": [{ "id": "w", "urlCommand": ["echo", "https:\\\\calendar.example.invalid\\private-SENTINEL-c4l-0000"] }] }),
+    ]
+}
+
+/// The generic save AND the first-config create used to stage `config-candidates/*.json` and let
+/// the engine refuse a calendar `url` (or a URL-shaped `urlCommand` argument) — so the secret was
+/// on disk, in the candidate, before the refusal. Now both answer the engine's own error text
+/// before anything is staged: no validation, no candidate directory, nothing written.
+#[test]
+fn a_calendar_link_address_is_refused_before_any_candidate_is_staged() {
+    use daily_briefing_gui_lib::config_save::CALENDAR_SECRET_ERROR;
+    let blocks = calendar_secret_blocks();
+    let s = sandbox("cfg-cal-url", Some(FULL));
+    let doc = s.read();
+    for block in &blocks {
+        let candidate = edit(&text_of(&doc), |v| v["calendar"] = block.clone());
+        let out = s
+            .save(&candidate, &base_of(&doc))
+            .expect("the save answers");
+        assert_eq!(kind(&out), "invalid", "{block}");
+        assert_eq!(
+            out["errors"],
+            json!([{ "field": "calendar", "message": CALENDAR_SECRET_ERROR }])
+        );
+        assert!(
+            !out.to_string().contains("SENTINEL"),
+            "the answer echoed the address"
+        );
+        assert_eq!(s.on_disk(), FULL, "written");
+    }
+    assert_eq!(
+        s.validations(),
+        0,
+        "a candidate holding a link address reached the engine"
+    );
+    assert!(!s.candidates.exists(), "a candidate file was staged");
+
+    let c = sandbox("cfg-cal-create", None);
+    for block in &blocks {
+        let mut candidate: Value = serde_json::from_str(&create_candidate()).expect("JSON");
+        candidate["calendar"] = block.clone();
+        let out = c
+            .create(&candidate.to_string())
+            .expect("the create answers");
+        assert_eq!(kind(&out), "invalid", "{block}");
+        assert_eq!(out["errors"][0]["message"], CALENDAR_SECRET_ERROR);
+    }
+    assert_eq!(
+        c.validations(),
+        0,
+        "a create holding a link address reached the engine"
+    );
+    assert!(!c.candidates.exists(), "a candidate file was staged");
+    assert!(!c.config.exists(), "nothing was written");
+
+    // A 1Password reference is a pointer, not the address: it still goes to the engine.
+    let candidate = edit(
+        &text_of(&doc),
+        |v| {
+            v["calendar"] =
+                json!({ "links": [{ "id": "w", "urlCommand": ["op", "read", "op://v/cal/url"] }] })
+        },
+    );
+    s.save(&candidate, &base_of(&doc))
+        .expect("the save answers");
+    assert_eq!(
+        s.validations(),
+        1,
+        "an op:// reference must reach the engine's validation"
+    );
+    // Final harden r3: nor is a password-store entry that merely ends in `.ics`. (Re-read: the op://
+    // save above may have written, and a stale base is a conflict.)
+    let doc = s.read();
+    let candidate = edit(
+        &text_of(&doc),
+        |v| v["calendar"] = json!({ "links": [{ "id": "w", "urlCommand": ["pass", "show", "calendar/work.ics"] }] }),
+    );
+    s.save(&candidate, &base_of(&doc))
+        .expect("the save answers");
+    assert_eq!(
+        s.validations(),
+        2,
+        "a pass entry naming an .ics file must reach the engine's validation"
+    );
+}
+
+/* ── P3-M1-T2: candidate staging for Test and validate (`provider_candidate_check`) ──────────────── */
+
+/// The check path's fake engine: `config validate` and `provider test` over the staged candidate,
+/// everything else (`status --json`, and the validate's verdict itself) by [`files_sidecar`].
+///
+/// - Each staged path is classified by its NAME — `provider-check-…` (the check) or `candidate-…`
+///   (the save) — so a test can HOLD one kind of call while the other runs: with
+///   `<record>/hold-<kind>-<config|provider>` present, the fake writes the path it was handed to
+///   `held-<kind>-<op>` and waits (≤ 20 s) for `release-<kind>-<op>`, then appends `present` or
+///   `gone` to `survived-<kind>-<op>.txt` — whether the staged file it was handed still existed when
+///   its turn came, which is the "never delete each other's candidate" question.
+/// - `provider test` records its argv (`test-argv-<n>.txt`), a copy of the candidate
+///   (`tested-<n>.json`) and `<file mode> <dir mode>` (`tested-modes.txt`), then answers by marker:
+///   `__test_refused__` a `config` refusal (exit 2, a JSON line), `__test_garbage__` exit 0 with
+///   no JSON, `__test_crash__` exit 1 with only stderr, `__test_hang__` never answers; otherwise a pass.
+fn check_sidecar(scratch: &ScratchDir, state: &Path, config: &Path, record: &Path) -> PathBuf {
+    let files = files_sidecar(&scratch.path, "engine-files.sh", state, config, record);
+    let files = files.display();
+    let rec = record.display();
+    let body = format!(
+        r#"case "$1:$2" in
+  config:validate) f="$5" ;;
+  provider:test) f="$4" ;;
+  *) exec "{files}" "$@" ;;
+esac
+case "$(basename "$f")" in
+  provider-check-*) p=provider-check ;;
+  candidate-*) p=candidate ;;
+  *) p=other ;;
+esac
+op="$1"
+if [ -e "{rec}/hold-$p-$op" ]; then
+  printf '%s\n' "$f" > "{rec}/held-$p-$op.tmp" && mv "{rec}/held-$p-$op.tmp" "{rec}/held-$p-$op"
+  i=0
+  while [ ! -e "{rec}/release-$p-$op" ] && [ "$i" -lt 2000 ]; do sleep 0.01; i=$((i+1)); done
+  if [ -e "$f" ]; then printf 'present\n'; else printf 'gone\n'; fi >> "{rec}/survived-$p-$op.txt"
+fi
+if [ "$op" = config ]; then exec "{files}" "$@"; fi
+n="$(ls "{rec}" | grep -c '^tested-[0-9]')"
+printf '%s\n' "$@" > "{rec}/test-argv-$n.txt"
+cp "$f" "{rec}/tested-$n.json"
+d="$(dirname "$f")"
+fm="$(stat -c %a "$f" 2>/dev/null)" || fm="$(stat -f %Lp "$f")"
+dm="$(stat -c %a "$d" 2>/dev/null)" || dm="$(stat -f %Lp "$d")"
+printf '%s %s\n' "$fm" "$dm" >> "{rec}/tested-modes.txt"
+if grep -q '__test_refused__' "$f"; then
+  printf '%s' '{{"schemaVersion":1,"ok":false,"code":"config","error":"test: the candidate is not valid"}}'
+  exit 2
+elif grep -q '__test_garbage__' "$f"; then
+  printf '%s' 'this is not JSON'
+elif grep -q '__test_crash__' "$f"; then
+  printf 'boom\n' >&2
+  exit 1
+elif grep -q '__test_hang__' "$f"; then
+  sleep 30
+else
+  printf '%s' '{{"schemaVersion":1,"ok":true,"passed":true,"at":"2026-10-18T00:00:00.000Z","recorded":true}}'
+fi
+exit 0"#
+    );
+    common::fake_sidecar(&scratch.path, "engine.sh", &body)
+}
+
+/// A [`sandbox`] over [`check_sidecar`]; `cap` bounds every bounded operation (the Test's timeout).
+fn check_box(tag: &str, initial: Option<&str>, cap: Option<std::time::Duration>) -> Sandbox {
+    check_box_with(tag, initial, cap, false)
+}
+
+/// [`check_box`], with the settings-removed latch already set when `latched`.
+fn check_box_with(
+    tag: &str,
+    initial: Option<&str>,
+    cap: Option<std::time::Duration>,
+    latched: bool,
+) -> Sandbox {
+    let scratch = ScratchDir::new(tag);
+    let state = scratch.join("state");
+    let xdg = scratch.join("xdg").join("daily-briefing");
+    let record = scratch.join("record");
+    for d in [&state, &xdg, &record] {
+        std::fs::create_dir_all(d).expect("sandbox dir");
+    }
+    let config = xdg.join("config.json");
+    if let Some(text) = initial {
+        std::fs::write(&config, text).expect("initial config");
+    }
+    let candidates = scratch.join("app-data").join("config-candidates");
+    let program = check_sidecar(&scratch, &state, &config, &record);
+    let client = EngineClient::with_program(program);
+    let client = match cap {
+        Some(cap) => client.with_timeout_cap(cap),
+        None => client,
+    };
+    let saver = ConfigSaver::with_candidate_dir(&candidates);
+    let saver = if latched {
+        saver.with_settings_removed()
+    } else {
+        saver
+    };
+    let (app, webview) = app_with(client, saver);
+    Sandbox {
+        config,
+        candidates,
+        record,
+        app,
+        webview,
+        scratch,
+    }
+}
+
+/// `{ test: { index, testTimeoutMs } }`, the Test mode's wire shape.
+fn test_mode(index: u64, test_timeout_ms: u64) -> Value {
+    json!({ "test": { "index": index, "testTimeoutMs": test_timeout_ms } })
+}
+
+/// The in-flight guard is process-global and `cargo test` runs this binary's tests on parallel
+/// threads: every test that runs a Test (MUTATING) takes this turn first (`common::serialise`).
+fn mutating_turn() -> common::Serial {
+    tauri::async_runtime::block_on(common::serialise())
+}
+
+impl Sandbox {
+    fn check(&self, text: &str, mode: Value) -> Result<Value, Value> {
+        check_on(&self.webview, text, mode)
+    }
+
+    /// The check path's staged files still in the candidate directory.
+    fn checks_left(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.candidates)
+            .map(|d| {
+                d.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("provider-check-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn record_file(&self, name: &str) -> String {
+        std::fs::read_to_string(self.record.join(name)).unwrap_or_default()
+    }
+
+    /// How many times the engine was asked to `provider test`.
+    fn tests_run(&self) -> usize {
+        std::fs::read_dir(&self.record)
+            .expect("record dir")
+            .filter(|e| {
+                let n = e.as_ref().expect("entry").file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("tested-") && n.ends_with(".json")
+            })
+            .count()
+    }
+
+    fn hold(&self, what: &str) {
+        std::fs::write(self.record.join(format!("hold-{what}")), "").expect("hold");
+    }
+
+    fn release(&self, what: &str) {
+        std::fs::write(self.record.join(format!("release-{what}")), "").expect("release");
+    }
+
+    /// Wait (≤ 20 s) until the fake is HOLDING a `what` call; the staged path it was handed.
+    fn held(&self, what: &str) -> PathBuf {
+        let marker = self.record.join(format!("held-{what}"));
+        let started = std::time::Instant::now();
+        while !marker.exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the fake never started holding {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        PathBuf::from(std::fs::read_to_string(&marker).expect("held").trim_end())
+    }
+
+    /// What the fake found when its held `what` call resumed: `present` or `gone`, one per call.
+    fn survived(&self, what: &str) -> String {
+        self.record_file(&format!("survived-{what}.txt"))
+    }
+
+    /// An engine argv was recorded for anything at all (the check never ran `status --json` either).
+    fn engine_ran(&self) -> bool {
+        self.record.join("argv.txt").exists()
+            || self.record.join("validated-paths.txt").exists()
+            || self.tests_run() > 0
+    }
+}
+
+fn check_on(w: &WebviewWindow<MockRuntime>, text: &str, mode: Value) -> Result<Value, Value> {
+    call(
+        w,
+        "provider_candidate_check",
+        json!({ "text": text, "mode": mode }),
+    )
+}
+
+/// Is `path` a check-path staged file in `candidates`: `provider-check-<pid>-<seq>.json`?
+fn is_check_file(path: &Path, candidates: &Path) -> bool {
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    let pid = std::process::id().to_string();
+    path.parent() == Some(candidates)
+        && name
+            .strip_prefix(&format!("provider-check-{pid}-"))
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Validate mode answers the engine's `config validate --json` report VERBATIM, over a private
+/// staged copy under the check path's own prefix — and writes nothing to the real config.
+#[test]
+fn a_validate_check_returns_the_engines_report_and_writes_nothing() {
+    let s = check_box("chk-validate", Some(FULL), None);
+    let candidate = edit(FULL, |v| v["lookbackCapDays"] = json!(5));
+    let out = s
+        .check(&candidate, json!("validate"))
+        .expect("the check answers");
+    assert_eq!(kind(&out), "validated", "{out}");
+    assert_eq!(
+        out["report"],
+        json!({ "schemaVersion": 1, "valid": true, "errors": [], "warnings": [], "normalized": {} }),
+        "the report is the engine's, verbatim"
+    );
+    assert_eq!(s.validations(), 1);
+    let staged = PathBuf::from(s.record_file("validated-paths.txt").trim_end());
+    assert!(
+        is_check_file(&staged, &s.candidates),
+        "staged as {} — not provider-check-<pid>-<seq>.json in the candidate dir",
+        staged.display()
+    );
+    assert_eq!(
+        s.validated(0),
+        candidate,
+        "the engine validated other bytes"
+    );
+    assert_eq!(s.validated_modes(), vec!["600 700".to_string()]);
+    assert!(s.checks_left().is_empty(), "{:?}", s.checks_left());
+    assert_eq!(s.on_disk(), FULL, "the check wrote the real config");
+    assert!(s.backup().is_none(), "the check made a .bak");
+    assert!(s.leftovers().is_empty(), "{:?}", s.leftovers());
+    assert_eq!(
+        s.record_file("argv.txt"),
+        format!("config\nvalidate\n--json\n--file\n{}\n", staged.display()),
+        "the check asked the engine for something besides one `config validate` (no `status`: \
+         it never locates or reads the real config)"
+    );
+
+    // An INVALID verdict is still the engine's report, not an error.
+    let invalid = edit(FULL, |v| v["x-test"] = json!("__invalid__"));
+    let out = s
+        .check(&invalid, json!("validate"))
+        .expect("the check answers");
+    assert_eq!(kind(&out), "validated", "{out}");
+    assert_eq!(out["report"]["valid"], false);
+    assert_eq!(out["report"]["errors"][0]["field"], "lookbackCapDays");
+
+    // An exit-0 reply that is not JSON is an engine error in words, and the file is still removed.
+    let garbage = edit(FULL, |v| v["x-test"] = json!("__garbage__"));
+    let err = s.check(&garbage, json!("validate")).expect_err("garbage");
+    assert_eq!(kind(&err), "engine", "{err}");
+    assert!(
+        err["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "{err}"
+    );
+    assert!(s.checks_left().is_empty(), "{:?}", s.checks_left());
+    assert_eq!(s.on_disk(), FULL);
+}
+
+/// Test mode runs `provider test --file <the staged copy> --index <n> --json` and answers the
+/// engine's JSON line verbatim, with the bound the app applied.
+#[test]
+fn a_test_check_passes_the_staged_path_and_index() {
+    let _turn = mutating_turn();
+    let s = check_box("chk-test", Some(FULL), None);
+    let candidate = edit(FULL, |v| v["lookbackCapDays"] = json!(3));
+    let out = s
+        .check(&candidate, test_mode(2, 80_000))
+        .expect("the check answers");
+    assert_eq!(kind(&out), "tested", "{out}");
+    assert_eq!(
+        out["answer"],
+        json!({ "schemaVersion": 1, "ok": true, "passed": true, "at": "2026-10-18T00:00:00.000Z", "recorded": true })
+    );
+    assert_eq!(out["boundMs"], 80_000);
+    assert_eq!(s.tests_run(), 1);
+    let argv: Vec<String> = s
+        .record_file("test-argv-0.txt")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(argv.len(), 7, "{argv:?}");
+    assert_eq!(&argv[..3], ["provider", "test", "--file"]);
+    assert!(
+        is_check_file(Path::new(&argv[3]), &s.candidates),
+        "staged as {} — not provider-check-<pid>-<seq>.json in the candidate dir",
+        argv[3]
+    );
+    assert_eq!(&argv[4..], ["--index", "2", "--json"]);
+    assert_eq!(
+        s.record_file("tested-0.json"),
+        candidate,
+        "the engine probed other bytes"
+    );
+    assert_eq!(s.record_file("tested-modes.txt"), "600 700\n");
+    assert!(s.checks_left().is_empty(), "{:?}", s.checks_left());
+    assert_eq!(s.on_disk(), FULL, "the check wrote the real config");
+    assert!(s.backup().is_none());
+    assert_eq!(s.validations(), 0, "a Test validated through the save path");
+}
+
+/// The staged file is 0600 in a 0700 directory, and gone after EVERY outcome: a pass, an engine
+/// refusal (still the engine's JSON line), a crash, an unreadable reply, and a timeout.
+#[test]
+fn the_staged_file_is_private_and_removed_on_every_outcome() {
+    let _turn = mutating_turn();
+    let s = check_box(
+        "chk-outcomes",
+        Some(FULL),
+        // Long enough for every answering case on a loaded machine; the hang case sleeps 30 s.
+        Some(std::time::Duration::from_secs(6)),
+    );
+    let with = |marker: &str| edit(FULL, |v| v["x-test"] = json!(marker));
+
+    let out = s
+        .check(&with("pass"), test_mode(0, 80_000))
+        .expect("a pass");
+    assert_eq!(kind(&out), "tested", "{out}");
+    assert!(
+        s.checks_left().is_empty(),
+        "after a pass: {:?}",
+        s.checks_left()
+    );
+
+    let out = s
+        .check(&with("__test_refused__"), test_mode(0, 80_000))
+        .expect("a refusal is the engine's answer");
+    assert_eq!(kind(&out), "tested", "{out}");
+    assert_eq!(out["answer"]["ok"], false);
+    assert_eq!(out["answer"]["code"], "config");
+    assert!(
+        s.checks_left().is_empty(),
+        "after a refusal: {:?}",
+        s.checks_left()
+    );
+
+    let err = s
+        .check(&with("__test_crash__"), test_mode(0, 80_000))
+        .expect_err("a crash");
+    assert_eq!(kind(&err), "engine", "{err}");
+    assert!(
+        s.checks_left().is_empty(),
+        "after a crash: {:?}",
+        s.checks_left()
+    );
+
+    let err = s
+        .check(&with("__test_garbage__"), test_mode(0, 80_000))
+        .expect_err("an unreadable reply");
+    assert_eq!(kind(&err), "engine", "{err}");
+    assert!(
+        s.checks_left().is_empty(),
+        "after an unreadable reply: {:?}",
+        s.checks_left()
+    );
+
+    let err = s
+        .check(&with("__test_hang__"), test_mode(0, 80_000))
+        .expect_err("a timeout");
+    assert_eq!(kind(&err), "timeout", "{err}");
+    assert_eq!(err["operation"], "provider-test", "{err}");
+    assert!(
+        s.checks_left().is_empty(),
+        "after a timeout: {:?}",
+        s.checks_left()
+    );
+
+    assert_eq!(s.tests_run(), 5, "every case reached the engine");
+    assert_eq!(
+        s.record_file("tested-modes.txt"),
+        "600 700\n".repeat(5),
+        "a staged candidate was not 0600 in a 0700 directory"
+    );
+    assert_eq!(s.on_disk(), FULL);
+}
+
+/// An oversize candidate is refused exactly as the save path refuses it — before it is parsed,
+/// staged or sent anywhere.
+#[test]
+fn an_oversize_candidate_is_refused_as_the_save_refuses_it() {
+    let s = check_box("chk-oversize", Some(FULL), None);
+    let huge = format!(
+        "{{\"x\":\"{}\"}}",
+        "a".repeat(usize::try_from(MAX_CONFIG_BYTES).unwrap())
+    );
+    let saved = s
+        .save(&huge, &base_of(&s.read()))
+        .expect_err("the save refuses it");
+    let _ = std::fs::remove_file(s.record.join("argv.txt")); // the `config_read` above
+    for mode in [json!("validate"), test_mode(0, 80_000)] {
+        let err = s
+            .check(&huge, mode.clone())
+            .expect_err("the check refuses it");
+        assert_eq!(kind(&err), "tooLarge", "{mode}: {err}");
+        assert_eq!(err, saved, "{mode}: not the save path's refusal");
+    }
+    assert!(!s.candidates.exists(), "an oversize candidate was staged");
+    assert!(!s.engine_ran(), "an oversize candidate reached the engine");
+}
+
+/// A calendar link address is refused in BOTH modes before anything is staged — the same answer
+/// the save gives, so the secret never reaches `config-candidates/`.
+#[test]
+fn a_calendar_link_address_is_refused_by_the_check_before_staging() {
+    use daily_briefing_gui_lib::config_save::CALENDAR_SECRET_ERROR;
+    let s = check_box("chk-cal", Some(FULL), None);
+    for block in calendar_secret_blocks() {
+        let candidate = edit(FULL, |v| v["calendar"] = block.clone());
+        for mode in [json!("validate"), test_mode(0, 80_000)] {
+            let out = s
+                .check(&candidate, mode.clone())
+                .expect("the check answers");
+            assert_eq!(kind(&out), "invalid", "{mode} {block}");
+            assert_eq!(
+                out["errors"],
+                json!([{ "field": "calendar", "message": CALENDAR_SECRET_ERROR }])
+            );
+            assert_eq!(out["warnings"], json!([]));
+            assert!(
+                !out.to_string().contains("SENTINEL"),
+                "the answer echoed the address"
+            );
+        }
+    }
+    assert!(
+        !s.candidates.exists(),
+        "a candidate holding a link address was staged"
+    );
+    assert!(
+        !s.engine_ran(),
+        "a candidate holding a link address reached the engine"
+    );
+}
+
+/// PR 3 final r1 (reviewer A3): a candidate holding a LITERAL key — any non-`null` value at an
+/// `apiKey` slot of any ASCII case, at any depth, other than exactly [`REDACTED_API_KEY`] — is
+/// refused in BOTH modes before anything is staged. The webview never holds a key, so the only
+/// literal it can legitimately send is the placeholder; anything else was typed into the Raw JSON
+/// tab, and staging it would write a secret into `config-candidates/` that the save path refuses
+/// anyway (`refuse_new_or_changed_literals`). The answer is the calendar refusal's shape
+/// (`invalid`, one fixed note, never the value), which every caller of the check already words.
+/// The placeholder itself, and a `null` slot, still stage and check exactly as before.
+#[test]
+fn a_literal_key_is_refused_by_the_check_before_staging_and_the_placeholder_still_checks() {
+    use daily_briefing_gui_lib::config_save::CHECK_LITERAL_KEY_ERROR;
+    const SECRET: &str = "sk-ant-api03-SENTINEL-literal-0000";
+    let api = |key: Value| json!({ "kind": "anthropic", "model": "m", "apiKey": key });
+    let fallback = |key: Value| json!([{ "label": "spare", "api": api(key) }]);
+    let literal_cases: Vec<(&str, String)> = vec![
+        (
+            "item 1",
+            edit(FULL, |v| v["provider"]["api"] = api(json!(SECRET))),
+        ),
+        (
+            "a fallback",
+            edit(FULL, |v| v["fallbacks"] = fallback(json!(SECRET))),
+        ),
+        (
+            "a case variant",
+            edit(
+                FULL,
+                |v| {
+                    v["provider"]["api"] =
+                        json!({ "kind": "anthropic", "model": "m", "ApiKey": SECRET })
+                },
+            ),
+        ),
+        (
+            "anywhere else",
+            edit(FULL, |v| {
+                v["x-notes"] = json!({ "deep": [{ "apiKEY": SECRET }] })
+            }),
+        ),
+        (
+            "a number",
+            edit(FULL, |v| v["fallbacks"] = fallback(json!(12_345_678))),
+        ),
+        (
+            "an array",
+            edit(FULL, |v| v["fallbacks"] = fallback(json!([SECRET]))),
+        ),
+        (
+            "an object",
+            edit(FULL, |v| v["fallbacks"] = fallback(json!({ "k": SECRET }))),
+        ),
+        (
+            "empty",
+            edit(FULL, |v| v["fallbacks"] = fallback(json!(""))),
+        ),
+        (
+            "the placeholder, padded",
+            edit(FULL, |v| {
+                v["fallbacks"] = fallback(json!(format!(" {REDACTED_API_KEY}")))
+            }),
+        ),
+        (
+            "a placeholder beside a literal",
+            edit(FULL, |v| {
+                v["provider"]["api"] = api(json!(REDACTED_API_KEY));
+                v["fallbacks"] = fallback(json!(SECRET));
+            }),
+        ),
+    ];
+    let s = check_box("chk-literal", Some(FULL), None);
+    for (what, candidate) in &literal_cases {
+        for mode in [json!("validate"), test_mode(0, 80_000)] {
+            let out = s.check(candidate, mode.clone()).expect("the check answers");
+            assert_eq!(kind(&out), "invalid", "{what} {mode}: {out}");
+            assert_eq!(
+                out["errors"],
+                json!([{ "field": "apiKey", "message": CHECK_LITERAL_KEY_ERROR }]),
+                "{what} {mode}"
+            );
+            assert_eq!(out["warnings"], json!([]));
+            assert!(
+                !out.to_string().contains("SENTINEL"),
+                "{what}: the answer echoed the key"
+            );
+        }
+    }
+    assert!(
+        !s.candidates.exists(),
+        "a candidate holding a literal key was staged"
+    );
+    assert!(
+        !s.engine_ran(),
+        "a candidate holding a literal key reached the engine"
+    );
+
+    // The placeholder at a key slot, and a `null` slot, are checked exactly as today: staged as
+    // they are (the check never restores — that is the save path's step) and handed to the engine.
+    let _turn = mutating_turn();
+    let placeholder = edit(FULL, |v| {
+        v["provider"]["api"] = api(json!(REDACTED_API_KEY));
+        v["fallbacks"] = fallback(Value::Null);
+    });
+    let out = s
+        .check(&placeholder, json!("validate"))
+        .expect("the check answers");
+    assert_eq!(kind(&out), "validated", "{out}");
+    assert_eq!(
+        s.validated(0),
+        placeholder,
+        "the engine validated other bytes"
+    );
+    let out = s
+        .check(&placeholder, test_mode(0, 80_000))
+        .expect("the check answers");
+    assert_eq!(kind(&out), "tested", "{out}");
+    assert_eq!(
+        s.record_file("tested-0.json"),
+        placeholder,
+        "the engine probed other bytes"
+    );
+    assert!(s.checks_left().is_empty(), "{:?}", s.checks_left());
+    assert_eq!(s.on_disk(), FULL, "the check wrote the real config");
+}
+
+/// The mode is a closed shape: an index the engine would refuse, a misspelt mode, an extra field
+/// or a missing argument are refused before anything is staged.
+#[test]
+fn a_malformed_mode_is_refused_before_staging() {
+    let s = check_box("chk-mode", Some(FULL), None);
+    let err = s
+        .check(FULL, test_mode(1_000_000, 80_000))
+        .expect_err("an index past the engine's six digits");
+    assert_eq!(kind(&err), "invalidInput", "{err}");
+    for mode in [
+        json!("tset"),
+        json!({ "test": { "index": 0 } }),
+        json!({ "test": { "index": 0, "testTimeoutMs": 80000, "file": "/etc/passwd" } }),
+        json!({ "test": { "index": -1, "testTimeoutMs": 80000 } }),
+        json!({ "validate": {} }),
+    ] {
+        s.check(FULL, mode.clone())
+            .expect_err(&format!("{mode} must be refused"));
+    }
+    call(
+        &s.webview,
+        "provider_candidate_check",
+        json!({ "text": FULL }),
+    )
+    .expect_err("no mode");
+    call(
+        &s.webview,
+        "provider_candidate_check",
+        json!({ "mode": "validate" }),
+    )
+    .expect_err("no text");
+    let err = s
+        .check("{ not json", json!("validate"))
+        .expect_err("not JSON");
+    assert_eq!(kind(&err), "notJson", "{err}");
+    let err = s
+        .check("[1, 2]", json!("validate"))
+        .expect_err("not an object");
+    assert_eq!(kind(&err), "notJson", "{err}");
+    assert!(!s.candidates.exists(), "a refused check staged a candidate");
+    assert!(!s.engine_ran(), "a refused check reached the engine");
+}
+
+/// The prefix and the lock scope (the plan's two regressions): a save made WHILE a Test runs is not
+/// blocked by it — the check holds `ConfigSaver`'s lock only around its staging, never across the
+/// engine call — and the save's sweep (`candidate-`, this process's files included) never deletes
+/// the Test's staged copy.
+#[test]
+fn a_save_made_while_a_test_runs_is_not_blocked_and_spares_its_candidate() {
+    let _turn = mutating_turn();
+    let s = check_box("chk-vs-save", Some(FULL), None);
+    s.hold("provider-check-provider");
+    let doc = s.read();
+    let saved_text = edit(&text_of(&doc), |v| v["lookbackCapDays"] = json!(4));
+    let w = &s.webview;
+    let tested = std::thread::scope(|scope| {
+        let test = scope.spawn(|| check_on(w, FULL, test_mode(1, 80_000)));
+        let staged = s.held("provider-check-provider");
+        assert!(
+            staged.exists(),
+            "the Test's staged copy is missing while it runs"
+        );
+        // The fake is holding the Test; this save must complete WITHOUT it being released.
+        let saved = call(
+            w,
+            "config_save",
+            json!({ "text": saved_text, "base": base_of(&doc) }),
+        )
+        .expect("the save answers");
+        assert_eq!(kind(&saved), "saved", "{saved}");
+        assert!(
+            !test.is_finished(),
+            "the save finished only after the Test did — it waited for a lock the Test held \
+             across its engine call"
+        );
+        assert!(
+            staged.exists(),
+            "the save's sweep deleted the running Test's staged copy"
+        );
+        s.release("provider-check-provider");
+        test.join().unwrap()
+    });
+    let tested = tested.expect("the Test answers");
+    assert_eq!(kind(&tested), "tested", "{tested}");
+    assert_eq!(s.survived("provider-check-provider"), "present\n");
+    assert_eq!(
+        serde_json::from_str::<Value>(&s.on_disk()).unwrap()["lookbackCapDays"],
+        4,
+        "the save did not land"
+    );
+    assert!(s.checks_left().is_empty(), "{:?}", s.checks_left());
+}
+
+/// Check against check: a validate started while a Test runs completes (validate takes no
+/// in-flight guard), and each staged file survives until its own call ends.
+#[test]
+fn a_validate_started_while_a_test_runs_completes() {
+    let _turn = mutating_turn();
+    let s = check_box("chk-vs-chk", Some(FULL), None);
+    s.hold("provider-check-provider");
+    let w = &s.webview;
+    let tested = std::thread::scope(|scope| {
+        let test = scope.spawn(|| check_on(w, FULL, test_mode(0, 80_000)));
+        let test_staged = s.held("provider-check-provider");
+        let out = check_on(w, FULL, json!("validate")).expect("the validate answers");
+        assert_eq!(kind(&out), "validated", "{out}");
+        let validate_staged = PathBuf::from(s.record_file("validated-paths.txt").trim_end());
+        assert!(is_check_file(&validate_staged, &s.candidates));
+        assert_ne!(
+            validate_staged, test_staged,
+            "the two checks shared one file"
+        );
+        assert!(
+            !validate_staged.exists(),
+            "the validate's file outlived its call"
+        );
+        assert!(
+            test_staged.exists(),
+            "the validate's sweep deleted the running Test's staged copy"
+        );
+        s.release("provider-check-provider");
+        test.join().unwrap()
+    });
+    assert_eq!(kind(&tested.expect("the Test answers")), "tested");
+    assert_eq!(s.survived("provider-check-provider"), "present\n");
+    assert!(s.checks_left().is_empty(), "{:?}", s.checks_left());
+}
+
+/// A second Test while one runs is refused `busy` (Test is mutating), and its staged file is
+/// removed; the first keeps its own and completes.
+#[test]
+fn a_second_test_while_one_runs_is_busy_and_leaves_no_staged_file() {
+    let _turn = mutating_turn();
+    let s = check_box("chk-busy", Some(FULL), None);
+    s.hold("provider-check-provider");
+    let w = &s.webview;
+    let first = std::thread::scope(|scope| {
+        let first = scope.spawn(|| check_on(w, FULL, test_mode(0, 80_000)));
+        let first_staged = s.held("provider-check-provider");
+        let err = check_on(w, FULL, test_mode(1, 80_000)).expect_err("busy");
+        assert_eq!(kind(&err), "busy", "{err}");
+        assert_eq!(err["running"], "provider-test", "{err}");
+        let first_name = first_staged
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            s.checks_left(),
+            vec![first_name],
+            "the refused Test left a staged file, or removed the first's"
+        );
+        s.release("provider-check-provider");
+        first.join().unwrap()
+    });
+    assert_eq!(kind(&first.expect("the first Test answers")), "tested");
+    assert_eq!(s.tests_run(), 1, "the refused Test reached the engine");
+    assert_eq!(s.survived("provider-check-provider"), "present\n");
+    assert!(s.checks_left().is_empty(), "{:?}", s.checks_left());
+}
+
+/// The check's sweep of its own prefix removes ONLY a dead writer's files — never this process's
+/// (an in-flight check's), never a live pid's, never another prefix's (the save's `candidate-`),
+/// never anything else.
+#[test]
+fn a_check_sweeps_only_dead_writers_staged_files() {
+    let s = check_box("chk-sweep", Some(FULL), None);
+    let me = std::process::id();
+    let dead = {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap true");
+        pid
+    };
+    std::fs::create_dir_all(&s.candidates).unwrap();
+    let stale = format!("provider-check-{dead}-1.json");
+    let kept = [
+        format!("provider-check-{me}-900001.json"),
+        "provider-check-1-1.json".to_string(),
+        format!("candidate-{dead}-1.json"),
+        format!("candidate-{me}-900002.json"),
+        format!("provider-check-{dead}-1.json.tmp"),
+        "notes.txt".to_string(),
+    ];
+    for name in std::iter::once(&stale).chain(&kept) {
+        std::fs::write(s.candidates.join(name), "x").unwrap();
+    }
+    let out = s.check(FULL, json!("validate")).expect("the check answers");
+    assert_eq!(kind(&out), "validated", "{out}");
+    let mut left: Vec<String> = std::fs::read_dir(&s.candidates)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    let mut expected = kept.to_vec();
+    expected.sort();
+    assert_eq!(left, expected, "the check's sweep removed the wrong files");
+}
+
+/// The Test's bound is the row's `testTimeoutMs` as given — Rust adds nothing — clamped to between
+/// 17 s and the 30-minute cap (plan Q12), so a hand-edited timeout cannot hold the guard for hours.
+#[test]
+fn the_test_bound_is_the_rows_value_capped_at_30_minutes() {
+    let _turn = mutating_turn();
+    let s = check_box("chk-bound", Some(FULL), None);
+    for (given, applied) in [
+        (80_000_u64, 80_000_u64),
+        (125_000, 125_000),
+        (30 * 60 * 1000, 30 * 60 * 1000),
+        (30 * 60 * 1000 + 1, 30 * 60 * 1000),
+        (u64::MAX, 30 * 60 * 1000),
+        (0, 17_000),
+    ] {
+        let out = s
+            .check(FULL, test_mode(0, given))
+            .expect("the check answers");
+        assert_eq!(kind(&out), "tested", "{given}: {out}");
+        assert_eq!(out["boundMs"], applied, "testTimeoutMs {given}");
+    }
+
+    // `boundMs` is the bound `invoke` ENFORCES (`EngineClient::effective_timeout`), not the
+    // operation's own: under a harness cap the two differ, and the answer reports the applied one.
+    let capped = check_box(
+        "chk-bound-cap",
+        Some(FULL),
+        Some(std::time::Duration::from_secs(20)),
+    );
+    for (given, applied) in [(80_000_u64, 20_000_u64), (0, 17_000)] {
+        let out = capped
+            .check(FULL, test_mode(0, given))
+            .expect("the check answers");
+        assert_eq!(kind(&out), "tested", "{given}: {out}");
+        assert_eq!(
+            out["boundMs"], applied,
+            "testTimeoutMs {given} under a 20 s cap: not the bound the client applied"
+        );
+    }
+}
+
+/// The check TAKES `ConfigSaver`'s lock for its staging (the plan's lock-scope regression has two
+/// directions; the save-during-Test test above pins "not across the engine call"): while a SAVE
+/// holds the lock — here, through its own `config validate` — a check started meanwhile stages
+/// nothing and asks the engine nothing, and goes on once the save is done.
+#[test]
+fn a_check_started_while_a_save_holds_the_lock_waits_to_stage() {
+    let s = check_box("chk-wait-save", Some(FULL), None);
+    let doc = s.read();
+    let saved_text = edit(&text_of(&doc), |v| v["lookbackCapDays"] = json!(4));
+    s.hold("candidate-config");
+    // Held too, so a check that did NOT wait would sit in the fake with its staged file present.
+    s.hold("provider-check-config");
+    let w = &s.webview;
+    let checked = std::thread::scope(|scope| {
+        let save = scope.spawn(|| {
+            call(
+                w,
+                "config_save",
+                json!({ "text": saved_text, "base": base_of(&doc) }),
+            )
+        });
+        s.held("candidate-config");
+        let check = scope.spawn(|| check_on(w, FULL, json!("validate")));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        assert!(
+            !s.record.join("held-provider-check-config").exists(),
+            "the check reached the engine while a save held the lock"
+        );
+        assert!(
+            s.checks_left().is_empty(),
+            "the check staged while a save held the lock: {:?}",
+            s.checks_left()
+        );
+        assert!(!check.is_finished(), "the check did not wait for the save");
+        s.release("candidate-config");
+        let saved = save.join().unwrap().expect("the save answers");
+        assert_eq!(kind(&saved), "saved", "{saved}");
+        let staged = s.held("provider-check-config");
+        assert!(
+            is_check_file(&staged, &s.candidates) && staged.exists(),
+            "the check's staged copy: {}",
+            staged.display()
+        );
+        s.release("provider-check-config");
+        check.join().unwrap()
+    });
+    let checked = checked.expect("the check answers");
+    assert_eq!(kind(&checked), "validated", "{checked}");
+    assert_eq!(s.survived("candidate-config"), "present\n");
+    assert_eq!(s.survived("provider-check-config"), "present\n");
+    assert_eq!(
+        serde_json::from_str::<Value>(&s.on_disk()).unwrap()["lookbackCapDays"],
+        4,
+        "the save did not land"
+    );
+    assert!(s.checks_left().is_empty(), "{:?}", s.checks_left());
+}
+
+/// After Uninstall's settings leg (the latch), the check is refused in BOTH modes with the save's
+/// words — before anything is staged (`config-candidates/` is not re-created) or the engine asked
+/// (a Test would write into the state folder Uninstall cleared).
+#[test]
+fn after_uninstall_removed_the_settings_the_check_is_refused_and_creates_nothing() {
+    use daily_briefing_gui_lib::config_save::SETTINGS_REMOVED_BY_UNINSTALL;
+    let _turn = mutating_turn();
+    let s = check_box_with("chk-latched", Some(FULL), None, true);
+    assert!(
+        !s.candidates.exists(),
+        "premise: no candidate directory yet"
+    );
+    let saved = s.save(FULL, "base").expect_err("premise: the save refuses");
+    assert_eq!(
+        saved,
+        json!({ "kind": "unsupported", "detail": SETTINGS_REMOVED_BY_UNINSTALL })
+    );
+    for mode in [json!("validate"), test_mode(0, 80_000)] {
+        let err = s.check(FULL, mode.clone()).expect_err("the check refuses");
+        assert_eq!(
+            err,
+            json!({ "kind": "engine", "detail": SETTINGS_REMOVED_BY_UNINSTALL }),
+            "{mode}"
+        );
+    }
+    assert!(
+        !s.candidates.exists(),
+        "a refused check re-created the candidate directory"
+    );
+    assert!(!s.engine_ran(), "a refused check reached the engine");
+    assert_eq!(s.on_disk(), FULL);
 }

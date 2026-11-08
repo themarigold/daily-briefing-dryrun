@@ -4,7 +4,7 @@
 // Reading and parsing land in M2.
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
-import { PROMPT_HEADER } from "../generator";
+import { PROMPT_HEADER, SUMMARY_PROMPT_HEADER } from "../generator";
 
 /** §3.6's self-ingestion guard, re-exported from its single source of truth in generator.ts so it
  *  cannot drift away from the prompt it fingerprints. */
@@ -33,7 +33,7 @@ export const HISTORICAL_PROMPT_HEADERS = [
   "You are writing a developer's resumption-focused briefing from LOCAL GIT ACTIVITY on THIS machine only.",
 ] as const;
 
-const ALL_SELF_PROMPT_FINGERPRINTS: readonly string[] = [SELF_PROMPT_FINGERPRINT, ...HISTORICAL_PROMPT_HEADERS];
+const ALL_SELF_PROMPT_FINGERPRINTS: readonly string[] = [SELF_PROMPT_FINGERPRINT, SUMMARY_PROMPT_HEADER, ...HISTORICAL_PROMPT_HEADERS];
 
 /** True when a user turn is THIS APP talking to its own provider. Prefix, not equality: the prompt
  *  continues with the run's git context, so only the header is stable.

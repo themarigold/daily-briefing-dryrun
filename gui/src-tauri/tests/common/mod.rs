@@ -762,9 +762,11 @@ pub fn files_sidecar(
         r#"printf '%s\n' "$@" >> "{rec}/argv.txt"
 STATE="{state}"
 CONFIG="{config}"
+run_date=""
+[ -f "$STATE/last-run" ] && run_date="$(head -1 "$STATE/last-run" | tr -d '\n')"
 case "$1:$2" in
   status:--json)
-    printf '%s' "{{\"schemaVersion\":1,\"engineVersion\":\"0.1.1\",\"platform\":\"darwin\",\"paths\":{{\"stateDir\":\"$STATE\",\"configPath\":\"$CONFIG\",\"markerPath\":\"$STATE/last-run\",\"tickPath\":\"$STATE/last-tick\",\"latestBriefingPath\":\"$STATE/briefing-latest.md\",\"briefingsDir\":\"$STATE/briefings\",\"lastSkipPath\":\"$STATE/last-skip.json\",\"schedulePath\":\"$STATE/schedule.json\"}},\"configExists\":true,\"configError\":null,\"lastRunDate\":null,\"lastSkip\":null,\"lastTick\":null,\"latestBriefingMtime\":null,\"archivedDates\":[],\"logBytes\":null,\"morningTime\":{{\"value\":\"07:20\",\"minutes\":440,\"warning\":null}},\"isPastFloor\":true}}"
+    printf '%s' "{{\"schemaVersion\":1,\"engineVersion\":\"0.1.1\",\"platform\":\"darwin\",\"paths\":{{\"stateDir\":\"$STATE\",\"configPath\":\"$CONFIG\",\"markerPath\":\"$STATE/last-run\",\"tickPath\":\"$STATE/last-tick\",\"latestBriefingPath\":\"$STATE/briefing-latest.md\",\"briefingsDir\":\"$STATE/briefings\",\"lastSkipPath\":\"$STATE/last-skip.json\",\"schedulePath\":\"$STATE/schedule.json\"}},\"configExists\":true,\"configError\":null,\"lastRunDate\":$([ -n "$run_date" ] && printf '"%s"' "$run_date" || printf null),\"lastSkip\":null,\"lastTick\":null,\"latestBriefingMtime\":null,\"archivedDates\":[],\"logBytes\":null,\"morningTime\":{{\"value\":\"07:20\",\"minutes\":440,\"warning\":null}},\"isPastFloor\":true}}"
     ;;
   config:validate)
     f="$5"
@@ -1044,8 +1046,13 @@ impl Drop for Serial {
 /// body because a lock guard alive across an `.await` is what `clippy::await_holding_lock` objects
 /// to. Moved here from `tests/engine_client.rs` (Batch 2, T5.2) for its second consumer:
 /// `tests/uninstall.rs`, whose `uninstall_execute` now runs `schedule uninstall` (spec 3.7).
+///
+/// THE BUDGET IS 60 s (12,000 × 5 ms). It was 20 s, and that flaked under machine load (reported at review: 85 of
+/// 87 green, load ~10, while other suites ran beside this one): the waiters queue behind every other
+/// mutating test in the binary, and each holder's spawn slows with the load, so a fair turn can take
+/// far longer than any one test. A real leak still fails — just a minute later, not never.
 pub async fn serialise() -> Serial {
-    for _ in 0..4000 {
+    for _ in 0..12_000 {
         if SERIAL
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -1054,5 +1061,85 @@ pub async fn serialise() -> Serial {
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    panic!("a mutating-operation test held the serialiser for more than 20s");
+    panic!("a mutating-operation test held the serialiser for more than 60s");
+}
+
+/* ── B2's contract fixture on disk (wave-3 plan P-H1) ──────────────────────────────────────────────── */
+
+/// The shared fixture's `actionFacts`, rebased from `/fixture` to `root` and made real: `root` is canonicalised and
+/// quote-safe; before anything is created, every rebased path must lie inside it, with no `..` or empty component; then
+/// the checkouts, common-dir entries, sub-project folders and every listed stat input exist on disk. A file gets the
+/// fixture's length and mtime. A directory or symlink keeps its real stamp, which is substituted into the returned
+/// document (the only stamp values rewritten). Returns the rebased facts, whose stamps now describe the disk.
+pub fn materialise_action_facts(root: &Path, facts: &serde_json::Value) -> serde_json::Value {
+    use std::time::Duration;
+    let root = std::fs::canonicalize(root).expect("canonical root");
+    let text = root.to_str().expect("a UTF-8 root");
+    assert!(
+        text.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b)),
+        "the root needs no quoting: {text}"
+    );
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&facts.to_string().replace("/fixture", text)).expect("the rebased facts are JSON");
+    let inside = |p: &str| {
+        let path = Path::new(p);
+        let clean = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
+        assert!(clean && !p.contains("//") && path.starts_with(&root), "outside the materialiser's root: {p}");
+        path.to_path_buf()
+    };
+    for entry in doc.as_array().expect("an array of repos") {
+        let repo = inside(entry["path"].as_str().expect("path"));
+        std::fs::create_dir_all(repo.join(".git")).expect("the repo's common dir");
+        for b in entry["branches"].as_array().into_iter().flatten() {
+            if let Some(c) = b["checkoutPath"].as_str() {
+                std::fs::create_dir_all(inside(c)).expect("the checkout");
+            }
+        }
+        for r in entry["roots"].as_array().into_iter().flatten() {
+            std::fs::create_dir_all(repo.join(r["root"].as_str().expect("root"))).expect("the sub-project");
+        }
+    }
+    let real_stamp = |path: &Path| {
+        let meta = std::fs::symlink_metadata(path).expect("the input exists");
+        let ns = meta.modified().expect("an mtime").duration_since(UNIX_EPOCH).expect("after 1970").as_nanos();
+        (ns.to_string(), meta.len().to_string())
+    };
+    for entry in doc.as_array().expect("an array of repos") {
+        for input in entry["statInputs"].as_array().into_iter().flatten() {
+            let path = inside(input["path"].as_str().expect("path"));
+            let stamp = &input["stamp"];
+            let parent = path.parent().expect("a parent");
+            match stamp["kind"].as_str().expect("kind") {
+                "file" => {
+                    std::fs::create_dir_all(parent).expect("the parent");
+                    let f = std::fs::File::create(&path).expect("the file");
+                    f.set_len(stamp["size"].as_str().expect("size").parse().expect("a size")).expect("the length");
+                    let ns: u64 = stamp["mtimeNs"].as_str().expect("mtime").parse().expect("an mtime");
+                    f.set_modified(UNIX_EPOCH + Duration::from_nanos(ns)).expect("the mtime");
+                }
+                "dir" => std::fs::create_dir_all(&path).expect("the directory"),
+                "symlink" => {
+                    std::fs::create_dir_all(parent).expect("the parent");
+                    let _ = std::fs::remove_file(&path);
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(stamp["target"].as_str().expect("target"), &path).expect("the link");
+                    #[cfg(not(unix))]
+                    panic!("the contract fixture's symlink input is materialised on unix only");
+                }
+                _ => assert!(std::fs::symlink_metadata(&path).is_err(), "a missing input exists: {path:?}"),
+            }
+        }
+    }
+    // A second pass, so a directory's real stamp is taken after everything inside it was created.
+    for entry in doc.as_array_mut().expect("an array of repos") {
+        for input in entry["statInputs"].as_array_mut().into_iter().flatten() {
+            let kind = input["stamp"]["kind"].as_str().expect("kind").to_string();
+            if kind == "dir" || kind == "symlink" {
+                let (mtime, size) = real_stamp(Path::new(input["path"].as_str().expect("path")));
+                input["stamp"]["mtimeNs"] = mtime.into();
+                input["stamp"]["size"] = size.into();
+            }
+        }
+    }
+    doc
 }

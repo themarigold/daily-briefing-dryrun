@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-provider-pending-reset-flush"
+description = "Enables the provider_pending_reset_flush command without any pre-configured scope."
+commands.allow = ["provider_pending_reset_flush"]
+
+[[permission]]
+identifier = "deny-provider-pending-reset-flush"
+description = "Denies the provider_pending_reset_flush command without any pre-configured scope."
+commands.deny = ["provider_pending_reset_flush"]

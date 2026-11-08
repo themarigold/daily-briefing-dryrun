@@ -11,7 +11,7 @@
 //!      `autostart::lock_changes` — the same lock the toggle's ON holds across its branding
 //!      `rename`, which could otherwise re-create the plist this leg just removed (Phase E M5b).
 //!   2. **The app's own files** — the enumerated records in `app_data_dir()`
-//!      ([`APP_DATA_FILES`], [`APP_DATA_DIRS`]) and the window-state file in `app_config_dir()`
+//!      ([`APP_DATA_FILES`], [`APP_DATA_GLOBS`], [`APP_DATA_DIRS`]) and the window-state file in `app_config_dir()`
 //!      ([`APP_CONFIG_FILES`]). ⚠ TWO directories on purpose, MEASURED rather than assumed:
 //!      `tauri-plugin-window-state` 2.4.1 saves through `app_config_dir()`
 //!      (`src/lib.rs:122-124`), not `app_data_dir()` — the two coincide on macOS
@@ -28,9 +28,11 @@
 //!      directory (Batch 2, spec 3.5.2; below).
 //!
 //! ⚠ **NEVER a recursive delete of the support directory.** The engine leg's only
-//! `remove_dir_all`s are on the two SUBDIRECTORIES the script itself `rm -rf`s — `briefings` (the
-//! archive) and `provider-cwd` (the provider's scratch working folder; a symlink there is unlinked,
-//! never followed) — and every other entry is one named file or a one-star glob. Since Batch 2 the
+//! `remove_dir_all`s are on the SUBDIRECTORIES the script itself `rm -rf`s — `briefings` (the
+//! archive), `provider-cwd` (the provider's scratch working folder; a symlink there is unlinked,
+//! never followed) and, since v0.3.0, `calendar` (the managed calendar-link files, the Mac helper
+//! copy and its run folder, the health file — spec r4 §8; the script's line is W1's M7) — and
+//! every other entry is one named file or a one-star glob. Since Batch 2 the
 //! list names every file the engine owns at the state root (spec 3.5.1: `src/json.ts`'s
 //! `engineOwns`), so what it deliberately leaves is `schedule.json` — the scheduler's record, the
 //! ENGINE's to remove (`schedule uninstall`, the scheduler step below; while it is there the leg is
@@ -128,14 +130,23 @@
 //!   7. **Settings**, if consented and not refused — [`REFUSED_FOR_KEPT_SCHEDULER`], then the gate
 //!      look's refusal, then (this step only) an error when the engine's `configPath` is unknown —
 //!      under the lock of step 2, which is still held ([`settings_leg`], below).
-//!   8. **The app's own files** (leg 2 below).
+//!   8. **The app's own files** (leg 2 below), with the pending-reset store CLOSED around it
+//!      (`PendingResets::close_for_uninstall`, P3-M6-T4), and the app-preference store too
+//!      (`app_prefs::AppPrefs::close_for_uninstall`, A-M1).
+//!   9. **The key leg** (provider fallback P3-M6-T4, [`KeysReport`]), behind the settings box:
+//!      `provider key delete-all --json`, the one await after the gate look, so it comes last. Refused
+//!      with the settings leg's own refusal, when the `configPath` is unknown, and — read at step
+//!      **3b**, under the settings lock, before the gate look — while a KEPT schedule's config may
+//!      use app-stored keys by the engine's `config validate` rows ([`kept_config_key_refusal`]) —
+//!      a refusal lifted only once step 7 has left neither `config.json` nor `config.json.bak`
+//!      (checkpoint P3-M6; the backup since PR 3 final r1).
 //!
 //! ## The settings leg (Batch 2, spec 3.5.3) — it removes the user's settings and API key files
 //!
 //! ⚠ **Only behind the explicit `removeSettings` consent, and only in the folder the ENGINE names**:
 //! the parent of `status --json`'s absolute `paths.configPath` (never a path computed from `HOME`
-//! here). Its whole reach is: each key file a readable config names (`provider.api.apiKeyFile`,
-//! `~`-expanded) — removed FIRST, and only when it is a regular file whose parent IS that folder by
+//! here). Its whole reach is: each key file a readable config names (every entry's
+//! `api.apiKeyFile` since P3-M6-T4 — item 1's and each fallback's — `~`-expanded) — removed FIRST, and only when it is a regular file whose parent IS that folder by
 //! identity (device and inode after `canonicalize`) and is not `config.json` or `config.json.bak` by
 //! identity; then `config.json`, then `config.json.bak` (unlinked: a link loses the link, never its
 //! target); then the folder itself, only if it is now empty, through the non-recursive
@@ -175,11 +186,14 @@ use crate::briefing_files::{
     absolute, engine_paths, engine_schedule_view, read_text_capped, ReadRefusal,
 };
 use crate::config_save::ConfigSaver;
+use crate::config_save::SaveError;
 use crate::engine::{
     Engine, EngineClient, EngineError, EngineOutcome, Invoker, NoProgress, Operation,
 };
+use crate::key_refs::{any_app_key_referenced, combined_entries};
+use crate::pending_resets::PendingResets;
 use crate::schedule_state::ScheduleView;
-use crate::{access, autostart, config_save, notifications};
+use crate::{access, app_prefs, autostart, config_save, notifications, pending_resets};
 
 /* ── the bounded lists ────────────────────────────────────────────────────────────────────────── */
 
@@ -274,11 +288,36 @@ pub const ENGINE_STATE_REMOVALS: &[EngineEntry] = &[
         token: "recap-campaigns.jsonl",
         kind: EntryKind::File,
     },
+    // Provider fallback (P1-M10-T3): the per-provider status record (`src/providerStatus.ts`) and the day's
+    // unresolved-failure record (`src/marker.ts`). The app-owned key folder (`keys/`) is the key leg's, not this list's.
+    EngineEntry {
+        token: "provider-status.json",
+        kind: EntryKind::File,
+    },
+    // B1-M1-T3 (wave 2): the morning run's record for the live git check (`src/runRecord.ts`).
+    EngineEntry {
+        token: "run-record.json",
+        kind: EntryKind::File,
+    },
+    EngineEntry {
+        token: "last-failure.json",
+        kind: EntryKind::File,
+    },
     // Batch 2 (spec 3.5.1): the provider's scratch working folder (`src/harden.ts`), removed with
     // its contents the way `briefings` is. `remove_dir_all` removes a top-level symlink itself
     // without following it (`tests/uninstall.rs` pins that).
     EngineEntry {
         token: "provider-cwd",
+        kind: EntryKind::Dir,
+    },
+    // v0.3.0 (calendar connection, spec r4 §8; plan M8): the engine's calendar folder — the managed
+    // link files (`links/<id>.url`, each a SECRET private-calendar URL), the Mac helper's installed
+    // copy and its `run/` folder (`reader/`), and the health file — removed whole, the way
+    // `briefings` and `provider-cwd` are (a top-level symlink is unlinked, never followed). The
+    // script's matching line is `rm -rf "$SUPPORT"/calendar` (M7); the parity pin in
+    // `tests/uninstall.rs` holds the two lists equal.
+    EngineEntry {
+        token: "calendar",
         kind: EntryKind::Dir,
     },
 ];
@@ -535,13 +574,33 @@ impl ScheduleSeen {
     }
 }
 
-/// The app-owned records in `app_data_dir()` — the three `STORE_FILE` constants, referenced from
-/// their owning modules so a rename there is a compile error here, not a leftover file.
+/// The app-owned records in `app_data_dir()` — referenced from their owning modules so a rename
+/// there is a compile error here, not a leftover file: the three `STORE_FILE` constants, and since
+/// provider fallback PR 3 (P3-M6-T4, in one change) the notify dedupe dates
+/// (`notified-dates.json`, P3-M5-T2) and Replace's pending-reset store (`pending-resets.json`,
+/// P3-M4-T3). The store is removed with its mutex held and its latch set (`uninstall_execute`
+/// step 8, [`PendingResets::close_for_uninstall`]), so its retry task cannot re-create it. Since
+/// the briefing redesign (A-M1), the app-preference store (`app-prefs.json`: the first name and the
+/// slides switch), appended LAST so the indices `tests/uninstall.rs` uses keep their files. It is
+/// closed the same way at step 8 ([`crate::app_prefs::AppPrefs::close_for_uninstall`]), so a
+/// Settings save after Uninstall cannot write the first name back.
 pub const APP_DATA_FILES: &[&str] = &[
     autostart::STORE_FILE,
     notifications::STORE_FILE,
     access::STORE_FILE,
+    notifications::NOTIFIED_DATES_FILE,
+    pending_resets::PENDING_RESETS_FILE,
+    app_prefs::APP_PREFS_FILE,
 ];
+
+/// One-star globs over direct children of `app_data_dir()` (P3-M6-T4): the pending-reset store's
+/// temp files, `pending-resets.json.tmp-<pid>-<seq>` — a crash between its write and its rename
+/// leaves one, 0600 and holding labels, and the store's own sweep skips this process's pid — and
+/// (A-M1) the app-preference store's, `app-prefs.json.tmp-<pid>-<seq>`, 0600 and holding the first
+/// name, which nothing else ever sweeps. Each is its store's temp prefix
+/// (`pending_resets::PENDING_RESETS_TEMP_PREFIX`, `app_prefs::APP_PREFS_TEMP_PREFIX`) plus `*`;
+/// `tests/uninstall.rs` holds each pair equal.
+pub const APP_DATA_GLOBS: &[&str] = &["pending-resets.json.tmp-*", "app-prefs.json.tmp-*"];
 
 /// App-owned directories in `app_data_dir()`: T15's candidate staging dir (normally empty — every
 /// save sweeps its own temp files — but a crash mid-save can leave one behind).
@@ -1027,7 +1086,8 @@ pub struct SettingsReport {
     /// The settings folder — the parent of `status --json`'s `paths.configPath`, the preview's
     /// `settingsFolder` — or `null` when that is unknown.
     pub folder: Option<String>,
-    /// One line per distinct `provider.api.apiKeyFile` the readable configs name (spec 3.5.3 step
+    /// One line per distinct `apiKeyFile` the readable configs name in ANY entry's `api` block —
+    /// item 1's and every fallback's ([`key_ref_in`], P3-M6-T4) (spec 3.5.3 step
     /// 2), in the order named, the path after `~` expansion (a relative one as written): `removed`
     /// (its `reason` the other-link note when another link still holds it), `absent`, `kept` with
     /// why, or `failed` with the error. A path that IS `config.json` or `config.json.bak` by
@@ -1056,6 +1116,138 @@ pub struct SettingsReport {
     /// ([`config_other_link_note`]), and the staged copies ([`staged_copies_note`]). Key-file notes
     /// stay in [`Self::key_files`]' reasons.
     pub notes: Vec<String>,
+}
+
+/// `UninstallReport::keys` — THE KEY LEG (provider fallback P3-M6-T4; spec r9 §6 "Uninstall") —
+/// ALWAYS present. Behind the settings box (`removeSettings`, the existing consent: "my settings and
+/// API keys"), it asks the engine to remove every key the app stores — `provider key delete-all
+/// --json` (`docs/gui-seam.md` §1d): the `daily-briefing.app-key` Keychain items on macOS, the state
+/// folder's `keys/` elsewhere. Rust never removes a key or `keys/` itself, and the engine-data leg
+/// never touches `keys/` ([`ENGINE_STATE_REMOVALS`]). With the box unticked it is all-default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeysReport {
+    /// The settings box was ticked.
+    pub asked: bool,
+    /// The engine's `deleted`: how many app-stored keys it removed — on a refusal, a lower bound
+    /// (§1d). `null` when the engine was not asked, or gave no count.
+    pub deleted: Option<u64>,
+    /// The engine's `kept`: files in the key folder that are not the app's, left with the folder.
+    pub kept: Option<u64>,
+    /// Why the leg did not run, by rule: the settings leg's own refusal (the same text), the
+    /// settings unknown ([`KEYS_KEPT_SETTINGS_UNKNOWN`]), or a kept schedule whose config may use
+    /// app keys ([`KEYS_KEPT_FOR_SCHEDULE`], [`KEYS_KEPT_UNVERIFIED`]).
+    pub refused: Option<String>,
+    /// The engine was asked and the keys may not all be gone: its `error`, or why it gave none.
+    pub error: Option<String>,
+}
+
+/// The key leg's refusal while a schedule is KEPT and the engine's rows over its config say an
+/// entry reads, or may read, a key the app stores (spec r9 §6 "Consent — App").
+pub const KEYS_KEPT_FOR_SCHEDULE: &str = "A background scheduler may still be running, and its \
+     settings use API keys this app stored, so those keys were kept.";
+
+/// The same refusal when the engine could not vouch for the kept schedule's config: unreadable,
+/// invalid, rows that do not cover every entry, or a check that failed — each counts as "uses app
+/// keys" (the PR 3 start decision): a key in doubt is kept.
+pub const KEYS_KEPT_UNVERIFIED: &str = "A background scheduler may still be running, and its \
+     settings couldn't be checked for API keys this app stored, so those keys were kept.";
+
+/// The key leg's refusal when the engine could not name its settings file: nothing about the
+/// settings can be checked, and the settings box's own label promises "nothing until it can".
+pub const KEYS_KEPT_SETTINGS_UNKNOWN: &str = "The engine couldn't say where your settings are, so \
+     the API keys this app stored were kept.";
+
+/// The kept-schedule refusal from the ENGINE's answer over that config (the PR 3 start decision:
+/// `config validate --file`'s `providers` rows, `appOwnedKey` / `appKeyId`, joined to the written
+/// entries by `key_refs` — Rust matches no reference shape and resolves no list). `None` — the key
+/// leg may run — ONLY for a config the engine calls valid whose rows cover every entry and name no
+/// app key ([`any_app_key_referenced`]); anything else refuses. **Pure.**
+pub fn kept_config_key_refusal(
+    config: &serde_json::Value,
+    report: &serde_json::Value,
+) -> Option<&'static str> {
+    if report.get("valid").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Some(KEYS_KEPT_UNVERIFIED);
+    }
+    let Some(rows) = report
+        .get("providers")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Some(KEYS_KEPT_UNVERIFIED);
+    };
+    match any_app_key_referenced(config, rows) {
+        None => Some(KEYS_KEPT_UNVERIFIED),
+        Some(true) => Some(KEYS_KEPT_FOR_SCHEDULE),
+        Some(false) => None,
+    }
+}
+
+/// The kept-schedule check, over the SAVED config as it is now (`config_save::read_saved_with_report`
+/// — the pending-reset store's own read: `status --json` locates it, the bytes are validated as a
+/// staged candidate). ⚠ THE CALLER HOLDS [`ConfigSaver`]'s lock, so no save changes the config
+/// between this check and the legs. No config at all is no reference (a scheduled run then stops at
+/// `no-config` and reads no key); every other failure refuses.
+async fn kept_schedule_key_refusal<R: Runtime>(
+    app: &AppHandle<R>,
+    client: &EngineClient,
+    saver: &ConfigSaver,
+) -> Option<String> {
+    let Ok(dir) = config_save::candidate_dir(app, saver) else {
+        return Some(KEYS_KEPT_UNVERIFIED.to_string());
+    };
+    match config_save::read_saved_with_report(client, &dir).await {
+        Err(SaveError::NoConfig { .. }) => None,
+        Err(_) => Some(KEYS_KEPT_UNVERIFIED.to_string()),
+        Ok((config, report)) => kept_config_key_refusal(&config, &report).map(str::to_string),
+    }
+}
+
+/// The key leg's engine call: `provider key delete-all --json` (16 s, the in-flight guard), its
+/// answer read from the JSON's `ok` only, never the exit status (§1d).
+async fn delete_all_keys(engine: &Engine) -> KeysReport {
+    let mut report = KeysReport {
+        asked: true,
+        ..KeysReport::default()
+    };
+    let client = match engine.client() {
+        Ok(client) => client,
+        Err(e) => {
+            report.error = Some(format!("the engine couldn't be run ({e})"));
+            return report;
+        }
+    };
+    let outcome = match client.invoke(Operation::KeyDeleteAll, &NoProgress).await {
+        Ok(outcome) => outcome,
+        Err(EngineError::Busy { .. }) => {
+            report.error = Some(
+                "another engine task was running, so they were not removed; run Uninstall again"
+                    .into(),
+            );
+            return report;
+        }
+        Err(e) => {
+            report.error = Some(e.to_string());
+            return report;
+        }
+    };
+    let Some(payload) = outcome.payload.as_ref() else {
+        report.error = Some("the engine stopped before it answered".into());
+        return report;
+    };
+    let count = |key: &str| payload.get(key).and_then(serde_json::Value::as_u64);
+    report.deleted = count("deleted");
+    report.kept = count("kept");
+    if payload.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        report.error = Some(
+            payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the engine refused")
+                .to_string(),
+        );
+    }
+    report
 }
 
 /// `uninstall_execute`'s answer.
@@ -1113,6 +1305,8 @@ pub struct UninstallReport {
     /// Batch 2 (spec 3.3.7, 3.5.3): the settings leg — ALWAYS present; with the box unticked it
     /// only names the folder that stays ([`SettingsReport`]).
     pub settings: SettingsReport,
+    /// Provider fallback PR 3 (P3-M6-T4): the key leg — ALWAYS present ([`KeysReport`]).
+    pub keys: KeysReport,
     /// `std::env::consts::OS` — the done view's last step is per platform (round 3, B3-L6).
     pub os: String,
 }
@@ -1179,8 +1373,9 @@ fn remove_glob_at(fs: &dyn UninstallFs, dir: &Path, token: &str) -> Outcome {
     }
 }
 
-/// The app-file legs: the records and candidate dir in `data_dir`, the window-state file in
-/// `config_dir`. Enumerated removals only; the directories themselves are left in place.
+/// The app-file legs: the records, the store's temp siblings and the candidate dir in `data_dir`,
+/// the window-state file in `config_dir`. Enumerated removals only; the directories themselves are
+/// left in place.
 pub fn remove_app_files(
     fs: &dyn UninstallFs,
     data_dir: &Path,
@@ -1191,6 +1386,12 @@ pub fn remove_app_files(
         report.push(ActionReport {
             name: (*name).into(),
             outcome: remove_file_at(fs, data_dir, name),
+        });
+    }
+    for token in APP_DATA_GLOBS {
+        report.push(ActionReport {
+            name: (*token).into(),
+            outcome: remove_glob_at(fs, data_dir, token),
         });
     }
     for name in APP_DATA_DIRS {
@@ -1505,6 +1706,15 @@ pub fn config_other_link_note(name: &str) -> String {
     format!("{name} removed; {OTHER_LINK_NOTE}")
 }
 
+/// The prefix of the engine's `key scrub-backup` staged copy of `backup` (`config.json.bak`):
+/// `.<backup>.scrub-<pid>-<random>`, beside it (`src/providerCli.ts`, `scrubTempRe`). A crashed scrub
+/// leaves one holding the literal keys it was removing, so the settings leg names it with the
+/// save's own staged copies ([`config_save::staged_prefix`]) — named, never removed. Its spelling
+/// is the engine's; `tests/uninstall.rs` pins it against the engine source.
+pub fn scrub_staged_prefix(backup: &str) -> String {
+    format!(".{backup}.scrub-")
+}
+
 /// Spec 3.5.3: the staged copies still in the folder, named, by [`STAGED_COPIES_NOTE`].
 pub fn staged_copies_note(names: &[String]) -> String {
     format!("{}: {STAGED_COPIES_NOTE}", names.join(", "))
@@ -1517,6 +1727,10 @@ pub fn settings_folder_link(target: &Path) -> String {
         target.display()
     )
 }
+
+/// A key file that is not directly in the settings folder ([`key_verdict`]).
+pub const KEY_OUTSIDE_FOLDER: &str = "it isn't in the settings folder (a key the app stored is \
+     removed with the app's stored keys instead)";
 
 /// A key file left alone because the leg had already stopped at one that would not unlink.
 const KEY_NOT_ATTEMPTED: &str =
@@ -1542,27 +1756,49 @@ fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// What one config says of its key file (spec 3.5.3 step 1).
-enum KeyRef {
-    /// Not there, or names none.
-    None,
-    /// `provider.api.apiKeyFile`, as written.
-    Named(String),
-    /// It could not be read or parsed: `keyRefsUnknown`.
-    Unknown,
+/// What one config says of its key files (spec 3.5.3 step 1).
+#[derive(Default)]
+struct KeyRef {
+    /// Every entry's `api.apiKeyFile`, as written, in list order (item 1 first).
+    named: Vec<String>,
+    /// The config could not be read or parsed, or an entry's `apiKeyFile` is not a string:
+    /// `keyRefsUnknown`.
+    unknown: bool,
 }
 
-/// `provider.api.apiKeyFile` in a config's text — the one key reference spec 3.5.3 step 2 acts on.
-/// Text that is not a JSON object, or a reference that is not a string, is [`KeyRef::Unknown`].
-fn key_ref_in(text: &str) -> KeyRef {
-    match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(value) if value.is_object() => match value.pointer("/provider/api/apiKeyFile") {
-            None => KeyRef::None,
-            Some(serde_json::Value::String(path)) => KeyRef::Named(path.clone()),
-            Some(_) => KeyRef::Unknown,
-        },
-        _ => KeyRef::Unknown,
+impl KeyRef {
+    fn unknown() -> Self {
+        Self {
+            named: Vec::new(),
+            unknown: true,
+        }
     }
+}
+
+/// Every `apiKeyFile` in a config's text — the key references spec 3.5.3 step 2 acts on. Since
+/// provider fallback PR 3 (P3-M6-T4) that is EVERY entry's `api` block — item 1's and each
+/// fallback's — through the list enumeration `key_refs` shares with the pending-reset store
+/// ([`combined_entries`]), not `provider.api` alone. It keeps its "any `apiKeyFile`" semantics: a
+/// user's own key file counts as much as one the app wrote, and whether it is REMOVED is still
+/// [`key_verdict`]'s (only inside the settings folder). Which key an entry READS is never decided
+/// here: that is the engine's (the kept-schedule check). Text that is not a JSON object is
+/// unknown; so is an `apiKeyFile` that is not a string, beside the others found.
+fn key_ref_in(text: &str) -> KeyRef {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return KeyRef::unknown();
+    };
+    if !value.is_object() {
+        return KeyRef::unknown();
+    }
+    let mut found = KeyRef::default();
+    for entry in combined_entries(&value) {
+        match entry.block.get("api").and_then(|api| api.get("apiKeyFile")) {
+            None => {}
+            Some(serde_json::Value::String(path)) => found.named.push(path.clone()),
+            Some(_) => found.unknown = true,
+        }
+    }
+    found
 }
 
 /// One config file as step 1 saw it (`lstat`).
@@ -1598,12 +1834,12 @@ impl ConfigSeen {
     /// `notifications::read_engine_config_text` — the engine's own follow-the-link reading, which
     /// opens non-blocking, needs a regular target and stops at [`config_save::MAX_CONFIG_BYTES`] —
     /// and never by a no-follow read, which would call every linked config unreadable. Both at most
-    /// 1 MiB. Anything else, or any refusal, is [`KeyRef::Unknown`].
+    /// 1 MiB. Anything else, or any refusal, is unknown ([`KeyRef::unknown`]).
     fn key_ref(&self, fs: &dyn UninstallFs) -> KeyRef {
         let stat = match &self.stat {
-            Ok(None) => return KeyRef::None,
+            Ok(None) => return KeyRef::default(),
             Ok(Some(stat)) => stat,
-            Err(_) => return KeyRef::Unknown,
+            Err(_) => return KeyRef::unknown(),
         };
         let text = match stat.kind {
             LstatKind::File => fs
@@ -1612,7 +1848,7 @@ impl ConfigSeen {
             LstatKind::Symlink => notifications::read_engine_config_text(&self.path).ok(),
             LstatKind::Dir | LstatKind::Other => None,
         };
-        text.as_deref().map_or(KeyRef::Unknown, key_ref_in)
+        text.as_deref().map_or_else(KeyRef::unknown, key_ref_in)
     }
 }
 
@@ -1657,7 +1893,10 @@ fn key_verdict(
         .and_then(|parent| parent.id);
     match (parent_id, folder_id) {
         (Some(parent), Some(folder)) if parent == folder => {}
-        (Some(_), Some(_)) => return KeyVerdict::Kept("it isn't in the settings folder".into()),
+        // Not "kept" for good on Linux: an app-stored key (`<state>/keys/`) is outside this folder
+        // and the key leg's `delete-all` removes it (checkpoint P3-M6). Rust does not tell the two
+        // apart — it matches no key shape — so the reason says both.
+        (Some(_), Some(_)) => return KeyVerdict::Kept(KEY_OUTSIDE_FOLDER.into()),
         _ => {
             return KeyVerdict::Kept(
                 "its folder couldn't be compared with the settings folder".into(),
@@ -1687,7 +1926,8 @@ fn key_verdict(
 ///   * **A folder that is a link is not entered** (nothing inside it is removed:
 ///     [`settings_folder_link`]); one that is not a folder is not entered either.
 ///   * **1.** `lstat` `config.json` and `config.json.bak`, and read each that is a regular file of at
-///     most 1 MiB, or a link (read through, [`ConfigSeen::key_ref`]), for `provider.api.apiKeyFile`.
+///     most 1 MiB, or a link (read through, [`ConfigSeen::key_ref`]), for every entry's
+///     `api.apiKeyFile` ([`key_ref_in`], P3-M6-T4 — item 1's alone before).
 ///     One that cannot be read or parsed sets `keyRefsUnknown`, and is still removed.
 ///   * **2. Key files FIRST**, so a crash between steps cannot leave a key file no config names:
 ///     each distinct reference, `~`-expanded, is removed only on [`key_verdict`]'s conditions.
@@ -1699,7 +1939,8 @@ fn key_verdict(
 ///     pass, L7); another link still holding a removed file — one this leg did not remove itself (L6)
 ///     — gets [`config_other_link_note`].
 ///   * **5.** The folder, with the NON-recursive [`UninstallFs::remove_empty_dir`], only if it is
-///     now empty — so `.config.json.save-*` staged copies, which are named, not removed
+///     now empty — so `.config.json.save-*` staged copies, and a crashed scrub's
+///     `.config.json.bak.scrub-*` ([`scrub_staged_prefix`]), which are named, not removed
 ///     ([`staged_copies_note`]), keep it.
 ///
 /// ⚠ ITS WHOLE REACH: a key file only when its parent IS the folder by identity, the two config
@@ -1755,14 +1996,12 @@ pub fn settings_leg(
     ];
     let mut named: Vec<(String, PathBuf)> = Vec::new();
     for config in &configs {
-        match config.key_ref(fs) {
-            KeyRef::None => {}
-            KeyRef::Unknown => report.key_refs_unknown = true,
-            KeyRef::Named(raw) => {
-                let path = expand_tilde(&raw, home);
-                if !named.iter().any(|(_, seen)| *seen == path) {
-                    named.push((raw, path));
-                }
+        let refs = config.key_ref(fs);
+        report.key_refs_unknown |= refs.unknown;
+        for raw in refs.named {
+            let path = expand_tilde(&raw, home);
+            if !named.iter().any(|(_, seen)| *seen == path) {
+                named.push((raw, path));
             }
         }
     }
@@ -1895,11 +2134,16 @@ pub fn settings_leg(
         Err(e) if not_there(&e) => {}
         Err(e) => errors.push(format!("the settings folder couldn't be listed ({e})")),
     }
-    let staged_prefix = config_save::staged_prefix(SETTINGS_CONFIG);
+    // A killed save's staged copies, and a crashed `key scrub-backup`'s (checkpoint P3-M6): either
+    // may hold a key. Named, never removed.
+    let staged_prefixes = [
+        config_save::staged_prefix(SETTINGS_CONFIG),
+        scrub_staged_prefix(SETTINGS_BACKUP),
+    ];
     let staged: Vec<String> = report
         .remaining
         .iter()
-        .filter(|name| name.starts_with(&staged_prefix))
+        .filter(|name| staged_prefixes.iter().any(|p| name.starts_with(p.as_str())))
         .cloned()
         .collect();
     if !staged.is_empty() {
@@ -1940,6 +2184,9 @@ fn app_preview(fs: &dyn UninstallFs, data_dir: &Path, config_dir: &Path) -> Vec<
     let mut entries: Vec<(String, EntryKind, PathBuf)> = Vec::new();
     for name in APP_DATA_FILES {
         entries.push(((*name).into(), EntryKind::File, data_dir.join(name)));
+    }
+    for token in APP_DATA_GLOBS {
+        entries.push(((*token).into(), EntryKind::Glob, data_dir.to_path_buf()));
     }
     for name in APP_DATA_DIRS {
         entries.push(((*name).into(), EntryKind::Dir, data_dir.join(name)));
@@ -2059,9 +2306,11 @@ fn removal_message(outcome: &EngineOutcome) -> String {
 ///     error, an unresolved sidecar — → `ScheduleFailed`, with the engine's stderr or the error's
 ///     text.
 ///
-/// ⚠ NO RUST READ TIMEOUT (spec 3.1.4, "Rust timeout"), like every other mutating engine call: the
-/// engine's own deadline (45 s from its entry) bounds it, and a timeout here could not stop the
-/// engine's effects — only report a removal as failed while it went on.
+/// ⚠ NO RUST READ TIMEOUT (spec 3.1.4, "Rust timeout"), like every other mutating engine call but
+/// one: the engine's own deadline (45 s from its entry) bounds it, and a timeout here could not stop
+/// the engine's effects — only report a removal as failed while it went on. (The one exception is
+/// v0.3.0's `calendar connect mac`, whose long pole is a person answering a dialog —
+/// `engine::CALENDAR_CONNECT_MAC_TIMEOUT`.)
 async fn remove_scheduler(
     engine: &Engine,
     take_over: bool,
@@ -2265,6 +2514,25 @@ pub async fn uninstall_execute<R: Runtime>(
         SchedulerChoice::RemoveAny => Some(remove_scheduler(&engine, true, status.as_ref()).await?),
     };
 
+    // ── 3b. The kept schedule's keys (P3-M6-T4, spec r9 §6 "Consent — App"): with the settings box
+    // ticked and the scheduler KEPT — "Uninstall anyway" with nothing detected sends `keep` and the
+    // boxes as ticked, so a scheduler nobody could see may still run — the key leg is refused while
+    // that schedule's config (the engine's, the one the settings leg removes) may use app-stored
+    // keys, by the engine's rows — and step 9 applies it only if the settings leg leaves that
+    // config in place (checkpoint P3-M6). Read here, under the settings lock step 2 holds, BEFORE
+    // the gate look, so nothing is awaited between that look and the legs. With a scheduler
+    // detected, the settings leg — and with it the key leg — is refused anyway, so nothing is asked.
+    let kept_keys_refusal = match (&client, remove_settings == Some(true)) {
+        (Ok(client), true) if choice == SchedulerChoice::Keep && !detected_first => {
+            kept_schedule_key_refusal(&app, client, &saver).await
+        }
+        // Defence in depth: with no engine, `config_path` is unknown too, so step 9 refuses with
+        // `KEYS_KEPT_SETTINGS_UNKNOWN` before this is read. Kept so that a later change to step 9's
+        // order fails closed rather than open.
+        (Err(_), true) if choice == SchedulerChoice::Keep => Some(KEYS_KEPT_UNVERIFIED.to_string()),
+        _ => None,
+    };
+
     // ── 4. Leg 1 — the login item, through T19's own disable (reused, not forked). `is_enabled`
     // first: the plugin's `disable()` on an absent entry is not a removal to report as one. Read
     // and disable run under the login-item change lock, so a concurrent ON's branding cannot
@@ -2359,27 +2627,40 @@ pub async fn uninstall_execute<R: Runtime>(
         .ok()
         .and_then(|path| path.parent())
         .map(|folder| folder.display().to_string());
-    let settings = if remove_settings != Some(true) {
+    let settings_refused = kept_refusal.or_else(|| gate.refusal());
+    // Whether this leg's step 3 COMPLETED — `config.json` removed, or found absent — which is also
+    // what step 9 reads: a kept schedule with no config reads no key (checkpoint P3-M6). False on
+    // every other path: not asked, refused, the folder unknown, or a leg that stopped.
+    let (settings, config_step_completed) = if remove_settings != Some(true) {
         // Not asked: the report only names the folder that stays.
-        SettingsReport {
-            folder: settings_folder,
-            ..SettingsReport::default()
-        }
-    } else if let Some(refused) = kept_refusal.or_else(|| gate.refusal()) {
-        SettingsReport {
-            asked: true,
-            folder: settings_folder,
-            refused: Some(refused),
-            error: config_path.as_ref().err().cloned(),
-            ..SettingsReport::default()
-        }
-    } else {
-        match &config_path {
-            Err(detail) => SettingsReport {
-                asked: true,
-                error: Some(detail.clone()),
+        (
+            SettingsReport {
+                folder: settings_folder,
                 ..SettingsReport::default()
             },
+            false,
+        )
+    } else if let Some(refused) = settings_refused.clone() {
+        (
+            SettingsReport {
+                asked: true,
+                folder: settings_folder,
+                refused: Some(refused),
+                error: config_path.as_ref().err().cloned(),
+                ..SettingsReport::default()
+            },
+            false,
+        )
+    } else {
+        match &config_path {
+            Err(detail) => (
+                SettingsReport {
+                    asked: true,
+                    error: Some(detail.clone()),
+                    ..SettingsReport::default()
+                },
+                false,
+            ),
             Ok(config_path) => {
                 let (report, config_step_completed) = settings_leg(fs, config_path, &home);
                 // Spec 3.5.3 step 6: the latch, set BEFORE the lock is released — `_settings_lock`
@@ -2388,13 +2669,67 @@ pub async fn uninstall_execute<R: Runtime>(
                 if config_step_completed {
                     saver.mark_settings_removed();
                 }
-                report
+                (report, config_step_completed)
             }
         }
     };
 
-    // ── 8. Leg 2 — the app's own files.
-    let app_report = remove_app_files(fs, &data_dir, &config_dir);
+    // ── 8. Leg 2 — the app's own files. The pending-reset store is CLOSED around it (P3-M6-T4,
+    // P3-M4-T3's known race): its mutex is held while its file and temp siblings go, and its latch
+    // refuses every later write, so the 15 s retry task cannot re-create `pending-resets.json`. The
+    // app-preference store is closed the same way (A-M1-T3 checkpoint review): the app stays open
+    // on Settings after Uninstall, and a first-name save on blur would otherwise write
+    // `app-prefs.json` back. This is the one place both stores' mutexes are held, always
+    // PendingResets then AppPrefs; neither module takes the other's. The guards are `std` mutex
+    // guards and are dropped before anything below awaits.
+    let app_report = {
+        let store = app.try_state::<PendingResets>();
+        let _closed = store
+            .as_ref()
+            .map(|store| store.inner().close_for_uninstall());
+        let prefs = app.try_state::<app_prefs::AppPrefs>();
+        let _prefs_closed = prefs.as_ref().map(|p| p.inner().close_for_uninstall());
+        remove_app_files(fs, &data_dir, &config_dir)
+    };
+
+    // ── 9. The key leg (P3-M6-T4, spec r9 §6 "Uninstall"), behind the settings box, LAST: its
+    // engine call is the one await after the gate look, so it follows every leg that look gates.
+    // Refused, never asking the engine, by the settings leg's own refusal (a kept scheduler, or the
+    // gate look's record or unit — the same text), then by an unknown settings file, then by a kept
+    // schedule whose config may use app keys (step 3b) — but only while that config is still there:
+    // step 3b judged the config step 7 removes, and once its step 3 completed (`config.json` gone)
+    // a scheduled run stops at `no-config` and reads no key (checkpoint P3-M6). A leg that stopped
+    // at a key file, failed to remove `config.json`, or did not run keeps the refusal — and so does
+    // a `config.json.bak` still there (PR 3 final r1): it holds the same settings, a hand restore
+    // brings them back, and a restored one would read the keys `delete-all` removes. The backup is
+    // looked at here, through `fs`, not inferred from the report: gone means not there now (removed
+    // by step 4, or never there). The settings lock is still held.
+    let settings_gone = config_step_completed
+        && config_path
+            .as_ref()
+            .ok()
+            .and_then(|path| path.parent())
+            .is_some_and(
+                |folder| matches!(fs.kind(&folder.join(SETTINGS_BACKUP)), Err(e) if not_there(&e)),
+            );
+    let keys = if remove_settings != Some(true) {
+        KeysReport::default()
+    } else if let Some(refused) = settings_refused
+        .or_else(|| {
+            config_path
+                .is_err()
+                .then(|| KEYS_KEPT_SETTINGS_UNKNOWN.to_string())
+        })
+        .or(kept_keys_refusal.filter(|_| !settings_gone))
+    {
+        KeysReport {
+            asked: true,
+            refused: Some(refused),
+            ..KeysReport::default()
+        }
+    } else {
+        delete_all_keys(&engine).await
+    };
 
     // The report's scheduler facts: the gate look's, and the ways out of what it still saw.
     let mut leftover = Vec::new();
@@ -2427,6 +2762,7 @@ pub async fn uninstall_execute<R: Runtime>(
         schedule,
         engine_copies,
         settings,
+        keys,
         os: std::env::consts::OS.to_string(),
     })
 }

@@ -6,6 +6,9 @@
       "signingIdentity": null,
       "hardenedRuntime": true,
       "entitlements": "entitlements.plist",
+      "files": {
+        "Resources/Daily Briefing Calendar Reader.app": "../../reader/build/Daily Briefing Calendar Reader.app"
+      },
       "dmg": {
         "background": "branding/dmg-background.png",
         "windowSize": { "width": 660, "height": 400 },

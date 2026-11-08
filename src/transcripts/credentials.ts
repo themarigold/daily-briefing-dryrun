@@ -10,17 +10,38 @@
 // detection; unknown-shaped ones fall back to the PII posture (opt-in + minimisation + own-account +
 // never-persist-raw). These patterns close literal STRINGS, not classes — `mysql -p S3cretPW`
 // (spaced), `cookie:session=…` (lowercase), `Set-Cookie:`, `TOKEN: 'sk-…'`, a newline between `=`
-// and the value, and `{"apiKey":"sk-…"}` all still pass. Say "these literals are caught", never
-// "the class is closed".
+// and the value, and `{"apiKey":"sk-…"}` all still pass. `scheme://user:password@host` IS caught
+// (userinfo only), EXCEPT a password holding a raw `/ ? # ^ { } | \ [ ]` (the RFC 3986 tradeoff at
+// the url-userinfo pattern below) or a whole URL that is escaped or percent-encoded (`https:\/\/…`,
+// `https%3A%2F%2F…`): those pass. Say "these literals are caught", never "the class is closed".
 //
 // Entropy scoring was DELETED, not deferred: zero measured true positives and two HIGH findings.
 
 export type CredentialPattern = { name: string; re: RegExp };
 
-/** Global-flagged for `replace`; every use that needs statefulness resets `lastIndex` first, and
+/** Global-flagged for span scans; every stateful use clones the regex first, and
  *  `test` is never called on these directly (see `matchesCredential`) — a global regex's `test` is
  *  stateful and would alternate true/false across calls on the same input. */
 export const CREDENTIAL_PATTERNS: readonly CredentialPattern[] = [
+  // Output redaction unions all original-text spans, including overlaps with env-assignment.
+  // URL userinfo with a password (2026-10-24): `https://user:pw@host/x` →
+  // `https://[redacted]@host/x`. The first `:` separates username and password; either may be empty.
+  // Both exclude whitespace, `/`, `?`, `#` and text delimiters forbidden unencoded in RFC 3986
+  // userinfo (double quotes, angle/square brackets, backtick, braces, pipe, backslash, caret); the
+  // username also excludes `:`. RFC sub-delims such as apostrophe, parentheses, comma and semicolon
+  // stay admitted, trading ambiguous adjacent punctuation for matching valid password spellings.
+  // Percent escapes, Unicode and raw `@` remain admitted;
+  // the greedy password ends at the LAST `@` in that authority, so `u@ser:p@ss@host` leaves no tail.
+  // A username alone, a port, and `:`/`@` in a path/query/fragment cannot match.
+  // ⚠ LINEAR TIME: a match STARTS only after `://`, checked by a bounded (at most 34-char)
+  // lookbehind. Neither forward class crosses `/`, so scans from successive starts cannot overlap;
+  // excluding `:` from the username also leaves only ONE username/password split to try. Keep this
+  // anchor — an unanchored userinfo scan retries the same long run at every character (quadratic).
+  // Both scheme classes spell out upper AND lower case, so the /i clone stays a superset without
+  // changing any delimiter; ordinary lower-case words gain no match.
+  // KNOWN FAIL-CLOSED COST, accepted: a container image reference with a tag and a digest has the
+  // same shape, so `docker://alpine:3.18@sha256:…` renders as `docker://[redacted]@sha256:…`.
+  { name: "url-userinfo", re: /(?<=[A-Za-z][A-Za-z0-9+.-]{0,30}:\/\/)[^\s/:?#"<>`{}|\\^\[\]]*:[^\s/?#"<>`{}|\\^\[\]]*(?=@)/g },
   // Provider-issued key shapes with a distinctive prefix.
   // ⚠ The tail must be an UNHYPHENATED run of >=20 alnum chars, with at most a few short
   // hyphenated label segments before it (`pk-live-<long run>`). Real `sk-ant-` keys do NOT fit this
@@ -72,11 +93,27 @@ export const CREDENTIAL_PATTERNS: readonly CredentialPattern[] = [
   { name: "github-token", re: /(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}(?![A-Za-z0-9])/g },
   { name: "slack-token", re: /(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9])/g },
   { name: "private-key-block", re: /-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/g },
-  { name: "jwt", re: /(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g },
+  // ⚠ LINEAR-TIME REWRITES of jwt and env-assignment (2026-10-09) — same matches, same spans; the
+  // differential in test/credentials.linear-time.test.ts runs a frozen copy of the old table beside these.
+  // Both old shapes were QUADRATIC in one long token: 100k chars of `_eyJ` took ~9.5 s, 100k of
+  // `SECRET` ~1.8 s, and the case-insensitive clones the same again.
+  // jwt: every `eyJ` after a `_`/`-` is a fresh start, and each start scanned its first segment to the
+  // end of the shared base64url run. The added `(?<!…)` refuses a start that has an earlier valid start
+  // in the SAME run — that earlier one ends its first segment at the same place, and a longer segment
+  // only helps, so it matches whenever the later one would and the later one is never what `test` or
+  // `replace` reports. (A run cannot straddle a previous match's end, because a match ends at a `\b`
+  // with only `-` after it in the run.) The `*?` finds the NEAREST earlier start, which is what keeps
+  // the refusal itself linear; `(?=eyJ)` keeps that lookbehind off every other position.
+  { name: "jwt", re: /(?<![A-Za-z0-9])(?=eyJ)(?<!(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]*?)eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g },
   // `KEY=value` shapes: an env-var-looking name containing a credential word, assigned a non-trivial
   // value on the SAME line. The name test is what keeps `PATH=/usr/bin` out. `:=` (Make, Go) is the
   // same assignment and is matched too (user-directed 2026-10-02: `API_TOKEN:=…` used to escape).
-  { name: "env-assignment", re: /\b[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*:?=\s*["']?[^\s"'`]{8,}/g },
+  // The name was `[A-Z0-9_]*(?:WORD)[A-Z0-9_]*`: two stars around the word, so a long name with no `=`
+  // after it retried every split at every word occurrence. Neither `\s`, `:` nor `=` is a name
+  // character, so the name can only ever end at the END of its run — the lookahead asks "does that run
+  // contain a credential word" once, and one star consumes the run. `\b` is load-bearing: every name
+  // character is a word character, so it admits only the run START as a candidate.
+  { name: "env-assignment", re: /\b(?=[A-Z0-9_]*?(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY))[A-Z0-9_]*\s*:?=\s*["']?[^\s"'`]{8,}/g },
   // Auth headers.
   { name: "auth-header", re: /\bAuthorization\s*:\s*(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi },
 ];
@@ -89,7 +126,7 @@ export function matchesCredential(text: string): boolean {
 }
 
 /** Case-INSENSITIVE clones of `CREDENTIAL_PATTERNS`, for text that was case-folded (or may have been)
- *  before it reaches an output. Every class but auth-header is case-sensitive, and for four of them
+ *  before it reaches an output. Most classes lack the `i` flag, and for four of them
  *  (aws-access-key-id, jwt, private-key-block, env-assignment) lower-casing breaks the match, so a
  *  lower-cased `akia…` key id or `eyj…` JWT — trivially reversible, so still a leak — no longer
  *  matches the shared set. The shared matcher's semantics are untouched:
@@ -108,19 +145,16 @@ export function matchesCredentialAnyCase(text: string): boolean {
   return CREDENTIAL_PATTERNS_ANY_CASE.some((re) => new RegExp(re.source, re.flags.replace("g", "")).test(text));
 }
 
-/** `redactCredentials`, then the case-insensitive clones: for text a normaliser may have case-folded
- *  (`norm` lowercases labels). Text with no match in either case is returned byte-identical; text the
- *  case-sensitive pass leaves alone but a clone matches is redacted too, which fails closed. Consumers:
+/** Union original-text spans from both the shared patterns and case-insensitive clones: for text a
+ *  normaliser may have case-folded (`norm` lowercases labels). Text with no match in either case is
+ *  returned byte-identical; a clone's additional matches are redacted too, which fails closed. Consumers:
  *  `json.ts`'s envelope KEYS (every key; the `whys` keys are `norm(label)`) and `recapCampaigns.ts`'s
  *  record LABELS (`norm(repo)`). Cost, stated: a lower-case word shaped like a key id — `asia` plus 16
  *  alnum, e.g. a branch `feat/asiapacificexpansion` (or, since the trailing lookahead, `…_v2`) — is
  *  redacted too; 0 of 527 real PR branches, and 0 of 542 re-measured (round-2 harden, 2026-10-02:
  *  this repo's merged-PR branch names, raw and space-split, before and after the lookahead). */
 export function redactCredentialsAnyCase(text: string): string {
-  if (typeof text !== "string") return text;   // as `redactCredentials`: a non-string, unchanged
-  let out = redactCredentials(text);
-  for (const re of CREDENTIAL_PATTERNS_ANY_CASE) out = out.replace(new RegExp(re.source, re.flags), REDACTION);
-  return out;
+  return redactCredentialSpans(text, [...CREDENTIAL_PATTERNS.map(({ re }) => re), ...CREDENTIAL_PATTERNS_ANY_CASE]);
 }
 
 /** Which patterns matched — for telemetry and for tests, never for a message shown to a user
@@ -143,10 +177,77 @@ export const REDACTION = "[redacted]";
  *  `status --json` once handed this a `morningTime` of 720 and `.replace` threw (round-2 harden D-M1).
  *  A caller that needs a string spells the value itself first (json.ts reports `JSON.stringify`). */
 export function redactCredentials(text: string): string {
+  return redactCredentialSpans(text, CREDENTIAL_PATTERNS.map(({ re }) => re));
+}
+
+/** Redact known shapes AND the optional resolved secret in the same original-text span union. */
+export function redactCredentialsWithSecret(text: string, secret?: string): string {
+  return redactCredentialSpans(text, CREDENTIAL_PATTERNS.map(({ re }) => re), secret);
+}
+
+/** Scan every pattern and the optional literal against the ORIGINAL text. Either sequential order
+ *  can destroy an overlapping match and leave part of a credential behind. Merge overlapping and
+ *  adjacent spans before replacing anything. Each regex supplies an ordered stream of matches;
+ *  merging a fixed number of streams avoids an O(n log n) sort and keeps the scan linear. Literal
+ *  searches advance past each occurrence, as split(secret) did, without treating the key as a regex.
+ *  ⚠ EVERY STREAM MUST ADVANCE, or the loop never ends: each clone is forced global (a non-`g` `exec`
+ *  restarts at 0 forever) and an EMPTY match is skipped by stepping `lastIndex` past it (a global
+ *  regex does not move on its own after an empty match). No table entry is either today — pinned in
+ *  test/credentials.span-termination.test.ts — so this changes nothing for them; it makes a future
+ *  entry unable to hang every redactor. */
+function redactCredentialSpans(text: string, patterns: readonly RegExp[], secret = ""): string {
   if (typeof text !== "string") return text;
-  let out = text;
-  for (const p of CREDENTIAL_PATTERNS) out = out.replace(new RegExp(p.re.source, p.re.flags), REDACTION);
-  return out;
+  const scans = patterns.map((re) => new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g"));
+  const next = (re: RegExp): RegExpExecArray | null => {
+    let m = re.exec(text);
+    while (m && m[0] === "") { re.lastIndex++; m = re.exec(text); }
+    return m;
+  };
+  const matches = scans.map(next);
+  let literal = secret ? text.indexOf(secret) : -1;
+  let start = -1, end = -1, copied = 0;
+  const parts: string[] = [];
+  for (;;) {
+    let nextStart = literal < 0 ? Infinity : literal;
+    let nextEnd = nextStart + secret.length;
+    let pattern = -1;
+    for (let i = 0; i < matches.length; i++) {
+      const match = matches[i];
+      if (match && match.index < nextStart) {
+        nextStart = match.index;
+        nextEnd = match.index + match[0].length;
+        pattern = i;
+      }
+    }
+    if (nextStart === Infinity) break;
+    if (pattern < 0) literal = text.indexOf(secret, nextEnd);
+    else matches[pattern] = next(scans[pattern]!);
+
+    if (nextStart > end) {
+      if (start >= 0) {
+        parts.push(text.slice(copied, start), REDACTION);
+        copied = end;
+      }
+      start = nextStart;
+      end = nextEnd;
+    } else end = Math.max(end, nextEnd);
+  }
+  if (start < 0) return text;
+  parts.push(text.slice(copied, start), REDACTION, text.slice(end));
+  return parts.join("");
+}
+
+/** Test seam only: the span union with an injected pattern list. Production callers use the three
+ *  `redactCredentials*` wrappers above. */
+export { redactCredentialSpans as redactCredentialSpansForTests };
+
+/** An incomplete stream can stop before a credential's delimiter or minimum length arrives. Only
+ *  whitespace proves the preceding token ended: withhold its unfinished tail BEFORE redaction.
+ *  No whitespace means no complete token; trailing whitespace means the whole prefix can stay. */
+export function dropTrailingPartialToken(text: string): string {
+  let end = text.length;
+  while (end > 0 && !/\s/.test(text[end - 1]!)) end--;
+  return text.slice(0, end);
 }
 
 /** INGEST-SIDE: FAIL CLOSED — a credential hit drops the why ENTIRELY and the bullet renders bare.
@@ -157,4 +258,24 @@ export function redactCredentials(text: string): string {
  *  Returns the reason code rather than a boolean so the caller records the right DropReason. */
 export function ingestScan(text: string): { ok: true } | { ok: false; reason: "credential-hit" } {
   return matchesCredential(text) ? { ok: false, reason: "credential-hit" } : { ok: true };
+}
+
+/** Clip RAW provider input without leaving a credential prefix that output redaction cannot match.
+ *  Inspect spans in the uncut text; a cut inside any match backs up to its start. Complete credentials
+ *  remain raw by design. URL spans include their required @ lookahead delimiter. Descending starts also cover chains of overlapping classes regardless of
+ *  table order. Only spans starting before the cap matter (at most maxChars per pattern). */
+export function clipBeforeCredential(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const spans: { start: number; end: number }[] = [];
+  for (const { name, re } of CREDENTIAL_PATTERNS) {
+    for (const m of text.matchAll(new RegExp(re.source, re.flags))) {
+      if (m.index >= maxChars) break;
+      spans.push({ start: m.index, end: m.index + m[0].length + (name === "url-userinfo" ? 1 : 0) });
+    }
+  }
+  let cut = maxChars;
+  for (const { start, end } of spans.sort((a, b) => b.start - a.start)) {
+    if (start < cut && cut < end) cut = start;
+  }
+  return text.slice(0, cut);
 }

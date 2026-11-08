@@ -101,6 +101,10 @@ describe("checkSize", () => {
     mkdirSync(app);
     sized(app, "x", 10);
     expect(checkSize(b, "app-test", app).ok).toBe(true);
+    // v0.3.0: the Calendar Reader's `reader-*` row measures a .app directory too (M11 checkpoint HIGH).
+    const rb = { ...b, artifacts: { ...b.artifacts, "reader-test": { ...b.artifacts["app-test"]! } } };
+    expect(checkSize(rb, "reader-test", app).ok).toBe(true);
+    expect(checkSize(rb, "reader-test", sized(d, "g", 10)).ok).toBe(false);
     expect(checkSize(b, "app-test", sized(d, "f", 10)).ok).toBe(false);
     expect(checkSize(b, "dmg-test", app).ok).toBe(false);
   });

@@ -10,11 +10,16 @@
 // (process.execPath), so the payload table below drives the script's own parse of the eval contract.
 // The release check itself runs `bun run eval --json` against the real provider; no test ever does.
 import "./fixtures/isolate-state";
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, setDefaultTimeout } from "bun:test";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
+
+// Each run makes a worktree, runs every check's stub and removes the worktree, and nothing here asserts wall time. Under
+// a loaded machine bun's 5 s default expired mid-run (measured up to 22 s), bun TERMed the script, and its trap made it
+// exit 130, which then read as a wrong exit code. Bun scopes this default to the file (measured, 1.3.14).
+setDefaultTimeout(60_000);
 
 const ROOT = resolve(import.meta.dir, "..");
 const SCRIPT = join(ROOT, "scripts", "release-check.sh");
@@ -220,9 +225,7 @@ describe("release-check.sh: the all-PASS run", () => {
     expect(git(fx.repo, "worktree", "list", "--porcelain").match(/^worktree /gm)?.length).toBe(1);
     expect(readdirSync(fx.tmp).sort()).toEqual(before);
     expect(git(fx.repo, "status", "--porcelain")).toBe("");
-    // A whole run (worktree add, every check's stub, worktree remove) in one test: under a loaded machine
-    // the 5 s default expired mid-run, bun TERMed the script, and its trap made it exit 130.
-  }, 60_000);
+  });
 
   test("the eval-integrity header is there: wiring only, the accepted posture set is the literal {\"full\"}", () => {
     const src = readFileSync(SCRIPT, "utf8");
@@ -286,7 +289,7 @@ describe("release-check.sh: the eval predicate (check 6) over fixture payloads",
     expect(note).toBeGreaterThan(six);
     expect(note).toBeLessThan(verdict);
     expect(verdict).toBeLessThan(seven);
-  }, 60_000);
+  });
 
   // The same inputs as the "exit 1, payload otherwise clean" row above, plus the knob: the count is taken
   // before check 6's early return, so a failing eval still reports it.
@@ -303,7 +306,7 @@ describe("release-check.sh: the eval predicate (check 6) over fixture payloads",
     expect(note).toBeGreaterThan(six);
     expect(note).toBeLessThan(exited);
     expect(exited).toBeLessThan(seven);
-  }, 60_000);
+  });
 });
 
 describe("release-check.sh: every check runs, whatever failed before it", () => {
@@ -386,7 +389,7 @@ describe("release-check.sh: every check runs, whatever failed before it", () => 
     // signal itself (no exit code), which is what this pins against.
     expect({ code, signal: proc.signalCode }).toEqual({ code: 129, signal: null });
     expect(git(fx.repo, "worktree", "list", "--porcelain").match(/^worktree /gm)?.length).toBe(1);
-  }, 60_000);
+  });
 
   test("the logs are kept when anything failed, and the worktree is removed all the same", () => {
     const fx = mono();
@@ -522,7 +525,7 @@ describe("release-check.sh: check 1 and the worktree", () => {
     expect(r.out).toContain("steps 5-7");
     expect(r.out).not.toContain(`git tag v${V} ${head}`);
     expect(r.out).not.toMatch(/^\s*git tag /m);
-  }, 60_000);
+  });
 });
 
 describe("release-check.sh: arguments", () => {

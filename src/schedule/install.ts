@@ -41,7 +41,7 @@ import { stripControl } from "../render";
 import {
   launchdPlist, systemdUnits, windowsTaskXml, windowsTaskXmlBytes, assertNoMountPath,
   SCHEDULE_LABEL, SYSTEMD_SERVICE_NAME, SYSTEMD_TIMER_NAME, WINDOWS_TASK_NAME, DEFAULT_INTERVAL_SEC,
-  type ScheduleOpts,
+  LOGIN_ITEMS_OFF_HINT, type ScheduleOpts,
 } from "./units";
 
 // ── the seams ───────────────────────────────────────────────────────────────────────────────────
@@ -491,22 +491,44 @@ async function ensureIdentity(exec: Exec, identity: string, home: string): Promi
   }
 }
 
+/** What a signed copy is and which macOS grant its stable signature keeps. The schedule's managed binary by
+ *  default; the calendar's reader copy passes its own (v0.3.0 plan M10b, `src/calendar/reader-install.ts`). */
+export type SignedCopyKind = {
+  identifier: string;
+  grant: string;
+  /** A BUNDLE (a folder): strip quarantine from every file in it (`xattr -dr`), not only the top folder — a copy
+   *  made with `fs.cp` keeps each file's extended attributes (M10b checkpoint). The schedule's copy is one file. */
+  recursive?: boolean;
+};
+const SCHEDULE_COPY: SignedCopyKind = { identifier: SCHEDULE_LABEL, grant: "the macOS folder-access grant" };
+
 /** Strip quarantine from the COPY, then sign it. Degrades with a warning at every step.
  *  Legitimate here precisely because the user explicitly executed this binary and asked it to
- *  schedule itself — and it is STATED in the output rather than done quietly. */
-async function signManagedCopy(d: Resolved, copyPath: string, identity: string): Promise<"stable" | "adhoc" | "unsigned"> {
+ *  schedule itself — and it is STATED in the output rather than done quietly.
+ *
+ *  ⚠ EXPORTED FOR THE CALENDAR READER ONLY (v0.3.0 plan M10b), which re-signs its attended copy under
+ *  `local.daily-briefing.calendar` with the same stable identity. Every OS command still leaves through `d.exec`
+ *  (scanner 4's R1: nothing under src/schedule/ spawns), so the caller owns the exec and a test injects a fake.
+ *  It touches the login keychain (`ensureIdentity`): call it ONLY from an attended flow, never a scheduled run. */
+export async function signManagedCopy(
+  d: Pick<Resolved, "exec" | "say" | "warn" | "home">, copyPath: string, identity: string, kind: SignedCopyKind = SCHEDULE_COPY,
+): Promise<"stable" | "adhoc" | "unsigned"> {
   // An absent attribute makes `xattr -d` exit non-zero; that is the common case, not a problem — but
   // it is NOT "removed", and saying so regardless made the line evidence-free. Branch on the code.
-  const q = await d.exec(["xattr", "-d", "com.apple.quarantine", copyPath]).catch(() => ({ code: 1, out: "", err: "" }));
+  const q = await d.exec(["xattr", kind.recursive ? "-dr" : "-d", "com.apple.quarantine", copyPath]).catch(() => ({ code: 1, out: "", err: "" }));
   if (q.code === 0) d.say(`Removed the macOS quarantine attribute from the managed copy at ${copyPath}.`);
   else d.say(`No macOS quarantine attribute to remove from ${copyPath} (xattr exited ${q.code}) — the ordinary case for a locally built binary.`);
-  if (await ensureIdentity(d.exec, identity, d.home)) {
+  // `-` is codesign's AD-HOC identity, never a stable one (codex W3 review): `DBA_SIGN_IDENTITY=-` must not come
+  // back "stable", or the calendar reader's installer would trade a granted copy for an ad-hoc one.
+  if (identity === "-") {
+    d.warn(`WARN: the signing identity '-' is ad hoc — ${kind.grant} may not persist.`);
+  } else if (await ensureIdentity(d.exec, identity, d.home)) {
     // `--timestamp=none` on BOTH signatures (Phase E M5b checkpoint): codesign's default for whether
     // it asks Apple's timestamp server is per-identity and unspecified, and the README's privacy
     // section promises nothing else is contacted — so no signature this tool makes may depend on it.
-    const signed = await d.exec(["codesign", "--force", "--sign", identity, "--timestamp=none", "--identifier", SCHEDULE_LABEL, copyPath]);
+    const signed = await d.exec(["codesign", "--force", "--sign", identity, "--timestamp=none", "--identifier", kind.identifier, copyPath]);
     if (signed.code === 0) {
-      d.say(`Signed the managed copy with '${identity}' — the macOS folder-access grant will persist across re-installs.`);
+      d.say(`Signed the managed copy with '${identity}' — ${kind.grant} will persist across re-installs.`);
       return "stable";
     }
     d.warn(`WARN: codesign with '${identity}' failed — falling back to an ad-hoc signature; the grant may not persist.`);
@@ -719,6 +741,13 @@ export async function installSchedule(opts: InstallOpts = {}, deps: ScheduleDeps
   // the verification — is reported as before and undoes nothing (spec 3.2.1).
   try {
     if (d.platform === "linux") await reportLinger(d, opts);
+    // ⚠ `launchctl load` EXITS 0 FOR AN ITEM SWITCHED OFF IN LOGIN ITEMS, and launchd then cannot find the
+    // job (measured, macOS 26.6.2). One read-only probe after the load says so. The exit code stands and
+    // nothing rolls back: the unit is correct, and only the user can flip the switch. With verification on,
+    // the verdict below may fail too; this line is its explanation.
+    if (kind === "launchd" && (await probeRegistration(d, { timeoutMs: INSTALL_PROBE_TIMEOUT_MS })).state === "gone") {
+      d.warn(`WARN: ${LOGIN_ITEMS_OFF_HINT}`);
+    }
 
     if (opts.noVerify) {
       d.say("Skipped the verification kickstart (--no-verify).");
@@ -1551,6 +1580,9 @@ export type RegistrationCheck =
 
 /** launchd's "service not found" exit code (`launchctl print` / `list` on a missing label). */
 const LAUNCHD_NOT_FOUND = 113;
+
+/** The cap on each exec of the install's one post-load probe — `schedule status`'s own 5 s. */
+const INSTALL_PROBE_TIMEOUT_MS = 5_000;
 
 /** One read-only probe exec. A THROWN exec counts as -2 (spec 3.1.4) — synchronously or by rejecting
  *  (`execNoThrow`) — so nothing here can throw, and `schedule status` never crashes on the check. */

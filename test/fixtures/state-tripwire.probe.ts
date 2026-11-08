@@ -16,13 +16,19 @@
 import { test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { archivedBriefingPath, latestBriefingPath, localDateStr, stampToday } from "../../src/marker";
 import { configPath } from "../../src/config";
 import { removeAtRunEnd } from "./temp-dirs";
 
 const sandbox = process.env.DBA_TRIPWIRE_SANDBOX ?? "";
-if (!basename(sandbox).startsWith("dba-tripwire-") || homedir() !== join(sandbox, "home") || resolve(tmpdir()) !== resolve(sandbox, "tmp")) {
+// With test/preload.ts, TMPDIR is already this process's run root (fixtures/run-tmp.ts), a `dba-run-*` dir
+// directly inside the sandbox's tmp/; bare, it is tmp/ itself. Read here rather than imported, so the bare
+// control does not load the run root.
+const tmp = resolve(tmpdir());
+const sandboxTmp = resolve(sandbox, "tmp");
+const inSandboxTmp = tmp === sandboxTmp || (dirname(tmp) === sandboxTmp && basename(tmp).startsWith("dba-run-"));
+if (!basename(sandbox).startsWith("dba-tripwire-") || homedir() !== join(sandbox, "home") || !inSandboxTmp) {
   throw new Error("state-tripwire.probe.ts runs only as the sandboxed child of test/state-tripwire.test.ts");
 }
 

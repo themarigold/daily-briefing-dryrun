@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "macos": {
+    "status": "ok",
+    "notices": [
+      "helper-outdated"
+    ],
+    "calendars": [
+      {
+        "id": "3F2504E0-4F89-41D3-9A0C-0305E82C3301",
+        "title": "Home",
+        "account": "iCloud",
+        "editable": true,
+        "type": "standard",
+        "selected": true
+      },
+      {
+        "id": "6BA7B810-9DAD-41D1-80B4-00C04FD430C8",
+        "title": "Work",
+        "account": "me@work.example",
+        "editable": true,
+        "type": "standard",
+        "selected": true
+      },
+      {
+        "id": "9C4F1D2A-7E3B-4A5C-8D6E-1F2A3B4C5D6E",
+        "title": "US Holidays",
+        "account": "Subscribed Calendars",
+        "editable": false,
+        "type": "subscribed",
+        "selected": false
+      },
+      {
+        "id": "A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D",
+        "title": "Birthdays",
+        "account": "Other",
+        "editable": false,
+        "type": "birthdays",
+        "selected": false
+      }
+    ]
+  },
+  "links": [
+    {
+      "id": "home",
+      "name": "Home (Google)",
+      "urlPathOwner": "me@example.com",
+      "confirmedOwner": "me@example.com",
+      "urlFrom": "file",
+      "fileStatus": "ok"
+    },
+    {
+      "id": "work",
+      "name": "Work (Outlook)",
+      "configuredOwner": "me@work.example",
+      "confirmedOwner": null,
+      "urlFrom": "command"
+    },
+    {
+      "id": "team",
+      "confirmedOwner": null,
+      "urlFrom": "env"
+    },
+    {
+      "id": "trip",
+      "name": "Trip",
+      "confirmedOwner": null,
+      "urlFrom": "file",
+      "fileStatus": "refused",
+      "fileReason": "file-permissions"
+    },
+    {
+      "id": "lost",
+      "confirmedOwner": null,
+      "urlFrom": "file",
+      "fileStatus": "failed",
+      "fileReason": "read-error"
+    }
+  ]
+}

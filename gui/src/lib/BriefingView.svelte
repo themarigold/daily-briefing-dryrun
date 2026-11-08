@@ -40,6 +40,10 @@
    * its level-2 lines with each Stage-1 group among them still collapsed until clicked. Sub-groups are
    * keyed by `subRowKey` — index AND header — for the same reason rows are. No `open` attribute is
    * ever written, at either level. A two-level page has no `nested2` line and draws as before.
+   *
+   * v0.3.0 (spec r4 §7): a `calendar` block — a line of the "Today's calendar" section — is a row of
+   * its own, drawn at the bullet level with the engine's `◦` glyph. It never joins a recap group
+   * (`briefing-rows.ts` groups only `nested`/`nested2` members).
    */
   import type { Block, Span } from "./briefing-md";
   import { groupRows, rowKey, subRowKey, type Member } from "./briefing-rows";
@@ -93,11 +97,20 @@
   .why,
   .placeholder,
   .coverage,
-  .legend {
+  .legend,
+  .calendar {
     padding-left: 1.1rem;
   }
   .bullet::before {
     content: "•";
+    display: inline-block;
+    width: 1.1rem;
+    margin-left: -1.1rem;
+    color: var(--muted);
+  }
+  /* v0.3.0: a calendar section line — the engine's `◦` at the first level. */
+  .calendar::before {
+    content: "◦";
     display: inline-block;
     width: 1.1rem;
     margin-left: -1.1rem;
@@ -167,7 +180,8 @@
   .why,
   .legend,
   .placeholder,
-  .footer {
+  .footer,
+  .notice {
     color: var(--muted);
   }
   .outage,

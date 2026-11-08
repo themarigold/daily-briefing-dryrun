@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-github"
+description = "Enables the open_github command without any pre-configured scope."
+commands.allow = ["open_github"]
+
+[[permission]]
+identifier = "deny-open-github"
+description = "Denies the open_github command without any pre-configured scope."
+commands.deny = ["open_github"]

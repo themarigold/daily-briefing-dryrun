@@ -45,8 +45,9 @@ const TOKENS: Record<string, string> = {
   "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
   "env-assignment": "API_TOKEN=s3cr3tvalue1234",
   "auth-header": "Authorization: Bearer abcdef1234567890",
+  "url-userinfo": "https://user:UrlPasswordMark@host/repo",
 };
-const CLASSES = CREDENTIAL_PATTERNS.map((p) => p.name);
+const CLASSES = Object.keys(TOKENS);
 const GH = TOKENS["github-token"]!;
 
 /** The SECRET part of each token — what must never reach an output in ANY case. Not the whole token
@@ -62,14 +63,15 @@ const SECRETS: Record<string, string> = {
   "jwt": "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
   "env-assignment": "s3cr3tvalue1234",
   "auth-header": "abcdef1234567890",
+  "url-userinfo": "UrlPasswordMark",
 };
 const leaksSecret = (text: string, cls: string) => text.toLowerCase().includes(SECRETS[cls]!.toLowerCase());
 
 test("premise: every CREDENTIAL_PATTERNS class has a token here, and each token matches ITS OWN class", () => {
-  expect(Object.keys(TOKENS).sort()).toEqual([...CLASSES].sort());
+  expect(Object.keys(TOKENS).sort()).toEqual(CREDENTIAL_PATTERNS.map((p) => p.name).sort());
   for (const name of CLASSES) {
     expect(`${name}: ${credentialHits(TOKENS[name]!).includes(name)}`).toBe(`${name}: true`);
-    expect(redactCredentials(TOKENS[name]!)).toBe(REDACTION);
+    expect(redactCredentials(TOKENS[name]!)).toBe(name === "url-userinfo" ? `https://${REDACTION}@host/repo` : REDACTION);
     // …and its SECRET part is really inside it, and is not something the redaction marker contains.
     expect(`${name}: ${leaksSecret(TOKENS[name]!, name)}`).toBe(`${name}: true`);
     expect(`${name}: ${leaksSecret(REDACTION, name)}`).toBe(`${name}: false`);
@@ -422,7 +424,7 @@ describe("property: renderBriefing(redactStruct(s)) === redactCredentials(render
     }
   }
 
-  test("the divergence list is exactly what was measured: 12 of 192 variants", () => {
+  test("the divergence list is exactly the 12 known env-assignment variants", () => {
     let n = 0, known = 0;
     for (const { struct } of CORPUS) for (const cls of CLASSES) for (const pos of POSITIONS) {
       n++; if (knownDivergence(struct, cls, pos)) known++;

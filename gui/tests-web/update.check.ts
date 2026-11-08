@@ -81,7 +81,7 @@ function webviewSources(): Map<string, string> {
 
 const RESULT_NEWER = {
   status: "newer" as const, current: "0.1.1", latest: "0.2.0",
-  url: "https://github.com/themarigold/daily-briefing/releases/tag/v0.2.0", checkedAt: "2026-10-01T08:00:00.000Z",
+  url: "https://github.com/norn-app/daily-briefing/releases/tag/v0.2.0", checkedAt: "2026-10-01T08:00:00.000Z",
 };
 
 /* ── the wire shapes mirror the engine's ─────────────────────────────────────────────────────── */
@@ -360,8 +360,10 @@ describe("the Settings toggle is the engine's updateCheck, with the engine's own
   test("the form renders the section", () => {
     const draft: Draft = { provider: { cli: "claude", argv: ["-p"], promptVia: "stdin" }, updateCheck: { enabled: true } };
     const body = html(SettingsForm, { draft, errors: {}, onfield: () => {}, onnotifycommand: () => {}, ondefault: () => {}, onremovekey: () => {} });
-    expect(body).toMatch(/<legend[^>]*>Update check<\/legend>/);
-    expect(body).toContain("Check for new versions automatically");
+    expect(body).toMatch(/<legend[^>]*><h4[^>]*>Update check<\/h4><\/legend>/);
+    // Redesign D final round 2 (V8, user-directed): the S-A mockup's words.
+    expect(body).toContain("Check for updates automatically");
+    expect(body).not.toContain("Check for new versions automatically");
     expect(body).toContain("it downloads nothing and installs nothing");
   });
 });

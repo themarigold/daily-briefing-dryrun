@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { runCore } from "../src/core";
 import { run } from "../src/main";
 import { renderBriefing } from "../src/render";
+import { MASKED_LABEL } from "../src/failover";
 import { buildRepo } from "./fixtures/build-repo";
 import { loadAccountState, accountStatePath } from "../src/account";
 import type { Config } from "../src/types";
@@ -51,7 +52,9 @@ if [ "$CLAUDE_CONFIG_DIR" != "${okDir}" ]; then
   printf "You've hit your weekly limit \\302\\267 resets $RESET (America/Los_Angeles)\\n"
   exit 1
 fi
-printf "RESUME\\n- resumed\\nRECAP\\n- recapped\\nSUGGESTIONS\\n- suggested\\n"
+# Real section headings (P1-M7-T1): an answer with none is \`unusable-answer\` to the walk (hasBriefingSection), so a
+# heading-less "delivery" would now move on, and on the last entry take the parse-empty path with an hour mark.
+printf "## RESUME\\n- resumed\\n## RECAP\\n- recapped\\n## SUGGESTIONS\\n- suggested\\n"
 `);
   await chmod(p, 0o755);
   return p;
@@ -104,7 +107,9 @@ const deps = {
 };
 
 describe("failover through the real provider stack", () => {
-  test("tick A: the limit is classified, the account marked, and the tick exits QUIETLY with no briefing", async () => {
+  // Provider fallback P1-M7-T1 (spec r9 §5 step 5): INVERTED. A usage wall used to end the tick quietly and leave the
+  // fallback for the next one; the walk now marks the wall and hands off to the fallback IN THE SAME TICK.
+  test("tick A: the limit is classified, the account marked, and the SAME tick hands off to the fallback and delivers", async () => {
     const dir = await mkdtemp(join(tmpdir(), "fake-cli-"));
     const limitedDir = join(dir, "limited"), okDir = join(dir, "ok");
     const cli = await fakeClaude(dir, okDir);
@@ -112,38 +117,37 @@ describe("failover through the real provider stack", () => {
 
     const r = await runCore(cfg, deps);
 
-    expect(r.skipReason).toBe("limited");
-    expect(r.offlineSkipped).toBe(true);            // the GATE for the quiet return 0 — not skipReason alone
-    expect(r.limited?.label).toBe("primary");
-    expect(r.limited?.isProbe).toBe(false);         // a PARSED reset, so the message may state it
-    // COMPUTED against the state as written, not assumed. Shipped hardcoded `true`-equivalent, and the
-    // 2026-08-24 live test printed "no other account is available" on exactly this tick.
-    expect(r.limited?.exhausted).toBe(false);       // the fallback is unmarked and delivers next tick
-    expect(r.account).toBeUndefined();              // nothing was produced, so nothing to attribute
-    expect(r.rawText).toBe("");                     // no briefing produced
+    expect(r.skipReason).toBeUndefined();           // no quiet skip: the fallback delivered this tick
+    expect(r.limited).toBeUndefined();
+    expect(r.rawText).toContain("RESUME");
+    expect(r.account).toBe("fallback");             // the entry that produced it
     const st = await loadAccountState(stateDir);
-    expect(st.accounts.primary).toBeDefined();
+    expect(st.accounts.primary?.reason).toBe("usage");
+    expect(st.accounts.primary?.isProbe).toBe(false);   // a PARSED reset
     expect(st.lastLimit?.label).toBe("primary");    // the cause record, which is the outage TRIGGER
+    expect(st.accounts.fallback).toBeUndefined();   // the winner's mark is cleared (it had none)
 
-    // One spawn, not three: the ladder must not re-run a walled account.
-    expect((await spawns(dir)).length).toBe(1);
+    // One spawn per entry: the walled login is not retried and the ladder does not re-run it.
+    expect(await spawns(dir)).toEqual([limitedDir, okDir]);
     await rm(dir, { recursive: true, force: true });
     await rm(accountStatePath(stateDir), { force: true });
   });
 
+  // P1-M7-T1: the two-tick hand-off is now same-tick (tick A above); tick B pins that the mark then STICKS — the
+  // walled primary is filtered out before any spawn and the fallback runs alone.
   test("tick B: with the primary marked, the fallback is selected, spawned under ITS config dir, and delivers", async () => {
     const dir = await mkdtemp(join(tmpdir(), "fake-cli-"));
     const limitedDir = join(dir, "limited"), okDir = join(dir, "ok");
     const cli = await fakeClaude(dir, okDir);
     const cfg = await cfgFor(cli, [{ label: "primary", configDir: limitedDir }, { label: "fallback", configDir: okDir }]);
 
-    await runCore(cfg, deps);                        // tick A marks the primary
+    await runCore(cfg, deps);                        // tick A marks the primary (and delivers through the fallback)
     const before = process.env.CLAUDE_CONFIG_DIR;
     const r = await runCore(cfg, deps);              // tick B
 
     expect(r.skipReason).toBeUndefined();
     expect(r.rawText).toContain("RESUME");           // a real briefing came back
-    expect((await spawns(dir)).at(-1)).toBe(okDir);  // spawned under the FALLBACK's dir
+    expect(await spawns(dir)).toEqual([limitedDir, okDir, okDir]);   // tick B: the FALLBACK's dir only
     // Provenance the SHELL can log. Until 2026-08-24 the only proof of which account delivered was the
     // mtime of a session dir under the fallback's config dir — incidental, and not evidence that would
     // survive a CLI change, for the one fact the whole feature turns on.
@@ -165,18 +169,15 @@ describe("failover through the real provider stack", () => {
     const cli = await fakeClaude(dir, join(dir, "ok"));       // neither account's dir is the working one
     const cfg = await cfgFor(cli, [{ label: "primary", configDir: limitedA }, { label: "fallback", configDir: limitedB }]);
 
-    const first = await runCore(cfg, deps);          // marks primary — the fallback is still selectable
-    expect(first.limited?.exhausted).toBe(false);
-
-    // THE case the old shared-dir test could not reach: the CATCH branch, with two accounts configured,
-    // where the account being marked is the last one standing. A `accounts.length > 1` implementation
-    // answers false here and the shell then promises a retry that can never happen.
-    const second = await runCore(cfg, deps);         // marks fallback — now nothing is left
-    expect(second.limited?.label).toBe("fallback");
-    expect(second.limited?.exhausted).toBe(true);
+    // P1-M7-T1: ONE tick now walks both walls — the primary is marked and the walk moves on to the fallback, which
+    // walls too. THE case the old shared-dir test could not reach: the account being marked is the last one standing.
+    const first = await runCore(cfg, deps);
+    expect(first.skipReason).toBe("limited");
+    expect(first.limited?.label).toBe("fallback");   // the last wall of the walk
+    expect(first.limited?.exhausted).toBe(true);
 
     const spawnsBefore = (await spawns(dir)).length;
-    expect(spawnsBefore).toBe(2);                    // exactly one spawn per tick, no ladder re-runs
+    expect(spawnsBefore).toBe(2);                    // exactly one spawn per walled entry, no ladder re-runs
     const r = await runCore(cfg, deps);              // nothing usable left — the early-return branch
 
     expect(r.skipReason).toBe("limited");
@@ -192,7 +193,7 @@ describe("failover through the real provider stack", () => {
     await rm(accountStatePath(stateDir), { force: true });
   });
 
-  // Provenance is gated on `hardened` for the same reason recordLimit/clearMark/recordAuthProbe are:
+  // Provenance is gated on `owned` for the same reason recordLimit/clearMark/recordHourMark are:
   // an injected provider means the resolved label never reached a spawn, so attributing output to it
   // would describe a process that never ran. The eval harness calls runCore exactly this way.
   test("an INJECTED provider produces no account attribution, even with accounts configured", async () => {
@@ -231,6 +232,26 @@ describe("failover through the real provider stack", () => {
     await rm(dir, { recursive: true, force: true });
     await rm(accountStatePath(stateDir), { force: true });
     await rm(join(stateDir, "last-run"), { force: true });
+  });
+
+  // PR 1 final review round 3, R0: the outage label is masked at its SOURCE (core.ts), not in render.ts — render must
+  // commute with redaction (test/envelope-redaction.test.ts), so this is the pin for the masking itself.
+  test("round 3 R0: the recovery struct's outage label is masked when the recorded limit label is a key or a link", async () => {
+    const KEY = "sk-ant-api03-Zq9xR2bT7mVwK4pLs8NcYf3HjA6uDe1GiO5rQ0tXzBnMvCwEkPaLyJhUgSdFo2Ii-AbCdEfGhAA";
+    const LINK = "Cal https://calendar.google.com/calendar/ical/abc%40group.calendar.google.com/private-0123456789abcdef0123456789abcdef/basic.ics";
+    for (const label of [`Key ${KEY}`, LINK]) {
+      const dir = await mkdtemp(join(tmpdir(), "fake-cli-"));
+      const okDir = join(dir, "ok");
+      const cli = await fakeClaude(dir, okDir);
+      const cfg = await cfgFor(cli, [{ label: "primary", configDir: okDir }]);
+      await writeFile(join(stateDir, "last-run"), "2026-08-21");
+      await writeFile(accountStatePath(stateDir), JSON.stringify({ accounts: {}, lastLimit: { label, at: "2026-08-22T07:20:00-07:00" } }));
+      const r = await runCore(cfg, deps);
+      expect(r.struct.outage).toEqual({ missedDays: 2, label: MASKED_LABEL });
+      await rm(dir, { recursive: true, force: true });
+      await rm(accountStatePath(stateDir), { force: true });
+      await rm(join(stateDir, "last-run"), { force: true });
+    }
   });
 
   test("a single-account machine (no `accounts` configured) still detects, marks and skips quietly", async () => {
@@ -288,19 +309,19 @@ describe("run() — the shell's own output on the failover path", () => {
     }
   }
 
-  test("a limited tick with a fallback left does NOT claim there is no other account", async () => {
+  // P1-M7-T1: INVERTED. A wall with a fallback left no longer ends the tick as `limited` — the same tick delivers
+  // through the fallback, so no limited line (and no "no other account" claim) is printed at all.
+  test("a walled tick with a fallback left delivers through it and prints no limited line", async () => {
     const dir = await mkdtemp(join(tmpdir(), "fake-cli-"));
     const limitedDir = join(dir, "limited"), okDir = join(dir, "ok");
     const cli = await fakeClaude(dir, okDir);
 
     await withShell([{ label: "primary", configDir: limitedDir }, { label: "fallback", configDir: okDir }], cli, async (err) => {
       const code = await run(true, deps);
-      expect(code).toBe(0);                                   // a wall is a known outage, not an error
-      const line = err.find((l) => l.includes("is at its usage limit"));
-      expect(line).toBeDefined();
-      expect(line).toContain('account "primary"');
-      expect(line).toContain("the next tick will use another account");
-      expect(line).not.toContain("no other account is available");   // the defect, at its call site
+      expect(code).toBe(0);
+      expect(err.some((l) => l.includes("is at its usage limit"))).toBe(false);
+      expect(err.some((l) => l.includes("no other account is available"))).toBe(false);   // the defect, at its call site
+      expect(err).toContain('briefing generated by account "fallback"');
     });
     await rm(dir, { recursive: true, force: true });
   });

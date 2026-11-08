@@ -2,7 +2,7 @@
 // check-size-budget.ts — the release-time size gate (Phase E, E3), wired by the bundle legs.
 //
 // Usage: bun scripts/check-size-budget.ts <path> <budget-row>
-//   <path>        the built artifact: a file, or for an `app-*` row the `.app` DIRECTORY
+//   <path>        the built artifact: a file, or for an `app-*` or `reader-*` row the `.app` DIRECTORY
 //   <budget-row>  a key under `artifacts` in gui/size-budget.json (e.g. dmg-aarch64-apple-darwin)
 //
 // Why a script and not `cargo test`: gui/src-tauri/tests/packaging.rs re-stats only rows whose
@@ -71,7 +71,8 @@ export function checkSize(budget: unknown, rowName: string, path: string): Verdi
 
   let st;
   try { st = lstatSync(path); } catch { return fail(`${rowName}: path '${path}' does not exist`); }
-  const wantDir = rowName.startsWith("app-");
+  // `app-*` rows and the Calendar Reader's `reader-*` row (v0.3.0) measure a `.app` DIRECTORY.
+  const wantDir = rowName.startsWith("app-") || rowName.startsWith("reader-");
   if (wantDir && !st.isDirectory()) return fail(`${rowName}: an app row measures a .app DIRECTORY, and '${path}' is not one`);
   if (!wantDir && !st.isFile()) return fail(`${rowName}: '${path}' is not a regular file`);
 

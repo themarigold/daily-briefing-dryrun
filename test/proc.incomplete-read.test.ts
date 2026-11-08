@@ -86,6 +86,27 @@ async function bounded<T>(p: Promise<T>, ms = 5_000): Promise<T> {
   } finally { if (guardTimer) clearTimeout(guardTimer); }
 }
 
+test("a FRACTIONAL timeout still spawns: Bun.spawn throws on one, so run() hands it a whole number (W3 VM sitting)", async () => {
+  // The real spawn, not a fake: what is pinned is Bun's own refusal of a non-integer `timeout`, which made a budget
+  // computed from performance.now() silently never start `calendar connect mac`'s reader.
+  const r = await bounded(run(["/usr/bin/true"], { timeoutMs: 1000.5 }));
+  expect([r.spawned, r.code]).toEqual([true, 0]);
+  const seen: unknown[] = [];
+  const spy = spyOn(Bun, "spawn").mockImplementation(((_cmd: unknown, o: { timeout?: unknown }) => {
+    seen.push(o.timeout);
+    return fakeSpawn({ stdout: eofStream([""]), stderr: eofStream([]) });
+  }) as never);
+  try {
+    await bounded(run(["x"], { timeoutMs: 113_457.38 }));
+    await bounded(run(["x"], { timeoutMs: 0.2 }));
+    // Bun reads 0, NaN and Infinity as NO timeout: each gets the default instead, never an unbounded child; a value past
+    // 2^31-1 (which Bun kills at once) is capped.
+    for (const t of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) await bounded(run(["x"], { timeoutMs: t }));
+    await bounded(run(["x"], { timeoutMs: 2 ** 40 }));
+    expect(seen).toEqual([113_458, 1, DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 2 ** 31 - 1]);
+  } finally { spy.mockRestore(); }
+});
+
 test("run() returns the output and exit code for a normal, fully-EOF'd invocation", async () => {
   const spy = spyOn(Bun, "spawn").mockImplementation(() =>
     fakeSpawn({ stdout: eofStream(["hello\n"]), stderr: eofStream(["warn\n"]) }));

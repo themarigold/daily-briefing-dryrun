@@ -25,11 +25,12 @@
   import {
     afterKick,
     afterKickRefusal,
+    armDecision,
     armLoop,
     beginKick,
+    evidenceStep,
     initialLoop,
     MAX_VERIFY_ATTEMPTS,
-    onEvidence,
     type LoopState,
     type VerifyEvidence,
   } from "./verify-flow";
@@ -44,8 +45,21 @@
      */
     trigger?: number;
     onfinished?: (outcome: EngineOutcome) => void;
+    /**
+     * Design 2026-10-31 r6 §4: the panel is mounted but hidden (the wizard behind another tab). A trigger then
+     * waits and arms once on show (`armDecision`), and a kick the evidence makes due is suppressed — never held
+     * (`evidenceStep`). On show the evidence decides again: the kick comes back only if what is there then still makes
+     * one due (an unchanged retrying state, say). The Schedule screen passes nothing.
+     */
+    suspended?: boolean;
+    /**
+     * True while a verify call is in flight — the CALL's lifetime, not the stage (r5): a delivery can settle the
+     * loop in `watching` before the call returns. Emitted on a change only. The wizard holds Back, Finish and
+     * "Finish setup later" on it; the Schedule screen passes nothing.
+     */
+    onbusy?: (busy: boolean) => void;
   }
-  let { evidence, trigger = 0, onfinished }: Props = $props();
+  let { evidence, trigger = 0, onfinished, suspended = false, onbusy }: Props = $props();
 
   /**
    * The whole loop lives in `lib/verify-flow.ts`'s pure state machine; this component only feeds
@@ -54,9 +68,18 @@
    */
   let loop = $state<LoopState>(initialLoop());
   let seenTrigger = $state(0);
+  /** Verify calls in flight (`onbusy`). Gates, not shown. */
+  let inFlight = 0;
+
+  function track(delta: 1 | -1): void {
+    const before = inFlight > 0;
+    inFlight += delta;
+    if ((inFlight > 0) !== before) onbusy?.(inFlight > 0);
+  }
 
   async function kick(which: number): Promise<void> {
     loop = beginKick(evidence, which);
+    track(1);
     try {
       const outcome = await scheduleVerify();
       loop = afterKick(loop, outcome, which, evidence);
@@ -64,13 +87,15 @@
     } catch (e) {
       // A `busy` refusal means a run or an install is already in flight; nothing was started.
       loop = afterKickRefusal(loop, describeFailure(e));
+    } finally {
+      track(-1);
     }
   }
 
   // The parent's trigger arms the loop — a delivery already on the books confirms WITHOUT a kick
-  // (plan R1, final-check M3; `armLoop`).
+  // (plan R1, final-check M3; `armLoop`). While suspended it waits: `seenTrigger` advances only on "arm".
   $effect(() => {
-    if (trigger > seenTrigger) {
+    if (armDecision(trigger, seenTrigger, suspended) === "arm") {
       seenTrigger = trigger;
       const armed = armLoop(evidence);
       loop = armed.state;
@@ -79,9 +104,12 @@
   });
 
   // And the watcher's pushes feed the machine, which decides absorb / confirm / kick
-  // (`onEvidence` — the own-kick absorption and the delivery-ends-the-loop rule live there).
+  // (`onEvidence`, through `evidenceStep` — the own-kick absorption and the delivery-ends-the-loop rule live
+  // there). Reading `suspended` here re-runs this on show, so a kick suppressed while hidden comes back by itself when
+  // the evidence at show still makes one due (unchanged retrying evidence, say); evidence that moved meanwhile (a
+  // delivery) decides afresh.
   $effect(() => {
-    const next = onEvidence(loop, evidence);
+    const next = evidenceStep(loop, evidence, suspended);
     if (next.state !== loop) loop = next.state;
     if (next.kick !== null) void kick(next.kick);
   });

@@ -76,3 +76,35 @@ test("P1: absolute and relative apiKeyFile values are unchanged, and no apiKeyFi
     expect("apiKeyFile" in (none.provider.api ?? {})).toBe(false);
   });
 });
+
+test("P2-M5-T1: a `~/…` apiKeyFile that expands INTO the app's key folder is read by the strict reader, on the run and doctor paths", async () => {
+  await withTempHome(async (home) => {
+    const keys = join(home, "state", "keys");
+    await mkdir(keys, { recursive: true });
+    await chmod(keys, 0o700);
+    const good = join(keys, "k-0123456789ab.key");
+    await writeFile(good, `${FAKE_KEY}\n`);
+    await chmod(good, 0o600);
+    const wrong = join(keys, "anthropic-key");
+    await writeFile(wrong, `${FAKE_KEY}\n`);
+    await chmod(wrong, 0o600);
+
+    // The app's own file, named through `~`: expanded, then read strictly.
+    const run = await resolveApiKey(validateConfig(rawWith("~/state/keys/k-0123456789ab.key"), home).provider.api!, {}, { keysDir: keys });
+    expect([run.source, run.detail, run.key]).toEqual(["file", good, FAKE_KEY]);
+
+    // A private file there with a name the app never writes: refused on both paths, never read by the lax check.
+    const raw = rawWith("~/state/keys/anthropic-key");
+    const refused = await resolveApiKey(validateConfig(raw, home).provider.api!, {}, { keysDir: keys });
+    expect([refused.source, refused.key]).toEqual(["none", undefined]);
+    expect(refused.warnings.join(" ")).toMatch(/not an app key file/);
+    const report = validateCandidate(raw, home, {});
+    const doctor = await resolveApiKey(report.normalized!.provider.api!, {}, { skipCommand: true, keysDir: keys });
+    expect([doctor.source, doctor.key]).toEqual(["none", undefined]);
+    expect(doctor.warnings.join(" ")).not.toContain(FAKE_KEY);
+
+    // The same `~/…` shape OUTSIDE keys/ is today's lax read (the first test in this file), unchanged.
+    const outside = await resolveApiKey(validateConfig(rawWith(`~/${REL}`), home).provider.api!, {}, { keysDir: keys });
+    expect([outside.source, outside.key]).toEqual(["file", FAKE_KEY]);
+  });
+});

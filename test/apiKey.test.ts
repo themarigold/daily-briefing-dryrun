@@ -4,13 +4,22 @@
 // secret, and the whole invariant — the key value never reaches a warning, an error, a log line or any
 // returned field but `key` — is one careless template literal away from being false. So a distinctive
 // value goes in and every non-`key` byte that comes out is searched for it.
-import { test, expect } from "bun:test";
+import "./fixtures/isolate-state";
+import { test, expect, describe } from "bun:test";
 import { mkdtemp, writeFile, chmod, rm } from "node:fs/promises";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveApiKey, keyStatusLine, DEFAULT_KEY_ENV, PLAINTEXT_KEY_SENTINEL } from "../src/apiKey";
-import type { ProviderApi } from "../src/types";
+import { ProviderError, type ProviderApi } from "../src/types";
 import type { RunResult } from "../src/proc";
+import { AnthropicApiProvider } from "../src/providers/anthropic";
+import { failoverReason } from "../src/failover";
+import { isAppOwnedKey, type ListEntry } from "../src/providerList";
+import { keysDir } from "../src/marker";
+import { appKeyFileRelation, readsAsAppKeyFile, strictReadFolder } from "../src/keyFile";
+import { ASYNC_FS, type AsyncFsOps } from "../src/strictFile";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 /** Distinctive enough that a substring match cannot be an accident, and shaped like a real key so a
  *  redaction pattern that happens to match real keys would also match this one. */
@@ -259,4 +268,395 @@ test("⚠ the two no-key cases do NOT share a line — a loopback endpoint needs
   const remote = await resolveApiKey({ kind: "openai-compatible", model: "m", baseUrl: "https://api.openai.com/v1" }, {});
   expect(remote.optional).toBeUndefined();
   expect(keyStatusLine(remote)).toMatch(/not found/);
+});
+
+// ── rung 2 under <state>/keys/: the strict reader (provider-fallback P2-M5-T1, spec r9 §6 "Strict reader") ──────────
+//
+// A file in the app's key folder is one the APP wrote (`k-<12 hex>.key`, 0600, one link, in a 0700 folder), so the
+// morning rung reads it only through the strict reader, opening the path AS CONFIGURED. Anything else there — a
+// wrong name (judged on the canonical path, so a symlinked alias cannot borrow a good name), a symlink, a second
+// hard link, a loose mode, another owner — is refused with a warning and never handed to the lax mode-only check.
+// Every other `apiKeyFile` keeps today's check exactly. Each case builds its own `<root>/state/keys` and passes it
+// as `keysDir`; one case drives the production default, `keysDir()`, inside the isolated state dir.
+
+const GOOD = "k-0123456789ab.key";
+
+/** Does the volume `tmpdir()` is on fold case? Measured once: a folder made lower-case, looked up upper-case. */
+const TMP_FOLDS_CASE = (() => {
+  const probe = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-apikey-case-")));
+  mkdirSync(join(probe, "case"));
+  return existsSync(join(probe, "CASE"));
+})();
+
+/** `<root>/state/keys` (0700) holding GOOD = SENTINEL (0600), and an empty `<root>/outside`. */
+function keyFolder(): { root: string; keys: string; good: string; outside: string } {
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-apikey-keys-")));
+  const keys = join(root, "state", "keys");
+  mkdirSync(keys, { recursive: true });
+  chmodSync(keys, 0o700);
+  const good = join(keys, GOOD);
+  writeFileSync(good, `${SENTINEL}\n`);
+  chmodSync(good, 0o600);
+  const outside = join(root, "outside");
+  mkdirSync(outside);
+  return { root, keys, good, outside };
+}
+/** A private (0600) file holding SENTINEL — what the LAX check would happily read. */
+function privateFile(path: string): string {
+  writeFileSync(path, SENTINEL);
+  chmodSync(path, 0o600);
+  return path;
+}
+/** A `statFile` that records every path the LAX check was asked about, answering as the real one does. */
+function laxSpy() {
+  const asked: string[] = [];
+  const statFile = async (p: string) => { asked.push(p); try { return { mode: statSync(p).mode }; } catch { return undefined; } };
+  return { asked, statFile };
+}
+
+describe("rung 2 under <state>/keys/ — the strict reader", () => {
+  test("an app key file the app wrote resolves through the strict reader, never the lax check", async () => {
+    const { keys, good } = keyFolder();
+    const lax = laxSpy();
+    const r = await resolveApiKey(anthropic({ apiKeyFile: good }), {}, { keysDir: keys, statFile: lax.statFile });
+    expect([r.key, r.source, r.detail]).toEqual([SENTINEL, "file", good]);
+    expect(r.warnings).toEqual([]);
+    expect(lax.asked).toEqual([]);
+  });
+
+  test("a keys/ path whose basename is not k-<12 hex>.key is REFUSED, never handed to the lax check", async () => {
+    const { keys } = keyFolder();
+    for (const name of ["notes.key", "k-0123456789AB.key", "k-0123456789ab.key.bak", "k-0123456789a.key", "anthropic-key"]) {
+      const p = privateFile(join(keys, name));
+      const lax = laxSpy();
+      const r = await resolveApiKey(anthropic({ apiKeyFile: p }), {}, { keysDir: keys, statFile: lax.statFile });
+      expect(`${name}: ${r.key} ${r.source}`).toBe(`${name}: undefined none`);
+      expect(`${name}: ${r.warnings.join(" ")}`).toMatch(/refusing to read provider\.api\.apiKeyFile .* not an app key file/);
+      expect(`${name}: lax asked ${lax.asked.length}`).toBe(`${name}: lax asked 0`);
+      expect(printableSurface(r)).not.toContain(SENTINEL);
+    }
+    // A keys/ name that does not exist yet with a wrong basename is refused by its name too (not "could not be read").
+    const missing = await resolveApiKey(anthropic({ apiKeyFile: join(keys, "not-yet.key") }), {}, { keysDir: keys });
+    expect(missing.warnings.join(" ")).toMatch(/not an app key file/);
+  });
+
+  test("the basename is judged on the CANONICAL path: a symlinked alias cannot borrow a good name, nor a symlinked parent", async () => {
+    const { root, keys, outside } = keyFolder();
+    const target = privateFile(join(keys, "notes.txt"));
+    // The alias's OWN name passes the pattern; the file it IS does not.
+    const alias = join(outside, "k-aaaaaaaaaaaa.key");
+    symlinkSync(target, alias);
+    const viaAlias = await resolveApiKey(anthropic({ apiKeyFile: alias }), {}, { keysDir: keys });
+    expect([viaAlias.key, viaAlias.source]).toEqual([undefined, "none"]);
+    expect(viaAlias.warnings.join(" ")).toMatch(/not an app key file/);
+    // A symlinked PARENT into keys/.
+    symlinkSync(keys, join(root, "keys-alias"));
+    const viaParent = await resolveApiKey(anthropic({ apiKeyFile: join(root, "keys-alias", "notes.txt") }), {}, { keysDir: keys });
+    expect([viaParent.key, viaParent.source]).toEqual([undefined, "none"]);
+    expect(viaParent.warnings.join(" ")).toMatch(/not an app key file/);
+    // ⚠ The warning names the path AS CONFIGURED and nothing it resolves to: not the folder, not the target's name.
+    for (const r of [viaAlias, viaParent]) {
+      expect(r.warnings.join(" ")).not.toContain(keys);
+      expect(printableSurface(r)).not.toContain(SENTINEL);
+    }
+    expect(viaAlias.warnings.join(" ")).not.toContain("notes.txt");
+  });
+
+  test("an alias to a GOOD app key file is still read only as configured — so the strict reader refuses it", async () => {
+    const { root, keys, good, outside } = keyFolder();
+    const alias = join(outside, "my.key");
+    symlinkSync(good, alias);
+    symlinkSync(keys, join(root, "keys-alias"));
+    // …and a RELATIVE spelling of the good file itself that goes through `..`: `strictReadFolder` (src/keyFile.ts)
+    // trusts a relative parent only when the path has NO `..` segment, so this one is handed `keys`, whose exact-name
+    // test refuses it. Spelled explicitly from a fixed cwd (the key folder's root), never `relative(process.cwd(), …)`,
+    // whose answer has a `..` only when TMPDIR sits outside the cwd (P2-M5 checkpoint B2).
+    const cwd = process.cwd();
+    process.chdir(root);
+    try {
+      for (const p of [alias, join(root, "keys-alias", GOOD), `state/keys/../keys/${GOOD}`]) {
+        const lax = laxSpy();
+        const r = await resolveApiKey(anthropic({ apiKeyFile: p }), {}, { keysDir: keys, statFile: lax.statFile });
+        expect(`${p}: ${r.key} ${r.source}`).toBe(`${p}: undefined none`);
+        expect(r.warnings.join(" ")).toMatch(/refusing to read provider\.api\.apiKeyFile .* app's key folder/);
+        expect(lax.asked).toEqual([]);
+      }
+      // The contrast, from the same cwd: a relative spelling with NO `..` whose parent is canonically keys/ IS read —
+      // by the strict reader, still never the lax check (the docstring's rule, so the case above is refused for its `..`).
+      const lax = laxSpy();
+      const plain = await resolveApiKey(anthropic({ apiKeyFile: `state/keys/${GOOD}` }), {}, { keysDir: keys, statFile: lax.statFile });
+      expect([plain.key, plain.source]).toEqual([SENTINEL, "file"]);
+      expect(lax.asked).toEqual([]);
+    } finally { process.chdir(cwd); }
+  });
+
+  test("a keys/ file failing the strict reader — symlink out, second hard link, loose mode, another owner, loose folder — is refused by name", async () => {
+    const cases: [string, (f: ReturnType<typeof keyFolder>) => string, RegExp, { owner?: boolean }?][] = [
+      // A symlink INSIDE keys/ that resolves OUTSIDE it: the lax check would read the outside file.
+      // Its target carries a good name too, so the NAME test passes and the strict reader is what refuses it.
+      ["symlink out", (f) => { const p = join(f.keys, "k-bbbbbbbbbbbb.key"); symlinkSync(privateFile(join(f.outside, "k-dddddddddddd.key")), p); return p; }, /file-symlink/],
+      ["second hard link", (f) => { linkSync(f.good, join(f.outside, "copy")); return f.good; }, /file-hardlinked/],
+      ["group-readable", (f) => { chmodSync(f.good, 0o640); return f.good; }, /file-permissions/],
+      ["folder group-readable", (f) => { chmodSync(f.keys, 0o750); return f.good; }, /dir-permissions/],
+      ["another owner", (f) => f.good, /file-owner/, { owner: true }],
+    ];
+    for (const [name, make, reason, o] of cases) {
+      const f = keyFolder();
+      const p = make(f);
+      const lax = laxSpy();
+      const r = await resolveApiKey(anthropic({ apiKeyFile: p }), {}, {
+        keysDir: f.keys, statFile: lax.statFile,
+        ...(o?.owner ? { keyFileOwnerCheck: (_st: { uid: number }, which: "dir" | "file") => which === "dir" } : {}),
+      });
+      expect(`${name}: ${r.key} ${r.source}`).toBe(`${name}: undefined none`);
+      expect(`${name}: ${r.warnings.join(" ")}`).toMatch(/refusing to read provider\.api\.apiKeyFile .* app's key folder/);
+      expect(`${name}: ${r.warnings.join(" ")}`).toMatch(reason);
+      expect(`${name}: lax asked ${lax.asked.length}`).toBe(`${name}: lax asked 0`);
+      expect(`${name}: ${printableSurface(r).includes(SENTINEL)}`).toBe(`${name}: false`);
+      expect(`${name}: ${r.warnings.join(" ").includes(f.outside)}`).toBe(`${name}: false`);
+    }
+  });
+
+  test("a hard link OUTSIDE keys/ to an app key file IS an app key file (hub Q26): strict, so refused", async () => {
+    const { keys, good, outside } = keyFolder();
+    const hard = join(outside, "hard.key");
+    linkSync(good, hard);
+    const lax = laxSpy();
+    const r = await resolveApiKey(anthropic({ apiKeyFile: hard }), {}, { keysDir: keys, statFile: lax.statFile });
+    expect([r.key, r.source]).toEqual([undefined, "none"]);
+    expect(lax.asked).toEqual([]);
+  });
+
+  test("a refused keys/ file behaves as today's failed file rung: warned, then the later rungs are tried", async () => {
+    const { keys } = keyFolder();
+    const bad = privateFile(join(keys, "notes.key"));
+    const viaCmd = await resolveApiKey(anthropic({ apiKeyFile: bad, apiKeyCommand: ["helper"] }), {},
+      { keysDir: keys, exec: fakeRun({ out: "from-command\n" }) });
+    expect([viaCmd.key, viaCmd.source]).toEqual(["from-command", "command"]);
+    expect(viaCmd.warnings.join(" ")).toMatch(/not an app key file/);
+    // …and with no later rung, no key: the provider then raises the named `key-unavailable` skip.
+    const none = await resolveApiKey(anthropic({ apiKeyFile: bad }), { ANTHROPIC_API_KEY: "ambient" }, { keysDir: keys });
+    expect([none.key, none.source]).toEqual([undefined, "none"]);
+    let fetched = 0;
+    const p = new AnthropicApiProvider(anthropic({ apiKeyFile: bad }), {
+      env: {}, keyOpts: { keysDir: keys }, fetchImpl: (async () => { fetched++; return new Response("{}"); }) as unknown as typeof fetch,
+    });
+    const err = await p.generate("hi").then(() => undefined, (e: unknown) => e);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect(failoverReason(err as ProviderError, "anthropic")).toBe("key-unavailable");
+    expect(fetched).toBe(0);
+    expect(p.runtimeWarnings.join(" ")).toMatch(/not an app key file/);
+  });
+
+  test("⚠ a non-keys/ apiKeyFile behaves EXACTLY as today — the lax check, today's words — whatever keys/ holds", async () => {
+    const f = keyFolder();
+    // keys/ holds a hard-to-walk corner (hub Q26's incomplete walk): it must not turn the user's own file strict.
+    mkdirSync(join(f.keys, "locked"));
+    chmodSync(join(f.keys, "locked"), 0o300);
+    try {
+      const own = privateFile(join(f.outside, "anthropic-key"));
+      const lax = laxSpy();
+      const ok = await resolveApiKey(anthropic({ apiKeyFile: own }), {}, { keysDir: f.keys, statFile: lax.statFile });
+      expect([ok.key, ok.source, ok.detail]).toEqual([SENTINEL, "file", own]);
+      expect(ok.warnings).toEqual([]);
+      expect(lax.asked).toEqual([own]);
+      // A loose mode: today's refusal, word for word.
+      const loose = privateFile(join(f.outside, "loose"));
+      chmodSync(loose, 0o644);
+      const refused = await resolveApiKey(anthropic({ apiKeyFile: loose }), {}, { keysDir: f.keys });
+      expect(refused.warnings).toEqual([`api key: refusing to read provider.api.apiKeyFile ${loose} — it is group- or world-readable (mode 644); run \`chmod 600\` on it`]);
+      // Missing and empty: today's words. A k-<hex>.key NAME outside keys/ is not an app key file either.
+      expect((await resolveApiKey(anthropic({ apiKeyFile: join(f.outside, "absent") }), {}, { keysDir: f.keys })).warnings)
+        .toEqual([`api key: provider.api.apiKeyFile ${join(f.outside, "absent")} could not be read`]);
+      const empty = join(f.outside, "empty");
+      writeFileSync(empty, "\n");
+      chmodSync(empty, 0o600);
+      expect((await resolveApiKey(anthropic({ apiKeyFile: empty }), {}, { keysDir: f.keys })).warnings)
+        .toEqual([`api key: provider.api.apiKeyFile ${empty} is empty`]);
+      const lookalike = privateFile(join(f.outside, GOOD));
+      expect((await resolveApiKey(anthropic({ apiKeyFile: lookalike }), {}, { keysDir: f.keys })).key).toBe(SENTINEL);
+      // A sibling folder whose name merely STARTS with `keys` is outside.
+      mkdirSync(join(f.root, "state", "keysX"));
+      const sib = privateFile(join(f.root, "state", "keysX", "notes.key"));
+      expect((await resolveApiKey(anthropic({ apiKeyFile: sib }), {}, { keysDir: f.keys })).key).toBe(SENTINEL);
+      // A user's own file under a state dir with NO keys/ at all.
+      expect((await resolveApiKey(anthropic({ apiKeyFile: own }), {}, { keysDir: join(f.root, "no-keys") })).key).toBe(SENTINEL);
+    } finally { chmodSync(join(f.keys, "locked"), 0o700); }
+  });
+
+  test("agreement with isAppOwnedKey: every key file it calls app-owned is read only by the strict reader", async () => {
+    const f = keyFolder();
+    symlinkSync(f.keys, join(f.root, "keys-alias"));
+    linkSync(f.good, join(f.outside, "hard.key"));
+    mkdirSync(join(f.keys, "sub"));
+    symlinkSync(join(f.keys, "sub"), join(f.outside, "link"));
+    const owned = [
+      f.good, join(f.keys, "notes.key"), join(f.root, "keys-alias", GOOD), join(f.outside, "hard.key"),
+      `${f.outside}/link/../${GOOD}`,       // RAW: `join` would fold the `..` the kernel resolves through `link`
+    ];
+    for (const p of owned) {
+      const entry = { provider: { cli: "x", argv: [], promptVia: "stdin", api: anthropic({ apiKeyFile: p }) } } as unknown as ListEntry;
+      expect(`${p}: ${isAppOwnedKey(entry, f.keys)}`).toBe(`${p}: true`);
+      const lax = laxSpy();
+      await resolveApiKey(anthropic({ apiKeyFile: p }), {}, { keysDir: f.keys, statFile: lax.statFile });
+      expect(`${p}: lax asked ${lax.asked.length}`).toBe(`${p}: lax asked 0`);
+    }
+  });
+
+  // P2-M5-T1 checkpoint LOW 1: an incomplete walk of keys/ (here keys/ itself 0300 — enterable, not listable) leaves a
+  // hard link OUTSIDE keys/ to a genuine key with relation `unknown`. A second link is what makes it strict; a user's own
+  // single-link file keeps today's lax read (requirement 9).
+  test("an incomplete walk: a hard link outside keys/ to a genuine key is REFUSED; a single-link user file is read as today", async () => {
+    const f = keyFolder();
+    const hard = join(f.outside, "hard.key");
+    linkSync(f.good, hard);
+    const named = join(f.outside, GOOD);                    // a hard link that ALSO borrows a good basename
+    linkSync(f.good, named);
+    const own = privateFile(join(f.outside, "anthropic-key"));
+    chmodSync(f.keys, 0o300);
+    try {
+      for (const p of [hard, named]) {
+        expect(`${p}: ${appKeyFileRelation(p, f.keys)}`).toBe(`${p}: unknown`);   // the branch under test
+        const lax = laxSpy();
+        const r = await resolveApiKey(anthropic({ apiKeyFile: p }), {}, { keysDir: f.keys, statFile: lax.statFile });
+        expect(`${p}: ${r.key} ${r.source}`).toBe(`${p}: undefined none`);
+        expect(`${p}: lax asked ${lax.asked.length}`).toBe(`${p}: lax asked 0`);
+        expect(r.warnings.join(" ")).toMatch(/refusing to read provider\.api\.apiKeyFile .* it is, or may name, a file in the app's key folder/);
+        expect(printableSurface(r)).not.toContain(SENTINEL);
+        expect(r.warnings.join(" ")).not.toContain(f.keys);
+      }
+      expect(appKeyFileRelation(own, f.keys)).toBe("unknown");
+      const lax = laxSpy();
+      const ok = await resolveApiKey(anthropic({ apiKeyFile: own }), {}, { keysDir: f.keys, statFile: lax.statFile });
+      expect([ok.key, ok.source, ok.detail]).toEqual([SENTINEL, "file", own]);
+      expect(ok.warnings).toEqual([]);
+      expect(lax.asked).toEqual([own]);
+    } finally { chmodSync(f.keys, 0o700); }
+  });
+
+  // P2-M5-T1 checkpoint LOW 2: the configured path and keysDir() may reach the SAME folder through different symlinked
+  // ancestors; a genuine single-link key there is read, in both directions. The final folder itself must still not be
+  // a symlink (the "alias to a GOOD app key file" case above).
+  test("a genuine key reached through a different symlinked ANCESTOR of keys/ is read, both directions", async () => {
+    const f = keyFolder();
+    symlinkSync(join(f.root, "state"), join(f.root, "state-alias"));
+    const aliasKeys = join(f.root, "state-alias", "keys");
+    for (const [name, path, keys] of [
+      ["keys via alias, path real", f.good, aliasKeys],
+      ["keys real, path via alias", join(aliasKeys, GOOD), f.keys],
+    ] as const) {
+      const lax = laxSpy();
+      const r = await resolveApiKey(anthropic({ apiKeyFile: path }), {}, { keysDir: keys, statFile: lax.statFile });
+      expect(`${name}: ${r.key} ${r.source} ${r.detail}`).toBe(`${name}: ${SENTINEL} file ${path}`);
+      expect(`${name}: ${r.warnings.join(" ")}`).toBe(`${name}: `);
+      expect(`${name}: lax asked ${lax.asked.length}`).toBe(`${name}: lax asked 0`);
+    }
+    // …and a wrong name reached that way is still refused by its name, a second link still by the strict reader.
+    privateFile(join(f.keys, "notes.key"));
+    const r1 = await resolveApiKey(anthropic({ apiKeyFile: join(aliasKeys, "notes.key") }), {}, { keysDir: f.keys });
+    expect([r1.key, r1.warnings.join(" ")]).toEqual([undefined, expect.stringMatching(/not an app key file/)]);
+    linkSync(f.good, join(f.outside, "copy"));
+    const r2 = await resolveApiKey(anthropic({ apiKeyFile: join(aliasKeys, GOOD) }), {}, { keysDir: f.keys });
+    expect([r2.key, r2.warnings.join(" ")]).toEqual([undefined, expect.stringMatching(/file-hardlinked/)]);
+  });
+
+  // P2-M5-T4 checkpoint LOW 5: `canonicalPath` case-folds on darwin, so on a case-SENSITIVE volume a sibling folder
+  // `<state>/Keys/` compares equal to `<state>/keys/`. It is a different folder: the strict reader must be handed keys/
+  // (which refuses the path by name), never the sibling (which it would read as if it were the app's folder). Skipped
+  // by name where the test volume folds case, since `Keys` there IS `keys` (the symlinked-ANCESTOR case above covers
+  // that a genuine alias still reads). On Linux nothing folds, so the sibling never compared equal: the answer holds.
+  test.skipIf(TMP_FOLDS_CASE)("a different-CASE sibling of keys/ on a case-sensitive volume is not keys/: the strict reader gets keys/, and refuses", async () => {
+    const f = keyFolder();
+    const sibling = join(f.root, "state", "Keys");
+    mkdirSync(sibling);
+    chmodSync(sibling, 0o700);
+    const p = privateFile(join(sibling, GOOD));
+    expect(await strictReadFolder(p, f.keys)).toBe(f.keys);
+    if (process.platform === "darwin") {
+      // Folded equal on darwin, so the morning rung reads it strictly — and the reader, handed keys/, refuses it by name.
+      expect(await readsAsAppKeyFile(p, f.keys)).toBe(true);
+      const lax = laxSpy();
+      const r = await resolveApiKey(anthropic({ apiKeyFile: p }), {}, { keysDir: f.keys, statFile: lax.statFile });
+      expect([r.key, r.source]).toEqual([undefined, "none"]);
+      expect(r.warnings.join(" ")).toMatch(/name-invalid/);
+      expect(lax.asked).toEqual([]);
+    }
+  });
+
+  // P2-M5-T1 checkpoint LOW 4: the one deliberate DISAGREEMENT with isAppOwnedKey (src/keyFile.ts header, difference
+  // 2): a symlink entry in keys/ pointing OUTSIDE names a file that is not the app's, so it is not app-owned — yet the
+  // morning rung reads it strictly, which refuses it as a symlink rather than reading the file it points at.
+  test("a symlink entry in keys/ pointing outside: NOT app-owned, yet strict on the morning rung (refused as a symlink)", async () => {
+    const f = keyFolder();
+    const p = join(f.keys, "k-bbbbbbbbbbbb.key");
+    symlinkSync(privateFile(join(f.outside, "k-dddddddddddd.key")), p);
+    const entry = { provider: { cli: "x", argv: [], promptVia: "stdin", api: anthropic({ apiKeyFile: p }) } } as unknown as ListEntry;
+    expect(isAppOwnedKey(entry, f.keys)).toBe(false);
+    expect(await readsAsAppKeyFile(p, f.keys)).toBe(true);
+    const lax = laxSpy();
+    const r = await resolveApiKey(anthropic({ apiKeyFile: p }), {}, { keysDir: f.keys, statFile: lax.statFile });
+    expect([r.key, r.source]).toEqual([undefined, "none"]);
+    expect(r.warnings.join(" ")).toMatch(/file-symlink/);
+    expect(lax.asked).toEqual([]);
+  });
+
+  test("the production default is keysDir(): a wrong name there is refused with no keysDir passed", async () => {
+    const keys = keysDir();
+    const existed = existsSync(keys);
+    mkdirSync(keys, { recursive: true });
+    chmodSync(keys, 0o700);
+    const p = privateFile(join(keys, "notes.key"));
+    try {
+      const r = await resolveApiKey(anthropic({ apiKeyFile: p }), {});
+      expect([r.key, r.source]).toEqual([undefined, "none"]);
+      expect(r.warnings.join(" ")).toMatch(/not an app key file/);
+    } finally {
+      rmSync(p, { force: true });
+      if (!existed) rmSync(keys, { recursive: true, force: true });
+    }
+  });
+});
+
+// PR 2 final harden round 3, M1: the key-folder test runs on EVERY `apiKeyFile` — a user's own file outside keys/ too —
+// and it stats and walks. Run synchronously, a stat stalled on a dead mount blocked the event loop, so the walk's
+// attempt deadline and `provider test`'s could not fire (reviewer A measured 1812 ms for a 300 ms Test). It is async now.
+describe("rung 2's key-folder test is ASYNC: a stalled mount cannot block the event loop (final harden r3, M1)", () => {
+  /** `ASYNC_FS` with every call held until `release()` — a dead mount — counting the calls it was asked. */
+  function stalledFs() {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let asked = 0;
+    const ops = Object.fromEntries(Object.entries(ASYNC_FS).map(([op, f]) =>
+      [op, async (p: string) => { asked++; await gate; return (f as (p: string) => Promise<unknown>)(p); }])) as AsyncFsOps;
+    return { ops, release, asked: () => asked };
+  }
+
+  test("a stat stalled on a user's own apiKeyFile leaves a 300 ms timer free to fire; once released, the same answer as today", async () => {
+    const { keys, outside } = keyFolder();
+    const own = privateFile(join(outside, "user.key"));
+    const fs = stalledFs();
+    const t0 = performance.now();
+    const pending = resolveApiKey(anthropic({ apiKeyFile: own }), {}, { keysDir: keys, keyFileFs: fs.ops });
+    const first = await Promise.race([pending.then(() => "resolved"), new Promise<string>((r) => setTimeout(() => r("timer"), 300))]);
+    expect(first).toBe("timer");
+    expect(performance.now() - t0).toBeLessThan(1_000);
+    expect(fs.asked()).toBeGreaterThan(0);                     // the rung asked the injected fs — else the timer proves nothing
+    fs.release();
+    const r = await pending;
+    expect([r.key, r.source, r.detail]).toEqual([SENTINEL, "file", own]);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test("all three key-folder questions run on the injected fs: a genuine key's name test and folder test ask it too", async () => {
+    const { keys, good } = keyFolder();
+    const asked: string[] = [];
+    const ops = Object.fromEntries(Object.entries(ASYNC_FS).map(([op, f]) =>
+      [op, (p: string) => { asked.push(`${op} ${p}`); return (f as (p: string) => Promise<unknown>)(p); }])) as AsyncFsOps;
+    const r = await resolveApiKey(anthropic({ apiKeyFile: good }), {}, { keysDir: keys, keyFileFs: ops });
+    expect([r.key, r.source]).toEqual([SENTINEL, "file"]);
+    // `readsAsAppKeyFile` (its canonical test answers app-key at once) and `isAppKeyFileName` each realpath the path;
+    // only `strictReadFolder` asks the native realpath, of the parent (= keys/) and of keys/.
+    expect(asked.filter((a) => a === `realpath ${good}`)).toHaveLength(2);
+    expect(asked.filter((a) => a === `realpathNative ${keys}`)).toHaveLength(2);
+  });
 });

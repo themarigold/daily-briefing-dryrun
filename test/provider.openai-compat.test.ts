@@ -6,6 +6,7 @@
 import { test, expect, afterEach } from "bun:test";
 import { startFakeApi, okJson, status, slow, badJson, type FakeApiHandler } from "./helpers/fakeApi";
 import { OpenAiCompatibleProvider } from "../src/providers/openaiCompatible";
+import { API_TIMEOUT_MS } from "../src/provider";
 import { ProviderError, API_LABEL_OPENAI, type ProviderApi } from "../src/types";
 import { isPostureWarning, posturePhrase, API_TRUNCATION_SENTINEL, API_CLEARTEXT_SENTINEL } from "../src/eval/posture";
 import { matchesCredential } from "../src/transcripts/credentials";
@@ -102,7 +103,7 @@ test("the content of choices[0] is the result; finish_reason length warns exactl
 
   const t = await serve(okJson(reply("cut off here", "length")));
   const p = local(`${t.origin}/v1`, { maxTokens: 16 });
-  expect(await p.generate("p")).toBe("cut off here");
+  expect(await p.generate("p")).toBe("cut off ");
   const truncation = p.runtimeWarnings.filter((w) => w.includes(API_TRUNCATION_SENTINEL));
   expect(truncation).toHaveLength(1);
   expect(isPostureWarning(truncation[0]!)).toBe(false);
@@ -340,4 +341,44 @@ test("⚠ a timeout DURING THE BODY READ is `timeout`, not `the body is not JSON
   expect(e?.code).toBe("timeout");
   expect(e?.message).toContain("300ms");
   expect(e?.message).not.toMatch(/not JSON/);
+});
+
+// ── P1-M3-T1: the transport-boundary tags (provider fallback) ────────────────────────────────────────
+
+test("an openai-style context-length 400 carries prompt-too-long; an ordinary 400 does not", async () => {
+  const s = await serve(status(400, { error: { message: "This model's maximum context length is 8192 tokens. However, your messages resulted in 9001 tokens.", type: "invalid_request_error", code: "context_length_exceeded" } }));
+  const e = await local(s.origin).generate("p").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.failCause]).toEqual(["missing-binary", "prompt-too-long"]);
+  s.setHandler(status(400, { error: { message: "Unknown parameter: 'foo'", type: "invalid_request_error" } }));
+  const plain = await local(s.origin).generate("p").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([plain.code, plain.failCause]).toEqual(["missing-binary", undefined]);
+  expect(e.cause).toBeUndefined();
+});
+
+test("a missing key for a non-loopback endpoint carries key-missing", async () => {
+  const p = new OpenAiCompatibleProvider(api("https://llm.example/v1", { apiKeyEnv: "ABSENT_VAR" }), { timeoutMs: 5_000, env: {} });
+  const e = await p.generate("x").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.failCause]).toEqual(["missing-binary", "key-missing"]);
+  expect(e.cause).toBeUndefined();
+});
+
+test("a transient 429 carries retryAfterMs", async () => {
+  const s = await serve(status(429, { error: { message: "busy" } }, { "retry-after": "7" }));
+  const e = await local(s.origin).generate("p").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.retryAfterMs]).toEqual(["nonzero-exit", 7_000]);
+});
+
+test("round 3 L7: an absurd retry-after (out of Date's range) is a ProviderError usage-limit with no resetAt, not a RangeError", async () => {
+  const s = await serve(status(429, { error: { message: "slow down" } }, { "retry-after": "99999999999999" }));
+  let e: unknown;
+  try { await local(`${s.origin}/v1`).generate("p"); } catch (x) { e = x; }
+  expect(e).toBeInstanceOf(ProviderError);
+  expect([(e as ProviderError).code, (e as ProviderError).resetAt]).toEqual(["usage-limit", undefined]);
+});
+
+test("with no timeoutMs given the request timeout is the 5-minute API default; a given one wins", () => {
+  const ceiling = (p: OpenAiCompatibleProvider) => (p as unknown as { timeoutMs(): number }).timeoutMs();
+  expect(API_TIMEOUT_MS).toBe(300_000);
+  expect(ceiling(new OpenAiCompatibleProvider(api("http://127.0.0.1:1/v1"), { env: {} }))).toBe(300_000);
+  expect(ceiling(new OpenAiCompatibleProvider(api("http://127.0.0.1:1/v1"), { timeoutMs: 7_000, env: {} }))).toBe(7_000);
 });

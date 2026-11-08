@@ -14,22 +14,25 @@
 // registration check (`probeRegistration`, the ONE check, shared with uninstall) and the Linux linger
 // read — goes through the injected exec like everything else in this module, every exec capped at 5 s
 // so status always answers well inside the app's 30 s read timeout (Batch 2, spec 3.1.5).
+import { isAbsolute } from "node:path";
 import pkg from "../../package.json";
 import { parseTickLine, statePaths, JSON_SCHEMA_VERSION } from "../json";
 import { stripControl } from "../render";
 import { readLastRunDate, readLastSkip, localDateStr, type LastSkip } from "../marker";
 import { parseFloor, isPastFloor, DEFAULT_MORNING_TIME } from "../schedule";
 import { loadConfig } from "../config";
-import { DEFAULT_INTERVAL_SEC } from "./units";
+import { DEFAULT_INTERVAL_SEC, LOGIN_ITEMS_OFF_HINT } from "./units";
 import {
   readScheduleRecord, schedulePath, unitPaths, primaryUnitPath, kindFor, lingerState,
   probeRegistration, pathPresent, manualRemoveSteps,
   resolveScheduleDeps as resolveDeps,
   type ScheduleDeps, type ScheduleKind, type ScheduleOwner, type LingerState, type RegistrationReason,
+  type Exec, type ExecResult,
 } from "./install";
 
-/** The cap on each exec status makes — the three (macOS) or two (Linux) probe commands and the Linux
- *  linger read — so the whole report stays well inside the app's 30 s engine read timeout (spec 3.1.5). */
+/** The cap on each exec status makes — the three (macOS) or two (Linux) probe commands, the Linux linger read and
+ *  the scheduled binary's `--version` (provider-fallback P2-M5-T3) — so the whole report stays well inside the app's
+ *  30 s engine read timeout (spec 3.1.5). */
 const STATUS_EXEC_TIMEOUT_MS = 5_000;
 
 /**
@@ -112,6 +115,21 @@ export type ScheduleStatusReport = {
    *  line — each surface adds its own. `null` where launchd and systemd do not apply (Windows and
    *  unsupported platforms). */
   removeSteps: string | null;
+
+  // ── spec 2026-10-11 (login-items-off), appended the same way: always present, nothing else changed.
+  /** `"login-items-off"` on macOS when the unit file is on disk and the check says `gone` — the signal of
+   *  an item switched off in System Settings › General › Login Items & Extensions (or, equally, a job
+   *  unloaded by hand; hence "probably" in `LOGIN_ITEMS_OFF_HINT`). `null` in every other state and on
+   *  every other platform. */
+  registeredHint: "login-items-off" | null;
+
+  // ── provider-fallback P2-M5-T3 (spec r9 §6), appended the same way: always present, nothing else changed.
+  /** The scheduled binary's version as it answers NOW: the first line of `<binPath> --version`, through the injected
+   *  exec, capped at `STATUS_EXEC_TIMEOUT_MS`. `installedEngineVersion` is the install-time RECORD and goes stale when
+   *  the binary is replaced in place; the app's older-engine warning reads this one. `null` when there is no
+   *  `binPath` or it is not absolute (nothing is run), or the read fails — could not run, a thrown exec, a non-zero
+   *  exit, a timeout, or output that is not a bare version. */
+  scheduledEngineVersion: string | null;
 };
 
 export type ScheduleStatusDeps = ScheduleDeps & { now?: () => Date };
@@ -151,6 +169,7 @@ export async function scheduleStatusReport(deps: ScheduleStatusDeps = {}): Promi
   // ⚠ Today's count only. A parsed line from YESTERDAY is not today's tick count, and reporting it as
   // one would overstate a scheduler that has not fired since.
   const ticksToday = parsed && parsed.localDate === localDateStr(now) ? parsed.count : parsed ? 0 : null;
+  const binPath = record?.binPath || null;
 
   return {
     schemaVersion: JSON_SCHEMA_VERSION,
@@ -165,7 +184,7 @@ export async function scheduleStatusReport(deps: ScheduleStatusDeps = {}): Promi
     invoker: record?.invoker ?? null,
     kind: record?.kind ?? kind,
     unitPath: record?.unitPath ?? primaryUnitPath(d.platform, d.env, d.home),
-    binPath: record?.binPath || null,
+    binPath,
     installedAt: record?.installedAt || null,
     installedEngineVersion: record?.engineVersion || null,
 
@@ -200,7 +219,32 @@ export async function scheduleStatusReport(deps: ScheduleStatusDeps = {}): Promi
     removeSteps: kind === "launchd" || kind === "systemd"
       ? manualRemoveSteps(kind, { units, record: recordPath, home: d.home })
       : null,
+    registeredHint: kind === "launchd" && unitPresent && check.state === "gone" ? "login-items-off" : null,
+    // Only an ABSOLUTE binPath is run (P2-M5-T4 checkpoint LOW 3): a relative or bare one would resolve against this
+    // caller's cwd or PATH, a binary nobody scheduled. Records carry `binPath` from 2026-09-14 (2de01af379), after
+    // `--version` became real (66b5ae0859, 2026-07-17), so the binary an install recorded answers `--version`. An
+    // ACCEPTED RESIDUAL, and NOT a harmless one (PR 2 final harden round 1, A6): a binary replaced in place by a
+    // pre-2026-07-15 build reads `--version` as `run` (scripts/uninstall.sh's removeSteps gate, "a managed binary built
+    // … before 2026-07-15"), so this read starts a REAL briefing — a provider call, possibly billed. It is capped at
+    // `STATUS_EXEC_TIMEOUT_MS` (5 s) and its direct child killed, but a grandchild it started (a provider CLI's own
+    // children) can outlive the kill; the field is `null`.
+    scheduledEngineVersion: binPath === null || !isAbsolute(binPath) ? null : await engineVersionOf(d.exec, binPath),
   };
+}
+
+/** A bare semver, as the engine's `--version` prints `package.json`'s version (src/main.ts). */
+const VERSION_LINE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+/** `<binPath> --version`'s first line when it is a bare version, else `null`. THROUGH THE INJECTED EXEC (nothing
+ *  under src/schedule/ spawns directly — isolation R1), capped like every status exec, and never throws: the call
+ *  itself sits inside the `try`, so a synchronous throw is caught too (as `execNoThrow` does in install.ts). The
+ *  default exec maps a timeout to -1 (`execResultOf`), so only an exit of 0 is read. */
+async function engineVersionOf(exec: Exec, binPath: string): Promise<string | null> {
+  let r: ExecResult;
+  try { r = await exec([binPath, "--version"], { timeoutMs: STATUS_EXEC_TIMEOUT_MS }); } catch { return null; }
+  if (r.code !== 0) return null;
+  const line = r.out.split(/\r?\n/, 1)[0]!.trim();
+  return VERSION_LINE.test(line) ? line : null;
 }
 
 /** The human rendering. Deliberately a pure function of the report, so the text and the JSON cannot
@@ -217,6 +261,7 @@ export function renderScheduleStatus(r: ScheduleStatusReport): string {
   const s = (v: unknown) => stripControl(String(v));
   if (r.experimental) lines.push("⚠ EXPERIMENTAL platform — this scheduling leg has no runtime evidence.");
   lines.push(`registered:      ${yn(r.registered)}${r.unitPresent ? "" : "  (no unit file on disk)"}`);
+  if (r.registeredHint === "login-items-off") lines.push(`  ⚠ ${LOGIN_ITEMS_OFF_HINT}`);
   lines.push(`owner:           ${r.owner ? s(r.owner) : "—"}${r.invoker && r.invoker !== r.owner ? ` (invoked as ${s(r.invoker)})` : ""}`);
   lines.push(`kind:            ${r.kind ? s(r.kind) : "—"}`);
   lines.push(`unit:            ${r.unitPath ? s(r.unitPath) : "—"}`);

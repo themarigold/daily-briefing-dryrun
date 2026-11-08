@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildRepo } from "./fixtures/build-repo";
 import { run } from "../src/main";
-import { acquireRunLock, runLockPath, LOCK_STALE_GRACE_MS, lockStaleMs, MAX_PROVIDER_ATTEMPTS, type LockInfo } from "../src/runlock";
+import { acquireRunLock, runLockPath, LOCK_STALE_GRACE_MS, lockStaleMs, MAX_PROVIDER_ATTEMPTS, type LockInfo, type LockHeld } from "../src/runlock";
 import { readLastSkip, lastSkipPath, localDateStr } from "../src/marker";
 import { TIMEOUT_MS, KILL_GRACE_MS, flushWindowMs } from "../src/provider";
 import { PROVIDER_RETRY_DELAYS_MS } from "../src/core";
@@ -715,5 +715,200 @@ describe("run() under the lock: tier B widens the bound only when enabled", () =
   test("[TB-P11b] mode trial: the same lock is respected (bound 1 135 s) — skip 'concurrent', no provider call", async () => {
     expect(await runAgainstAgedLiveHolder({ recapCampaigns: { mode: "trial" } }))
       .toEqual({ code: 0, calls: 0, concurrent: true, skip: "concurrent", delivered: false });
+  });
+});
+
+// ── P1-M4-T1: how the lock was taken, and `stillOwns` (provider fallback) ─────────────────────────────────
+
+describe("LockHeld.owned and stillOwns", () => {
+  const held = (got: Awaited<ReturnType<typeof acquireRunLock>>): LockHeld => {
+    if (!got.acquired) throw new Error("expected the lock to be acquired");
+    return got;
+  };
+
+  test("a first create is `created`, and stillOwns is true", async () => {
+    const env = withEnv();
+    try {
+      const a = held(await acquireRunLock({ invoker: "first", timeoutMs: TIMEOUT_MS }));
+      expect(a.owned).toBe("created");
+      expect(await a.stillOwns()).toBe(true);
+      expect(await a.stillOwns()).toBe(true);
+      await a.release();
+      expect(await a.stillOwns()).toBe(false);          // released: nothing on disk to own
+    } finally { env.cleanup(); }
+  });
+
+  test("a dead pid's lock reclaimed is `reclaimed`", async () => {
+    const env = withEnv();
+    try {
+      mkdirSync(env.stateDir, { recursive: true });
+      writeFileSync(runLockPath(), JSON.stringify({ pid: await deadPid(), startedIso: new Date().toISOString(), invoker: "scheduled" }));
+      const b = held(await acquireRunLock({ invoker: "cli", timeoutMs: TIMEOUT_MS }));
+      expect(b.owned).toBe("reclaimed");
+      expect(await b.stillOwns()).toBe(true);
+      await b.release();
+    } finally { env.cleanup(); }
+  });
+
+  test("a LOST reclaim race is busy, not fail-open: another contender's fresh live lock landed between our unlink and create", async () => {
+    const env = withEnv();
+    try {
+      mkdirSync(env.stateDir, { recursive: true });
+      writeFileSync(runLockPath(), JSON.stringify({ pid: await deadPid(), startedIso: new Date().toISOString(), invoker: "scheduled" }));
+      const winner: LockInfo = { pid: process.pid, startedIso: new Date().toISOString(), invoker: "the-other-contender", nonce: "theirs" };
+      const realUnlink = fsp.unlink;
+      const spy = spyOn(fsp, "unlink").mockImplementation((async (p: Parameters<typeof fsp.unlink>[0]) => {
+        await realUnlink(p);
+        writeFileSync(String(p), JSON.stringify(winner), { flag: "wx" });   // the other reclaimer's O_EXCL create wins
+      }) as typeof fsp.unlink);
+      let b: Awaited<ReturnType<typeof acquireRunLock>>;
+      try { b = await acquireRunLock({ invoker: "cli", timeoutMs: TIMEOUT_MS }); } finally { spy.mockRestore(); }
+      expect(b.acquired).toBe(false);
+      if (!b.acquired) expect(b.holder.invoker).toBe("the-other-contender");
+      expect((JSON.parse(readFileSync(runLockPath(), "utf8")) as LockInfo).nonce).toBe("theirs");   // not overwritten
+    } finally { env.cleanup(); }
+  });
+
+  /** A STALE lock naming a LIVE pid (this process): past `lockStaleMs` by mtime, so it is reclaimable. */
+  const staleLiveLock = (extra: Partial<LockInfo> = {}): LockInfo => {
+    const info: LockInfo = { pid: process.pid, startedIso: new Date(Date.now() - 7_200_000).toISOString(), invoker: "scheduled", nonce: "stale-one", ...extra };
+    writeFileSync(runLockPath(), JSON.stringify(info));
+    const old = (Date.now() - lockStaleMs(TIMEOUT_MS) - 60_000) / 1000;
+    utimesSync(runLockPath(), old, old);
+    return info;
+  };
+
+  test("the WEDGE case (P1-M8 checkpoint HIGH 1): an unlink that fails, then EEXIST on the SAME stale lock, fails open — never busy", async () => {
+    const env = withEnv();
+    try {
+      mkdirSync(env.stateDir, { recursive: true });
+      staleLiveLock();
+      const spy = spyOn(fsp, "unlink").mockImplementation((async () => {
+        throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+      }) as typeof fsp.unlink);
+      const outcomes: string[] = [];
+      try {
+        for (let i = 0; i < 3; i++) {                  // every tick, not just the first
+          const b = await acquireRunLock({ invoker: "cli", timeoutMs: TIMEOUT_MS });
+          outcomes.push(b.acquired ? b.owned : "busy");
+          staleLiveLock();                             // the fail-open overwrite refreshed it; put the stale one back
+        }
+      } finally { spy.mockRestore(); }
+      expect(outcomes).toEqual(["fail-open", "fail-open", "fail-open"]);
+    } finally { env.cleanup(); }
+  });
+
+  test("a DIFFERENT but STALE replacement after the lost race fails open too (only a fresh, live, different lock is busy)", async () => {
+    const env = withEnv();
+    try {
+      mkdirSync(env.stateDir, { recursive: true });
+      writeFileSync(runLockPath(), JSON.stringify({ pid: await deadPid(), startedIso: new Date().toISOString(), invoker: "scheduled" }));
+      const realUnlink = fsp.unlink;
+      const spy = spyOn(fsp, "unlink").mockImplementation((async (p: Parameters<typeof fsp.unlink>[0]) => {
+        await realUnlink(p);
+        writeFileSync(String(p), JSON.stringify({ pid: process.pid, startedIso: new Date().toISOString(), invoker: "other", nonce: "other" }), { flag: "wx" });
+        const old = (Date.now() - lockStaleMs(TIMEOUT_MS) - 60_000) / 1000;
+        utimesSync(String(p), old, old);               // a different acquisition, but stale by mtime
+      }) as typeof fsp.unlink);
+      let b: Awaited<ReturnType<typeof acquireRunLock>>;
+      try { b = await acquireRunLock({ invoker: "cli", timeoutMs: TIMEOUT_MS }); } finally { spy.mockRestore(); }
+      expect(b.acquired && b.owned).toBe("fail-open");
+    } finally { env.cleanup(); }
+  });
+
+  test("stillOwns (P1-M8 checkpoint LOW 3): ENOENT is lost; another I/O error is retried once, then read as still owned", async () => {
+    const env = withEnv();
+    try {
+      const a = held(await acquireRunLock({ invoker: "cli", timeoutMs: TIMEOUT_MS }));
+      const realStat = fsp.stat;
+      for (const [failures, code, expected] of [[1, "EIO", true], [2, "EIO", true], [1, "ENOENT", false]] as const) {
+        let left: number = failures;
+        let calls = 0;
+        const spy = spyOn(fsp, "stat").mockImplementation((async (...x: Parameters<typeof fsp.stat>) => {
+          calls++;
+          if (left-- > 0) throw Object.assign(new Error(`${code}: blip`), { code });
+          return realStat(...x);
+        }) as typeof fsp.stat);
+        let got: boolean;
+        try { got = await a.stillOwns(); } finally { spy.mockRestore(); }
+        expect(`${failures}×${code}: ${got}`).toBe(`${failures}×${code}: ${expected}`);
+        if (code === "EIO") expect(calls).toBe(2);   // one retry, never more
+      }
+      expect(await a.stillOwns()).toBe(true);
+      await a.release();
+    } finally { env.cleanup(); }
+  });
+
+  test("stillOwns (P1-M9 checkpoint MED 1): a blip on the FIRST fs call of the read (here: the existence probe Bun's `exists()` would swallow) is not a loss", async () => {
+    const env = withEnv();
+    try {
+      const a = held(await acquireRunLock({ invoker: "cli", timeoutMs: TIMEOUT_MS }));
+      // `Bun.file(p).exists()` answers false — never throws — when its stat fails with anything (ENOTDIR, EIO), so a
+      // read that starts there turns a blip into "lost". Both possible first calls fail once: the existence probe
+      // and `stat`.
+      const realFile = Bun.file;
+      let existsBlips = 1;
+      const fileSpy = spyOn(Bun, "file").mockImplementation(((...x: Parameters<typeof Bun.file>) => {
+        const f = realFile(...x);
+        return new Proxy(f, { get: (t, k) => (k === "exists" && existsBlips-- > 0 ? async () => false : Reflect.get(t, k, t)) });
+      }) as typeof Bun.file);
+      const realStat = fsp.stat;
+      let statBlips = 1;
+      const statSpy = spyOn(fsp, "stat").mockImplementation((async (...x: Parameters<typeof fsp.stat>) => {
+        if (statBlips-- > 0) throw Object.assign(new Error("ENOTDIR: blip"), { code: "ENOTDIR" });
+        return realStat(...x);
+      }) as typeof fsp.stat);
+      let got: boolean;
+      try { got = await a.stillOwns(); } finally { fileSpy.mockRestore(); statSpy.mockRestore(); }
+      expect(got).toBe(true);
+      await a.release();
+    } finally { env.cleanup(); }
+  });
+
+  test("an unremovable lock overwritten in place is `fail-open`, and remember() is not called for it", async () => {
+    const env = withEnv();
+    const dir = join(env.stateDir, "ro");
+    const path = join(dir, "run.lock");
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path, JSON.stringify({ pid: await deadPid(), startedIso: new Date().toISOString(), invoker: "scheduled" }));
+      chmodSync(dir, 0o500);                           // the lock cannot be unlinked or re-created, only overwritten
+      const realStat = fsp.stat;
+      const spy = spyOn(fsp, "stat").mockImplementation(((...a: Parameters<typeof fsp.stat>) => realStat(...a)) as typeof fsp.stat);   // pass-through, counted
+      let b: LockHeld;
+      let statCalls = -1;
+      try { b = held(await acquireRunLock({ invoker: "cli", timeoutMs: TIMEOUT_MS, path })); statCalls = spy.mock.calls.length; }
+      finally { spy.mockRestore(); }          // (read the count first: mockRestore clears it)
+      expect(b.owned).toBe("fail-open");
+      // Two stats — the reclaim branch's age read, and the lost-race check's re-read of the lock its create met
+      // (P1-M8 checkpoint HIGH 1). `remember()` would have been a third.
+      expect(`stat calls: ${statCalls}`).toBe("stat calls: 2");
+      expect((JSON.parse(readFileSync(path, "utf8")) as LockInfo).invoker).toBe("cli");   // the overwrite landed
+      expect(await b.stillOwns()).toBe(true);           // contents alone decide: the inode was never learned
+      await b.release();
+    } finally { chmodSync(dir, 0o700); env.cleanup(); }
+  });
+
+  test("stillOwns is false once a contender replaces the file, or overwrites it in place", async () => {
+    const env = withEnv();
+    try {
+      const a = held(await acquireRunLock({ invoker: "first", timeoutMs: TIMEOUT_MS }));
+      const mine = JSON.parse(readFileSync(runLockPath(), "utf8")) as LockInfo;
+      // Replaced: a successor's unlink + create.
+      rmSync(runLockPath());
+      writeFileSync(runLockPath(), JSON.stringify({ ...mine, invoker: "second", nonce: "successor-nonce" }));
+      expect(await a.stillOwns()).toBe(false);
+      await a.release();                               // …and release still refuses to unlink it
+      expect((JSON.parse(readFileSync(runLockPath(), "utf8")) as LockInfo).invoker).toBe("second");
+    } finally { env.cleanup(); }
+    const env2 = withEnv();
+    try {
+      const a = held(await acquireRunLock({ invoker: "first", timeoutMs: TIMEOUT_MS }));
+      const mine = JSON.parse(readFileSync(runLockPath(), "utf8")) as LockInfo;
+      writeFileSync(runLockPath(), JSON.stringify({ ...mine, nonce: "successor-nonce" }));   // same inode
+      expect(await a.stillOwns()).toBe(false);
+      await a.release();
+      expect(existsSync(runLockPath())).toBe(true);
+    } finally { env2.cleanup(); }
   });
 });

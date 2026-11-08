@@ -7,7 +7,7 @@
 // hook lives there, how a failure is reported); this module owns the registration contract.
 //
 // No `bun:test` import here: `src/eval/run-case.ts` reaches this module from the eval CLI, outside the
-// test runner, where the list is simply never drained.
+// test runner. There the list is drained by scripts/eval.ts's exit hook instead (`removeRegisteredTempDirs`).
 import { chmodSync, lstatSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -49,6 +49,16 @@ export function removeRegisteredTempDirs(): void {
     if (reason !== undefined) failures.push(`${dir}: ${reason}`);
   }
   if (failures.length > 0) throw new Error(`could not remove ${failures.length} temp dir(s):\n  ${failures.join("\n  ")}`);
+}
+
+/** Delete ONE tree with the same chmod-walk-then-rm (and one retry) as the drain; throws `path: reason` if it
+ *  stays. For fixtures/run-tmp.ts: test/preload.ts's removal of the run root — which is not a child of
+ *  `tmpdir()`, it IS `tmpdir()`, so it cannot go through `removeAtRunEnd` — and the sweep of dead runs'
+ *  roots. Additive: nothing the eval CLI reaches (`removeAtRunEnd`, `removeRegisteredTempDirs`) calls it. */
+export function removeTree(dir: string): void {
+  let reason = tryRemove(dir);
+  if (reason !== undefined) reason = tryRemove(dir);
+  if (reason !== undefined) throw new Error(`could not remove ${dir}: ${reason}`);
 }
 
 /** One attempt; returns why it did not fully succeed, or undefined. The chmod walk and the rm are separate

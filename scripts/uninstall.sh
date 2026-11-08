@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: bash scripts/uninstall.sh [--remove-signing-identity]
+# Usage: bash scripts/uninstall.sh [--remove-signing-identity] [--remove-keys]
 set -euo pipefail
 SUPPORT="${DBA_TEST_DIR:-$HOME/Library/Application Support/daily-briefing}"
 # PLIST is test-overridable too, so a test never judges the REAL agent file. Nothing here removes it or
@@ -10,18 +10,28 @@ RECORD="$SUPPORT/schedule.json"
 # The identity scripts/install.sh creates, and the engine's `schedule install` re-signs its managed copy
 # with (src/schedule/install.ts DEFAULT_SIGN_IDENTITY).
 SIGN_ID="Daily Briefing (local) Signing"
+# The --remove-keys leg (provider fallback P2-M5-T4, spec r9 §6 Uninstall): the Keychain service every app-owned API
+# key item is stored under, the most deletions one run makes, and the keychain tool's "not found" exit
+# (errSecItemNotFound) — the engine's own APP_KEY_SERVICE (src/appKeyNames.ts) and KEY_DELETE_ALL_MAX_ITERATIONS and
+# KEY_NOT_FOUND_EXIT (src/keyStore.ts), which test/uninstall.test.ts pins these three lines to, read as text.
+KEY_SERVICE="daily-briefing.app-key"
+KEY_DELETE_MAX=256
+KEY_NOT_FOUND=44
 
 REMOVE_IDENTITY=""
+REMOVE_KEYS=""
 for arg in "$@"; do
   case "$arg" in
     --remove-signing-identity) REMOVE_IDENTITY=1 ;;
-    *) echo "usage: bash scripts/uninstall.sh [--remove-signing-identity]" >&2; exit 2 ;;
+    --remove-keys) REMOVE_KEYS=1 ;;
+    *) echo "usage: bash scripts/uninstall.sh [--remove-signing-identity] [--remove-keys]" >&2; exit 2 ;;
   esac
 done
 
 # Test interlock (c): DBA_TEST_KEYCHAIN is a TEST override, read only under DBA_TEST_DIR, and it becomes the
-# keychain OPERAND of `security delete-identity` below, where a value like `-t` would parse as an option
-# and leave no operand at all, and with none `security` searches the default list, login keychain included
+# keychain OPERAND of `security delete-identity` and of the key leg's `security delete-generic-password` below,
+# where a value like `-t` would parse as an option and leave no operand at all, and with none `security`
+# searches the default list, login keychain included
 # (`man security`, delete-identity). So: set without DBA_TEST_DIR → refuse; under DBA_TEST_DIR it must be an
 # absolute path inside DBA_TEST_DIR (which can never begin with "-") with no ".." segment, inside it
 # PHYSICALLY as well (its directory resolved, symlinks followed, must lie in DBA_TEST_DIR resolved the same
@@ -69,6 +79,12 @@ fi
 # never reach the login keychain. Checked before anything runs; nothing is removed.
 if [ -n "$REMOVE_IDENTITY" ] && [ -n "${DBA_TEST_DIR:-}" ] && [ -z "${DBA_TEST_KEYCHAIN:-}" ]; then
   echo "refusing --remove-signing-identity: DBA_TEST_DIR is set without DBA_TEST_KEYCHAIN (a test must name a scratch keychain). Nothing was removed." >&2
+  exit 1
+fi
+# Its twin for the key leg (P2-M5-T4): --remove-keys deletes every app-owned key item from $KEYCHAIN, which is the
+# login keychain unless DBA_TEST_KEYCHAIN names a scratch one, so under DBA_TEST_DIR the flag needs it too.
+if [ -n "$REMOVE_KEYS" ] && [ -n "${DBA_TEST_DIR:-}" ] && [ -z "${DBA_TEST_KEYCHAIN:-}" ]; then
+  echo "refusing --remove-keys: DBA_TEST_DIR is set without DBA_TEST_KEYCHAIN (a test must name a scratch keychain). Nothing was removed." >&2
   exit 1
 fi
 if [ -n "${DBA_TEST_DIR:-}" ]; then
@@ -336,9 +352,21 @@ rm -f "$SUPPORT"/update-check.json 2>/dev/null || true
 # Mirrored token for token by the desktop app's ENGINE_STATE_REMOVALS, like every line above.
 rm -f "$SUPPORT"/last-run "$SUPPORT"/last-tick "$SUPPORT"/last-skip.json "$SUPPORT"/run.lock 2>/dev/null || true
 rm -f "$SUPPORT"/account-state.json "$SUPPORT"/recap-campaigns.jsonl 2>/dev/null || true
+# Provider fallback (P1-M10-T3): the per-provider status record and the day's unresolved-failure record. Mirrored
+# token for token by the desktop app's ENGINE_STATE_REMOVALS. The app-owned key folder (keys/) is the KEY leg's.
+rm -f "$SUPPORT"/provider-status.json "$SUPPORT"/last-failure.json 2>/dev/null || true
+# B1-M1-T3 (wave 2): the morning run's record for the desktop app's live git check. Mirrored token for
+# token by the desktop app's ENGINE_STATE_REMOVALS.
+rm -f "$SUPPORT"/run-record.json 2>/dev/null || true
 # The provider's scratch working folder (src/harden.ts): a DIRECTORY, removed with its contents the way
 # briefings is, and bounded the same way — never a bare recursive delete of $SUPPORT.
 rm -rf "$SUPPORT"/provider-cwd 2>/dev/null || true
+# v0.3.0 (calendar connection, spec r4 §8): the engine's calendar folder — the managed link files
+# (`links/<id>.url`, each a SECRET private-calendar address), the health file, and the Mac reader's copy and
+# run folder once it ships — removed whole, bounded like the two folders above. Mirrored by the desktop app's
+# ENGINE_STATE_REMOVALS (`calendar`, kind Dir). Sources configured by `urlEnv` / `urlCommand` live outside it
+# and are left alone.
+rm -rf "$SUPPORT"/calendar 2>/dev/null || true
 
 # --remove-signing-identity (opt-in, T19): delete the identity's certificate and private key from the login
 # keychain (DBA_TEST_KEYCHAIN in tests). `security` is called by NAME, never by absolute path, so a PATH
@@ -353,6 +381,54 @@ if [ -n "$REMOVE_IDENTITY" ]; then
   fi
 fi
 
+# --remove-keys (opt-in, provider fallback P2-M5-T4, spec r9 §6 Uninstall): the app-owned API keys. This script is
+# macOS-only (SUPPORT above), so, like the identity leg, the key leg has no OS gate; on Linux the app's own key leg
+# (`provider key delete-all`) removes key files. First every `$KEY_SERVICE` item in $KEYCHAIN (DBA_TEST_KEYCHAIN in
+# tests), one deletion per call, the way the engine's `key delete-all` does it (src/keyStore.ts keychainDeleteAll):
+# `security` by NAME, so a PATH stub intercepts it (test/uninstall.test.ts asserts both), with the item's printed
+# attributes discarded and its message kept for a warning. The loop ends on:
+#   0                  an item deleted → the next call;
+#   $KEY_NOT_FOUND     none left → done (the loop's normal end, and its message is not shown);
+#   anything else      → stop at once and warn, never retried: a locked keychain, a refusal, or a "not found" code
+#                      other than 44 (the engine's value, errSecItemNotFound; `delete-generic-password`'s own code is
+#                      UNVERIFIED, on the real-Mac sitting's list), so a wrong guess there costs a warning, not a loop;
+#   $KEY_DELETE_MAX    deletions with none reported left → stop and warn, so no answer can loop it forever.
+# Then the app-owned key folder, `<state>/keys/`, removed whole and bounded like the folders above (a symlinked
+# `keys` goes as the link, and what it points at is kept — no trailing slash on the operand). It is the KEY
+# leg's, on this flag's consent only: the unconditional state leg above never touches it (spec r9 §6), and
+# gui/src-tauri/tests/uninstall.rs allow-lists its exact line, so it is not read as a state-leg removal. It goes
+# whatever the Keychain answered. The script never reads the config, so an `apiKeyFile` it names elsewhere is the
+# app's key leg's to remove (plan Q10).
+KEYS_FAILED=""
+if [ -n "$REMOVE_KEYS" ]; then
+  keys_deleted=0
+  key_rc=0
+  key_err=""
+  # No deadline here, unlike the engine's KEY_OP_DEADLINE_MS (src/keyStore.ts): on a LOCKED keychain the tool's
+  # unlock dialog blocks this loop until it is answered (docs/TROUBLESHOOTING.md, the locked-Keychain remedy).
+  while [ "$keys_deleted" -lt "$KEY_DELETE_MAX" ]; do
+    key_rc=0
+    key_err="$(security delete-generic-password -s "$KEY_SERVICE" "$KEYCHAIN" 2>&1 >/dev/null)" || key_rc=$?
+    [ "$key_rc" = 0 ] || break
+    keys_deleted=$((keys_deleted + 1))
+  done
+  if [ "$key_rc" = "$KEY_NOT_FOUND" ]; then
+    echo "Removed $keys_deleted app-owned API key(s) from $KEYCHAIN."
+  elif [ "$key_rc" = 0 ]; then
+    echo "WARN: stopped after $KEY_DELETE_MAX deletions from $KEYCHAIN without the keychain tool reporting none left; some app-owned API keys may remain (Keychain Access lists them under $KEY_SERVICE)." >&2
+    KEYS_FAILED=1
+  else
+    echo "WARN: could not delete the app-owned API keys from $KEYCHAIN: the keychain tool exited $key_rc after $keys_deleted deletion(s): $key_err" >&2
+    KEYS_FAILED=1
+  fi
+  if ! rm -rf "$SUPPORT"/keys; then
+    echo "WARN: could not remove the app-owned key folder $SUPPORT/keys." >&2
+    KEYS_FAILED=1
+  else
+    echo "Removed the app-owned key folder $SUPPORT/keys (if there was one)."
+  fi
+fi
+
 # A pre-StartInterval build may have left a repeating pmset wake armed that no CLI here disarms — flag
 # it so the user can finish the cleanup (needs sudo; clears all repeat schedules, so we don't auto-run it).
 # grep reads ALL of pmset's output (no -q): under pipefail, a `grep -q` that exits at its first match can
@@ -364,8 +440,20 @@ fi
 # desktop app's alone (its Uninstall checkbox, which checks each key file first), so this script keeps it
 # and says so (spec 3.5.3).
 echo "Kept your settings folder, ~/.config/daily-briefing: this script never removes it, and it may hold your API key file."
+# The calendar's two leftovers outside this machine's files (spec r4 §8): the secret address is still live at
+# its provider, and macOS keeps its own record of a Calendar permission.
+echo "If a private calendar link you added may have leaked, reset it at the calendar provider (Google Calendar: the calendar's settings, Secret address in iCal format, Reset): removing it here does not stop the old address from working."
+echo "To remove the Calendar permission, open System Settings → Privacy & Security → Calendars and turn off Daily Briefing Calendar Reader, if it is listed."
+if [ -n "$ID_FAILED" ] && [ -n "$KEYS_FAILED" ]; then
+  echo "Uninstalled, except the '$SIGN_ID' identity and some app-owned API keys, which could not be deleted (see the WARN above)."
+  exit 1
+fi
 if [ -n "$ID_FAILED" ]; then
   echo "Uninstalled, except the '$SIGN_ID' identity, which could not be deleted (see the WARN above)."
+  exit 1
+fi
+if [ -n "$KEYS_FAILED" ]; then
+  echo "Uninstalled, except some app-owned API keys, which could not be deleted (see the WARN above)."
   exit 1
 fi
 echo "Uninstalled."

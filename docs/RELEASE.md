@@ -130,7 +130,15 @@ it, and finally that no check rewrote a tracked file — in a throwaway worktree
 PASS/FAIL for each (the script's header lists them). Under check 1 it also notes, without failing, when
 that `HEAD` is not in `origin/main` as your checkout last fetched it. ⚠
 The eval check calls your configured provider for real, several times per gold case; the worktree is a
-full checkout of the repository, and the GUI check compiles the shell from scratch inside it. It prints the `HEAD` it checked: that sha is the
+full checkout of the repository, and the GUI check compiles the shell from scratch inside it. The eval
+check also needs posture `full`, which only a CLI provider gives: an API provider reports
+`unhardened (api provider)` and fails it even when every gold case passes. If your own config uses an
+API provider, point `XDG_CONFIG_HOME` at a folder holding a temporary `daily-briefing/config.json`
+that uses the `claude` CLI, for this run only. If your Claude login can't use a subscription with
+Claude Code, set `"credential": "env-api-key"` in that provider (and `--model` in its `argv`, so the
+CLI doesn't pick a costlier default) and export `ANTHROPIC_API_KEY` for the run; this bills API
+credits. Run it from a plain terminal: inside a Claude Code session the CLI inherits that session's
+own API address and organization, and fails. It prints the `HEAD` it checked: that sha is the
 release commit from here on. Any later commit means running it again.
 
 ### 3. Read the soft residuals
@@ -162,7 +170,7 @@ The export must print `— hard residual sweep: clean`, and the gates inside it 
 
 ### 5. Sync the export into the public repo checkout, commit it, and check the commit's tree
 
-In your checkout of the public repo (`themarigold/daily-briefing`), on `main`, up to date with
+In your checkout of the public repo (`norn-app/daily-briefing`), on `main`, up to date with
 `origin/main`:
 
 ```sh
@@ -226,8 +234,8 @@ the exit code. (Measured in a throwaway bare repo, 2026-09-21 and 2026-09-22.)
 **(excluded from the runbook test: it watches a live workflow run.)**
 
 ```sh
-gh run list -R themarigold/daily-briefing --workflow release.yml -L 1
-gh run watch <run-id> -R themarigold/daily-briefing --exit-status
+gh run list -R norn-app/daily-briefing --workflow release.yml -L 1
+gh run watch <run-id> -R norn-app/daily-briefing --exit-status
 ```
 
 `gate` (typecheck, tests, `scripts/check-versions.sh` against the tag, the signing mode) → the CLI
@@ -241,9 +249,9 @@ is refused (user-directed 2026-10-02; the [Bundle-status contract](#bundle-statu
 **(excluded from the runbook test: it reads the live release.)**
 
 ```sh
-gh release view vX.Y.Z -R themarigold/daily-briefing --json assets --jq '.assets[].name' | LC_ALL=C sort
-D=$(mktemp -d) && gh release download vX.Y.Z -R themarigold/daily-briefing -D "$D" && (cd "$D" && shasum -a 256 -c SHA256SUMS)
-gh release view vX.Y.Z -R themarigold/daily-briefing --json body --jq .body
+gh release view vX.Y.Z -R norn-app/daily-briefing --json assets --jq '.assets[].name' | LC_ALL=C sort
+D=$(mktemp -d) && gh release download vX.Y.Z -R norn-app/daily-briefing -D "$D" && (cd "$D" && shasum -a 256 -c SHA256SUMS)
+gh release view vX.Y.Z -R norn-app/daily-briefing --json body --jq .body
 ```
 
 The asset list must be exactly the [Assets](#assets) names for `X.Y.Z`, minus the assets of any leg the
@@ -309,8 +317,8 @@ two repository secrets, each its own yes, and delete the directory:
 **(excluded from the runbook test: `gh secret set` writes to the repository.)**
 
 ```sh
-gh secret set DBA_SIGNING_P12 -R themarigold/daily-briefing < release-signing.p12.b64
-printf '%s' "$PW" | gh secret set DBA_SIGNING_P12_PASSWORD -R themarigold/daily-briefing
+gh secret set DBA_SIGNING_P12 -R norn-app/daily-briefing < release-signing.p12.b64
+printf '%s' "$PW" | gh secret set DBA_SIGNING_P12_PASSWORD -R norn-app/daily-briefing
 cd / && rm -rf "$D"
 ```
 
@@ -333,6 +341,13 @@ These names are **frozen**. `gui/scripts/stage-bundles.sh` renames Tauri's outpu
 | Windows NSIS | none: a workflow artifact only, kept for one day, never attached | — |
 
 `<v>` is plain semver, `X.Y.Z`: the tag without its leading `v`. There is no release-candidate form.
+
+The **Mac Calendar Reader** (v0.3.0) is not an asset of its own. Each macOS leg builds it universal with
+`reader/build.sh` (its "Calendar Reader (universal)" step, before Build), and the DMG's app carries it at
+`Contents/Resources/Daily Briefing Calendar Reader.app` (`gui/src-tauri/tauri.macos.conf.json`
+`bundle.macOS.files`). The leg's size gate checks it against the `reader-universal-apple-darwin` row, and its
+smoke checks both slices, the signature, and a FIFO round trip in `status` mode (`reader/smoke.sh`). A
+reader for command-line-only installs comes with the Homebrew formula change, not here.
 
 The attach set is the flat directory `dist/`, which holds **only** names from this table. Markers and
 release notes never live in `dist/`.

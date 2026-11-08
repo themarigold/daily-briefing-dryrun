@@ -1,4 +1,5 @@
 // src/reduce.ts
+import { clipBeforeCredential } from "./transcripts/credentials";
 import type { Activity, ActivityMeta, ReducedContext, TokenBudget } from "./types";
 
 export const STAGE1_TEXT_CAP = 200;   // long prose bodies (AI-session prompts/responses) → first 200 chars
@@ -19,7 +20,7 @@ function trimActivity(a: Activity): Activity {
   // as `a.text ?? a.target ?? ""`, so a coerced "" would shadow the `target` fallback of a text-less
   // signal (e.g. a future branch/stash activity). Unreachable today (git producers always set text),
   // but pinned by a regression test so it stays correct once AI-session producers land.
-  const text = a.text !== undefined ? a.text.slice(0, STAGE1_TEXT_CAP) : undefined;
+  const text = a.text !== undefined ? clipBeforeCredential(a.text, STAGE1_TEXT_CAP) : undefined;
   if (!a.meta) return { ...a, text };
   const meta: ActivityMeta = { ...a.meta };
   if (meta.diffstat && meta.diffstat.length > STAGE1_LIST_CAP) meta.diffstat = meta.diffstat.slice(0, STAGE1_LIST_CAP);

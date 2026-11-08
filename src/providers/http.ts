@@ -12,8 +12,8 @@
 // authority. A provider-internal loop underneath it multiplies attempts — 3 x 4 calls, ~10 minutes —
 // which is the same reasoning provider.ts gives for keeping the hardening ladder's rungs single
 // attempts. `Retry-After` is therefore SURFACED (in the message and in `resetAt`), never slept on.
-import { ProviderError, type ProviderErrorCode } from "../types";
-import { redactCredentials, REDACTION } from "../transcripts/credentials";
+import { ProviderError, type FailCause, type ProviderErrorCode } from "../types";
+import { dropTrailingPartialToken, redactCredentialsWithSecret } from "../transcripts/credentials";
 import { printableEndpoint, endpointHasWithheldParts } from "./endpoint";
 
 /** Diagnostic slice, matching `provider.ts`'s 300-char cap on a CLI's stderr/stdout. Same number on
@@ -77,26 +77,20 @@ export type ApiPostInput = {
    *  the truncation branch never runs — a "cap" test written that way passes without exercising the cap.
    *  A small cap makes the mechanism itself observable. Production passes nothing. */
   maxBytes?: number;
+  /** Provider fallback (P1-M3-T5): the walk's per-attempt deadline, COMBINED with this call's own timeout — either
+   *  aborts the fetch, and either is reported as `timeout`. Absent ⇒ exactly today's request. */
+  signal?: AbortSignal;
 };
 
 /**
- * Cap the diagnostic AND scrub it. THREE STEPS, AND THE ORDER IS THE WHOLE POINT:
- *
- *   1. LITERAL SCRUB of the key we actually resolved. `redactCredentials` matches key SHAPES, and its
- *      own header says so in as many words ("these literals are caught, never the class is closed") —
- *      an Azure OpenAI 32-hex key, a Google AI Studio `AIza…` key and a self-hosted vLLM `--api-key`
- *      token all sail straight through it. A 401 body that echoes the key back therefore reached
- *      stderr, briefing.log, the persisted last-skip record and `status --json` unredacted. The only
- *      reliable matcher for THIS key is the key itself, so it is passed in and removed by value.
- *   2. SHAPE REDACTION, kept as the second layer: it still catches a credential that is NOT ours (a
- *      gateway echoing an upstream token, an `Authorization:` line in a proxy error page).
- *   3. SLICE LAST. It used to run FIRST, which meant a key straddling the 300-char boundary was cut in
- *      half and its prefix survived as text no pattern could match any more.
+ * Redact the union of shape and literal-secret spans on the original text, THEN flatten and clip.
+ * Either sequential replacement order can consume part of the other's match. Shape matching also
+ * catches upstream credentials; literal matching catches this key even when its shape is unknown
+ * (Azure's 32-hex keys, Google AI Studio keys, or self-hosted tokens). Whitespace normalization and
+ * clipping must wait too, since either can destroy the original match and leave a prefix exposed.
  */
 export function diagnostic(text: string, secret?: string): string {
-  const flat = text.replace(/\s+/g, " ").trim();
-  const scrubbed = secret !== undefined && secret !== "" ? flat.split(secret).join(REDACTION) : flat;
-  return redactCredentials(scrubbed).slice(0, DIAG_CHARS);
+  return redactCredentialsWithSecret(text, secret).replace(/\s+/g, " ").trim().slice(0, DIAG_CHARS);
 }
 
 /**
@@ -132,7 +126,7 @@ export function printableTarget(url: string): string {
  *  ABORT fired mid-read used to be indistinguishable from a body that simply was not JSON, so a
  *  timeout landing after the response headers was reported as "HTTP 200 but the body is not JSON" —
  *  the ceiling the operator could actually raise was never named, and the message quoted a truncated
- *  body prefix instead. `complete` is false only when the read ended by throwing. */
+ *  body prefix instead. `complete` is false when the read throws OR reaches the byte cap before EOF. */
 async function readCapped(res: Response, maxBytes: number): Promise<{ text: string; complete: boolean }> {
   if (!res.body) return { text: "", complete: true };
   const reader = res.body.getReader();
@@ -146,7 +140,7 @@ async function readCapped(res: Response, maxBytes: number): Promise<{ text: stri
       if (!value) continue;
       chunks.push(value);
       total += value.byteLength;
-      if (total >= maxBytes) { await reader.cancel().catch(() => {}); complete = true; break; }
+      if (total >= maxBytes) { await reader.cancel().catch(() => {}); break; }
     }
   } catch {
     // A body that errors mid-read still yields whatever arrived; the caller's JSON parse will fail and
@@ -159,8 +153,36 @@ async function readCapped(res: Response, maxBytes: number): Promise<{ text: stri
   return { text: new TextDecoder().decode(joined), complete };
 }
 
-/** `retry-after` in SECONDS, or as an HTTP-date. Returns milliseconds from `now`, or undefined. */
+const DAY3 = "(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)";
+const MON3 = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
+const HMS = "\\d{2}:\\d{2}:\\d{2}";
+/** RFC 9110 §5.6.7's three HTTP-date forms, and nothing else (PR 1 final review round 3, L8): `Date.parse` alone is
+ *  lenient — it reads `"1.5"`, `"Oct 17"` and `"10/17/2026"` as dates — so a header must match one of these first. */
+const IMF_FIXDATE = new RegExp(`^${DAY3}, \\d{2} ${MON3} \\d{4} ${HMS} GMT$`);
+const RFC850_DATE = new RegExp(`^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \\d{2}-${MON3}-\\d{2} ${HMS} GMT$`);
+const ASCTIME_DATE = new RegExp(`^${DAY3} ${MON3} (?: \\d|\\d{2}) ${HMS} \\d{4}$`);
+
+/** `retry-after` in SECONDS, or as an HTTP-date in one of RFC 9110's three forms (an asctime date is GMT, so it is
+ *  parsed as GMT, never in the local zone). Returns milliseconds from `now`, or undefined for anything else. */
 export function retryAfterMs(header: string | null, now: Date): number | undefined {
+  if (header === null) return undefined;
+  const t = header.trim();
+  if (t === "") return undefined;
+  if (/^\d+$/.test(t)) return Number(t) * 1000;
+  let at: number;
+  if (IMF_FIXDATE.test(t) || RFC850_DATE.test(t)) at = Date.parse(t);
+  else if (ASCTIME_DATE.test(t)) at = Date.parse(`${t} GMT`);
+  else return undefined;
+  if (Number.isNaN(at)) return undefined;
+  return Math.max(0, at - now.getTime());
+}
+
+/** `retry-after` as origin/main read it — seconds, or anything `Date.parse` accepts, however lenient — in ms from `now`.
+ *  KEPT for the two WALL verdicts and `resetAt` (PR 1 final review round 5, M1; requirement 9): a single entry's wall
+ *  decisions must stay origin/main's — with ONE exception: a `retry-after` past `Date`'s range, on which origin/main
+ *  threw a RangeError, is now a wall with no `resetAt` (round 3 L7). Only the carried transient wait
+ *  (`StatusMapping.retryAfterMs`, read by `withEntryRetry`) uses the strict `retryAfterMs`. */
+export function legacyRetryAfterMs(header: string | null, now: Date): number | undefined {
   if (header === null) return undefined;
   const t = header.trim();
   if (t === "") return undefined;
@@ -182,7 +204,12 @@ export function parseRegainAccess(message: string): string | undefined {
   return Number.isNaN(t) ? undefined : new Date(t).toISOString();
 }
 
-export type StatusMapping = { code: ProviderErrorCode; resetAt?: string };
+export type StatusMapping = { code: ProviderErrorCode; resetAt?: string; failCause?: FailCause; retryAfterMs?: number };
+
+/** A 400 body that names the PROMPT'S LENGTH (Anthropic's "prompt is too long: N tokens > M maximum", the
+ *  OpenAI-family "maximum context length" / `context_length_exceeded`). Matched on the parsed error's message
+ *  and code only, before the body is dropped. */
+const PROMPT_LENGTH_RE = /prompt is too long|maximum context length|context[_ ]length[_ ]exceeded|input is too long|too many (?:input )?tokens/i;
 
 /**
  * HTTP status → one of the FIVE frozen `ProviderErrorCode` members. No sixth code: the union is frozen
@@ -223,9 +250,12 @@ export type StatusMapping = { code: ProviderErrorCode; resetAt?: string };
  *   • openai-compatible  → a 429 is a wall ONLY on POSITIVE EVIDENCE (the spend-cap `error_code`, the
  *                          `regain access on …` sentence, or a `retry-after` longer than the whole
  *                          retry budget). Everything else stays `nonzero-exit` and is retried.
- * A MALFORMED `retry-after` (`"30s"`, an unparseable date) is treated exactly as an ABSENT one —
- * `retryAfterMs` already returns undefined for both — so a gateway's non-conforming header cannot
- * conjure a wall out of a transient limit on the openai-compatible side.
+ * The WALL verdicts read `retry-after` as origin/main did (`legacyRetryAfterMs`, lenient
+ * `Date.parse`; round 5 M1): an unparseable one (`"30s"`) is treated as ABSENT — on the openai-compatible
+ * side that cannot conjure a wall out of a transient limit, on the anthropic side it is the documented
+ * inference. The carried transient wait uses the strict RFC 9110 parse (`retryAfterMs`) instead. A
+ * `retry-after` beyond `Date`'s range is a wall with no `resetAt` (round 3 L7), never a thrown RangeError —
+ * the one case where the verdict differs from origin/main, which threw there.
  */
 export function mapStatus(
   status: number, headers: Headers, bodyText: string, now: Date,
@@ -239,20 +269,32 @@ export function mapStatus(
   const errorCode = typeof details.error_code === "string" ? details.error_code : "";
 
   if (status === 429) {
-    const afterMs = retryAfterMs(headers.get("retry-after"), now);
+    const afterHeader = headers.get("retry-after");
+    // TWO readings of one header (round 5 M1): the walls and `resetAt` use origin/main's lenient one (origin's verdicts,
+    // except a value past `Date`'s range, where origin threw — round 3 L7); the strict RFC 9110 one is only the
+    // transient wait carried to `withEntryRetry` (a gateway's odd header must not set how long an earlier entry sleeps).
+    const afterMs = legacyRetryAfterMs(afterHeader, now);
+    const waitMs = retryAfterMs(afterHeader, now);
     const regainAt = parseRegainAccess(message);
     // POSITIVE evidence of a wall, true for either transport: the documented spend-cap error code, or a
     // body that names the instant access resumes.
     const provenWall = errorCode === "enforced_spend_limit_reached" || regainAt !== undefined;
-    // The vendor-documented INFERENCE. Anthropic only — see the ⚠ above.
+    // The vendor-documented INFERENCE. Anthropic only — see the ⚠ above. On origin/main's lenient reading (round 5 M1):
+    // an absent or unparseable header (`"30s"`) is a wall; one `Date.parse` reads (`… +0000`, an ISO instant) is a wait.
     const inferredWall = kind === "anthropic" && afterMs === undefined;
     if (provenWall || inferredWall) {
       return { code: "usage-limit", ...(regainAt ? { resetAt: regainAt } : {}) };
     }
     if (afterMs !== undefined && afterMs > USAGE_WALL_RETRY_AFTER_MS) {
-      return { code: "usage-limit", resetAt: new Date(now.getTime() + afterMs).toISOString() };
+      // An absurd `retry-after` (`"99999999999999"`) lands past `Date`'s range, where `toISOString` throws a RangeError —
+      // a non-ProviderError, which would stop the walk (PR 1 final review round 3, L7). It is still a wall; with no
+      // reset the walk's own probe mark applies.
+      const reset = new Date(now.getTime() + afterMs);
+      return { code: "usage-limit", ...(Number.isFinite(reset.getTime()) ? { resetAt: reset.toISOString() } : {}) };
     }
-    return { code: "nonzero-exit" };     // transient: the retry schedule outlasts it
+    // transient: the retry schedule outlasts it. A parsed `retry-after` rides along (provider fallback):
+    // an earlier walk entry waits that long instead of its fixed ~5 s when it is short enough.
+    return { code: "nonzero-exit", ...(waitMs !== undefined ? { retryAfterMs: waitMs } : {}) };
   }
 
   if (status === 400 && /You have reached your specified (workspace )?API usage limits/i.test(message)) {
@@ -267,6 +309,14 @@ export function mapStatus(
   // core.ts's limit machinery could see. DELIBERATELY NO `resetAt`: a top-up has no schedule, so core.ts's
   // one-hour probe mark is exactly the right fallback here.
   if (status === 402) return { code: "usage-limit" };
+
+  // Provider fallback: a prompt too long for THIS model is permanent here and tells the walk to move on
+  // without a mark. 413 always; a 400 only when its body names the prompt's length (the spend-cap 400
+  // above is matched first and stays a wall).
+  const errCode = typeof err.code === "string" ? err.code : "";
+  if (status === 413 || (status === 400 && (PROMPT_LENGTH_RE.test(message) || PROMPT_LENGTH_RE.test(errCode)))) {
+    return { code: "missing-binary", failCause: "prompt-too-long" };
+  }
 
   // 408 Request Timeout and 409 conflict are the only retryable 4xx; everything else in that range is a
   // property of the request or the account and will not change within a run.
@@ -287,6 +337,28 @@ export async function postJson(input: ApiPostInput): Promise<unknown> {
   // The ONLY timeout on this path. `provider.timeoutMs` bounds a spawned CLI and bounds this call the
   // same way, so the two transports share one knob and one meaning.
   const timer = setTimeout(() => ctl.abort(), input.timeoutMs);
+  // The caller's deadline aborts the same controller, so every abort path below (before the headers, mid-body)
+  // reads it exactly as it reads the timeout. Removed again however the call ends.
+  const onCallerAbort = (): void => ctl.abort();
+  if (input.signal?.aborted) { clearTimeout(timer); throw new ProviderError("timeout", `${input.label}: the attempt's deadline passed before the request was sent`); }
+  input.signal?.addEventListener("abort", onCallerAbort, { once: true });
+  try {
+    return await postJsonWith(input, ctl, timer, now, doFetch);
+  } finally {
+    input.signal?.removeEventListener("abort", onCallerAbort);
+  }
+}
+
+/** The `timeout` for an aborted request: this call's own timeout, or the caller's deadline (P1-M3-T5). */
+function abortedError(input: ApiPostInput): ProviderError {
+  return input.signal?.aborted
+    ? new ProviderError("timeout", `${input.label}: the attempt's deadline passed during the request`)
+    : new ProviderError("timeout", `${input.label} timed out after ${input.timeoutMs}ms`);
+}
+
+async function postJsonWith(
+  input: ApiPostInput, ctl: AbortController, timer: ReturnType<typeof setTimeout>, now: () => Date, doFetch: typeof fetch,
+): Promise<unknown> {
   let res: Response;
   try {
     // `redirect: "error"`, never fetch's default `"follow"` (Phase E M5b checkpoint) — the same rule
@@ -308,7 +380,7 @@ export async function postJson(input: ApiPostInput): Promise<unknown> {
     });
   } catch (e) {
     clearTimeout(timer);
-    if (ctl.signal.aborted) throw new ProviderError("timeout", `${input.label} timed out after ${input.timeoutMs}ms`);
+    if (ctl.signal.aborted) throw abortedError(input);
     // ⚠ A REFUSED REDIRECT IS WORDED HERE, NOT QUOTED: bun's message for it names the WIRE URL
     // ("UnexpectedRedirect fetching \"<url>\"…", measured), query and all — exactly what
     // `printableTarget` exists to withhold.
@@ -319,7 +391,9 @@ export async function postJson(input: ApiPostInput): Promise<unknown> {
     // backoff and two more requests that could only fail the same way. The next tick still tries
     // again, as it does after any permanent failure.
     if ((e as { code?: unknown } | null)?.code === "UnexpectedRedirect") {
-      throw new ProviderError("missing-binary", `${input.label}: ${printableTarget(input.url)} answered with a redirect, which is not followed — the prompt and the key are never re-sent to another address. Set baseUrl to the final URL.`);
+      const refused = new ProviderError("missing-binary", `${input.label}: ${printableTarget(input.url)} answered with a redirect, which is not followed — the prompt and the key are never re-sent to another address. Set baseUrl to the final URL.`);
+      refused.failCause = "redirect-refused";
+      throw refused;
     }
     // Connect refused, DNS failure, TLS failure. Retryable: a wake-before-wifi morning looks exactly
     // like this, and it is the case the whole retry schedule exists for.
@@ -340,13 +414,22 @@ export async function postJson(input: ApiPostInput): Promise<unknown> {
   // prefix: the timeout misattributed to the server's JSON, and the one knob the operator could actually
   // raise never named. `complete` distinguishes our abort from a body that genuinely was not JSON.
   if (!read.complete && ctl.signal.aborted) {
-    throw new ProviderError("timeout", `${input.label} timed out after ${input.timeoutMs}ms`);
+    throw abortedError(input);
   }
 
+  // An errored/capped read may end halfway through ANY credential shape, before its delimiter or
+  // minimum length. Withhold the final token before shape/literal redaction; whitespace proves the
+  // preceding token ended. With no whitespace the entire partial text is withheld. Keep `text` for
+  // status classification/parsing, so diagnostic minimisation does not change provider semantics.
+  const diagnosticText = read.complete ? text : dropTrailingPartialToken(text);
+
   if (!res.ok) {
-    const { code, resetAt } = mapStatus(res.status, res.headers, text, now(), input.kind);
-    const err = new ProviderError(code, `${input.label}: HTTP ${res.status} — ${diagnostic(text, input.secret) || "(no body)"}`);
+    const { code, resetAt, failCause, retryAfterMs: afterMs } = mapStatus(res.status, res.headers, text, now(), input.kind);
+    const err = new ProviderError(code, `${input.label}: HTTP ${res.status} — ${diagnostic(diagnosticText, input.secret) || "(no body)"}`);
     if (resetAt !== undefined) err.resetAt = resetAt;
+    if (failCause !== undefined) err.failCause = failCause;
+    if (afterMs !== undefined) err.retryAfterMs = afterMs;
+    err.httpStatus = res.status;
     throw err;
   }
 
@@ -354,6 +437,8 @@ export async function postJson(input: ApiPostInput): Promise<unknown> {
   catch {
     // A 200 whose body is not JSON is a proxy, a captive portal or a gateway error page. Retryable: it
     // is far more often a transient piece of network furniture than a permanent condition.
-    throw new ProviderError("nonzero-exit", `${input.label}: HTTP 200 but the body is not JSON — ${diagnostic(text, input.secret) || "(empty body)"}`);
+    const err = new ProviderError("nonzero-exit", `${input.label}: HTTP 200 but the body is not JSON — ${diagnostic(diagnosticText, input.secret) || "(empty body)"}`);
+    err.httpStatus = res.status;
+    throw err;
   }
 }

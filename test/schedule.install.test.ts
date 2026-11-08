@@ -23,7 +23,7 @@ import {
   probeRegistration, lingerState, manualRemoveSteps, MANUAL_STEPS_CLI_CLOSING,
   type Exec, type ScheduleDeps, type RegistrationCheck, type RegistrationReason,
 } from "../src/schedule/install";
-import { SCHEDULE_LABEL, SYSTEMD_SERVICE_NAME, SYSTEMD_TIMER_NAME, WINDOWS_TASK_NAME } from "../src/schedule/units";
+import { SCHEDULE_LABEL, SYSTEMD_SERVICE_NAME, SYSTEMD_TIMER_NAME, WINDOWS_TASK_NAME, LOGIN_ITEMS_OFF_HINT } from "../src/schedule/units";
 import { markerPath, lastSkipPath, localDateStr } from "../src/marker";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
@@ -468,6 +468,15 @@ describe("install (darwin)", () => {
     expect(f.ran("launchctl").map((c) => c.join(" "))).toContain(`launchctl load ${join(UNITS, `${SCHEDULE_LABEL}.plist`)}`);
   });
 
+  test("the identity '-' is codesign's AD-HOC identity — never looked up, never reported stable (codex W3 review)", async () => {
+    const f = fakeExec({ "find-identity": { out: `1) ABC "-"` } });
+    expect(await installSchedule({ noVerify: true, identity: "-" }, deps("darwin", f.exec))).toBe(EXIT_OK);
+    expect(f.ran("security")).toEqual([]);
+    expect(f.ran("codesign").map((c) => c.join(" ")).some((c) => c.includes("--identifier"))).toBe(false);
+    expect(f.ran("codesign").map((c) => c.join(" ")).some((c) => c.startsWith("codesign -s - -f"))).toBe(true);
+    expect(warned.join("\n")).toContain("the signing identity '-' is ad hoc");
+  });
+
   test("the identity is parameterized — --identity beats DBA_SIGN_IDENTITY beats the default", () => {
     expect(resolveIdentity({ identity: "Developer ID Application: X" }, { DBA_SIGN_IDENTITY: "env" } as NodeJS.ProcessEnv))
       .toBe("Developer ID Application: X");
@@ -479,7 +488,11 @@ describe("install (darwin)", () => {
     const f = fakeExec();
     expect(await installSchedule({ invoker: "app", noVerify: true }, deps("darwin", f.exec))).toBe(EXIT_OK);
     const unit = join(UNITS, `${SCHEDULE_LABEL}.plist`);
-    expect(f.ran("launchctl").map((c) => c.join(" "))).toEqual([`launchctl unload ${unit}`, `launchctl load ${unit}`]);
+    // Then the ONE post-load probe (spec 2026-10-11 login-items-off): read-only, by the exact label.
+    expect(f.ran("launchctl").map((c) => c.join(" "))).toEqual([
+      `launchctl unload ${unit}`, `launchctl load ${unit}`,
+      `launchctl print gui/4242/${SCHEDULE_LABEL}`, `launchctl print user/4242/${SCHEDULE_LABEL}`, `launchctl list ${SCHEDULE_LABEL}`,
+    ]);
     const rec = await readScheduleRecord();
     expect(rec).toMatchObject({ owner: "app", invoker: "app", kind: "launchd", unitPath: unit });
     expect(rec!.installedAt).toBe("2026-09-14T12:00:00.000Z");
@@ -802,13 +815,50 @@ describe("verify — the engine-side kickstart (plan R1)", () => {
     withVerify.onCall("launchctl start", () => writeFileSync(markerPath(), EVIDENCE_DATE));
     await installSchedule({ verify: V }, deps("darwin", withVerify.exec));
     const order = withVerify.ran("launchctl").map((c) => c[1]);
-    expect(order).toEqual(["unload", "load", "start"]);   // ⚠ start is LAST
+    expect(order).toEqual(["unload", "load", "print", "print", "list", "start"]);   // ⚠ start is LAST, after the post-load probe
 
     said.length = 0;
     const without = fakeExec();
     await installSchedule({ noVerify: true, verify: V }, deps("darwin", without.exec));
-    expect(without.ran("launchctl").map((c) => c[1])).toEqual(["unload", "load"]);
+    expect(without.ran("launchctl").map((c) => c[1])).toEqual(["unload", "load", "print", "print", "list"]);
     expect(said.join("\n")).toContain("Skipped the verification kickstart");
+  });
+});
+
+// ── spec 2026-10-11 (login-items-off): `launchctl load` exits 0 for an item the user switched off in Login
+// Items, and launchd then cannot find the job. The install probes once after the load and warns; the exit
+// code stands and nothing is rolled back.
+describe("install (darwin): the post-load Login Items probe", () => {
+  test("load 0, then the probe says gone → the hint as a warning, exit 0, the record kept", async () => {
+    const f = launchdJob(false);
+    f.onCall("launchctl load", () => f.set(false));   // the switch is off: the load "succeeds", nothing is found
+    expect(await installSchedule({ noVerify: true }, deps("darwin", f.exec))).toBe(EXIT_OK);
+    // Exactly one hint line (the signing fallback's own warnings may sit beside it; they are not this test's).
+    expect(warned.filter((l) => l.includes(LOGIN_ITEMS_OFF_HINT))).toEqual([`WARN: ${LOGIN_ITEMS_OFF_HINT}`]);
+    expect(await readScheduleRecord()).toMatchObject({ kind: "launchd" });
+    expect(existsSync(join(UNITS, `${SCHEDULE_LABEL}.plist`))).toBe(true);
+    // Read-only, 5 s each, and no unload after the load: nothing is undone.
+    const probe = f.calls.map((c, i) => [c, f.timeouts[i]] as const).filter(([c]) => c[1] === "print" || c[1] === "list");
+    expect(probe.map(([, t]) => t)).toEqual([5_000, 5_000, 5_000]);
+    expect(f.ran("launchctl").map((c) => c[1])).toEqual(["unload", "load", "print", "print", "list"]);
+  });
+
+  test("load 0 and the job is found → no warning", async () => {
+    const f = launchdJob(false);
+    expect(await installSchedule({ noVerify: true }, deps("darwin", f.exec))).toBe(EXIT_OK);
+    expect(warned.join("\n")).not.toContain(LOGIN_ITEMS_OFF_HINT);
+  });
+
+  test("a probe that cannot say (no desktop session) → no warning: unknown is not gone", async () => {
+    const f = fakeExec({ "print gui/": { code: 113, err: "Could not find domain for port identifier: 4242" }, "print user/": { code: 113, err: SERVICE_NOT_FOUND }, "list ": { code: 113, err: SERVICE_NOT_FOUND } });
+    expect(await installSchedule({ noVerify: true }, deps("darwin", f.exec))).toBe(EXIT_OK);
+    expect(warned.join("\n")).not.toContain(LOGIN_ITEMS_OFF_HINT);
+  });
+
+  test("linux never probes for it", async () => {
+    const f = systemdJob(false, false);
+    expect(await installSchedule({ noVerify: true, enableLinger: false }, deps("linux", f.exec))).toBe(EXIT_OK);
+    expect(warned.join("\n")).not.toContain(LOGIN_ITEMS_OFF_HINT);
   });
 });
 

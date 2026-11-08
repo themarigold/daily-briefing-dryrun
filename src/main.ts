@@ -6,7 +6,7 @@
 // worst shape of publish defect (it passes every local gate and breaks only for the consumer).
 // Bun/TypeScript both strip a leading shebang, and `bun build --compile` embeds its own, so this is
 // inert for every path except the installed-from-npm one it exists for.
-import { loadConfig, initConfig, configPath, resolveRecapCampaigns, type InitApiOptions } from "./config";
+import { loadConfig, initConfig, configPath, type InitApiOptions } from "./config";
 import { resolveApiKey, keyStatusLine, DEFAULT_KEY_ENV } from "./apiKey";
 import { chmod } from "node:fs/promises";
 import { assertInitSafeArgv } from "./harden";
@@ -14,19 +14,31 @@ import { type RepoProbe } from "./extractor";
 import { renderBriefing, stripControl } from "./render";
 import { redactCredentials } from "./transcripts/credentials";
 import { diagCrash, diagError } from "./diag";
-import { checkRanToday, stampToday, stampTick, localDateStr, latestBriefingPath, archivedBriefingPath, markerExists, markerPath, rotateLogIfLarge, readLastRunDate, writeLastSkip, clearLastSkip } from "./marker";
+import { checkRanToday, stampToday, stampTick, localDateStr, latestBriefingPath, archivedBriefingPath, markerExists, markerPath, rotateLogIfLarge, readLastRunDate, writeLastSkip, clearLastSkip, writeLastFailure, clearLastFailure, FAILURE_SKIP_REASONS } from "./marker";
 import { warnFor, isInaccessible, type GuardOpts } from "./protectedPath";
-import { ProviderError, type Provider } from "./types";
+import { LostLockError, ProviderError, type Provider } from "./types";
+import { resolveProviderList } from "./providerList";
+import { homedir } from "node:os";
 import { parseFloor, isPastFloor } from "./schedule";
 import { clearLastLimit } from "./account";
-import { runCore, type CoreResult } from "./core";
-import { section } from "./generator";
-import { TIMEOUT_MS } from "./provider";
-import { acquireRunLock } from "./runlock";
+import { runCore, type CoreResult, type SummarySeed } from "./core";
+import { resolveAiSummary } from "./summary/config";
+import { summaryCardsFromPage } from "./summary/cards";
+import { runSummaryJob, SUMMARY_CLEANUP_MS, type PreparedSummary } from "./summary/job";
+import { pageHashOf, readPageIdentity } from "./summary/page-version";
+import { pruneSummaryRecords } from "./summary/store";
+import { hasBriefingSection } from "./generator";
+import { formatResetTime, outOfUsageLine, safeLabel, unusableAnswerMessage } from "./failover";
+import { acquireRunLock, FAIL_OPEN_LOCK_DIAGNOSTIC, heartbeatCapMs, runLockInputs } from "./runlock";
 import { notify, notifyPayload } from "./notify";
 import { autoUpdateCheck, checkForUpdate, type UpdateCheckDeps, type UpdateCheckResult } from "./updateCheck";
+import { startKeepAwake } from "./keep-awake";
+// The env-var constant only. units.ts is the PURE, import-free generator module, so this static edge pulls
+// in no installer and no `proc.run` — the dynamic `./schedule/install` imports in `dispatch` stay the only
+// way into the scheduler's effects.
+import { KEEP_AWAKE_ENV } from "./schedule/units";
 import {
-  envelopeFrom, gateEnvelope, redactEnvelope, resolveJsonOutPath, statusReport, doctorReport, validateCandidate,
+  briefingsDir, envelopeFrom, gateEnvelope, redactEnvelope, resolveJsonOutPath, statusReport, doctorReport, validateCandidateBounded,
   type RunEnvelope, type SkipReason,
 } from "./json";
 import { access, constants as FS_CONSTANTS } from "node:fs/promises";
@@ -49,9 +61,26 @@ export type RunDeps = {
   netPollMs?: number;
   now?: () => Date;                      // injectable clock for the floor gate (tests pin it; production uses real time)
   interactive?: boolean;                 // TTY at the entry point → floor-exempt (dispatch passes isTTY; tests default false for determinism)
+  /** `run --now` — the app's Run now. Exempt from the morning floor and from NOTHING else: the once-per-day guard
+   *  still applies (that is `--force`), and it is not `interactive` — logging, the lock's `invoker` and the calendar
+   *  trigger stay what the TTY check decides. Scheduled ticks never pass it, so they keep waiting for the floor. */
+  runNow?: boolean;
   /** Phase E (E11): the automatic update check's seams (`fetch`, `now`, the state-file path). Read ONLY
    *  by `run()`'s post-run call below — never by the pipeline, whose `deps` spread carries it inert. */
   updateCheck?: UpdateCheckDeps;
+  /** v0.3.0 calendar: the calendar step seam and its outer bound, passed through to `runCore` (core.ts `RunDeps`).
+   *  Tests only; production leaves both unset and `runCore` builds the step from `cfg.calendar`. */
+  calendar?: import("./core").RunDeps["calendar"];
+  calendarBoundMs?: number;
+  /** A2-M3-T9 (plan M11): the AI summary's named test seam, tests only. With an injected main provider no summary runs
+   *  unless BOTH of this pair are supplied; without the pair the next two are ignored. No environment, CLI or config
+   *  switch reaches any of the four; production leaves them unset and uses only the entry that actually won. */
+  summaryProvider?: Provider;
+  summaryTestSeed?: SummarySeed;
+  /** Plan R5-L11: the summary phase's clock (monotonic milliseconds), read at each decision point. Timers stay real. */
+  summaryClock?: () => number;
+  /** Replaces T's 30 000 ms, before the winner's shorter timeout is applied. */
+  summaryTimeoutMs?: number;
 };
 
 // The pipeline (discover → … → generate → drift) and its helpers — blockedDelivery,
@@ -64,6 +93,7 @@ export { blockedDelivery, workingTreeDriftWarnings } from "./core";
 // deadlocked the real `doctor` for 20 s. See that file's header for the measurement. Re-exported so
 // every existing `import { preflightRepos } from "../src/main"` is untouched.
 import { preflightRepos } from "./preflight";
+import { buildRunRecord, writeRunRecord } from "./runRecord";
 export { preflightRepos };
 
 /** Why `p` could not be written, or `undefined` when it looks writable. NON-DESTRUCTIVE: it asks
@@ -106,12 +136,15 @@ function emitNetMessage(net: { online: boolean; waitedMs: number } | null | unde
  *  built inline at its only call site, so the falsehood shipped through ten review rounds.
  *
  *  The reset is stated ONLY for a parsed one — a probe deadline is a one-hour guess, and calling it a
- *  reset would claim knowledge the system does not have. `exhausted === false` rather than a truthy
- *  test: an absent payload keeps the conservative wording instead of promising a retry that may not come. */
+ *  reset would claim knowledge the system does not have.
+ *
+ *  Provider fallback (P1-M7-T2, spec r9 §5 "Retired"): the `exhausted === false` branch and its "the next tick will
+ *  use another account" wording are gone. A wall with another entry left now hands off IN THE SAME TICK, so a
+ *  `limited` result always means nothing is left (`exhausted` is typed `true`). */
 export function limitedSkipMessage(limited: CoreResult["limited"]): string {
-  // A PROBE mark does not prove a usage limit. `recordAuthProbe` writes one for a non-limit failure on
-  // a fallback (the likeliest cause being a config dir that was never logged into), and a limit whose
-  // reset would not parse writes one too — this branch cannot tell them apart. Saying "at its usage
+  // A PROBE mark does not prove a usage limit. The walk writes an hour mark for a non-limit failure on a
+  // non-first entry (`recordHourMark` — the likeliest cause being a config dir that was never logged into), and a
+  // limit whose reset would not parse writes a probe mark too — this branch cannot tell them apart. Saying "at its usage
   // limit" for a broken login would be the same false-cause defect one clause to the left, so a probe
   // gets the weaker, always-true wording instead. A parsed reset is the only case that names the cause.
   // `until` is guarded as well as `isProbe`: the exhausted branch reads it from state and falls back to
@@ -119,11 +152,9 @@ export function limitedSkipMessage(limited: CoreResult["limited"]): string {
   const state = limited?.isProbe === false && limited.until
     ? `is at its usage limit until ${limited.until}`
     : "is unavailable";
-  const tail = limited?.exhausted === false
-    ? "the next tick will use another account"
-    : "no other account is available; will retry next interval";
-  // The label is arbitrary config text; every other config-derived line in run() is stripped.
-  return `skipped: account "${stripControl(limited?.label ?? "?")}" ${state} — ${tail}`;
+  const tail = "no other account is available; will retry next interval";
+  // The label is arbitrary config text: control-stripped, redacted and calendar-scrubbed (hub Q25 (2)).
+  return `skipped: account "${safeLabel(limited?.label ?? "?")}" ${state} — ${tail}`;
 }
 
 /** The two ADDITIVE output flags (gui-tauri T1). Deliberately a THIRD parameter rather than fields on
@@ -168,9 +199,30 @@ export type RunOutput = {
  *  ⚠ IT REACHES NO CHANNEL THE RUN REPORTS: no stdout/stderr byte, nothing in `struct.warnings`,
  *  `runtimeWarnings` or the envelope's `warnings` — its one output is `<state>/update-check.json`
  *  (src/updateCheck.ts). `test/update-check.test.ts` pins that byte-for-byte against a disabled run.
- *  A run that THROWS (a crash) rethrows before reaching it, unchanged. */
+ *  A run that THROWS (a crash) rethrows before reaching it, unchanged.
+ *
+ *  ⚠ THE AI SUMMARY (A2-M3-T9) RUNS BEFORE THE CHECK AND WITHOUT ITS EXCLUSION: every delivered run with the switch on
+ *  waits for it, scheduled, terminal and `--json` alike, inside the one bound `runBriefing` started. Its gate and call
+ *  sit in one swallowing `try`, on top of the job's own total catch, so neither a throwing cards function nor a throwing
+ *  job can change the returned code or reach the check differently; the `finally` ends the phase on every exit, quiet
+ *  days and no-seed runs included. */
 export async function run(force: boolean, deps: RunDeps = {}, out: RunOutput = {}): Promise<number> {
-  const { code, delivered } = await runBriefing(force, deps, out);
+  const { code, delivered, aiSummaryEnabled, summary } = await runBriefing(force, deps, out);
+  try {
+    if (delivered && aiSummaryEnabled === true && summary?.seed !== undefined && !summary.emptyWindow) {
+      const cards = summaryCardsFromPage(summary.page);
+      if (cards.length > 0) {
+        const seam = summaryTestSeam(deps);
+        await runSummaryJob(summary, cards, {
+          ...(seam !== undefined ? { provider: seam.provider } : {}),
+          ...(seam?.clock !== undefined ? { clock: seam.clock } : {}),
+        });
+      }
+    }
+  } catch { /* print nothing: the run has already reported */ }
+  finally {
+    try { summary?.controller.abort(); } catch { /* the same */ }
+  }
   if (delivered && !(deps.interactive ?? false) && !out.json) {
     // `.catch` on top of autoUpdateCheck's own total try/catch — the notify()-call rule above: a
     // feature whose failure mode would be "the run reported something it should not" gets both.
@@ -179,11 +231,64 @@ export async function run(force: boolean, deps: RunDeps = {}, out: RunOutput = {
   return code;
 }
 
-/** What `runBriefing` hands back to `run()`: the exit code, and the `delivered` field of the envelope
- *  it emitted — the post-run update check's gate (see `run`). */
-type BriefingOutcome = { code: number; delivered: boolean };
+/** The summary seam, whole or not at all (plan M11): half a pair never builds a transport from a test seed. */
+function summaryTestSeam(deps: RunDeps) {
+  if (deps.summaryProvider === undefined || deps.summaryTestSeed === undefined) return undefined;
+  return { provider: deps.summaryProvider, seed: deps.summaryTestSeed, clock: deps.summaryClock, timeoutMs: deps.summaryTimeoutMs };
+}
 
-async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promise<BriefingOutcome> {
+/** What `runBriefing` hands back to `run()`: the exit code, and the `delivered` field of the envelope
+ *  it emitted — the post-run update check's gate (see `run`). `aiSummaryEnabled` is the resolved switch, set only on
+ *  the delivered return (missing means off), and `summary` is there only when its preparation succeeded. Neither
+ *  reaches the envelope, which `emit` has already written by the time they are set. */
+export type BriefingOutcome = { code: number; delivered: boolean; aiSummaryEnabled?: boolean; summary?: PreparedSummary };
+
+/** The summary phase's whole bound (A2 `:28`). */
+const SUMMARY_PHASE_MS = 30_000;
+
+/** The switch-gated preparation (A2-M3-T8), run after the delivered `emit` and before `finally` releases the run lock.
+ *  It starts the summary phase's one clock, then captures the delivered page's identity and prunes that date's
+ *  superseded sidecars. Every await is raced against the one abort timer, which keeps running into the job, so time
+ *  spent here comes off the job's allowance.
+ *
+ *  ⚠ TOTAL AND SILENT. Nothing here may change what the run has already reported: no work allowance, expiry, a throw, a
+ *  marker that is not `date`, or no identity of this page all abort the phase and return undefined. It prints nothing
+ *  (see the notifier's note). */
+async function prepareSummary(
+  page: string, date: string, emptyWindow: boolean, seed: SummarySeed | undefined,
+  clock: () => number = () => performance.now(), phaseMs: number = SUMMARY_PHASE_MS,
+): Promise<PreparedSummary | undefined> {
+  let controller: AbortController | undefined;
+  const abandon = (): undefined => { controller?.abort(); return undefined; };
+  try {
+    const startedAt = clock();
+    const whole = Math.min(phaseMs, seed?.winner.timeoutMs ?? phaseMs);
+    const work = whole - Math.min(SUMMARY_CLEANUP_MS, whole);
+    if (work <= 0) return abandon();                     // T of 5 000 ms or less: nothing runs, pruning included
+    const deadline = startedAt + whole;
+    const workCutoff = startedAt + work;
+    const phase = new AbortController();
+    controller = phase;
+    const timer = setTimeout(() => phase.abort(), work);
+    timer.unref();                                       // the entry point exits explicitly; never hold it open
+    const expired = new Promise<never>((_, reject) => {
+      phase.signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("summary phase ended")); }, { once: true });
+    });
+    expired.catch(() => {});                             // nothing may be racing it when it fires
+    const bounded = <V>(task: Promise<V>): Promise<V> => Promise.race([task, expired]);
+
+    if (await bounded(readLastRunDate()) !== date) return abandon();
+    const identity = await bounded(readPageIdentity(latestBriefingPath()));
+    // The identity is the file's and `page` is what this run rendered: a mismatch means the file is no longer this page.
+    if (identity === null || pageHashOf(page) !== identity.pageHash) return abandon();
+    await bounded(pruneSummaryRecords(briefingsDir(), { pageDate: date, ...identity }, () => phase.signal.aborted));
+    return { page, date, identity, seed, emptyWindow, startedAt, deadline, workCutoff, controller: phase };
+  } catch {
+    return abandon();
+  }
+}
+
+export async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promise<BriefingOutcome> {
   // ⚠ FIRST LINE OF THE FUNCTION, ahead of the log rotation and the tick heartbeat, because the
   // contract for the shape guard is "throws BEFORE any write" — and `stampTick` is a write. It is
   // pure, so hoisting it costs nothing. `dispatch` guards too (turning the throw into exit 2); this
@@ -258,12 +363,19 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
    *  `net` is threaded through for the ONE gate return that has one — the provider failure, which
    *  prints `emitNetMessage(err.net)` to stderr a line earlier. Without it the envelope for the most
    *  operationally interesting failure was strictly poorer than the stderr beside it. */
+  /** The ONE skip-record writer (provider fallback P1-M9-T1): `last-skip.json` always, and `last-failure.json` too for
+   *  a failure-class reason (`FAILURE_SKIP_REASONS`, the app's FAILED class). Both redact `detail` at the file and
+   *  both are fail-open. Every caller reaches it AFTER the ownership re-check, so a holder that lost the run lock
+   *  never writes either (its quiet exit writes nothing). */
+  const noteSkip = async (reason: SkipReason, detail?: string): Promise<void> => {
+    await writeLastSkip({ iso: now.toISOString(), localDate, reason, ...(detail ? { detail } : {}) }).catch(() => {});
+    if (FAILURE_SKIP_REASONS.has(reason)) await writeLastFailure({ localDate, reason, detail: detail ?? "" }).catch(() => {});
+  };
   const skip = async (
     reason: SkipReason, exitCode: number, detail?: string,
     net?: { online: boolean; waitedMs: number } | null,
   ): Promise<BriefingOutcome> => {
-    await writeLastSkip({ iso: now.toISOString(), localDate, reason, ...(detail ? { detail } : {}) })
-      .catch(() => {});
+    await noteSkip(reason, detail);
     return emit(gateEnvelope({ exitCode, runDate: localDate, skipReason: reason, net: net ?? null }));
   };
 
@@ -309,9 +421,10 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
 
   // Morning floor: gates only the SCHEDULED (non-interactive) agent — below it a scheduled tick no-ops
   // silently (no per-tick log spam; git state is identical whenever we generate). An interactive run (a
-  // human at the terminal) or --force is floor-exempt: they explicitly asked for the briefing now.
+  // human at the terminal), --now (the app's Run now) or --force is floor-exempt: they explicitly asked
+  // for the briefing now.
   const floor = parseFloor(cfg.morningTime);
-  if (!force && !interactive && !isPastFloor(now, floor.minutes)) return skip("below-floor", 0);
+  if (!force && !interactive && !(deps.runNow ?? false) && !isPastFloor(now, floor.minutes)) return skip("below-floor", 0);
 
   // ── THE RUN LOCK (backlog IN-5). It closes the check-then-act race between `checkRanToday` above
   // and `stampToday` below: today that window is nearly unreachable (only the 600 s launchd tick
@@ -337,16 +450,45 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
   // `runCore`, which gates the phase with it — so the two cannot disagree. A malformed key resolves to
   // `off`, so a typo can never widen the lock; its warning is §4.8's to push onto the page from
   // `runCore`, and this site discards it.
-  const recapMode = resolveRecapCampaigns(cfg.recapCampaigns).mode;
+  // The inputs through `runLockInputs` (src/runlock.ts), the one derivation `provider reset` / `test` share (B6).
+  const lockIn = runLockInputs(cfg);
+  // Provider fallback (P1-M8-T2, spec r9 §5 Run lock): the heartbeat cap is derived from the WHOLE combined list,
+  // resolved here before the lock (the eligible list is not known until the walk), the same resolver runCore uses.
+  // With today's constants a single-entry CLI holder at its default 120 s timeout stays fresh for 1 653 s (1 978 s with
+  // the calendar and recap campaigns on), against `lockStaleMs`'s 845 s; past the cap staleness eviction applies again.
+  const providerList = resolveProviderList(cfg, homedir());
   const lock = await acquireRunLock({
     invoker: interactive ? "cli" : "scheduled",
-    timeoutMs: cfg.provider.timeoutMs ?? TIMEOUT_MS,
-    recapCampaigns: recapMode !== "off",
+    // `timeoutMs`, `recapCampaigns` and `calendar` — the latter (v0.3.0 calendar, spec r4 §3 "Run lock") through the
+    // same resolver `runCore` reads, on the same raw key, so the two cannot disagree; a malformed block resolves to off
+    // and never widens the lock.
+    ...lockIn,
+    heartbeatCapMs: heartbeatCapMs(providerList.entries, { recapCampaigns: lockIn.recapCampaigns, calendar: lockIn.calendar }),
   });
   if (!lock.acquired) {
     console.error(`skipped: another daily-briefing run is already in progress (pid ${lock.holder.pid}, started ${lock.holder.startedIso}) — will retry next interval`);
     return skip("concurrent", 0, `held by pid ${lock.holder.pid} (${lock.holder.invoker}) since ${lock.holder.startedIso}`);
   }
+  // Fail-open (spec r9 §5 "Fail-open acquisition"): no ownership to verify, no heartbeat — said once, here.
+  if (lock.owned === "fail-open") console.error(FAIL_OPEN_LOCK_DIAGNOSTIC);
+  // ── Ownership (P1-M8-T2, spec r9 §5 Run lock). `lockLost` never fires for a fail-open lock (nothing to lose);
+  // `dayStamped` is the day-marker half, which a forced run is exempt from, as from the gates above.
+  const lockLost = async (): Promise<boolean> => lock.owned !== "fail-open" && !(await lock.stillOwns());
+  // The RUN's `localDate` (L3), the date this run would stamp, not a second reading of the wall clock.
+  const dayStamped = async (): Promise<boolean> => !force && (await readLastRunDate()) === localDate;
+  /** The QUIET exit: exit 0, the envelope only — no delivery, and no `last-skip.json`, so a superseded holder can never
+   *  overwrite the winner's record. */
+  const quietExit = async (reason: "concurrent" | "already-ran", net?: { online: boolean; waitedMs: number } | null): Promise<BriefingOutcome> => {
+    if (reason === "concurrent") console.error("skipped: another daily-briefing run took over the run lock — stopping without delivering");
+    else if (interactive) console.error("Already ran today. Use --force to regenerate.");
+    return emit(gateEnvelope({ exitCode: 0, runDate: localDate, skipReason: reason, net: net ?? null }));
+  };
+  /** The delivery-side re-check: a quiet exit when the lock was lost or the day got stamped, else undefined. */
+  const ownershipExit = async (net?: { online: boolean; waitedMs: number } | null): Promise<BriefingOutcome | undefined> => {
+    if (await lockLost()) return quietExit("concurrent", net);
+    if (await dayStamped()) return quietExit("already-ran", net);
+    return undefined;
+  };
   // ⚠ ONE `try` spanning the whole remainder of run(), so the `finally` below releases on EVERY exit
   // path — the nine `return`s, a rethrown non-ProviderError, anything unforeseen. A lock that
   // outlives its process is the one way this mechanism could cost a morning.
@@ -381,12 +523,23 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
     r = await runCore(cfg, {
       ...deps, preWarnings: floor.warning ? [floor.warning] : [],
       recapInvocation: { invoker: interactive ? "cli" : "scheduled", json: !!out.json },
+      // v0.3.0 calendar (spec r4 §3 "Health"): only the unattended tick — no TTY, no `--json` (the desktop app's
+      // "Run now"), no `--force` — is a SCHEDULED read, the one Settings shows as proof the unattended path works.
+      calendarTrigger: !interactive && !out.json && !force ? "scheduled" : "manual",
+      // P1-M8-T2: the lock-only check — never for a fail-open lock — and the post-walk re-check (lock + day marker).
+      lockStillHeld: lock.owned === "fail-open" ? undefined : () => lock.stillOwns(),
+      verifyOwnership: async () => !(await lockLost()) && !(await dayStamped()),
     }, force);
   } catch (e) {
     // Surface the pre-provider diagnostics runCore attached (pipeline warnings + net-gate outcome)
     // even though the pipeline failed — old inline run() printed them BEFORE the provider, so a
     // network-caused failure still shows the reason. Order matches old: warnings → net → the error.
     const err = e as ProviderError; // .warnings/.net attached by runCore for any Error
+    // P1-M8-T2: a lost lock is never a failure. A `LostLockError` from inside the walk, and any failure met after the
+    // lock was lost (or the day stamped), end in the quiet exit BEFORE `skip("provider-fail")` and `skip("crashed")`.
+    if (e instanceof LostLockError) return await quietExit("concurrent", err.net);
+    const stopped = await ownershipExit(err.net);
+    if (stopped) return stopped;
     // stripControl on every terminal line that can carry git/fs-derived text (repo paths, a provider
     // CLI's stderr): the same terminal-escape-injection class the render boundary closes (a repo path
     // or filename can legally contain ANSI/control bytes) reaches the terminal here too.
@@ -397,10 +550,16 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
       // builds `diag` from both streams), so an auth failure that echoes the key back arrives here
       // verbatim. stripControl stays — control bytes and credential shapes are different classes.
       diagError(stripControl(`Briefing provider failed (${e.code}): ${e.message}`));
+      // The walk's aggregate error: each tried entry's own diagnostic below the count line, redacted and stripped, for
+      // stderr / briefing.log only (P1-M7 checkpoint LOW 12) — never the skip detail or the FAILED body.
+      for (const d of e.diagnostics ?? []) diagError(stripControl(d));
       // `err.net` is threaded so the envelope carries what the stderr line above already said: this
       // is the most operationally interesting failure, and "the provider failed" without "and the
       // network was down for 25s" is the half of it a GUI cannot reconstruct.
-      return await skip("provider-fail", 1, `${e.code}: ${e.message}`, err.net);
+      // Provider fallback (P1-M7-T3, spec r9 §5 step 7 row 3): the walk's AGGREGATE error (it carries `attempts`) is
+      // written WITHOUT the `code: ` prefix, so the detail's first line — all the FAILED notification shows — is the
+      // count line ("2 providers failed — …"). A single entry's error keeps today's `code: message`.
+      return await skip("provider-fail", 1, e.attempts !== undefined ? e.message : `${e.code}: ${e.message}`, err.net);
     }
     // ⚠ EMIT BEFORE RETHROWING. Every other return in run() leaves a record; this one used to leave
     // NEITHER a last-skip entry NOR an envelope, so a crash was indistinguishable from "the scheduler
@@ -413,12 +572,21 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
     throw e; // non-ProviderError: diagnostics surfaced; rethrow to preserve the crash exit
   }
 
+  // ── The delivery-side re-check (P1-M8-T2, spec r9 §5 Run lock, point 2): immediately after the runCore try/catch,
+  // before the warnings print and every `writeLastSkip` and delivery write below. runCore's own post-walk check
+  // (`lostLock`) lands here too; it picks the reason by re-reading, defaulting to `concurrent`.
+  {
+    const stopped = await ownershipExit(r.net);
+    if (stopped) return stopped;
+    if (r.lostLock) return await quietExit("concurrent", r.net);
+  }
+
   // Surface every protected-path/read + pipeline issue (§5.11): discovery-side issues have no warning
   // string of their own, so format them here; the rest are already strings in r.warnings. Whenever
   // runCore built a discovery summary (v0.2.1 §2.4.2: an empty-window or blocked run, or — r8 — a
   // provider run whose window has no commits), r.warnings ends with it, so it prints AFTER every
   // per-folder line it summarises — nothing here is deduplicated.
-  for (const w of [...r.discIssues.map(warnFor), ...r.warnings]) diagError(stripControl(`⚠ ${w}`));
+  for (const w of [...r.discIssues.map(warnFor), ...r.warnings, ...(r.calendarWarnings ?? [])]) diagError(stripControl(`⚠ ${w}`));
 
   // Empty run + an inaccessible repo we tried to read = delivery FAILURE, not a quiet day (§5.11):
   // don't stamp, exit non-zero so the next run retries once access is fixed. Since v0.2.1 (§2.4.5) also
@@ -437,6 +605,14 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
     }).catch(() => {});
     return await emit(envelopeFrom(r, "", 1));
   }
+  // Provider fallback (P1-M7-T3, spec r9 §5 step 7 row 3 with nothing tried): every entry is benched and at least one by
+  // an hour mark. A failure, not a quiet skip — exit 1 as `provider-fail`, no delivery, no stamp — so the day's FAILED
+  // notification fires; the time is when the first hour mark ends, when the walk will try again.
+  if (r.paused) {
+    const line = `paused after failures until ${formatResetTime(r.paused.until, now)} — open Settings → Providers`;
+    console.error(line);
+    return await skip("provider-fail", 1, line, r.net);
+  }
   // Scheduled tick still offline after the grace: the provider was NOT called — skip without stamping;
   // the ~10-min interval loop retries. (A forced offline run proceeds; see the net message just below.)
   if (r.offlineSkipped) {
@@ -447,12 +623,10 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
     // class of failure this feature exists to end.
     // The reset time is printed ONLY when it was parsed from the message: a probe deadline is a
     // one-hour guess, and stating it as a reset would claim knowledge the system does not have.
-    // ⚠ The second half is `exhausted`, COMPUTED in runCore — not a fixed phrase. It was a hardcoded
-    // "no other account is available" until 2026-08-24, when the live failover test printed it on the
-    // tick that marked the primary while the fallback sat unmarked and delivered two minutes later.
-    // This is the ONLY line a limited tick leaves in briefing.log, so a false one misleads precisely
-    // when someone is reading the log to diagnose an outage. `=== false` rather than a truthy test:
-    // an absent `limited` keeps the conservative wording instead of promising a retry that may not come.
+    // ⚠ The second half says nothing is left. On 2026-08-24 that was FALSE on the tick that marked the primary while
+    // the fallback sat unmarked; since the provider walk (P1-M7-T1/T2) that tick hands off in the same tick, so a
+    // `limited` result always means every entry is out (`exhausted` is typed `true`). This is the ONLY line a
+    // limited tick leaves in briefing.log, so a false one misleads precisely when someone reads the log for an outage.
     // ⚠ `diagError` for the `limited` arm: `limitedSkipMessage` is built from `r.limited`, which is
     // PARSED OUT OF the provider's own rejection line (provider.ts's `limitMatch`), so it carries
     // provider text. The other two arms are engine-authored and have nothing to redact.
@@ -463,10 +637,16 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
       : `skipped: no network after ~${Math.round((r.net?.waitedMs ?? 0) / 1000)}s — will retry next interval`);
     // `r.skipReason` is already one of offline/darkwake/limited — the closed SKIP_REASONS vocabulary
     // is a superset of the pipeline's own, so no translation table is needed here (and cannot drift).
+    // Provider fallback (P1-M9-T2, spec r9 §5 Reporting): a step-7 row-1 skip (every provider out of usage) carries
+    // `allOutOfUsage`, and its detail's FIRST line is the out-of-usage notification body; `limitedSkipMessage` is the
+    // second line and stays the only briefing.log line (printed just above).
+    const usageDetail = r.limited === undefined ? undefined
+      : r.limited.allOutOfUsage === true ? `${outOfUsageLine(r.limited, now)}\n${limitedSkipMessage(r.limited)}` : limitedSkipMessage(r.limited);
     await writeLastSkip({
       iso: now.toISOString(), localDate,
       reason: r.skipReason ?? "offline",
-      ...(r.limited ? { detail: limitedSkipMessage(r.limited) } : {}),
+      ...(usageDetail !== undefined ? { detail: usageDetail } : {}),
+      ...(r.limited?.allOutOfUsage === true ? { allOutOfUsage: true as const } : {}),
     }).catch(() => {});
     return await emit(envelopeFrom(r, "", 0));
   }
@@ -478,7 +658,13 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
   // briefing —" header to EOF — so a line emitted after the render would be fed to the audit judge as
   // part of the briefing text it grades. Anything before the header is outside that slice.
   // Absent on a single-account machine (see CoreResult.account), so existing logs are unchanged.
-  if (r.account) console.error(`briefing generated by account "${stripControl(r.account)}"`);
+  // `diagError` (P1-M9-T3): every briefing.log line passes the secret redactor, and a label is arbitrary config text.
+  // Not for an UNUSABLE answer (PR 1 final review round 4, L5): it delivers nothing — the parse-empty gate below, on the
+  // same predicate — so naming an account as its author would be false. (An empty window never sets `account`.)
+  if (r.account && hasBriefingSection(r.rawText)) diagError(`briefing generated by account "${safeLabel(r.account)}"`);   // M3: masked, link-scrubbed
+  // The notices (P1-M9-T3): the render carries them above its title, and stdout and stderr are both briefing.log, so
+  // they are copied to stderr ONLY when stdout is not the render (`--json`) — the log never holds them twice.
+  if (out.json) for (const n of r.struct.notices ?? []) diagError(stripControl(n));
 
   // ── T8.1: OUTPUT-SIDE credential scan, sinks 1-3 (stdout, briefing-latest.md, briefing.log).
   //
@@ -532,30 +718,56 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
     // hiding a broken integration indefinitely. Note the asymmetry with the provider's own fail-open —
     // a briefing known to be CUT OFF still stamps, because it carries real model content plus a
     // warning saying so.
-    const parsedEmpty = ["RESUME", "RECAP", "SUGGESTIONS"].every((h) => section(r.rawText, h).length === 0);
+    const parsedEmpty = !hasBriefingSection(r.rawText);
     if (parsedEmpty) {
       console.error("Briefing did not parse into any section; not marking today done.");
-      await writeLastSkip({ iso: now.toISOString(), localDate, reason: "parse-empty" }).catch(() => {});
+      // Provider fallback (P1-M7-T2, spec r9 §5 step 7 row 2): for a combined list of two or more, an engine-worded
+      // first line naming the last entry — the FAILED body — then the earlier entries' lines, built from `attempts`
+      // (structured wording only; P1-M7 checkpoint MED 3). A single entry keeps today's record, with no detail.
+      const tried = (r.attempts ?? []).filter((a) => a.outcome !== "dropped");
+      const detail = tried.length >= 2 && r.account !== undefined ? unusableAnswerMessage(r.attempts!, r.account, now) : undefined;
+      await noteSkip("parse-empty", detail);
       return await emit(envelopeFrom(r, rendered, 1, "parse-empty"));
     }
   }
-  // The outage record is cleared once a briefing has actually been WRITTEN — not merely rendered.
-  // `parsedEmpty` returns 1 between renderBriefing and here, and clearing there would destroy the cause
-  // record without delivering anything: the cause IS the trigger, so the outage could then never be
-  // reported. Unconditional on delivery, NOT gated on "a line was rendered" — on the ordinary failover
-  // day missedDays is 0 and no line is due, and gating would leave the record alive to blame a later
-  // laptop-closed weekend on the usage limit.
+  // ⚠ briefing-latest.md IS THE DELIVERY, so its write FAILS CLOSED. It is the clean copy the user and
+  // the desktop app's Today screen read. This write used to be swallowed like the archive's, and the day
+  // was stamped anyway — so a failed write (disk full, a permission change) consumed the day: every later
+  // tick declined with `already-ran` and nothing new ever reached the app. Not stamping costs a provider
+  // call per tick until the write succeeds or midnight, the same trade `parse-empty` makes above.
+  try { await Bun.write(latestBriefingPath(), rendered); }
+  catch (e) {
+    console.error(stripControl(`could not save the briefing: ${e} — not marking today done`));
+    await noteSkip("write-fail", String(e));
+    return await emit(envelopeFrom(r, rendered, 1, "write-fail"));
+  }
+  // B1-M1-T3 (wave 2): the run record for the desktop app's live git check, right after the page is saved
+  // and bound to it by date (a run that stops between the two leaves the previous record, whose date is not
+  // this page's, so the live check rejects it). FAIL-OPEN like the archive below: a record that cannot be
+  // written never costs the briefing. ⚠ It prints NOTHING, on success or failure: briefing.log is an audit
+  // corpus (see the notifier's note below).
+  {
+    const record = buildRunRecord(r);
+    if (record !== undefined) await writeRunRecord(record).catch(() => {});
+  }
+  // The outage record is cleared once a briefing has actually been WRITTEN — not merely rendered, which
+  // is why it sits after the latest write above. `parsedEmpty` and `write-fail` both return 1 before
+  // here, and clearing there would destroy the cause record without delivering anything: the cause IS
+  // the trigger, so the outage could then never be reported. Unconditional on delivery, NOT gated on "a
+  // line was rendered" — on the ordinary failover day missedDays is 0 and no line is due, and gating
+  // would leave the record alive to blame a later laptop-closed weekend on the usage limit.
   await clearLastLimit().catch(() => {});
-  await Bun.write(latestBriefingPath(), rendered).catch(() => {}); // clean overwritten copy the user/audit read
-  // Dated archive alongside it — see archivedBriefingPath for why. Same fail-open `.catch` as the line
-  // above (which now also swallows the date-shape throw): an archive that could not be written must
+  // P1-M9-T1: the day's unresolved failure ends with a delivery — and ONLY with one (a later quiet skip keeps it).
+  await clearLastFailure().catch(() => {});
+  // Dated archive alongside it — see archivedBriefingPath for why. FAIL-OPEN, unlike the latest write
+  // above (the `.catch` also swallows the date-shape throw): an archive that could not be written must
   // never cost the user their briefing, and the marker below is what decides delivery. One file per
   // DAY — a same-day regeneration replaces it, exactly as it replaces briefing-latest.md above.
   await Bun.write(archivedBriefingPath(r.runDate), rendered).catch(() => {});
   try { await stampToday(r.runDate); } // fail-closed: only on a successful delivery (incl. a genuine quiet day)
   catch (e) {
     console.error(stripControl(`could not write the day marker: ${e} — not marking today done`));
-    await writeLastSkip({ iso: now.toISOString(), localDate, reason: "marker-fail", detail: String(e) }).catch(() => {});
+    await noteSkip("marker-fail", String(e));
     return await emit(envelopeFrom(r, rendered, 1, "marker-fail"));
   }
   // ── T7: the optional desktop notification.
@@ -591,7 +803,16 @@ async function runBriefing(force: boolean, deps: RunDeps, out: RunOutput): Promi
   // Kept as a written skip rather than suppressed: `run-lock.test.ts` pins the gate's record, and the
   // record is what distinguishes "declined, because today is done" from "the scheduler never fired".
   await clearLastSkip().catch(() => {});
-  return await emit(envelopeFrom(r, rendered, 0));
+  const outcome = await emit(envelopeFrom(r, rendered, 0));
+  // A2-M3-T8: off (or anything malformed) means no clock, no identity read, no prune and no sidecar; old sidecars wait
+  // for the next on-run. Here, not at the page write above: the day is done and the envelope is out.
+  outcome.aiSummaryEnabled = resolveAiSummary(cfg.aiSummary).enabled;
+  if (outcome.aiSummaryEnabled && outcome.delivered) {
+    const seam = summaryTestSeam(deps);
+    const summary = await prepareSummary(rendered, r.runDate, r.emptyWindow, r.summarySeed ?? seam?.seed, seam?.clock, seam?.timeoutMs);
+    if (summary !== undefined) outcome.summary = summary;
+  }
+  return outcome;
   } finally {
     await lock.release();
   }
@@ -765,7 +986,8 @@ function printUsage(): void {
 wake of the day (see morningTime: the floor it will not fire BEFORE, not a delivery time).
 
 Usage:
-  daily-briefing [run] [--force]   Generate today's briefing (the default command)
+  daily-briefing [run] [--force|--now]
+                                   Generate today's briefing (the default command)
   daily-briefing init              Create/refresh the config (${configPath()})
   daily-briefing status --json     Report engine state (state paths, last run, last tick) — reads only
   daily-briefing doctor --json     Check repos, provider, network and power — never generates
@@ -776,9 +998,33 @@ Usage:
   daily-briefing update --check [--json]
                                    Ask GitHub whether a newer release exists — notify-only: it
                                    downloads and installs nothing, and exits 0 whatever it finds
+  daily-briefing calendar connect mac | add-link --id X [--name N] [--owner EMAIL] [--confirm-owner]
+                          | remove-link --id X | list | test | status   (each with --json)
+                                   Today's calendar in the briefing. add-link reads the private
+                                   https address from STDIN (never an argument) and stores it in
+                                   the state folder, never in the config; no command ever prints it.
+                                   \`test\` reads every source now; \`status\` shows each one's last
+                                   scheduled read. \`connect mac\` needs the Calendar Reader, which
+                                   is not shipped yet: it reports that and installs nothing.
+  daily-briefing provider reset (--index <n> | --label-stdin) --json
+                                   Clear one provider entry's marks. --index is the 0-based position
+                                   in the saved list; --label-stdin reads {"label": "…"} from STDIN
+                                   (a label is never an argument). Refused while a briefing runs.
+  daily-briefing provider test --file <candidate.json> --index <n> --json
+  daily-briefing provider key set | migrate --index <n> | delete --id <keyId> | delete-all
+                          | scrub-backup   (each with --json)
+                                   The desktop app's key and provider operations.
+  daily-briefing repos status --json
+                                   The desktop app's live git check (the request on STDIN).
+                                   Push state is as of your last fetch or push; nothing is fetched.
+
+Internal (the engine runs this itself; not for direct use):
+  daily-briefing calendar-parse    Parse ONE calendar feed sent on stdin, answer in JSON on stdout —
+                                   reads no config, no state and no network
 
 Flags:
   --force, -f      Ignore the morning-time floor and the once-per-day guard
+  --now            run: ignore the morning-time floor only; once a day still applies (the app's Run now)
   --json           run: print the machine-readable envelope INSTEAD of the markdown briefing
                    schedule status|verify, update --check: print the report as JSON instead of text
   --json-out <p>   run: write that envelope to <p> and leave stdout exactly as it is
@@ -895,13 +1141,21 @@ async function readCandidate(argv: string[]): Promise<{ raw?: unknown; unreadabl
 
 /** Leading flags that still mean the default `run` command. Anything else starting with `-` is
  *  refused — the H2 lesson: a typo'd flag must never fall through to a full generate + day-stamp. */
-const RUN_LEADING_FLAGS = new Set(["--force", "-f", "--json", "--json-out"]);
+const RUN_LEADING_FLAGS = new Set(["--force", "-f", "--now", "--json", "--json-out"]);
 
 /** Every token `dispatch` treats as a COMMAND. Kept beside the switch below and asserted against it by
  *  `test/dispatch.json.test.ts`, so a new subcommand cannot be added without becoming un-swallowable.
  *  ⚠ Slice 4 added `schedule`, and adding it HERE — not merely to the switch — is what keeps
  *  `daily-briefing --json schedule install` from routing to `run` and consuming the morning. */
-const KNOWN_COMMANDS = new Set(["run", "init", "status", "doctor", "config", "help", "schedule", "update"]);
+//   ⚠ Calendar v0.3.0 (plan M2b) added the INTERNAL `calendar-parse` — the engine re-invokes itself with it to
+//   parse a calendar feed in a child it can kill at a deadline (src/calendar/parse-runner.ts). Listed here so
+//   `daily-briefing --json calendar-parse` is refused like every other swallowed command, never run.
+//   ⚠ Calendar v0.3.0 (plan M5) added `calendar` (connect mac | add-link | remove-link | list | test | status), for the
+//   same reason: `daily-briefing --json calendar status` must be refused, never run a briefing and stamp the day.
+//   ⚠ Provider fallback (P2-M1-T1) added `provider` (key … | reset | test), for the same reason.
+//   ⚠ B1-M3-T9 (wave 2) added `repos` (status --json, the desktop app's live git check), for the same reason:
+//   `daily-briefing --json repos status` must be refused, never run a briefing and stamp the day.
+const KNOWN_COMMANDS = new Set(["run", "init", "status", "doctor", "config", "help", "schedule", "update", "calendar", "calendar-parse", "provider", "repos"]);
 
 /** The verbs of `schedule`. Refused rather than defaulted: `daily-briefing schedule` with no verb must
  *  print usage and exit non-zero, never fall through to anything stateful (the H2 lesson). */
@@ -952,7 +1206,7 @@ function flagValue(argv: string[], flag: string): { value?: string; error?: stri
  * ⚠ THE `--json-out` OPERAND IS SCANNED TOO, deliberately. `--json-out status --json` is ambiguous
  * between "write the sidecar to a file called status" and a mangled `status --json`, and the H2 rule
  * is that ambiguity resolves AWAY from a stateful run. The cost is that a sidecar may not be named
- * exactly a KNOWN_COMMANDS token (`run`/`init`/`status`/`doctor`/`config`/`help`/`schedule`/`update`);
+ * exactly a KNOWN_COMMANDS token (`run`/`init`/`status`/`doctor`/`config`/`help`/`schedule`/`update`/`calendar`/`calendar-parse`/`provider`/`repos`);
  * `./status` or an absolute path still works.
  */
 function swallowedCommand(argv: string[]): string | undefined {
@@ -968,7 +1222,7 @@ export async function dispatch(
   // routing test that called it would be neither hermetic nor fast.
   deps: {
     run?: typeof run; init?: typeof init;
-    status?: typeof statusReport; doctor?: typeof doctorReport; configValidate?: typeof validateCandidate;
+    status?: typeof statusReport; doctor?: typeof doctorReport; configValidate?: typeof validateCandidateBounded;
     // ⚠ The two scheduling modules are injected as WHOLE MODULES and imported DYNAMICALLY below. Both
     // halves matter: injected, because a routing test must be able to assert that `schedule install`
     // routed without an `launchctl` ever being reached; dynamic, because a static import would pull the
@@ -984,6 +1238,22 @@ export async function dispatch(
     scheduleStatus?: typeof import("./schedule/status");
     /** Phase E (E11): the manual check, injectable so a routing test never reaches the network. */
     updateCheck?: typeof checkForUpdate;
+    /** Calendar v0.3.0 (M5): `calendar …`, injectable so a routing test touches no config, state or stdin. The real
+     *  one (src/calendar/cli.ts) is imported DYNAMICALLY below, for the `schedule` reason. */
+    calendarCli?: (args: string[]) => Promise<number>;
+    /** Calendar v0.3.0 (M2b): the internal `calendar-parse` child, injectable so a routing test reads no stdin.
+     *  The real one is imported DYNAMICALLY below, for the `schedule` reason: no other command loads it. */
+    calendarParse?: () => Promise<number>;
+    /** Provider fallback (P2-M1-T1): `provider …`, injectable so a routing test touches no config, state or stdin. The
+     *  real one (src/providerCli.ts) is imported DYNAMICALLY below, for the `schedule` reason. */
+    providerCli?: (args: string[]) => Promise<number>;
+    /** B1-M3-T9 (wave 2): `repos …`, injectable so a routing test touches no config, state, stdin or git. The real
+     *  one (src/repos/cli.ts) is imported DYNAMICALLY below, for the `schedule` reason. */
+    reposCli?: (args: string[]) => Promise<number>;
+    /** The scheduled run's idle-sleep guard (src/keep-awake.ts), injectable so no test ever starts a real
+     *  caffeinate; `platform` likewise, so the darwin gate is testable off darwin and vice versa. */
+    keepAwake?: (pid: number) => void;
+    platform?: NodeJS.Platform;
   } = {},
 ): Promise<number> {
   const runFn = deps.run ?? run;
@@ -1030,9 +1300,25 @@ export async function dispatch(
         try { resolveJsonOutPath(jsonOut.path); }
         catch (e) { console.error(stripControl(String(e instanceof Error ? e.message : e))); return 2; }
       }
+      // The scheduled run's idle-sleep guard, which used to be the plist's `caffeinate -i` wrapper (see
+      // `launchdPlist` in src/schedule/units.ts for why it moved). Only the LaunchAgent sets the variable.
+      // ⚠ READ ONCE, THEN DELETED on every platform, before run(): children that get an env built from
+      // `process.env` — `proc.run`, and the provider CLI whenever provider.ts merges one — must not inherit it,
+      // or an agent CLI that itself ran `daily-briefing run` would start a second caffeinate. MEASURED, bun
+      // 1.3.14: a child spawned with NO `env` option gets the STARTUP environment, so such a child (git.ts's
+      // direct spawns, a provider spawn with no env/envDelete) still sees it.
+      {
+        const keepAwake = process.env[KEEP_AWAKE_ENV.name] === KEEP_AWAKE_ENV.value;
+        delete process.env[KEEP_AWAKE_ENV.name];
+        if (keepAwake && (deps.platform ?? process.platform) === "darwin") {
+          // Never fatal: the real one already warns instead of throwing; this catches an injected one too.
+          try { (deps.keepAwake ?? startKeepAwake)(process.pid); }
+          catch (e) { console.error(`daily-briefing: keep-awake failed (${stripControl(String(e instanceof Error ? e.message : e))}) — running without it.`); }
+        }
+      }
       return runFn(
         argv.includes("--force") || argv.includes("-f"),
-        { interactive: Boolean(process.stdin.isTTY || process.stdout.isTTY) },
+        { interactive: Boolean(process.stdin.isTTY || process.stdout.isTTY), runNow: argv.includes("--now") },
         { json: wantsJson, ...(jsonOut.path !== undefined ? { jsonOut: jsonOut.path } : {}) },
       );
     }
@@ -1077,7 +1363,8 @@ export async function dispatch(
       if (unreadable) { console.error(stripControl(unreadable)); return 2; }
       // Exit 0 whether or not the candidate is valid — validity is the PAYLOAD. A Settings screen
       // asking "is this config good?" gets an answer, not a process failure.
-      console.log(JSON.stringify((deps.configValidate ?? validateCandidate)(raw)));
+      // The BOUNDED form (P3-M1-T1 checkpoint MED): its key-ownership rows run on the async shell under a 2 s deadline.
+      console.log(JSON.stringify(await (deps.configValidate ?? validateCandidateBounded)(raw)));
       return 0;
     }
     // ── Slice 4: the OS trigger. The ONLY way scheduling state transitions.
@@ -1163,6 +1450,35 @@ export async function dispatch(
       const result = await (deps.updateCheck ?? checkForUpdate)();
       console.log(wantsJson ? JSON.stringify(result) : renderUpdateResult(result));
       return 0;
+    }
+    // ── Calendar v0.3.0 (plan M5; spec r4 §8): `calendar <verb> …`. Everything after the command is the CLI's own
+    // to parse (src/calendar/cli.ts refuses `--json-out` and any unknown token with exit 2).
+    case "calendar": {
+      const args = argv.slice(3);
+      return deps.calendarCli ? deps.calendarCli(args) : (await import("./calendar/cli")).calendarMain(args);
+    }
+    // ── Calendar v0.3.0 (plan M2b; spec r4 §3): the INTERNAL parse child. ─────────────────────────────
+    // `src/calendar/parse-runner.ts` re-invokes this binary as `<engine> calendar-parse`, writes ONE request to
+    // stdin and SIGKILLs the child at its deadline. ⚠ THIS ARM MUST STAY FREE OF CONFIG, STATE AND NETWORK:
+    // nothing above it in `dispatch` reads any of them, and `calendarParseMain` reads only stdin and writes only
+    // stdout (test/calendar-parse.test.ts runs it in a real process with HOME, XDG_CONFIG_HOME and
+    // DAILY_BRIEFING_STATE_DIR in empty temp dirs and asserts they stay empty). No flags, no operands: anything
+    // after the command is a mistake, refused with exit 2 before stdin is read.
+    case "calendar-parse": {
+      if (argv.length !== 3) { console.error("calendar-parse: internal command — takes no arguments"); return 2; }
+      return deps.calendarParse ? deps.calendarParse() : (await import("./calendar/parse-job")).calendarParseMain();
+    }
+    // ── Provider fallback (P2-M1-T1; spec r9 §6): `provider <verb> …`. Everything after the command is the CLI's own to
+    // parse (src/providerCli.ts refuses any unknown token with exit 2; a label arrives on stdin, never in argv).
+    case "provider": {
+      const args = argv.slice(3);
+      return deps.providerCli ? deps.providerCli(args) : (await import("./providerCli")).providerMain(args);
+    }
+    // ── B1-M3-T9 (wave 2): `repos status --json`, the desktop app's live git check. Everything after the command is
+    // the CLI's own to parse (src/repos/cli.ts refuses any other argv with exit 2; the request arrives on STDIN).
+    case "repos": {
+      const args = argv.slice(3);
+      return deps.reposCli ? deps.reposCli(args) : (await import("./repos/cli")).reposMain(args);
     }
     default: console.error(`unknown command: ${cmd}`); printUsage(); return 2;
   }

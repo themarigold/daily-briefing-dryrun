@@ -27,18 +27,33 @@
 //!     operations the webview may invoke *individually*. One enum-taking command would have made
 //!     "may read status" and "may generate a briefing" the same grant.
 //!
-//! ## The two caller-supplied strings, and where they are refused
+//! ## The caller-supplied operands, and where they are refused
 //!
-//! Only two operands are not fixed literals: `run --json-out <name>` and
-//! `config validate --file <path>`. Both are parsed into newtypes ([`JsonOutName`],
-//! [`ConfigFilePath`]) that cannot be constructed without passing the validator, so an
-//! [`Operation`] carrying an unvalidated string is unrepresentable rather than merely unlikely.
+//! Every operand that is not a fixed literal is a newtype that cannot be constructed without
+//! passing its validator, so an [`Operation`] carrying an unvalidated value is unrepresentable
+//! rather than merely unlikely. FOUR reach argv — `run --json-out <name>` ([`JsonOutName`]),
+//! `config validate --file <path>` ([`ConfigFilePath`]), a provider `--index` ([`ProviderIndex`])
+//! and a key `--id` ([`KeyId`]) — and TWO are written to the engine's STDIN, never to argv: a reset
+//! label ([`Label`], as `{"label": …}`) and the key `key set` reads ([`KeySecret`], which is not an
+//! [`Operation`] operand at all). The first two are the originals, described here; the PR 3 ones
+//! follow below. (Since PR 3 final r1 the webview supplies only the first of the originals: the
+//! `--file` path is always one Rust staged or owns — `config_save.rs` — because the
+//! `engine_config_validate` command is gone; see [`COMMANDS`].)
 //! `--json-out` is a port of the capability regex B1 measured, character class for character
 //! class. `--file` is deliberately WIDER than B1's regex: that regex refused every directory the
 //! engine and the app naturally use (`~/.config/…` for a dot-leading segment, `~/Library/Application
 //! Support/…` for a space), and neither refusal had a threat model on this path — the argv is
 //! handed to `execve` as a vector with no shell in between, and the engine reads the operand whole.
 //! See [`json_out_name`] and [`config_file_path`], and `capabilities/README.md`.
+//!
+//! **Provider fallback PR 3 (P3-M1-T1) adds four, under the same rule:** a provider `--index`
+//! ([`ProviderIndex`]), a key `--id` ([`KeyId`]), a reset LABEL ([`Label`]) and the key itself
+//! ([`KeySecret`]). The first three are each a port of the ENGINE's own rule (`docs/gui-seam.md`
+//! §1d); the key is NOT: [`KeySecret`] checks only the engine's stdin bound (non-empty, at most
+//! [`KEY_STDIN_MAX_BYTES`]) and leaves the key rule itself (trimmed, 8–512 characters of the key
+//! charset) to the engine, which answers for it. The label never reaches argv: it is written to
+//! the engine's stdin as `{"label": …}`, as `key set`'s key is — and the key is not an operand of
+//! [`Operation`] at all, but a separate [`KeySecret`] ([`EngineClient::invoke_with_key`]).
 //!
 //! The invoker on `schedule install`/`uninstall` is NOT caller-supplied either: the commands pass
 //! [`Invoker::App`] unconditionally. The engine's foreign-owner refusal keys on the record's
@@ -57,13 +72,18 @@
 //!     validates with `config validate`; creating the first config is the wizard's (T16, B8) and
 //!     its shape is not designed yet — an operation the UI cannot drive is a surface nobody
 //!     reviewed (`docs/gui-seam.md` §10e).
-//!   * **No `calendar`.** R1's forward list carries it; the ENGINE does not (`src/main.ts`'s
-//!     `KNOWN_COMMANDS` is `run | init | status | doctor | config | help | schedule | update`, and
-//!     anything else exits 2). This enum is exhaustive over the operations the app may perform —
-//!     the engine surface minus `init` and `help` — not over R1's forward list, because a typed
-//!     operation that cannot run is a command that reports failure for a reason the user cannot act
-//!     on. (`update --check` was in this bullet until Phase E's E11 gave the engine the subcommand;
-//!     it is [`Operation::UpdateCheck`] now — see the section below.)
+//!   * ~~**No `calendar`.**~~ **AMENDED IN v0.3.0 (calendar connection, plan M8):** this bullet said
+//!     the ENGINE had no `calendar` subcommand, so the enum had no variant for it. The calendar
+//!     build gives the engine `calendar status|list|test|connect mac --json` (W1's M5) and this
+//!     enum the four typed operations below (W2's M8) in the SAME release, PR 1 — the two land
+//!     together, so the rule this bullet stated (a typed operation that cannot run reports failure
+//!     for a reason the user cannot act on) still holds for every shipped build. The enum is still
+//!     exhaustive over the operations the app may perform — the engine surface minus `init` and
+//!     `help`, and minus `calendar add-link` / `remove-link`, whose URL travels on STDIN, which the
+//!     app's spawns never give the engine (`stdin(null())` below): the app writes the managed link
+//!     file itself (`crate::calendar`). (`update --check` was in this bullet until Phase E's E11
+//!     gave the engine the subcommand; it is [`Operation::UpdateCheck`] now — see the section
+//!     below.)
 //!
 //! ## What B6 ADDED here, and the one thing that did not change
 //!
@@ -88,10 +108,28 @@
 //! operation it takes no operand: the argv is three fixed literals, and the request it makes is the
 //! engine's (`src/updateCheck.ts`), never the webview's — the webview's CSP permits no remote
 //! connection at all.
+//!
+//! ## What v0.3.0 (plan M8) ADDED: the four calendar operations, and a per-operation timeout
+//!
+//! [`Operation::CalendarStatus`] / [`Operation::CalendarList`] (reads),
+//! [`Operation::CalendarTest`] (a read of every configured source NOW — network fetches and the Mac
+//! helper — that touches no schedule and no briefing state) and [`Operation::CalendarConnectMac`]
+//! (MUTATING: it installs and re-signs the helper copy and raises the Calendar permission dialog).
+//! Each takes no operand. All four exist on every platform, so `COMMANDS`, `build.rs` and the
+//! capability stay in parity on the Linux CI job; off macOS the connect command refuses with
+//! [`EngineError::Unsupported`] before any spawn ([`mac_only`]), the `access.rs` precedent.
+//!
+//! ⚠ **THE FIRST OPERATIONS WITH THEIR OWN WALL-CLOCK BOUND** ([`Operation::timeout`]). Until M8 the
+//! only bound anywhere was the 30 s `shell::ENGINE_READ_TIMEOUT` that four READ paths wrap around
+//! `invoke` themselves; every other operation was unbounded at this layer. The four calendar
+//! operations carry theirs on the operation, and [`EngineClient::invoke`] applies it — so no caller
+//! can forget it — answering [`EngineError::Timeout`] when it fires. Every pre-existing operation
+//! answers `None` there and behaves exactly as before.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime, State};
@@ -124,13 +162,15 @@ impl Invoker {
 /// module header for what is deliberately absent and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
-    /// `run --json [--force] [--json-out <name>]`.
+    /// `run --json [--force] [--now] [--json-out <name>]`.
     ///
     /// `--json` is unconditional: the app always wants the envelope on stdout. `--json-out` is
     /// additive (the engine writes the same envelope to a file and leaves stdout alone about it),
-    /// not an alternative.
+    /// not an alternative. `--now` is the app's Run now: the engine lifts its morning-time floor for
+    /// it and keeps the once-a-day guard (`--force` lifts both).
     Run {
         force: bool,
+        now: bool,
         json_out: Option<JsonOutName>,
     },
     /// `status --json` — a pure state-dir read. `--json` is REQUIRED; there is no human form.
@@ -170,6 +210,205 @@ pub enum Operation {
     /// now" works while a run is in flight. Exit 0 whatever the answer; `unknown` in the payload is
     /// the engine reporting that the check could not complete, not a failure of this invocation.
     UpdateCheck,
+    /// `calendar status --json` (v0.3.0, plan M8) — the `calendar` configuration as resolved plus
+    /// each source's LAST SCHEDULED read from `<state>/calendar/health.json` (the engine's
+    /// `CalendarStatusJson`, `src/calendar/types.ts`). Makes no network call and never prompts.
+    /// A read: no in-flight guard; bounded by `shell::ENGINE_READ_TIMEOUT` ([`Operation::timeout`]).
+    CalendarStatus,
+    /// `calendar list --json` (plan M8) — the Mac calendars (for Settings' checklist; `null` off
+    /// macOS) and the configured links, NEVER a link's URL (`CalendarListJson`). On macOS it runs
+    /// the helper's `list` mode, which exits before creating an event store unless access is
+    /// already granted — so it cannot raise a prompt. A read, bounded like `CalendarStatus`.
+    CalendarList,
+    /// `calendar test --json` (plan M8) — read every configured source NOW and report per-source
+    /// counts, never titles (`CalendarTestJson`). It makes the link fetches and launches the Mac
+    /// helper's `read` mode.
+    ///
+    /// ⚠ NOT MUTATING, by the same rule as [`Operation::UpdateCheck`]: it changes no schedule and no
+    /// briefing state (the health file records SCHEDULED reads; the spec's "Test" shows the answer
+    /// directly), so a Test refused with `Busy` because a briefing is generating would guard
+    /// nothing. Bounded by [`CALENDAR_TEST_TIMEOUT`].
+    CalendarTest,
+    /// `calendar connect mac --json` (plan M8; the engine side is W1's M5 stub, then W3's M10b) —
+    /// install or update the helper copy under `<state>/calendar/reader/`, re-sign it with the
+    /// stable local identity, and run its `request` mode while the user is present.
+    ///
+    /// ⚠ MUTATING: it writes the helper copy and touches the KEYCHAIN (the managed-copy signing
+    /// `schedule install` also uses), so it must never run beside a schedule install or a second
+    /// connect — the in-flight guard holds it. Bounded by [`CALENDAR_CONNECT_MAC_TIMEOUT`], the
+    /// first MUTATING operation with a Rust-side bound — see that constant for what a timeout does.
+    /// Off macOS the command refuses before any spawn ([`mac_only`]); the variant exists on every
+    /// platform so the grant lists stay in parity.
+    CalendarConnectMac,
+    /// `provider key set --json` (provider fallback PR 3, P3-M1-T1; `docs/gui-seam.md` §1d) — store
+    /// a pasted key in the app's key store and answer the reference to save.
+    ///
+    /// ⚠ THE KEY IS NOT IN THIS VARIANT, AND THAT IS THE DESIGN. It travels as a [`KeySecret`] —
+    /// no `Debug`, no `Clone`, no `Serialize` — through [`EngineClient::invoke_with_key`], and
+    /// reaches the engine on STDIN only, never argv. So `format!("{op:?}")`, [`Operation::argv`] and
+    /// every log line built from an `Operation` cannot hold it. [`Operation::takes_key`] is true for
+    /// this variant alone, and `invoke` refuses it without a key (and refuses a key for any other).
+    KeySet,
+    /// `provider key migrate --index <n> --json` — move entry n's legacy literal `apiKey` from the
+    /// SAVED config into the key store. The key is the engine's to read; nothing secret is here.
+    KeyMigrate { index: ProviderIndex },
+    /// `provider key delete --id <keyId> --json` — remove one app-owned key.
+    KeyDelete { id: KeyId },
+    /// `provider key delete-all --json` — remove every app-owned key (the uninstall leg).
+    KeyDeleteAll,
+    /// `provider key scrub-backup --json` — remove from `<config>.bak` every literal key the saved
+    /// config no longer holds. ⚠ Its COMMAND holds `ConfigSaver`'s save lock across the call
+    /// ([`engine_provider_key_scrub_backup`]), so no settings save rewrites `.bak` meanwhile.
+    KeyScrubBackup,
+    /// `provider reset (--index <n> | --label-stdin) --json` — clear that entry's marks.
+    ///
+    /// ⚠ A LABEL NEVER REACHES ARGV (hub Q20; spec §4): [`ResetTarget::Label`] is written to the
+    /// engine's STDIN as `{"label": "…"}` ([`Operation::stdin_payload`]), and argv carries only
+    /// `--label-stdin`. A label is user text — `-h`, `--help` or `--old` are all legal labels, and
+    /// the engine's dispatch reads `-h`/`--help`/`-v`/`--version` ANYWHERE in argv as help/version.
+    ProviderReset { target: ResetTarget },
+    /// `provider test --file <candidate.json> --index <n> --json` — probe entry n of a CANDIDATE
+    /// file the app staged, and record the outcome.
+    ///
+    /// ⚠ NO WEBVIEW COMMAND CONSTRUCTS THIS: it takes a file path, and the only route to it is the
+    /// staging command (P3-M1-T2), which writes the candidate itself. `COMMANDS` and the capability
+    /// carry nothing for it (`tests/capability.rs` pins that no command body in `src/` names it, and
+    /// that nothing in `src/` outside its allowlist constructs one).
+    ///
+    /// `test_timeout_ms` is ALWAYS the `testTimeoutMs` the engine reports for that entry in
+    /// `config validate --json`'s `providers` rows (`docs/gui-seam.md` §1d), FOR EVERY ENTRY KIND:
+    /// a remote or CLI row is 80 000 ([`PROVIDER_TEST_REMOTE_TIMEOUT`]), a loopback row the effective
+    /// `timeoutMs` + 17 s — already summed, so nothing here adds to it, and the app never decides
+    /// "loopback" itself (P3-M1-T1 checkpoint: it was `loopback_timeout_ms: Option<u64>`, whose
+    /// `None` asked the caller to make exactly that decision). It is clamped to between
+    /// [`PROVIDER_TEST_LOOPBACK_EXTRA`] and [`PROVIDER_TEST_LOOPBACK_CAP`] (plan Q12: a hand-edited
+    /// `timeoutMs` cannot hold the in-flight guard for hours) — see [`Operation::timeout`]. The floor
+    /// stays 17 s, NOT 80 s: a loopback row is below 80 000 whenever its effective `timeoutMs` is
+    /// under 63 s (`appTestTimeoutMs`, `src/attemptBounds.ts`: `timeoutMs` + 17 000), so a remote
+    /// floor would stretch every such Test's bound past what the engine itself allows. A remote row below 80 000 is not something the engine
+    /// produces; the contract above, not the clamp, is what keeps a remote Test at 80 s.
+    ///
+    /// ⚠ AND ITS PROCESS GROUP IS KILLED WHEN IT RETURNS, not only when it is abandoned
+    /// ([`Operation::kills_its_group_on_return`]): a CLI Test's backgrounded grandchild can outlive
+    /// the engine (measured at the P2-M4 checkpoint).
+    ProviderTest {
+        file: ConfigFilePath,
+        index: ProviderIndex,
+        test_timeout_ms: u64,
+    },
+    /// `repos status --json` (briefing redesign B1, wave-2 plan B1-M4-T11) — the desktop app's live
+    /// git check: groups, push state and the "Not committed" counts for today's page.
+    ///
+    /// ⚠ THE REQUEST RIDES ON STDIN ([`Operation::stdin_payload`]), NEVER ARGV: argv is three fixed
+    /// literals. It is the [`ProviderReset`](Operation::ProviderReset) pattern — an operand the
+    /// operation carries, validated by [`ReposRequest::new`], not a secret.
+    ///
+    /// A READ: it changes no repo (the engine's hardening runs no repo-supplied code and writes
+    /// nothing) and no briefing state, so it takes no in-flight guard; one check at a time is
+    /// `repos::ReposLive`'s own latch. Bounded at `shell::ENGINE_READ_TIMEOUT`; the engine's own
+    /// overall budget is 5 s under it (`REPOS_STATUS_BUDGET_MS`, `src/repos/status.ts`).
+    ReposStatus { request: ReposRequest },
+    /// `calendar details --json [--skip-mac] [--skip-commands]` (briefing redesign wave 2, C-M3-T7)
+    /// — today's live calendar details: links, people and notes, read live and never saved.
+    ///
+    /// ⚠ RUN ONLY THROUGH THE SEALED PATH, [`EngineClient::invoke_sealed`]. Its stdout holds meeting
+    /// links, notes, names and the remembered command-link URLs, so it never reaches `classify`
+    /// (whose [`EngineOutcome`] keeps stdout and stderr verbatim and derives `Debug` and
+    /// `Serialize`); `invoke` and `invoke_with_key` refuse it before any spawn. The remembered URLs
+    /// are NOT in this variant: they travel beside it as a [`LinkHandback`], the [`KeySecret`]
+    /// pattern, so `format!("{op:?}")` and [`Operation::argv`] hold two booleans and nothing else.
+    ///
+    /// Both flags are built in Rust (`calendar_details::decide`), never taken from the webview.
+    /// NOT mutating (no schedule, no briefing state, no health file); bounded by
+    /// [`CALENDAR_DETAILS_TIMEOUT`]. Every match arm on it binds with a trailing `..`, so the
+    /// capability scan can tell a pattern from a construction (`tests/capability.rs`).
+    CalendarDetails { skip_mac: bool, skip_commands: bool },
+}
+
+/// Which entry `provider reset` clears: by position, or by label (the label on STDIN).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResetTarget {
+    Index(ProviderIndex),
+    Label(Label),
+}
+
+/// `key set` and `key migrate`: 1 s pre-store + 10 s store + 3 s cleanup = 14 s of the engine's own
+/// worst case, + 5 s (spec §6, amended at the P2-M2 / P2-M3-T1 checkpoints).
+pub const KEY_SET_TIMEOUT: Duration = Duration::from_secs(19);
+
+/// `key delete-all`: 1 s sweep + 10 s store = 11 s, + 5 s (spec §6).
+pub const KEY_DELETE_ALL_TIMEOUT: Duration = Duration::from_secs(16);
+
+/// `key delete`, `reset` and `key scrub-backup`: 10 s of the engine's own worst case, + 5 s (spec §6).
+pub const PROVIDER_OP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `provider test` for a remote or CLI entry: the engine's ≈ 72.5 s worst case + 5 s, rounded up
+/// (spec §6, amended at the P2-M4 checkpoint). The engine's own copy is `APP_REMOTE_TEST_TIMEOUT_MS`
+/// (`src/attemptBounds.ts`); `tests/engine_client.rs` reads it and asserts the two are equal.
+pub const PROVIDER_TEST_REMOTE_TIMEOUT: Duration = Duration::from_secs(80);
+
+/// The cap on a loopback Test's bound (plan Q12): 30 minutes. ⚠ THE ENGINE CAPS ITS PROBE SO THAT
+/// `probe + 17 s` STAYS UNDER THIS — `APP_LOOPBACK_TEST_CAP_MS` in `src/attemptBounds.ts` restates
+/// it, and nothing links the two copies but `tests/engine_client.rs`, which reads the engine's and
+/// asserts equality. Move one, move both.
+pub const PROVIDER_TEST_LOOPBACK_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// What the app adds to a loopback Test's probe timeout (spec §6) — and therefore the smallest
+/// bound the engine ever reports in `testTimeoutMs`, which is why it is the floor of the clamp in
+/// [`Operation::timeout`]. The engine's copy is `APP_LOOPBACK_TEST_EXTRA_MS`.
+pub const PROVIDER_TEST_LOOPBACK_EXTRA: Duration = Duration::from_secs(17);
+
+/// How long `calendar test --json` may take before it is abandoned (plan M8).
+///
+/// ⚠ DERIVED FROM THE ENGINE'S OWN BOUNDS, NOT MEASURED — `UNVERIFIED` against W1's M5, which builds
+/// the subcommand. Spec r4 §3 bounds a run's calendar step at 30 s from the moment the network check
+/// resolves, and that check's grace is up to 25 s (`NET_DEFAULT_GRACE_MS`, `src/net.ts`); a Test
+/// that probes the network first and then reads every source is therefore up to ~55 s of the
+/// engine's own waiting. 75 s adds 20 s for the process start, the config load and the helper
+/// launch, so the engine's own `timeout` / `offline` statuses are what the user sees — not this.
+pub const CALENDAR_TEST_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// How long `calendar details --json` may take before it is abandoned (wave-2 plan C-M3-T7): the
+/// engine's 30 s calendar bound (`CALENDAR_STEP_BOUND_MS`, `src/calendar/bounds.ts`) plus 15 s for
+/// the process start, the config load and the reader launch. It runs no network probe, so not
+/// [`CALENDAR_TEST_TIMEOUT`]'s 75 s.
+pub const CALENDAR_DETAILS_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long `calendar connect mac --json` may take before it is abandoned: **150 s**, spec r4 §8
+/// ("`CalendarConnectMac` (mutating, 150 s: the helper's own 120 s request limit plus headroom, so the
+/// engine reports its timeout status before the app kills it; …)").
+///
+/// ⚠ THE FIRST TIMEOUT ON A MUTATING INVOCATION, AND WHAT IT COSTS. Every other mutating operation
+/// is deliberately unbounded here (`uninstall.rs`, `remove_scheduler`: "a timeout here could not
+/// stop the engine's effects"). This one is bounded because its long pole is a PERSON — the helper's
+/// `request` mode waits for the Calendar permission dialog — and a Settings button that can hang
+/// forever is the worse failure. When it fires, dropping the invocation SIGKILLs the engine's process
+/// group (`ProcessGroupKill`), so an engine interrupted mid-copy or mid-sign is killed without grace;
+/// the helper itself is launched through LaunchServices (or `launchctl`), outside that group, and
+/// ends on its own limit.
+///
+/// ⚠ WHY 150 AND NOT 120 (hub decision, plan M9; spec §8 updated to match). §4.1 gives the helper's
+/// `request` mode a 120 s limit of its own, so a person can read and answer the dialog; at M8 this
+/// bound was the SAME 120 s, which let the engine's copy-and-sign time push the whole call past it
+/// and the Rust timeout fire before the engine could report its own `timeout` status. 150 s is that
+/// 120 s plus 30 s of headroom for the copy, the re-sign and the engine's own start and answer. If W3
+/// (M10b) raises the helper's limit, this must move with it.
+pub const CALENDAR_CONNECT_MAC_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// The answer off macOS for the one macOS-only operation, [`Operation::CalendarConnectMac`] — the
+/// `access.rs` precedent (`AccessError::Unsupported`): the command EXISTS on every platform, so the
+/// grant lists stay in parity on the Linux CI job, and refuses before any spawn where it cannot
+/// work. `on_macos` is a parameter (the command passes `cfg!(target_os = "macos")`) so both answers
+/// are testable on whichever platform the suite runs.
+pub fn mac_only(on_macos: bool) -> Result<(), EngineError> {
+    if on_macos {
+        return Ok(());
+    }
+    Err(EngineError::Unsupported {
+        detail: "the Mac Calendar app source is a macOS feature; calendar links work on this \
+                 platform without it"
+            .into(),
+    })
 }
 
 impl Operation {
@@ -183,11 +422,18 @@ impl Operation {
     pub fn argv(&self) -> Vec<String> {
         let mut argv: Vec<String> = Vec::new();
         match self {
-            Operation::Run { force, json_out } => {
+            Operation::Run {
+                force,
+                now,
+                json_out,
+            } => {
                 argv.push("run".into());
                 argv.push("--json".into());
                 if *force {
                     argv.push("--force".into());
+                }
+                if *now {
+                    argv.push("--now".into());
                 }
                 if let Some(name) = json_out {
                     argv.push("--json-out".into());
@@ -242,8 +488,119 @@ impl Operation {
                 argv.push("--check".into());
                 argv.push("--json".into());
             }
+            Operation::CalendarStatus => {
+                argv.push("calendar".into());
+                argv.push("status".into());
+                argv.push("--json".into());
+            }
+            Operation::CalendarList => {
+                argv.push("calendar".into());
+                argv.push("list".into());
+                argv.push("--json".into());
+            }
+            Operation::CalendarTest => {
+                argv.push("calendar".into());
+                argv.push("test".into());
+                argv.push("--json".into());
+            }
+            Operation::CalendarConnectMac => {
+                argv.push("calendar".into());
+                argv.push("connect".into());
+                argv.push("mac".into());
+                argv.push("--json".into());
+            }
+            // The `provider` verbs, spelled as `docs/gui-seam.md` §1d spells them: `--json`
+            // exactly once, last. Every operand is a validated newtype; no key and no label is ever
+            // pushed here.
+            Operation::KeySet => {
+                argv.extend(["provider", "key", "set", "--json"].map(String::from));
+            }
+            Operation::KeyMigrate { index } => {
+                argv.extend(["provider", "key", "migrate", "--index"].map(String::from));
+                argv.push(index.to_string());
+                argv.push("--json".into());
+            }
+            Operation::KeyDelete { id } => {
+                argv.extend(["provider", "key", "delete", "--id"].map(String::from));
+                argv.push(id.as_str().into());
+                argv.push("--json".into());
+            }
+            Operation::KeyDeleteAll => {
+                argv.extend(["provider", "key", "delete-all", "--json"].map(String::from));
+            }
+            Operation::KeyScrubBackup => {
+                argv.extend(["provider", "key", "scrub-backup", "--json"].map(String::from));
+            }
+            Operation::ProviderReset { target } => {
+                argv.extend(["provider", "reset"].map(String::from));
+                match target {
+                    ResetTarget::Index(index) => {
+                        argv.push("--index".into());
+                        argv.push(index.to_string());
+                    }
+                    // The label itself goes to stdin (`stdin_payload`), never here.
+                    ResetTarget::Label(_) => argv.push("--label-stdin".into()),
+                }
+                argv.push("--json".into());
+            }
+            Operation::ProviderTest { file, index, .. } => {
+                argv.extend(["provider", "test", "--file"].map(String::from));
+                argv.push(file.as_str().into());
+                argv.push("--index".into());
+                argv.push(index.to_string());
+                argv.push("--json".into());
+            }
+            // The request goes to stdin (`stdin_payload`), never here.
+            Operation::ReposStatus { .. } => {
+                argv.extend(["repos", "status", "--json"].map(String::from));
+            }
+            Operation::CalendarDetails {
+                skip_mac,
+                skip_commands,
+                ..
+            } => {
+                argv.extend(["calendar", "details", "--json"].map(String::from));
+                if *skip_mac {
+                    argv.push("--skip-mac".into());
+                }
+                if *skip_commands {
+                    argv.push("--skip-commands".into());
+                }
+            }
         }
         argv
+    }
+
+    /// The bytes the engine reads on STDIN for this operation, when the OPERATION supplies them:
+    /// `provider reset --label-stdin`'s `{"label": "…"}` and (wave 2, B1) `repos status`'s request,
+    /// and nothing else. `None` means the child's stdin is `/dev/null`, as it always was before PR 3.
+    ///
+    /// ⚠ NOT THE KEY. `key set`'s key is never part of an `Operation`; it arrives through
+    /// [`EngineClient::invoke_with_key`] as a separate [`KeySecret`]. An operation that supplied a
+    /// payload AND was handed a key would be refused — which cannot arise today, because only
+    /// [`Operation::KeySet`] takes a key and it supplies no payload.
+    pub fn stdin_payload(&self) -> Option<Vec<u8>> {
+        match self {
+            Operation::ProviderReset {
+                target: ResetTarget::Label(label),
+            } => Some(label.stdin_payload()),
+            Operation::ReposStatus { request } => Some(request.stdin_payload()),
+            _ => None,
+        }
+    }
+
+    /// Whether this operation reads a KEY on stdin — [`Operation::KeySet`] alone.
+    pub fn takes_key(&self) -> bool {
+        matches!(self, Operation::KeySet)
+    }
+
+    /// Whether the engine's process group is SIGKILLed when this invocation RETURNS normally, not
+    /// only when it is abandoned — [`Operation::ProviderTest`] alone (P2-M4 checkpoint, into P3: a
+    /// CLI Test's backgrounded grandchild can outlive the engine; the accepted 2026-10-16
+    /// descendant-kill residual). Every other operation keeps what it deliberately backgrounded
+    /// (`a_completed_invocation_leaves_what_the_engine_backgrounded_running`).
+    pub fn kills_its_group_on_return(&self) -> bool {
+        matches!(self, Operation::ProviderTest { .. })
     }
 
     /// A short, stable name for logs, events and the [`EngineError::Busy`] message.
@@ -258,6 +615,64 @@ impl Operation {
             Operation::ScheduleStatus => "schedule-status",
             Operation::ScheduleVerify => "schedule-verify",
             Operation::UpdateCheck => "update-check",
+            Operation::CalendarStatus => "calendar-status",
+            Operation::CalendarList => "calendar-list",
+            Operation::CalendarTest => "calendar-test",
+            Operation::CalendarConnectMac => "calendar-connect-mac",
+            Operation::KeySet => "provider-key-set",
+            Operation::KeyMigrate { .. } => "provider-key-migrate",
+            Operation::KeyDelete { .. } => "provider-key-delete",
+            Operation::KeyDeleteAll => "provider-key-delete-all",
+            Operation::KeyScrubBackup => "provider-key-scrub-backup",
+            Operation::ProviderReset { .. } => "provider-reset",
+            Operation::ProviderTest { .. } => "provider-test",
+            Operation::ReposStatus { .. } => "repos-status",
+            Operation::CalendarDetails { .. } => "calendar-details",
+        }
+    }
+
+    /// The wall-clock bound [`EngineClient::invoke`] puts on this operation, or `None` for none at
+    /// this layer (plan M8).
+    ///
+    /// ⚠ `None` IS NOT "UNBOUNDED EVERYWHERE". The pre-M8 operations keep exactly the behaviour they
+    /// had: the READ paths that need a bound (`shell::EngineSnapshots`, `briefing_files::engine_paths`,
+    /// `access::read_envelope`, `config_save`'s validate) wrap `invoke` in
+    /// `shell::ENGINE_READ_TIMEOUT` themselves, and every mutating one is deliberately unbounded
+    /// (the engine's own deadlines bound it; `uninstall.rs`, `remove_scheduler`). The calendar
+    /// operations carry their bound HERE instead, so every path to them is bounded by construction.
+    ///
+    /// ⚠ PR 3 (P3-M1-T1): the seven `provider` operations carry theirs too — spec §6, "every new
+    /// operation has an explicit app-side timeout": the engine's own worst case + 5 s. All seven are
+    /// MUTATING, so a timeout here kills an engine that may be mid-write; each verb's own deadlines
+    /// fire first by construction (+5 s), and the store writes are temp-and-rename.
+    pub fn timeout(&self) -> Option<Duration> {
+        match self {
+            Operation::CalendarStatus | Operation::CalendarList | Operation::ReposStatus { .. } => {
+                Some(crate::shell::ENGINE_READ_TIMEOUT)
+            }
+            Operation::CalendarTest => Some(CALENDAR_TEST_TIMEOUT),
+            Operation::CalendarDetails { .. } => Some(CALENDAR_DETAILS_TIMEOUT),
+            Operation::CalendarConnectMac => Some(CALENDAR_CONNECT_MAC_TIMEOUT),
+            Operation::KeySet | Operation::KeyMigrate { .. } => Some(KEY_SET_TIMEOUT),
+            Operation::KeyDeleteAll => Some(KEY_DELETE_ALL_TIMEOUT),
+            Operation::KeyDelete { .. }
+            | Operation::KeyScrubBackup
+            | Operation::ProviderReset { .. } => Some(PROVIDER_OP_TIMEOUT),
+            Operation::ProviderTest {
+                test_timeout_ms, ..
+            } => Some(
+                Duration::from_millis(*test_timeout_ms)
+                    .clamp(PROVIDER_TEST_LOOPBACK_EXTRA, PROVIDER_TEST_LOOPBACK_CAP),
+            ),
+            Operation::Run { .. }
+            | Operation::Status
+            | Operation::Doctor
+            | Operation::ConfigValidate { .. }
+            | Operation::ScheduleInstall { .. }
+            | Operation::ScheduleUninstall { .. }
+            | Operation::ScheduleStatus
+            | Operation::ScheduleVerify
+            | Operation::UpdateCheck => None,
         }
     }
 
@@ -292,6 +707,15 @@ impl Operation {
     /// — so a "Check now" refused with `Busy` because a briefing is generating would be a refusal
     /// guarding nothing. `tests/engine_client.rs` pins both halves: the partition, and the check
     /// succeeding while a run is in flight.
+    ///
+    /// ⚠ v0.3.0 (plan M8): `CalendarConnectMac` IS IN THIS SET — it writes and re-signs the helper
+    /// copy through the keychain identity a schedule install also uses. `CalendarStatus`,
+    /// `CalendarList` and `CalendarTest` are NOT: they change no schedule and no briefing state.
+    ///
+    /// ⚠ PR 3 (P3-M1-T1; spec §6 "the writing operations … hold the in-flight guard"): ALL SEVEN
+    /// `provider` operations are in this set — each writes the key store, the settings backup or
+    /// the engine's marks and status files. `ProviderTest` included: it records its outcome, and a
+    /// second Test while one runs is refused `Busy` (P3-M1-T2 relies on that).
     pub fn is_mutating(&self) -> bool {
         matches!(
             self,
@@ -299,11 +723,19 @@ impl Operation {
                 | Operation::ScheduleInstall { .. }
                 | Operation::ScheduleUninstall { .. }
                 | Operation::ScheduleVerify
+                | Operation::CalendarConnectMac
+                | Operation::KeySet
+                | Operation::KeyMigrate { .. }
+                | Operation::KeyDelete { .. }
+                | Operation::KeyDeleteAll
+                | Operation::KeyScrubBackup
+                | Operation::ProviderReset { .. }
+                | Operation::ProviderTest { .. }
         )
     }
 }
 
-/* ── the two caller-supplied operands ─────────────────────────────────────────────────────────── */
+/* ── the original caller-supplied operands: `--json-out` and `--file` ───────────────────────────── */
 
 /// Why an operand was refused. One variant per class, so a refusal is a fact the caller can act on
 /// rather than "did not match a pattern".
@@ -366,6 +798,15 @@ pub enum InputRefusal {
     /// as a Phase C follow-up (`docs/gui-seam.md` §16b dev 164 — the engine tree is read-only in
     /// B25); THIS refusal closes the app-reachable path (`engine_run_to_file`) now.
     EngineReadName,
+    /// PR 3: a provider `--index` outside the engine's `/^\d{1,6}$/` (`src/providerCli.ts`,
+    /// `parseIndex`) — so above [`MAX_PROVIDER_INDEX`].
+    IndexOutOfRange,
+    /// PR 3: a `--id` that is not `k-` followed by 12 LOWERCASE hex digits (the engine's
+    /// `KEY_ID_RE`, `src/keyFile.ts`).
+    NotKeyId,
+    /// PR 3: a stdin payload larger than the engine reads — a label whose `{"label": …}` is over
+    /// [`LABEL_STDIN_MAX_BYTES`], or a key over [`KEY_STDIN_MAX_BYTES`].
+    TooLarge,
 }
 
 impl InputRefusal {
@@ -395,6 +836,11 @@ impl InputRefusal {
                 "is transcript-health.json — a state file the engine reads (its health history), \
                  not a free envelope name; writing a run envelope there would destroy that history"
             }
+            InputRefusal::IndexOutOfRange => {
+                "is not a provider position the engine accepts (0 to 999999)"
+            }
+            InputRefusal::NotKeyId => "is not a key id (k- followed by 12 lowercase hex digits)",
+            InputRefusal::TooLarge => "is larger than the engine reads on stdin",
         }
     }
 }
@@ -624,6 +1070,483 @@ pub fn config_file_path(value: &str) -> Result<ConfigFilePath, InputRefusal> {
     Ok(ConfigFilePath(value.to_string()))
 }
 
+/* ── the provider operands (PR 3, P3-M1-T1) ───────────────────────────────────────────────────── */
+//
+// Four more caller-supplied values, each a newtype that cannot be built without its validator, so
+// the module header's invariant — every caller-supplied operand is a validated newtype — still
+// holds: two that reach argv, a provider `--index` and a key `--id`; and two written to stdin,
+// never argv — a reset LABEL and the KEY `key set` reads ([`KeySecret`], not an `Operation`
+// operand: `EngineClient::invoke_with_key` takes it beside one).
+// Each validator ports the ENGINE'S OWN rule (`docs/gui-seam.md` §1d), and `tests/engine_client.rs`
+// reads the engine's source for the rule it compares against.
+
+/// The largest provider position the engine accepts: `--index` must match `/^\d{1,6}$/`
+/// (`src/providerCli.ts`, `parseIndex`).
+pub const MAX_PROVIDER_INDEX: u32 = 999_999;
+
+/// The most `provider reset --label-stdin` reads: `LABEL_STDIN_MAX_BYTES` (`src/providerCli.ts`).
+/// The cap applies to the whole `{"label": …}` payload, which is what the engine measures.
+pub const LABEL_STDIN_MAX_BYTES: usize = 64 * 1024;
+
+/// The most `key set` reads on stdin: `KEY_STDIN_MAX_BYTES` (`src/providerCli.ts`).
+pub const KEY_STDIN_MAX_BYTES: usize = 4 * 1024;
+
+/// A validated provider `--index`: the 0-based position in the combined list (`status --json`'s
+/// `providers[].index`), at most [`MAX_PROVIDER_INDEX`]. Rendered as plain decimal — no sign, no
+/// leading zero — so it always matches the engine's `/^\d{1,6}$/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderIndex(u32);
+
+impl ProviderIndex {
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ProviderIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Parse a provider position, or say why not.
+pub fn provider_index(value: u64) -> Result<ProviderIndex, InputRefusal> {
+    u32::try_from(value)
+        .ok()
+        .filter(|n| *n <= MAX_PROVIDER_INDEX)
+        .map(ProviderIndex)
+        .ok_or(InputRefusal::IndexOutOfRange)
+}
+
+/// A validated `key delete --id`: `k-` and 12 LOWERCASE hex digits, exactly the engine's
+/// `KEY_ID_RE` (`src/keyFile.ts`). Not a secret — the engine answers it on stdout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyId(String);
+
+impl KeyId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Parse a key id, or say why not.
+pub fn key_id(value: &str) -> Result<KeyId, InputRefusal> {
+    let hex = value.strip_prefix("k-").ok_or(InputRefusal::NotKeyId)?;
+    if hex.len() == 12
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(KeyId(value.to_string()))
+    } else {
+        Err(InputRefusal::NotKeyId)
+    }
+}
+
+/// A validated `provider reset` label: non-empty, no NUL, and short enough that its
+/// `{"label": …}` payload fits the engine's [`LABEL_STDIN_MAX_BYTES`].
+///
+/// ⚠ THE CAP IS MEASURED ON THE PAYLOAD, NOT THE LABEL, and that is the measurement the plan asked
+/// for. The config validator's label rule (`src/providerList.ts`: a non-empty string after `trim`)
+/// has NO length limit, so no byte cap on the label could admit every label a config can hold; the
+/// real limit is what `reset --label-stdin` will read. JSON escaping can grow a label (a control
+/// byte becomes six), so the serialised payload — the bytes the engine actually counts — is what is
+/// compared. A label over the cap cannot be reset by label; `--index` still can.
+///
+/// ⚠ NOT A ROUTE INTO ARGV. The label is only ever written to stdin
+/// ([`Operation::stdin_payload`]); it is user text and may itself be key-shaped (spec §4), so its
+/// `Debug` prints the byte length only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Label(String);
+
+impl std::fmt::Debug for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Label(<{} bytes>)", self.0.len())
+    }
+}
+
+impl Label {
+    /// `{"label": "<label>"}`, exactly what `reset --label-stdin` reads (that one member only).
+    pub fn stdin_payload(&self) -> Vec<u8> {
+        label_payload(&self.0)
+    }
+}
+
+fn label_payload(label: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "label": label }))
+        .expect("a JSON object of one string member always serialises")
+}
+
+/// Parse a reset label, or say why not. Whitespace is NOT judged here: a label of spaces cannot be
+/// in a valid config (the validator trims), and the engine answers such a reset with its own
+/// `config` refusal — the app does not re-implement the list's rules.
+pub fn label(value: &str) -> Result<Label, InputRefusal> {
+    if value.is_empty() {
+        return Err(InputRefusal::Empty);
+    }
+    if value.contains('\0') {
+        return Err(InputRefusal::Nul);
+    }
+    if label_payload(value).len() > LABEL_STDIN_MAX_BYTES {
+        return Err(InputRefusal::TooLarge);
+    }
+    Ok(Label(value.to_string()))
+}
+
+/// The key `key set` reads on stdin — NOT part of any [`Operation`].
+///
+/// ⚠ DELIBERATELY NO `Debug`, `Display`, `Clone`, `Serialize` OR `PartialEq`: nothing can print it,
+/// copy it or compare it by accident, and `tests/engine_client.rs` pins the missing `Debug` at
+/// compile time. Its bytes are overwritten when it is dropped (best effort: the webview's `String`
+/// it was built from is Tauri's, and the pipe buffer is the kernel's). The engine trims it and
+/// applies the key rule (`docs/gui-seam.md` §1d); the app refuses only what the engine would never
+/// read — empty, or over [`KEY_STDIN_MAX_BYTES`] — and never echoes it.
+pub struct KeySecret(Vec<u8>);
+
+impl KeySecret {
+    pub fn new(key: String) -> Result<Self, InputRefusal> {
+        let secret = KeySecret(key.into_bytes());
+        if secret.0.is_empty() {
+            return Err(InputRefusal::Empty);
+        }
+        if secret.0.len() > KEY_STDIN_MAX_BYTES {
+            return Err(InputRefusal::TooLarge);
+        }
+        Ok(secret)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for KeySecret {
+    fn drop(&mut self) {
+        wipe_bytes(&mut self.0);
+    }
+}
+
+/// Overwrite `buf` with zeros so the bytes of a secret about to be freed do not linger in the heap.
+///
+/// ⚠ THE ONE VOLATILE LOOP (wave-2 plan C-M3-T7): [`KeySecret`]'s `Drop` and [`SecretBytes::wipe`]
+/// both call this, moved here unchanged from `KeySecret`'s `Drop`, so the two secrets cannot drift
+/// into a second copy the optimiser may drop. `tests/engine_client.rs` pins exactly one
+/// `write_volatile` in this file, inside this function.
+pub(crate) fn wipe_bytes(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        // SAFETY: `byte` is a valid, aligned, exclusively borrowed `u8`. Volatile so the
+        // overwrite of a buffer about to be freed is not optimised away.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+}
+
+/// Bytes that are a secret: zeroed when dropped, through [`wipe_bytes`].
+///
+/// ⚠ DELIBERATELY NO `Debug`, `Display`, `Clone`, `Serialize` OR `PartialEq` (the [`KeySecret`]
+/// rule; `tests/engine_client.rs` probes the first three at compile time and greps for the rest).
+/// It holds the live details read's handback ([`LinkHandback`]): the remembered command-link URLs.
+/// [`SecretBytes::from_vec`] takes the `Vec` by value, so no copy is made, and its caller builds it
+/// at its exact capacity (`calendar_details.rs`), so no reallocation leaves an unwiped copy behind.
+/// Best effort, as `KeySecret`'s is: copies this buffer does not own are not reached. In particular,
+/// the sealed read's final stdout/stderr buffers drop unwiped on timeout or a `child.wait()` error,
+/// before `SealedDetails::collect` can wipe them. Earlier allocations freed by growth, stderr's
+/// temporary reader/line/text buffers, serde's parse strings and kernel pipe buffers are not wiped.
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    /// Take ownership of `v`; nothing is copied.
+    pub fn from_vec(v: Vec<u8>) -> Self {
+        SecretBytes(v)
+    }
+
+    /// Zero the bytes now (also done on drop).
+    pub(crate) fn wipe(&mut self) {
+        wipe_bytes(&mut self.0);
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+/// The live details read's STDIN: `{"links":[{"id","entryHash","url"}…]}`, the command-link URLs
+/// Rust remembered, handed back so their commands do not run again (redesign C, "Later reads hand
+/// it back"). NOT part of any [`Operation`]: it travels beside [`Operation::CalendarDetails`]
+/// through [`EngineClient::invoke_sealed`], the [`KeySecret`] pattern.
+///
+/// ⚠ NO `Debug`, `Display`, `Clone` OR `Serialize` (probed). Its one production caller is the
+/// snapshot in `calendar_details.rs`, which copies the URLs into its buffer under that module's
+/// state lock (`tests/capability.rs` pins the caller).
+pub struct LinkHandback(SecretBytes);
+
+impl LinkHandback {
+    /// Wrap the snapshot's bytes. One production caller: `calendar_details.rs`'s snapshot.
+    pub fn new(bytes: SecretBytes) -> Self {
+        LinkHandback(bytes)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.0.bytes()
+    }
+}
+
+/* ── B1 (wave 2): the `repos status --json` request ───────────────────────────────────────────── */
+//
+// The live git check's operand (wave-2 plan B1-M4-T11; the B1 spec "Where it is computed"). It is
+// written to the engine's STDIN as ONE JSON document — `{ scope, pageDate, labels: [{ key, tokens }],
+// branches: [{ key, name }] }`, camelCase, exactly what `parseReposRequest` (`src/repos/status.ts`)
+// reads and no other member (the engine refuses one) — and never to argv: the `ProviderReset`
+// precedent, an operand the operation carries, not a secret. `tests/fixtures/repos-request-wire.json`
+// pins the bytes on both sides (`tests/engine_client.rs` and `test/repos.status.test.ts`).
+//
+// ⚠ ONE BAD ENTRY REFUSES THE WHOLE REQUEST, so the webview's `reposRequest` (`git-detail.ts`, B1-M5)
+// never builds one: it leaves an odd card out instead. The six limits and the character rule are
+// shared with it through `tests/fixtures/repos-request-limits.json`.
+
+/// At most this many labels (What-you-did cards).
+pub const REPOS_MAX_LABELS: usize = 64;
+/// At most this many branch entries (Where-you-left-off cards with a named branch).
+pub const REPOS_MAX_BRANCHES: usize = 64;
+/// A label key, and a branch entry's key, is at most this many Unicode scalar values.
+pub const REPOS_KEY_MAX_SCALARS: usize = 80;
+/// At most this many tokens on one label.
+pub const REPOS_TOKENS_PER_LABEL: usize = 512;
+/// At most this many tokens in the whole request.
+pub const REPOS_TOKENS_TOTAL: usize = 4096;
+/// A branch name is at most this many UTF-8 BYTES (not scalars).
+pub const REPOS_BRANCH_MAX_BYTES: usize = 255;
+/// The most `repos status` reads on stdin: `REPOS_STDIN_MAX_BYTES` (`src/repos/status.ts`), pinned
+/// to the engine's through `tests/fixtures/repos-request-wire.json`. The largest request the
+/// validation admits serialises under it (`tests/engine_client.rs`).
+pub const REPOS_STDIN_MAX_BYTES: usize = 256 * 1024;
+
+/// Which check the engine runs: everything, or the minute "Not committed" status alone. The gate
+/// (`repos::decide`) chooses it; the webview never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReposScope {
+    All,
+    Uncommitted,
+}
+
+/// One What-you-did card as the webview sends it: its key (`norm(label)`; the Other card's is `""`)
+/// and the hex tokens of its page lines. UNVALIDATED until [`ReposRequest::new`] takes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReposLabel {
+    pub key: String,
+    pub tokens: Vec<String>,
+}
+
+/// One Where-you-left-off card's named branch. UNVALIDATED until [`ReposRequest::new`] takes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReposBranch {
+    pub key: String,
+    pub name: String,
+}
+
+/// Why a repos request was refused: one variant per rule, never echoing the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReposRefusal {
+    /// More than [`REPOS_MAX_LABELS`] labels.
+    TooManyLabels,
+    /// More than [`REPOS_MAX_BRANCHES`] branch entries.
+    TooManyBranches,
+    /// A label key over [`REPOS_KEY_MAX_SCALARS`] scalar values.
+    LabelKeyTooLong,
+    /// A control (`char::is_control`) or refused format character ([`is_refused_format_character`])
+    /// in a label key.
+    LabelKeyCharacter,
+    /// A token that is not 1 to 40 ASCII hex characters.
+    TokenNotHex,
+    /// More than [`REPOS_TOKENS_PER_LABEL`] tokens on one label.
+    TooManyTokensInLabel,
+    /// More than [`REPOS_TOKENS_TOTAL`] tokens in all.
+    TooManyTokens,
+    /// A branch entry's key over [`REPOS_KEY_MAX_SCALARS`] scalar values.
+    BranchKeyTooLong,
+    /// A control or refused format character in a branch entry's key.
+    BranchKeyCharacter,
+    /// A branch name over [`REPOS_BRANCH_MAX_BYTES`] UTF-8 bytes.
+    BranchNameTooLong,
+    /// A control or refused format character in a branch name.
+    BranchNameCharacter,
+    /// `pageDate` is not a real `YYYY-MM-DD` date ([`crate::briefing_files::archive_date`]).
+    PageDate,
+}
+
+impl ReposRefusal {
+    /// The request member the refusal is about.
+    pub fn field(self) -> &'static str {
+        match self {
+            ReposRefusal::TooManyLabels
+            | ReposRefusal::LabelKeyTooLong
+            | ReposRefusal::LabelKeyCharacter => "labels",
+            ReposRefusal::TokenNotHex
+            | ReposRefusal::TooManyTokensInLabel
+            | ReposRefusal::TooManyTokens => "labels.tokens",
+            ReposRefusal::TooManyBranches
+            | ReposRefusal::BranchKeyTooLong
+            | ReposRefusal::BranchKeyCharacter
+            | ReposRefusal::BranchNameTooLong
+            | ReposRefusal::BranchNameCharacter => "branches",
+            ReposRefusal::PageDate => "pageDate",
+        }
+    }
+
+    /// A sentence for the webview; the value is never echoed.
+    pub fn message(self) -> &'static str {
+        match self {
+            ReposRefusal::TooManyLabels => "has more than 64 labels",
+            ReposRefusal::TooManyBranches => "has more than 64 branch entries",
+            ReposRefusal::LabelKeyTooLong => "has a label key longer than 80 characters",
+            ReposRefusal::LabelKeyCharacter => {
+                "has a label key holding a control or Unicode format character"
+            }
+            ReposRefusal::TokenNotHex => "has a token that is not 1 to 40 hex digits",
+            ReposRefusal::TooManyTokensInLabel => "has more than 512 tokens on one label",
+            ReposRefusal::TooManyTokens => "has more than 4096 tokens in all",
+            ReposRefusal::BranchKeyTooLong => "has a branch entry key longer than 80 characters",
+            ReposRefusal::BranchKeyCharacter => {
+                "has a branch entry key holding a control or Unicode format character"
+            }
+            ReposRefusal::BranchNameTooLong => "has a branch name longer than 255 bytes",
+            ReposRefusal::BranchNameCharacter => {
+                "has a branch name holding a control or Unicode format character"
+            }
+            ReposRefusal::PageDate => "is not a YYYY-MM-DD date",
+        }
+    }
+}
+
+impl From<ReposRefusal> for EngineError {
+    fn from(r: ReposRefusal) -> Self {
+        EngineError::InvalidInput {
+            field: r.field().into(),
+            reason: r.message().into(),
+        }
+    }
+}
+
+/// The character rule for keys and branch names: no control and no refused format character.
+fn repos_char_ok(c: char) -> bool {
+    !(c.is_control() || is_refused_format_character(c))
+}
+
+/// Why a key breaks the label-key rule, which a branch entry's key follows too.
+enum KeyBreak {
+    TooLong,
+    Character,
+}
+
+/// The label-key rule: at most [`REPOS_KEY_MAX_SCALARS`] scalars and no refused character; `""`
+/// (the Other card) is admitted.
+fn repos_key_check(key: &str) -> Result<(), KeyBreak> {
+    if key.chars().count() > REPOS_KEY_MAX_SCALARS {
+        return Err(KeyBreak::TooLong);
+    }
+    if !key.chars().all(repos_char_ok) {
+        return Err(KeyBreak::Character);
+    }
+    Ok(())
+}
+
+/// A validated `repos status` request. Constructed only by [`ReposRequest::new`]; serialises to
+/// exactly the engine's STDIN contract. It holds no secret and no path, so it derives `Debug`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReposRequest {
+    scope: ReposScope,
+    page_date: String,
+    labels: Vec<ReposLabel>,
+    branches: Vec<ReposBranch>,
+}
+
+impl ReposRequest {
+    /// Validate a request, or say which rule it breaks (plan B1-M4-T11).
+    pub fn new(
+        scope: ReposScope,
+        page_date: &str,
+        labels: Vec<ReposLabel>,
+        branches: Vec<ReposBranch>,
+    ) -> Result<Self, ReposRefusal> {
+        crate::briefing_files::archive_date(page_date).map_err(|_| ReposRefusal::PageDate)?;
+        if labels.len() > REPOS_MAX_LABELS {
+            return Err(ReposRefusal::TooManyLabels);
+        }
+        if branches.len() > REPOS_MAX_BRANCHES {
+            return Err(ReposRefusal::TooManyBranches);
+        }
+        let hex =
+            |t: &String| (1..=40).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_hexdigit());
+        let mut total = 0usize;
+        for label in &labels {
+            repos_key_check(&label.key).map_err(|b| match b {
+                KeyBreak::TooLong => ReposRefusal::LabelKeyTooLong,
+                KeyBreak::Character => ReposRefusal::LabelKeyCharacter,
+            })?;
+            if label.tokens.len() > REPOS_TOKENS_PER_LABEL {
+                return Err(ReposRefusal::TooManyTokensInLabel);
+            }
+            total += label.tokens.len();
+            if total > REPOS_TOKENS_TOTAL {
+                return Err(ReposRefusal::TooManyTokens);
+            }
+            if !label.tokens.iter().all(hex) {
+                return Err(ReposRefusal::TokenNotHex);
+            }
+        }
+        for branch in &branches {
+            repos_key_check(&branch.key).map_err(|b| match b {
+                KeyBreak::TooLong => ReposRefusal::BranchKeyTooLong,
+                KeyBreak::Character => ReposRefusal::BranchKeyCharacter,
+            })?;
+            if branch.name.len() > REPOS_BRANCH_MAX_BYTES {
+                return Err(ReposRefusal::BranchNameTooLong);
+            }
+            if !branch.name.chars().all(repos_char_ok) {
+                return Err(ReposRefusal::BranchNameCharacter);
+            }
+        }
+        Ok(Self {
+            scope,
+            page_date: page_date.to_string(),
+            labels,
+            branches,
+        })
+    }
+
+    pub fn page_date(&self) -> &str {
+        &self.page_date
+    }
+
+    pub fn labels(&self) -> &[ReposLabel] {
+        &self.labels
+    }
+
+    pub fn branches(&self) -> &[ReposBranch] {
+        &self.branches
+    }
+
+    /// The same validated request at another scope: the gate (`repos::decide`) chooses it.
+    pub fn with_scope(mut self, scope: ReposScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// The bytes the engine reads on stdin.
+    fn stdin_payload(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("a request of strings and lists always serialises")
+    }
+}
+
 /* ── T9: the launchd environment, reproduced ──────────────────────────────────────────────────── */
 
 /// The PATH the engine's own launchd generator puts in the plist, reproduced for every spawn this
@@ -690,8 +1613,12 @@ pub fn forwarded_env() -> Vec<&'static str> {
 /// `BUN_CRASH_REPORTING_OFF`), and the README's Privacy section promises both.
 pub const BUN_CRASH_REPORTING_OFF: (&str, &str) = ("BUN_ENABLE_CRASH_REPORTING", "0");
 
-/// The idle-sleep guard the plist wraps the engine in: `/usr/bin/caffeinate -i <bin> run`
-/// (`src/schedule/units.ts`, `launchdPlist`).
+/// The idle-sleep guard for app spawns. The plist USED to wrap the engine in it
+/// (`/usr/bin/caffeinate -i <bin> run`); since 2026-10-11 it starts `[<bin>, run]` directly — the
+/// wrapper made Background Activity list the job as "caffeinate" — and sets
+/// `DAILY_BRIEFING_KEEP_AWAKE=1`, on which the engine starts `caffeinate -i -w <its pid>` itself
+/// (`src/schedule/units.ts` `launchdPlist`, `src/keep-awake.ts`). App spawns do not set that
+/// variable, so they keep exactly one caffeinate: this wrapper.
 ///
 /// R1 grafts this onto ALL app spawns, not only scheduled ones ("PATH parity + caffeinate on app
 /// spawns"): a user-clicked run makes the same 30-120s provider call, and a machine that idles to
@@ -769,6 +1696,13 @@ pub enum EngineError {
     SidecarUnresolved { detail: String },
     /// The process could not be spawned, or died in a way the OS reported rather than the engine.
     Spawn { detail: String },
+    /// v0.3.0 (plan M8): the operation's own bound ([`Operation::timeout`]) passed before the engine
+    /// finished, and the invocation was abandoned — its process group killed (`ProcessGroupKill`).
+    /// `operation` is [`Operation::name`]; `seconds` the bound that fired.
+    Timeout { operation: String, seconds: u64 },
+    /// v0.3.0 (plan M8): the operation does not exist on this platform (the Mac Calendar app source
+    /// off macOS, [`mac_only`]). **No spawn happened.** The `access.rs` precedent.
+    Unsupported { detail: String },
 }
 
 impl std::fmt::Display for EngineError {
@@ -782,6 +1716,11 @@ impl std::fmt::Display for EngineError {
                 write!(f, "could not locate the bundled engine: {detail}")
             }
             EngineError::Spawn { detail } => write!(f, "could not run the engine: {detail}"),
+            EngineError::Timeout { operation, seconds } => write!(
+                f,
+                "the engine's {operation} did not finish within {seconds} s and was stopped"
+            ),
+            EngineError::Unsupported { detail } => write!(f, "{detail}"),
         }
     }
 }
@@ -893,8 +1832,11 @@ impl Drop for InFlight {
 ///
 /// ⚠ A NORMAL EXIT IS NOT A DROP. The guard is disarmed on a completed `wait()`, so an engine run
 /// that deliberately left something behind is left alone; only an ABANDONED invocation takes its
-/// group with it. The one shipped caller that abandons one is `shell::EngineSnapshots`'s read
-/// timeout (`shell::ENGINE_READ_TIMEOUT`).
+/// group with it. The shipped callers that abandon one are the read timeouts
+/// (`shell::ENGINE_READ_TIMEOUT`, around `shell::EngineSnapshots` and three other read paths) and,
+/// since v0.3.0 (plan M8), the calendar operations' own bounds ([`Operation::timeout`]) — including
+/// ONE MUTATING operation, `calendar connect mac` ([`CALENDAR_CONNECT_MAC_TIMEOUT`]); see the
+/// `SIGKILL` paragraph below for what that now costs.
 ///
 /// ⚠ AND THE SIGNAL IS `SIGKILL`, WITH NO `SIGTERM` GRACE — a deliberate choice, and one NO TEST
 /// PINS: swapping it for `SIGTERM` reddens nothing, because every fake in the suite dies on either.
@@ -906,7 +1848,11 @@ impl Drop for InFlight {
 /// (`status --json` is file reads; `schedule status` shells out to `launchctl list` on macOS and
 /// `systemctl is-enabled` / `loginctl show-user` on Linux — this guard is unix-wide, not
 /// macOS-only, so the inventory has to be too). It would start
-/// costing that the moment a MUTATING invocation became droppable. Under the old single-pid kill
+/// costing that the moment a MUTATING invocation became droppable — **and since v0.3.0 one is**:
+/// `calendar connect mac` is abandoned at [`CALENDAR_CONNECT_MAC_TIMEOUT`], so an engine still
+/// copying or re-signing the helper at that moment is killed mid-write. That is accepted there
+/// (the constant's docs say why: the long pole is a person answering a dialog) and is the engine's
+/// install step's to survive (a staged copy renamed into place, W3's M10b). Under the old single-pid kill
 /// descendants were spared only by being orphaned, which is the thing this closes, and a hung read
 /// leaving a live `launchctl` behind was judged the worse of the two.
 ///
@@ -970,6 +1916,30 @@ impl ProcessGroupKill {
     /// Give up the group: the child exited on its own terms.
     fn disarm(&mut self) {
         self.pgid = None;
+    }
+
+    /// SIGKILL the group NOW, then disarm — for an operation that must not leave descendants
+    /// behind even when it returns normally ([`Operation::kills_its_group_on_return`]).
+    ///
+    /// ⚠ CALLED BEFORE `wait()`, NEVER AFTER: the same un-reaped window the drop path relies on
+    /// (the struct docs) is what keeps the id from having been recycled. [`EngineClient::invoke`]
+    /// calls this once both pipes are at EOF — the engine has closed its stdio, i.e. it is exiting
+    /// or a zombie — and only then reaps it, so its exit status is the one it chose (a SIGKILL sent
+    /// to a process already in its exit path does not replace that status; `tests/engine_client.rs`
+    /// asserts exit 0 survives this).
+    fn kill_now(&mut self) {
+        self.signal();
+        self.disarm();
+    }
+
+    fn signal(&self) {
+        if let Some(pgid) = self.pgid {
+            // SAFETY: as in `Drop` below — two integers, nothing dereferenced, and the id is the
+            // un-reaped child's own group.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
     }
 }
 
@@ -1067,6 +2037,10 @@ pub struct EngineClient {
     path_env: Option<String>,
     caffeinate: PathBuf,
     extra_env: Vec<(OsString, OsString)>,
+    /// **Test harness only** ([`EngineClient::with_timeout_cap`]): an upper limit on every
+    /// [`Operation::timeout`], so a test can watch a 150 s bound fire in milliseconds. `None` in
+    /// the app.
+    timeout_cap: Option<Duration>,
 }
 
 impl EngineClient {
@@ -1082,7 +2056,26 @@ impl EngineClient {
             path_env: None,
             caffeinate: PathBuf::from(CAFFEINATE),
             extra_env: Vec::new(),
+            timeout_cap: None,
         }
+    }
+
+    /// Cap every operation's own bound at `cap`. **Test harness only** — it is what lets a test
+    /// prove [`Operation::timeout`] is APPLIED (the fake is killed and [`EngineError::Timeout`]
+    /// comes back) without waiting 150 s. An operation whose timeout is `None` stays unbounded: the
+    /// cap shortens a bound, it never invents one.
+    pub fn with_timeout_cap(mut self, cap: Duration) -> Self {
+        self.timeout_cap = Some(cap);
+        self
+    }
+
+    /// The bound [`EngineClient::invoke`] applies to `op`: [`Operation::timeout`], shortened by the
+    /// harness cap when one is set.
+    pub fn effective_timeout(&self, op: &Operation) -> Option<Duration> {
+        op.timeout().map(|bound| match self.timeout_cap {
+            Some(cap) => bound.min(cap),
+            None => bound,
+        })
     }
 
     /// Override the PATH applied to every spawn.
@@ -1182,11 +2175,147 @@ impl EngineClient {
     /// generation is never dropped this way; if one ever outlives its caller that is the engine's
     /// own concern — its `run.lock` (`src/runlock.ts`) refuses a second generation while one is
     /// still running, and it does not care who the first one's parent was.
+    ///
+    /// ⚠ v0.3.0 (plan M8): AN OPERATION WITH ITS OWN BOUND IS DROPPED HERE. When
+    /// [`Operation::timeout`] is `Some` (the four calendar operations), the invocation runs under
+    /// `tokio::time::timeout` and, when the bound passes, the inner future — child, pipe readers,
+    /// in-flight guard and process-group kill — is dropped exactly as a read timeout drops one, and
+    /// the answer is [`EngineError::Timeout`]. `None` (every pre-M8 operation) is the unchanged path.
     pub async fn invoke(
         &self,
         op: Operation,
         sink: &dyn ProgressSink,
     ) -> Result<EngineOutcome, EngineError> {
+        self.invoke_inner(op, None, sink).await
+    }
+
+    /// [`EngineClient::invoke`] for the one operation that reads a KEY on stdin,
+    /// [`Operation::KeySet`] (PR 3, P3-M1-T1).
+    ///
+    /// ⚠ THE KEY IS A SEPARATE ARGUMENT, NEVER PART OF THE OPERATION — see [`KeySecret`]. It is
+    /// written to the child's stdin and the pipe closed (the engine requires stdin to END within
+    /// 1 s); it is in no argv, no environment, no `Debug` and no answer. An operation that does not
+    /// take a key is refused with one, and `KeySet` is refused without one — both BEFORE any spawn.
+    pub async fn invoke_with_key(
+        &self,
+        op: Operation,
+        key: KeySecret,
+        sink: &dyn ProgressSink,
+    ) -> Result<EngineOutcome, EngineError> {
+        self.invoke_inner(op, Some(key), sink).await
+    }
+
+    /// The live details read, `calendar details --json` (wave-2 plan C-M3-T7): the SEALED path.
+    ///
+    /// ⚠ NO `EngineOutcome`, NO PROGRESS SINK, NO STDERR TEXT. The spawn, the stdin write, the
+    /// drain, the process-group kill and the wait are [`EngineClient::invoke`]'s own body
+    /// (`invoke_unbounded_with`); only the collector differs: stdout is parsed into
+    /// [`DetailsRaw`] inside Rust and its buffer zeroed, stderr is reduced to a fixed
+    /// [`DetailsFailure`] code, and stderr lines go to [`NoProgress`]. The handback is written to the
+    /// child's stdin and the pipe closed. Any `op` other than [`Operation::CalendarDetails`] is
+    /// refused before any spawn, as `invoke` refuses `CalendarDetails` (it takes a handback).
+    /// Bounded by [`EngineClient::effective_timeout`], under the same [`EngineError::Timeout`].
+    ///
+    /// One production caller: `calendar_details.rs` (`tests/capability.rs` pins it).
+    pub async fn invoke_sealed(
+        &self,
+        op: Operation,
+        handback: LinkHandback,
+    ) -> Result<Result<DetailsRaw, DetailsFailure>, EngineError> {
+        if !matches!(op, Operation::CalendarDetails { .. }) {
+            return Err(EngineError::InvalidInput {
+                field: "handback".into(),
+                reason: format!("is not an input of {}", op.name()),
+            });
+        }
+        let bound = self.effective_timeout(&op);
+        let operation = op.name();
+        let stdin = Some(StdinPayload::Links(handback));
+        self.within_bound(
+            bound,
+            operation,
+            self.invoke_unbounded_with(op, stdin, &NoProgress, SealedDetails),
+        )
+        .await
+    }
+
+    async fn invoke_inner(
+        &self,
+        op: Operation,
+        key: Option<KeySecret>,
+        sink: &dyn ProgressSink,
+    ) -> Result<EngineOutcome, EngineError> {
+        // Wave 2 (C-M3-T7): the live details read takes a handback and runs only sealed.
+        if matches!(op, Operation::CalendarDetails { .. }) {
+            return Err(EngineError::InvalidInput {
+                field: "handback".into(),
+                reason: "is required for this operation".into(),
+            });
+        }
+        let stdin = match (op.takes_key(), key, op.stdin_payload()) {
+            (true, Some(key), None) => Some(StdinPayload::Key(key)),
+            (false, None, payload) => payload.map(StdinPayload::Operand),
+            (true, None, _) => {
+                return Err(EngineError::InvalidInput {
+                    field: "key".into(),
+                    reason: "is required for this operation".into(),
+                })
+            }
+            // A key for an operation that reads none, or an operation that would supply its own
+            // stdin AND a key: refused, never merged.
+            (_, Some(_), _) => {
+                return Err(EngineError::InvalidInput {
+                    field: "key".into(),
+                    reason: format!("is not an input of {}", op.name()),
+                })
+            }
+        };
+        let bound = self.effective_timeout(&op);
+        let operation = op.name();
+        self.within_bound(
+            bound,
+            operation,
+            self.invoke_unbounded_with(op, stdin, sink, Classify),
+        )
+        .await
+    }
+
+    /// `answer` under `bound` when there is one: past it, the future — child, pipe readers,
+    /// in-flight guard and process-group kill — is dropped and the answer is
+    /// [`EngineError::Timeout`]. `None` awaits it unbounded (every pre-M8 operation).
+    async fn within_bound<T>(
+        &self,
+        bound: Option<Duration>,
+        operation: &'static str,
+        answer: impl std::future::Future<Output = Result<T, EngineError>>,
+    ) -> Result<T, EngineError> {
+        match bound {
+            None => answer.await,
+            Some(bound) => match tokio::time::timeout(bound, answer).await {
+                Ok(answer) => answer,
+                Err(_) => Err(EngineError::Timeout {
+                    operation: operation.to_string(),
+                    // Whole seconds for the sentence; a sub-second harness cap reads as 0.
+                    seconds: bound.as_secs(),
+                }),
+            },
+        }
+    }
+
+    /// [`EngineClient::invoke`] without the per-operation bound: spawn, stream, collect.
+    ///
+    /// ⚠ ONE BODY, TWO COLLECTORS (wave-2 plan C-M3-T7: factored, not copied): [`Classify`] is
+    /// today's path, unchanged (`classify` builds the [`EngineOutcome`]); [`SealedDetails`] is the
+    /// live details read's, which parses stdout inside Rust and keeps no text. Everything else —
+    /// the in-flight guard, the spawn, the stdin write, the drain, the process-group kill and the
+    /// wait — is this one body for both.
+    async fn invoke_unbounded_with<C: Collect>(
+        &self,
+        op: Operation,
+        stdin: Option<StdinPayload>,
+        sink: &dyn ProgressSink,
+        collector: C,
+    ) -> Result<C::Out, EngineError> {
         let _guard = InFlight::try_acquire(&op)?;
 
         let (program, argv) = self.command_line(&op);
@@ -1194,7 +2323,14 @@ impl EngineClient {
         cmd.args(&argv)
             .env_clear()
             .envs(self.env_plan())
-            .stdin(std::process::Stdio::null())
+            // `/dev/null` unless this operation reads stdin (PR 3: `key set`'s key, `reset
+            // --label-stdin`'s label). A piped stdin is written and CLOSED inside the drain below,
+            // before `wait()` — see the ordering note there.
+            .stdin(if stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // ⚠ KEPT, THOUGH THE UNIX SUITE NO LONGER PINS IT: on unix every drop the tests
@@ -1224,6 +2360,8 @@ impl EngineClient {
         let stderr = child.stderr.take().ok_or_else(|| EngineError::Spawn {
             detail: "the child has no stderr pipe".into(),
         })?;
+        // `None` exactly when `stdin` is: the pipe is configured above only when there is a payload.
+        let stdin_pipe = child.stdin.take();
 
         let name = op.name();
         // ⚠ THE PIPES ARE DRAINED FIRST AND `wait()` COMES AFTER, WHICH IS THE WHOLE SAFETY
@@ -1248,13 +2386,30 @@ impl EngineClient {
         // process-group id pinned — for exactly as long as anything it started still holds a pipe,
         // which is exactly as long as the group is still worth killing.
         //
-        // ⚠ AND THE ORDERING DEPENDS ON `stdin` BEING `null()` ABOVE. tokio's `wait()` drops the
-        // child's stdin first, precisely to avoid the deadlock where a child blocks on input the
-        // parent never closes (`tokio::process`, `Child::wait`); with `wait()` moved after the
-        // readers, a refactor to `.stdin(piped())` would deadlock on a pipe only that `wait()`
-        // closes. `tests/watcher.rs`'s `a_timed_out_read_kills_a_child_that_outlived_the_sidecar`
-        // is what pins this ordering.
-        let (out, err) = tokio::join!(read_all(stdout), stream_stderr(stderr, name, sink));
+        // ⚠ AND THE ORDERING DEPENDS ON STDIN BEING CLOSED INSIDE THE DRAIN. tokio's `wait()` drops
+        // the child's stdin first, precisely to avoid the deadlock where a child blocks on input
+        // the parent never closes (`tokio::process`, `Child::wait`); with `wait()` moved after the
+        // readers, a stdin pipe still open here would deadlock on a pipe only that `wait()`
+        // closes. So since PR 3 the stdin pipe (present only for an operation that reads one) was
+        // TAKEN above and is written AND DROPPED by `write_stdin`, joined with the two readers —
+        // concurrently, so a payload larger than the pipe buffer cannot deadlock against an engine
+        // that writes before it reads. Without a payload the stdin is `null()`, as before.
+        // `tests/watcher.rs`'s `a_timed_out_read_kills_a_child_that_outlived_the_sidecar` is what
+        // pins the drain-then-wait ordering.
+        let ((), out, err) = tokio::join!(
+            write_stdin(stdin_pipe, stdin),
+            read_all(stdout),
+            stream_stderr(stderr, name, sink)
+        );
+        // ⚠ PR 3 (P2-M4 checkpoint, into P3): `provider test` takes its process group with it even
+        // on a NORMAL return — a CLI Test's backgrounded grandchild can outlive the engine. HERE,
+        // after the drain and BEFORE `wait()`: the child is un-reaped, so its pid — the group id —
+        // is pinned (see `ProcessGroupKill::kill_now`). The group is the engine's own because
+        // `process_group(0)` above made the child its leader.
+        #[cfg(unix)]
+        if op.kills_its_group_on_return() {
+            group.kill_now();
+        }
         let status = child.wait().await;
         // ⚠ `ECHILD` GIVES THE GROUP UP; EVERY OTHER ERROR KEEPS IT. Another error leaves the
         // child's state unknown — it may well still be running — so the guard stays armed and the
@@ -1283,7 +2438,258 @@ impl EngineClient {
             detail: format!("waiting for the engine failed: {e}"),
         })?;
 
-        Ok(classify(&op, status.code(), out, err))
+        Ok(collector.collect(&op, status.code(), out, err))
+    }
+}
+
+/* ── the collectors (wave 2, C-M3-T7) ─────────────────────────────────────────────────────────── */
+
+/// What an invocation's exit code and output become. Two implementations: [`Classify`] (every
+/// operation but one) and [`SealedDetails`] (the live details read).
+trait Collect {
+    type Out;
+    fn collect(self, op: &Operation, code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>)
+        -> Self::Out;
+}
+
+/// Today's collector: [`classify`], unchanged.
+struct Classify;
+
+impl Collect for Classify {
+    type Out = EngineOutcome;
+    fn collect(
+        self,
+        op: &Operation,
+        code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) -> EngineOutcome {
+        classify(op, code, stdout, stderr)
+    }
+}
+
+/// The live details read's collector: stdout parsed into [`DetailsRaw`] and its buffer zeroed;
+/// stderr reduced to a fixed [`DetailsFailure`] code and zeroed. No raw child output is returned.
+/// This wipes the final buffers only on normal collection. On timeout (dropped reader futures) or
+/// a `child.wait()` error (early return), stdout/stderr drop unwiped. Stderr's temporary buffers and
+/// earlier allocations freed by growth are also outside this best-effort wipe (see [`SecretBytes`]).
+///
+/// ⚠ NO `Debug`, `Clone` OR `Serialize` (the grep test in `tests/engine_client.rs`).
+struct SealedDetails;
+
+impl Collect for SealedDetails {
+    type Out = Result<DetailsRaw, DetailsFailure>;
+    fn collect(
+        self,
+        _op: &Operation,
+        code: Option<i32>,
+        mut stdout: Vec<u8>,
+        mut stderr: Vec<u8>,
+    ) -> Result<DetailsRaw, DetailsFailure> {
+        let answer = match code {
+            Some(0) => DetailsRaw::parse(&stdout),
+            _ => Err(DetailsFailure::from_exit(code, &stderr)),
+        };
+        wipe_bytes(&mut stdout);
+        wipe_bytes(&mut stderr);
+        answer
+    }
+}
+
+/// Why the live details read gave no document. A FIXED CODE: no variant holds text from the child
+/// (its stderr may echo what it read, and a parse error can quote a value), so it may be printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailsFailure {
+    /// Exit 0, but stdout was not the sealed document.
+    Malformed,
+    /// The engine's own fixed codes (`src/calendar/details.ts`, `failed`), recognised only when its
+    /// stderr is exactly `calendar details: <code>`.
+    BadArguments,
+    StdinTooLarge,
+    StdinInvalid,
+    ConfigUnreadable,
+    Internal,
+    /// Any other non-zero exit (`None`: killed by a signal).
+    Exit(Option<i32>),
+}
+
+impl DetailsFailure {
+    fn from_exit(code: Option<i32>, stderr: &[u8]) -> Self {
+        let text = std::str::from_utf8(stderr).unwrap_or("").trim_end();
+        match text.strip_prefix("calendar details: ") {
+            Some("bad-arguments") => DetailsFailure::BadArguments,
+            Some("stdin-too-large") => DetailsFailure::StdinTooLarge,
+            Some("stdin-invalid") => DetailsFailure::StdinInvalid,
+            Some("config-unreadable") => DetailsFailure::ConfigUnreadable,
+            Some("internal") => DetailsFailure::Internal,
+            _ => DetailsFailure::Exit(code),
+        }
+    }
+}
+
+/// The live details read's answer, parsed inside Rust (`src/calendar/details.ts`'s
+/// `CalendarDetailsJson`, or its `{ schemaVersion: 1, refused: "calendar-off" }`).
+///
+/// ⚠ NO `Debug`, `Display`, `Clone` OR `Serialize`, AND NEITHER HAS ANYTHING IT HOLDS (probed and
+/// grepped): it carries meeting links, people, notes and the remembered command-link URLs. Its
+/// parts are read by `calendar_details.rs` only, which keeps them in Rust memory.
+pub struct DetailsRaw(DetailsDoc);
+
+enum DetailsDoc {
+    CalendarOff,
+    Read(DetailsRead),
+}
+
+/// One answered read. `pub(crate)` for `calendar_details.rs`, which turns it into its held state.
+pub(crate) struct DetailsRead {
+    pub(crate) read_at: String,
+    pub(crate) events: Vec<RawEvent>,
+    pub(crate) sources: Vec<RawSource>,
+    pub(crate) reader_outdated: bool,
+    pub(crate) links: Vec<RawLink>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawEvent {
+    pub(crate) title: String,
+    pub(crate) location: Option<String>,
+    pub(crate) row_text: String,
+    /// `CalendarStructEvent["time"]`, passed to the webview as it is (no secret: instants and dates).
+    pub(crate) time: serde_json::Value,
+    pub(crate) status: String,
+    pub(crate) ended: bool,
+    pub(crate) from_mac: bool,
+    /// `None` when the engine could not retain the raw details; `Some([])` is a known empty list.
+    pub(crate) people: Option<Vec<RawPerson>>,
+    pub(crate) notes: Option<String>,
+    /// A near-duplicate merge's other views' cleaned notes, core excluded (`CalendarDetailsEvent["otherNotes"]`).
+    /// Absent on an unmerged or older event; serde reads a missing `Option` as `None`.
+    pub(crate) other_notes: Option<Vec<RawOtherNote>>,
+    pub(crate) join: Option<RawJoin>,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct RawPerson {
+    pub(crate) name: Option<String>,
+    pub(crate) organiser: bool,
+}
+
+/// One `otherNotes` entry: `title` is null when it equals the shown title; `notes` may be empty.
+#[derive(serde::Deserialize)]
+pub(crate) struct RawOtherNote {
+    pub(crate) title: Option<String>,
+    pub(crate) notes: String,
+}
+
+/// `src/calendar/join.ts`'s `JoinCandidate`.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum RawJoin {
+    Known {
+        url: String,
+        host: String,
+    },
+    Other {
+        url: String,
+        host: String,
+    },
+    Service {
+        url: String,
+        host: String,
+        #[serde(rename = "serviceName")]
+        service_name: String,
+    },
+    Several,
+}
+
+/// `{ id, kind, status, reason? }` or `{ id, kind, skipped: true }`; never both.
+#[derive(serde::Deserialize)]
+pub(crate) struct RawSource {
+    /// Whether this link uses a command; env/file links have no command report entry.
+    #[serde(default)]
+    pub(crate) command: bool,
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) skipped: bool,
+}
+
+/// One command-sourced link's report: `{ id, entryHash, url? }` (`url` absent for a dead link or
+/// a command that gave none).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawLink {
+    pub(crate) id: String,
+    pub(crate) entry_hash: String,
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireRead {
+    schema_version: u32,
+    read_at: String,
+    events: Vec<RawEvent>,
+    sources: Vec<RawSource>,
+    reader_outdated: bool,
+    links: Vec<RawLink>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireRefused {
+    schema_version: u32,
+    refused: String,
+}
+
+impl DetailsRaw {
+    /// The one parse of the sealed document. One production caller: [`SealedDetails`]; the
+    /// integration tests build canned values with it (`tests/capability.rs` pins the caller).
+    ///
+    /// ⚠ A REFUSAL IS THE FIXED [`DetailsFailure::Malformed`], NEVER THE PARSER'S ERROR: a serde
+    /// message can quote the offending value, which here can be a URL.
+    pub fn parse(stdout: &[u8]) -> Result<DetailsRaw, DetailsFailure> {
+        if let Ok(r) = serde_json::from_slice::<WireRefused>(stdout) {
+            return if r.schema_version == 1 && r.refused == "calendar-off" {
+                Ok(DetailsRaw(DetailsDoc::CalendarOff))
+            } else {
+                Err(DetailsFailure::Malformed)
+            };
+        }
+        let w: WireRead =
+            serde_json::from_slice(stdout).map_err(|_| DetailsFailure::Malformed)?;
+        if w.schema_version != 1 {
+            return Err(DetailsFailure::Malformed);
+        }
+        if w.sources.iter().any(|s| s.skipped == s.status.is_some()) {
+            return Err(DetailsFailure::Malformed);
+        }
+        Ok(DetailsRaw(DetailsDoc::Read(DetailsRead {
+            read_at: w.read_at,
+            events: w.events,
+            sources: w.sources,
+            reader_outdated: w.reader_outdated,
+            links: w.links,
+        })))
+    }
+
+    /// The engine refused because the calendar is off (`{ refused: "calendar-off" }`).
+    pub fn calendar_off(&self) -> bool {
+        matches!(self.0, DetailsDoc::CalendarOff)
+    }
+
+    /// The answered read, or `None` for the calendar-off refusal. For `calendar_details.rs`.
+    pub(crate) fn into_read(self) -> Option<DetailsRead> {
+        match self.0 {
+            DetailsDoc::CalendarOff => None,
+            DetailsDoc::Read(read) => Some(read),
+        }
     }
 }
 
@@ -1395,6 +2801,37 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// What a spawn writes to the engine's stdin: the operation's own operand (a reset label), or the
+/// separate key secret. Never both — [`EngineClient::invoke_with_key`] refuses that before a spawn.
+enum StdinPayload {
+    Operand(Vec<u8>),
+    Key(KeySecret),
+    /// The live details read's handback (wave 2, C-M3-T7), only through [`EngineClient::invoke_sealed`].
+    Links(LinkHandback),
+}
+
+impl StdinPayload {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            StdinPayload::Operand(bytes) => bytes,
+            StdinPayload::Key(key) => key.bytes(),
+            StdinPayload::Links(handback) => handback.bytes(),
+        }
+    }
+}
+
+/// Write the payload to the child's stdin, then CLOSE it (the drop at the end) — the engine reads
+/// to EOF and requires the stream to end within 1 s (`docs/gui-seam.md` §1d). A write error is
+/// ignored: an engine that exits or refuses before reading closes its end (`EPIPE`; Rust ignores
+/// `SIGPIPE`), and its own answer on stdout is what the caller sees.
+async fn write_stdin(pipe: Option<tokio::process::ChildStdin>, payload: Option<StdinPayload>) {
+    use tokio::io::AsyncWriteExt;
+    if let (Some(mut pipe), Some(payload)) = (pipe, payload) {
+        let _ = pipe.write_all(payload.bytes()).await;
+        let _ = pipe.shutdown().await;
+    }
+}
+
 async fn read_all<Rd: tokio::io::AsyncRead + Unpin>(mut rd: Rd) -> Vec<u8> {
     let mut buf = Vec::new();
     // A read error mid-stream keeps whatever arrived: partial output is evidence, and losing it
@@ -1497,12 +2934,13 @@ pub fn classify(
 // ONE COMMAND PER OPERATION, and that is the design decision the capability rests on: the grant is
 // per command name, so `capabilities/default.json` can say "this webview may read status and
 // validate a config" distinctly from "this webview may generate a briefing and install a
-// schedule". A single command taking the operation as a parameter would collapse all ten into
+// schedule". A single command taking the operation as a parameter would collapse all of them into
 // one grant and put the distinction back inside application code, which is where B1's ceiling
 // measurement found it was not enforceable.
 //
 // None of these takes a program, an environment, a working directory or a raw argv. The only
-// caller-supplied values are the two operands above, and both are parsed before any spawn. The
+// caller-supplied values are the validated operands above (four on argv, two on stdin — the module
+// header), and each is parsed before any spawn. The
 // invoker on the schedule mutations is not caller-supplied either (see `Invoker`).
 
 /// The engine client, as Tauri managed state.
@@ -1515,7 +2953,7 @@ pub fn classify(
 ///     with the path it looked at, instead of the app refusing to launch or the click producing an
 ///     exit-127 to decode.
 ///   * **The client is injectable.** `tests/capability.rs` manages an [`Engine`] over a fake
-///     sidecar under a tempdir and drives all ten commands through real IPC, so every command
+///     sidecar under a tempdir and drives every engine command through real IPC, so every command
 ///     BODY is executed by a test rather than only reached. The previous shape — the commands
 ///     calling `EngineClient::bundled()` inline — left six of the (then) eight bodies unreachable by any
 ///     test, which a mutation (`engine_schedule_install` replaced by a constant `Ok`) confirmed
@@ -1562,12 +3000,14 @@ pub async fn engine_run<R: Runtime>(
     app: AppHandle<R>,
     engine: State<'_, Engine>,
     force: bool,
+    now: bool,
 ) -> Result<EngineOutcome, EngineError> {
     run_op!(
         app,
         engine,
         Operation::Run {
             force,
+            now,
             json_out: None
         }
     )
@@ -1579,6 +3019,7 @@ pub async fn engine_run_to_file<R: Runtime>(
     engine: State<'_, Engine>,
     name: String,
     force: bool,
+    now: bool,
 ) -> Result<EngineOutcome, EngineError> {
     let json_out = json_out_name(&name).map_err(|reason| EngineError::InvalidInput {
         field: "name".into(),
@@ -1589,22 +3030,10 @@ pub async fn engine_run_to_file<R: Runtime>(
         engine,
         Operation::Run {
             force,
+            now,
             json_out: Some(json_out)
         }
     )
-}
-
-#[tauri::command]
-pub async fn engine_config_validate<R: Runtime>(
-    app: AppHandle<R>,
-    engine: State<'_, Engine>,
-    file: String,
-) -> Result<EngineOutcome, EngineError> {
-    let file = config_file_path(&file).map_err(|reason| EngineError::InvalidInput {
-        field: "file".into(),
-        reason: reason.message().into(),
-    })?;
-    run_op!(app, engine, Operation::ConfigValidate { file })
 }
 
 /// `schedule install --invoker app [--take-over]`. The invoker is fixed: this IS the app.
@@ -1682,21 +3111,276 @@ pub async fn engine_update_check<R: Runtime>(
     run_op!(app, engine, Operation::UpdateCheck)
 }
 
+/// `calendar status --json` (v0.3.0, plan M8) — Settings → Calendar's configuration and each
+/// source's last SCHEDULED read. A read: no operand, no in-flight guard, bounded at 30 s.
+#[tauri::command]
+pub async fn engine_calendar_status<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+) -> Result<EngineOutcome, EngineError> {
+    run_op!(app, engine, Operation::CalendarStatus)
+}
+
+/// `calendar list --json` (plan M8) — the Mac calendars for the checklist and the configured links,
+/// never a URL. A read: no operand, no in-flight guard, bounded at 30 s.
+#[tauri::command]
+pub async fn engine_calendar_list<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+) -> Result<EngineOutcome, EngineError> {
+    run_op!(app, engine, Operation::CalendarList)
+}
+
+/// `calendar test --json` (plan M8) — Settings' "Test": read every source now. No operand; NOT
+/// mutating (see [`Operation::CalendarTest`]); bounded at [`CALENDAR_TEST_TIMEOUT`].
+#[tauri::command]
+pub async fn engine_calendar_test<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+) -> Result<EngineOutcome, EngineError> {
+    run_op!(app, engine, Operation::CalendarTest)
+}
+
+/// `calendar connect mac --json` (plan M8) — Settings' "Allow access": install or update the helper
+/// copy and request Calendar access while the user is present.
+///
+/// ⚠ MUTATING (the in-flight guard holds it) and bounded at [`CALENDAR_CONNECT_MAC_TIMEOUT`]. Off
+/// macOS it answers [`EngineError::Unsupported`] BEFORE any spawn ([`mac_only`]).
+#[tauri::command]
+pub async fn engine_calendar_connect_mac<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+) -> Result<EngineOutcome, EngineError> {
+    mac_only(cfg!(target_os = "macos"))?;
+    run_op!(app, engine, Operation::CalendarConnectMac)
+}
+
+/* ── the provider commands (PR 3, P3-M1-T1; `docs/gui-seam.md` §1d) ─────────────────────────────── */
+//
+// Five commands for the seven `provider` operations. Two operations have NONE: `provider test` takes
+// a candidate file path, so the webview reaches it only through the staging command (P3-M1-T2),
+// which stages the file itself; and `provider key delete-all` has had no command since PR 3 final
+// r1 — Uninstall runs [`Operation::KeyDeleteAll`] Rust-side (`uninstall.rs`). None of these five
+// takes a path. All five are MUTATING (the in-flight guard holds them) and bounded
+// ([`Operation::timeout`]). The answer is the engine's one JSON line as the
+// outcome's `payload`: the webview switches on its `code` and `reason`, never on the exit class.
+
+/// Turn an operand refusal into the IPC error, naming the argument and never echoing its value.
+fn refused(field: &str, reason: InputRefusal) -> EngineError {
+    EngineError::InvalidInput {
+        field: field.into(),
+        reason: reason.message().into(),
+    }
+}
+
+/// `provider key set --json` — store a pasted key; the answer carries the reference to save.
+///
+/// ⚠ THE KEY IS ON STDIN ONLY ([`EngineClient::invoke_with_key`]); it never enters an
+/// [`Operation`], an argv, an error or a log line, and the refusals below do not echo it.
+#[tauri::command]
+pub async fn engine_provider_key_set<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+    key: String,
+) -> Result<EngineOutcome, EngineError> {
+    let key = KeySecret::new(key).map_err(|reason| refused("key", reason))?;
+    let sink = AppProgress::new(app);
+    engine
+        .client()?
+        .invoke_with_key(Operation::KeySet, key, &sink)
+        .await
+}
+
+/// `provider key migrate --index <n> --json` — move entry n's legacy literal key into the store.
+#[tauri::command]
+pub async fn engine_provider_key_migrate<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+    index: u64,
+) -> Result<EngineOutcome, EngineError> {
+    let index = provider_index(index).map_err(|reason| refused("index", reason))?;
+    run_op!(app, engine, Operation::KeyMigrate { index })
+}
+
+/// `provider key delete --id <keyId> --json` — remove one app-owned key.
+#[tauri::command]
+pub async fn engine_provider_key_delete<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+    id: String,
+) -> Result<EngineOutcome, EngineError> {
+    let id = key_id(&id).map_err(|reason| refused("id", reason))?;
+    run_op!(app, engine, Operation::KeyDelete { id })
+}
+
+/// `provider key scrub-backup --json` — remove from `.bak` the literal keys the saved config no
+/// longer holds.
+///
+/// ⚠ HOLDS `ConfigSaver`'S SAVE LOCK ACROSS THE ENGINE CALL (plan P3-M1-T1): every settings write
+/// takes that lock and keeps `.bak`, so a save running beside the scrub could rewrite `.bak` between
+/// the scrub's read and its write. Taken BEFORE the in-flight guard, the lock order every holder of
+/// both uses (`uninstall_execute` holds it across its `schedule uninstall`).
+///
+/// ⚠ AND IT SWEEPS A CRASHED SAVE'S STAGED COPIES FIRST, UNDER THAT LOCK (P3-M4 checkpoint). A save
+/// cut short leaves `.<config>.save-<pid>-<seq>.prev`, a second name for `.bak`'s inode, which keeps
+/// the literals the scrub removes (the engine answers `otherCopies: true` and never touches it). The
+/// only other sweep runs inside a save that WRITES, and an unchanged save writes nothing. So the
+/// config is located the way every save locates it ([`crate::config_save::locate`]) and
+/// [`crate::config_save::sweep_stale`] runs over its staged prefix — safe here because the lock is
+/// held, so none of this process's staged files is in flight (`sweep_stale`'s own contract). A copy
+/// left after that is one the app did not make or could not remove. Best effort: a config that
+/// cannot be located sweeps nothing, and the scrub still runs (it reports its own refusal).
+#[tauri::command]
+pub async fn engine_provider_key_scrub_backup<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+    saver: State<'_, crate::config_save::ConfigSaver>,
+) -> Result<EngineOutcome, EngineError> {
+    let client = engine.client()?;
+    let _serialised = saver.lock.lock().await;
+    if let Ok(path) = crate::config_save::locate(client).await {
+        if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+            let prefix = crate::config_save::staged_prefix(&name.to_string_lossy());
+            crate::config_save::sweep_stale(dir, &prefix, crate::config_save::STAGED_SUFFIXES);
+        }
+    }
+    let sink = AppProgress::new(app);
+    client.invoke(Operation::KeyScrubBackup, &sink).await
+}
+
+/// `provider reset (--index <n> | --label-stdin) --json` — clear one entry's marks. Exactly one of
+/// `index` and `label` must be given; the label is written to stdin, never argv (hub Q20).
+#[tauri::command]
+pub async fn engine_provider_reset<R: Runtime>(
+    app: AppHandle<R>,
+    engine: State<'_, Engine>,
+    index: Option<u64>,
+    label: Option<String>,
+) -> Result<EngineOutcome, EngineError> {
+    let target = match (index, label) {
+        (Some(index), None) => {
+            ResetTarget::Index(provider_index(index).map_err(|reason| refused("index", reason))?)
+        }
+        (None, Some(text)) => {
+            ResetTarget::Label(self::label(&text).map_err(|reason| refused("label", reason))?)
+        }
+        _ => {
+            return Err(EngineError::InvalidInput {
+                field: "index/label".into(),
+                reason: "exactly one of the two is required".into(),
+            })
+        }
+    };
+    run_op!(app, engine, Operation::ProviderReset { target })
+}
+
 /// Every command name this module exposes, in the order `lib.rs` registers them.
 ///
 /// `build.rs` autogenerates one `allow-<command>` permission per entry and
 /// `capabilities/default.json` grants exactly these; `tests/capability.rs` asserts the three lists
 /// agree, so a command added here without a grant fails a test rather than shipping unreachable,
 /// and a grant without a command fails rather than lingering as a permission for nothing.
+///
+/// ⚠ THREE OPERATIONS HAVE NO COMMAND, ON PURPOSE: `ProviderTest` (only the candidate check stages
+/// one, `config_save.rs`), and since PR 3 final r1 `ConfigValidate` and `KeyDeleteAll`. The webview's `engine_config_validate(file)` returned `normalized` — every
+/// literal `apiKey` of any absolute file it named — and `engine_provider_key_delete_all` deleted
+/// every app key in one call, around uninstall's kept-schedule refusal and consent; no app code
+/// called either. Rust still runs both: the settings guard and the candidate check validate files
+/// they staged or own (`config_save.rs`), and uninstall's key leg deletes the keys behind its own
+/// gates (`uninstall.rs`). `tests/capability.rs` pins the refusal.
 pub const COMMANDS: &[&str] = &[
     "engine_status",
     "engine_doctor",
     "engine_run",
     "engine_run_to_file",
-    "engine_config_validate",
     "engine_schedule_install",
     "engine_schedule_uninstall",
     "engine_schedule_status",
     "engine_schedule_verify",
     "engine_update_check",
+    "engine_calendar_status",
+    "engine_calendar_list",
+    "engine_calendar_test",
+    "engine_calendar_connect_mac",
+    "engine_provider_key_set",
+    "engine_provider_key_migrate",
+    "engine_provider_key_delete",
+    "engine_provider_key_scrub_backup",
+    "engine_provider_reset",
 ];
+
+/// `wipe` and `wipe_bytes` are `pub(crate)`, so an integration test cannot reach them; this is
+/// where they are visible (wave-2 plan C-M3-T7, R4-M7). Run by `cargo test --lib secret_bytes`.
+/// No read through a pointer after a drop (that would be undefined behaviour): the wipe is checked
+/// on a live buffer.
+#[cfg(test)]
+mod secret_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn secret_bytes_wipe_zeroes_every_byte() {
+        let mut s = SecretBytes::from_vec(b"https://vault.example/MARKER".to_vec());
+        let ptr = s.0.as_ptr();
+        assert!(s.bytes().iter().any(|b| *b != 0), "the decoy: the bytes start non-zero");
+        s.wipe();
+        assert_eq!(s.0.len(), 28, "wipe keeps the length (it overwrites, it does not truncate)");
+        assert!(s.bytes().iter().all(|b| *b == 0), "a byte survived the wipe");
+        assert_eq!(s.0.as_ptr(), ptr, "the wipe reallocated instead of overwriting");
+    }
+
+    #[test]
+    fn secret_bytes_wipe_bytes_on_an_empty_slice_is_a_no_op() {
+        let mut empty: [u8; 0] = [];
+        wipe_bytes(&mut empty);
+        let mut s = SecretBytes::from_vec(Vec::new());
+        s.wipe();
+        assert!(s.bytes().is_empty());
+        let mut some = [7u8, 8, 9];
+        wipe_bytes(&mut some[1..]);
+        assert_eq!(some, [7, 0, 0], "wipe_bytes reached outside its slice");
+    }
+
+    /// The handback's bytes are exactly what it was given (the snapshot is the one writer).
+    #[test]
+    fn secret_bytes_link_handback_holds_its_bytes_unchanged() {
+        let h = LinkHandback::new(SecretBytes::from_vec(br#"{"links":[]}"#.to_vec()));
+        assert_eq!(h.bytes(), br#"{"links":[]}"#);
+        assert_eq!(StdinPayload::Links(h).bytes(), br#"{"links":[]}"#);
+    }
+
+    /// The private sealed types cannot be printed or serialised either (the integration probes reach
+    /// only the `pub` ones). Decoys both ways.
+    #[test]
+    fn secret_bytes_private_sealed_types_are_not_printable() {
+        use std::marker::PhantomData;
+        struct Probe<T>(PhantomData<T>);
+        trait NotDebug {
+            const IS_DEBUG: bool = false;
+        }
+        impl<T> NotDebug for Probe<T> {}
+        impl<T: std::fmt::Debug> Probe<T> {
+            #[allow(dead_code)]
+            const IS_DEBUG: bool = true;
+        }
+        struct SProbe<T>(PhantomData<T>);
+        trait NotSerialize {
+            const IS_SERIALIZE: bool = false;
+        }
+        impl<T> NotSerialize for SProbe<T> {}
+        impl<T: serde::Serialize> SProbe<T> {
+            #[allow(dead_code)]
+            const IS_SERIALIZE: bool = true;
+        }
+        struct Plain;
+        assert!(Probe::<String>::IS_DEBUG && !Probe::<Plain>::IS_DEBUG);
+        assert!(SProbe::<String>::IS_SERIALIZE && !SProbe::<Plain>::IS_SERIALIZE);
+        assert!(!Probe::<DetailsRead>::IS_DEBUG && !SProbe::<DetailsRead>::IS_SERIALIZE);
+        assert!(!Probe::<RawEvent>::IS_DEBUG && !SProbe::<RawEvent>::IS_SERIALIZE);
+        assert!(!Probe::<RawPerson>::IS_DEBUG && !SProbe::<RawPerson>::IS_SERIALIZE);
+        assert!(!Probe::<RawOtherNote>::IS_DEBUG && !SProbe::<RawOtherNote>::IS_SERIALIZE);
+        assert!(!Probe::<RawJoin>::IS_DEBUG && !SProbe::<RawJoin>::IS_SERIALIZE);
+        assert!(!Probe::<RawSource>::IS_DEBUG && !SProbe::<RawSource>::IS_SERIALIZE);
+        assert!(!Probe::<RawLink>::IS_DEBUG && !SProbe::<RawLink>::IS_SERIALIZE);
+        assert!(!Probe::<StdinPayload>::IS_DEBUG && !SProbe::<StdinPayload>::IS_SERIALIZE);
+    }
+}

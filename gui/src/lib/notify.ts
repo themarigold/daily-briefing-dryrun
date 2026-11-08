@@ -21,9 +21,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Os } from "./platform";
 
+/** The notification classes, as Rust's `NotifyClass::as_str` spells them (`src-tauri/src/notifications.rs`;
+ *  pinned member for member by `tests-web/notify.check.ts`). `out-of-usage` is provider fallback's
+ *  once-a-day "every provider is out of usage" notice (spec r9 §5, requirement 11). */
+export const NOTIFY_CLASSES = ["delivered", "failed", "blocked", "out-of-usage"] as const;
+export type NotifyClass = (typeof NOTIFY_CLASSES)[number];
+
 /** One suppressed firing, for the "a notification was withheld" line. */
 export interface Suppressed {
-  class: "delivered" | "failed" | "blocked";
+  class: NotifyClass;
   date: string;
   reason: "never-asked" | "disabled" | "engine-notifies" | "post-failed";
 }
@@ -121,7 +127,7 @@ export function engineNotifyLine(probe: EngineNotifyProbe): string {
         "nothing here — this app is the notifier.";
     case "invalid":
       return "The engine's configured notification setting is not one it accepts (it posts " +
-        "nothing) — this app is the notifier. The Settings form below can fix the value.";
+        "nothing) — this app is the notifier. Fix it in Settings → Advanced, under Notifications from the engine.";
     case "no-config":
       return "The engine has no config yet, so it posts nothing itself.";
     case "unreadable":
@@ -133,14 +139,27 @@ export function engineNotifyLine(probe: EngineNotifyProbe): string {
   }
 }
 
+/** What a withheld notification was about. An EXHAUSTIVE switch, no fall-through: a class added to
+ *  `NOTIFY_CLASSES` without its words fails `svelte-check` here (the old ternary read
+ *  `out-of-usage` as "failed"). */
+function withheldWhat(s: Suppressed): string {
+  switch (s.class) {
+    case "delivered":
+      return `Your briefing for ${s.date} arrived`;
+    case "failed":
+      return `A run on ${s.date} failed`;
+    case "blocked":
+      return `A run on ${s.date} was blocked`;
+    case "out-of-usage":
+      // Requirement 11: every provider was out of usage, so no briefing could be made yet. Not a
+      // failed run — the engine skips quietly and delivers once a limit resets.
+      return `On ${s.date} every provider was out of usage, so the briefing was waiting for a limit to reset`;
+  }
+}
+
 /** The one-line record of a withheld notification, newest last in `suppressed`. */
 export function suppressedLine(s: Suppressed): string {
-  const what =
-    s.class === "delivered"
-      ? `Your briefing for ${s.date} arrived`
-      : s.class === "blocked"
-        ? `A run on ${s.date} was blocked`
-        : `A run on ${s.date} failed`;
+  const what = withheldWhat(s);
   switch (s.reason) {
     case "never-asked":
       return `${what}, but notifications have not been enabled here yet.`;

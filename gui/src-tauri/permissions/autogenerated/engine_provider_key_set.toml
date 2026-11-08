@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-engine-provider-key-set"
+description = "Enables the engine_provider_key_set command without any pre-configured scope."
+commands.allow = ["engine_provider_key_set"]
+
+[[permission]]
+identifier = "deny-engine-provider-key-set"
+description = "Denies the engine_provider_key_set command without any pre-configured scope."
+commands.deny = ["engine_provider_key_set"]

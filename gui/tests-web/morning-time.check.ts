@@ -352,7 +352,10 @@ describe("the Settings field", () => {
       expect(formSubmission(draft, text, {})).toEqual({ kind: "save", text: JSON.stringify(draft, null, 2) });
     }
     const settings = readFileSync(new URL("../src/routes/Settings.svelte", import.meta.url), "utf8");
-    expect(settings).toContain('errors[field.id] = writeField(draft, field, value) ?? "";');
+    // Final round 3 (R3-M2): the answer is also what marks a refused field for its redraw — round 11 (M1): through the
+    // one decision, `fieldEdited`, which keeps that rule for every field but row 1's tool controls.
+    expect(settings).toContain("const refused = writeField(draft, field, value);");
+    expect(settings).toContain("const next = fieldEdited({ errors, redraw, tool: toolRows }, field, value, refused, noteStamp(draft, gesture));\n    errors = next.errors;\n    redraw = next.redraw;");
   });
 
   test("a dropdown change writes HH:MM; anything else is refused and changes nothing", () => {

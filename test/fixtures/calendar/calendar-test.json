@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "ranAt": "2026-10-14T08:45:03.120Z",
+  "sources": [
+    {
+      "id": "macos",
+      "kind": "macos",
+      "status": "ok",
+      "notices": [
+        "helper-outdated"
+      ],
+      "eventsToday": 6,
+      "durationMs": 1840
+    },
+    {
+      "id": "home",
+      "kind": "link",
+      "status": "ok",
+      "eventsToday": 3,
+      "durationMs": 412
+    },
+    {
+      "id": "work",
+      "kind": "link",
+      "status": "link-refused",
+      "eventsToday": null,
+      "durationMs": 230,
+      "reason": "http-refused"
+    },
+    {
+      "id": "team",
+      "kind": "link",
+      "status": "incomplete",
+      "notices": [
+        "identity-unknown"
+      ],
+      "eventsToday": 2,
+      "durationMs": 9870,
+      "reason": "unclear-time"
+    }
+  ],
+  "incomplete": true
+}

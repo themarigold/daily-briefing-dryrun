@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hardenedProvider } from "../src/harden";
 import { withRetry, withHardeningLadder } from "../src/provider";
-import { ProviderError } from "../src/types";
+import { ProviderError, LostLockError } from "../src/types";
 import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const fast = { probeMs: 3_000, flushMs: 150 };
@@ -408,4 +408,71 @@ echo "BARE-OK"
   // declines to act and lets the normal retry schedule handle the failure.
   expect(hp.runtimeWarnings.join(" ")).not.toMatch(/rejected an injected/i);
   expect(hp.hardeningActive()).toBe(true);
+});
+
+// ── P1-M3-T4: LostLockError always escapes, and the walk's two ladder options (provider fallback) ─────────
+
+/** A Laddered fake whose rungs are counted, and an error fast enough to engage the ladder. */
+function fakeLadder() {
+  const seen = { bare: 0, latched: 0 };
+  const hp = {
+    runtimeWarnings: [] as string[],
+    hardeningActive: () => true,
+    disableHardening: () => { seen.latched++; },
+    probeWithoutHardening: async <T>(fn: () => Promise<T>) => { seen.bare++; return fn(); },
+  };
+  const fastFail = () => { const e = new ProviderError("nonzero-exit", "fast"); e.durationMs = 10; return e; };
+  return { hp, seen, fastFail };
+}
+
+test("a LostLockError from rung 1 escapes the ladder with no option set", async () => {
+  const { hp, seen, fastFail } = fakeLadder();
+  let once = 0;
+  await expect(withHardeningLadder(hp, async () => { throw fastFail(); }, async () => { once++; throw new LostLockError(); }, 300_000))
+    .rejects.toBeInstanceOf(LostLockError);
+  expect([once, seen.bare]).toEqual([1, 0]);          // rung 2 never ran
+});
+
+test("a LostLockError from rung 2 escapes the ladder with no option set, and nothing is latched", async () => {
+  const { hp, seen, fastFail } = fakeLadder();
+  let once = 0;
+  await expect(withHardeningLadder(hp, async () => { throw fastFail(); }, async () => { once++; if (once === 1) throw fastFail(); throw new LostLockError(); }, 300_000))
+    .rejects.toBeInstanceOf(LostLockError);
+  expect([once, seen.bare, seen.latched]).toEqual([2, 1, 0]);
+});
+
+test("beforeRungs false skips both rungs and rethrows the original error; true lets them run", async () => {
+  const { hp, seen, fastFail } = fakeLadder();
+  const original = fastFail();
+  let once = 0, asked = 0;
+  await expect(withHardeningLadder(hp, async () => { throw original; }, async () => { once++; return "x"; }, 300_000, { beforeRungs: async () => { asked++; return false; } }))
+    .rejects.toBe(original);
+  expect([asked, once, seen.bare]).toEqual([1, 0, 0]);
+  expect(await withHardeningLadder(hp, async () => { throw fastFail(); }, async () => { once++; return "x"; }, 300_000, { beforeRungs: async () => { asked++; return true; } })).toBe("x");
+  expect([asked, once]).toEqual([2, 1]);
+});
+
+test("beforeRungs runs only after the existing gates passed: a slow failure never asks it", async () => {
+  const { hp } = fakeLadder();
+  const slow = new ProviderError("nonzero-exit", "slow"); slow.durationMs = 60_000;
+  let asked = 0;
+  await expect(withHardeningLadder(hp, async () => { throw slow; }, async () => "x", 300_000, { beforeRungs: async () => { asked++; return true; } })).rejects.toBe(slow);
+  expect(asked).toBe(0);
+});
+
+test("another non-ProviderError in a rung is rethrown with rethrowNonProviderErrors, and swallowed without it (today)", async () => {
+  for (const rung of [1, 2]) {
+    const bug = new TypeError(`bug in rung ${rung}`);
+    const mk = () => {
+      let n = 0;
+      const { hp, fastFail } = fakeLadder();
+      const original = fastFail();
+      const once = async (): Promise<string> => { n++; if (n === rung) throw bug; throw fastFail(); };
+      return { hp, original, once };
+    };
+    const a = mk();
+    await expect(withHardeningLadder(a.hp, async () => { throw a.original; }, a.once, 300_000, { rethrowNonProviderErrors: true })).rejects.toBe(bug);
+    const b = mk();
+    await expect(withHardeningLadder(b.hp, async () => { throw b.original; }, b.once, 300_000)).rejects.toBe(b.original);
+  }
 });

@@ -1,13 +1,12 @@
 # Installing daily-briefing
 
-Every download is on the [latest release](https://github.com/themarigold/daily-briefing/releases/latest)
+Every download is on the [latest release](https://github.com/norn-app/daily-briefing/releases/latest)
 page. Pick one row:
 
 | You have | Get | Section |
 | --- | --- | --- |
 | A Mac, and want the desktop app | `daily-briefing-<version>-darwin-arm64.dmg` (Apple silicon) or `daily-briefing-<version>-darwin-x64.dmg` (Intel) | [macOS: the desktop app](#macos-the-desktop-app) |
 | Linux (x86_64), and want the desktop app | `daily-briefing-<version>-linux-x86_64.AppImage`, or `daily-briefing_<version>_amd64.deb` for Debian and Ubuntu | [Linux: the AppImage](#linux-the-appimage), [Linux: the .deb](#linux-the-deb) |
-| Homebrew, and want the command-line tool | `brew install themarigold/tap/daily-briefing` | [Homebrew](#homebrew-macos-and-linux) |
 | Any platform, and want just the command-line tool | `daily-briefing-darwin-arm64`, `-darwin-x64`, `-linux-x64`, `-linux-arm64` or `-windows-x64.exe` | [The command-line binary](#the-command-line-binary) |
 | Windows | the command-line binary only, experimental | [Windows](#windows-command-line-binary-only-experimental) |
 
@@ -79,19 +78,14 @@ Two consequences are covered in [TROUBLESHOOTING](TROUBLESHOOTING.md):
 when a repository is in a protected folder such as Documents), whether to check GitHub for new versions
 (No by default), the morning time, and background delivery, which installs the scheduler that writes the briefing each morning. Its last step also asks
 whether the app should start when you log in (ticked by default; nothing is registered until you
-press Finish). To use the same engine
-from a terminal, open **Settings › This app › Command-line tool**; it links `daily-briefing` in
+press Finish). With an Anthropic API key you paste the key there and the app stores it for you (the
+Keychain on macOS, a private key folder elsewhere), never in the settings file; more providers, in
+order, are added later in **Settings › AI providers › Providers, in order**
+([In the desktop app](PROVIDERS.md#in-the-desktop-app)). If you have two or more providers and the
+background engine is older than the one that can move on to the next during a run, the Schedule screen
+says so ([Provider fallback](TROUBLESHOOTING.md#provider-fallback-skipped-not-tried-and-paused)). To use the same engine
+from a terminal, open **Settings › Advanced › The daily-briefing command in Terminal**; it links `daily-briefing` in
 `/usr/local/bin` to the engine copy the scheduler runs.
-
-## Homebrew (macOS and Linux)
-
-Homebrew installs the command-line tool, not the desktop app:
-
-```sh
-brew install themarigold/tap/daily-briefing
-daily-briefing init               # writes the config; see "First run" in the README
-daily-briefing schedule install   # optional: deliver it every morning
-```
 
 ## The command-line binary
 
@@ -100,8 +94,8 @@ silicon Mac (substitute your platform's asset name throughout), in `bash` or `zs
 is not POSIX `sh`):
 
 ```bash
-curl -fsSLO https://github.com/themarigold/daily-briefing/releases/latest/download/daily-briefing-darwin-arm64
-curl -fsSLO https://github.com/themarigold/daily-briefing/releases/latest/download/SHA256SUMS
+curl -fsSLO https://github.com/norn-app/daily-briefing/releases/latest/download/daily-briefing-darwin-arm64
+curl -fsSLO https://github.com/norn-app/daily-briefing/releases/latest/download/SHA256SUMS
 shasum -a 256 -c <(grep ' daily-briefing-darwin-arm64$' SHA256SUMS)     # verify before running
 chmod +x daily-briefing-darwin-arm64
 ./daily-briefing-darwin-arm64 init                    # writes the config template — edit it, then:
@@ -267,14 +261,24 @@ Uninstall does the first step itself.
    steps to finish by hand
    ([Removing the background scheduler by hand](TROUBLESHOOTING.md#removing-the-background-scheduler-by-hand)).
 2. **The program.**
-   - **Desktop app (macOS and Linux):** **Settings › This app › Uninstall** shows what it will do,
+   - **Desktop app (macOS and Linux):** **Settings › About & uninstall › Uninstall** shows what it will do,
      then removes, in this order: the background scheduler the app set up; the app's login item; with
      the first box ticked, the engine's data (your whole briefing archive and its log, and the
      background engine copy, which on Linux is `~/.local/share/daily-briefing/bin/daily-briefing`);
-     with the second box ticked, your settings (the API key file they name when it sits in the
-     settings folder, then `config.json` and its backup `config.json.bak`, then the folder itself if
-     that leaves it empty); and the app's own files. Both boxes are off by default. It usually takes
-     under a minute, and at most about two.
+     with the second box ticked, your settings and API keys (every API key file the settings name,
+     for any provider in the list, when it sits in the settings folder, then `config.json` and its
+     backup `config.json.bak`, then the folder itself if that leaves it empty); the app's own files;
+     and, with the second box ticked, last, the API keys the app stored (your login Keychain's
+     `daily-briefing.app-key` items on macOS, the state folder's `keys/` elsewhere). Both boxes are
+     off by default. It usually takes under a minute, and at most about two.
+     - The stored keys stay whenever the settings step is refused before it removes anything (a
+       scheduler still needs the settings, or the engine cannot say where they are), and when
+       **Uninstall anyway** keeps a scheduler that may still be running and its settings use, may
+       use, or cannot be checked for a key the app stored, and the settings step could not remove
+       `config.json` or its backup `config.json.bak` (once both are gone, that scheduler can read no
+       key, and the stored keys are removed). The last screen says so; run Uninstall again once the
+       scheduler is gone. A settings step that stops on a file error keeps them only in that second
+       case: with no such scheduler kept, the stored keys are still removed.
      - A scheduler the app did not set up (from the terminal, or with nothing recording who set it
        up) is removed only if you choose **Remove it**. **Keep it running** is preselected, and keeping
        it also keeps the engine's data and your settings, which that scheduler still needs.
@@ -289,14 +293,13 @@ Uninstall does the first step itself.
 
      Then remove the app itself: on macOS, move Daily Briefing from Applications to the Trash; on
      Linux, the .deb or AppImage step below.
-   - **The command-line link, if you made one** (**Settings › This app › Command-line tool**):
+   - **The command-line link, if you made one** (**Settings › Advanced › The daily-briefing command in Terminal**):
      Uninstall does not remove `/usr/local/bin/daily-briefing`, and once the engine copy is gone the
      link points at nothing. Remove it first with **Remove command-line tool** in the same place; when
      that needs administrator rights, the app shows the `sudo rm` command to run. If the app is already
      gone, `ls -l /usr/local/bin/daily-briefing` shows where the link points; when that is the engine
      copy (in the state folder on macOS, under `~/.local/share/daily-briefing/` on Linux), delete the
      link with `sudo rm /usr/local/bin/daily-briefing`.
-   - **Homebrew:** `brew uninstall daily-briefing`.
    - **The command-line binary:** delete the file you downloaded.
    - **The .deb:** `sudo apt remove daily-briefing`.
    - **The AppImage:** delete the `.AppImage` file.
@@ -310,6 +313,12 @@ Uninstall does the first step itself.
    The state folder holds your past briefings and the logs, and on macOS and Windows also the engine
    copy the scheduler ran. On Linux that copy is outside it, in `~/.local/share/daily-briefing/`
    (`$XDG_DATA_HOME`): delete that folder as well. Paths are in the table above.
+   - **Calendar links are secrets.** If you added [the calendar](CONFIG.md#calendar), the state folder's
+     `calendar/links/` holds each private calendar address. Deleting the files removes them from this
+     machine but does **not** revoke an address that may already have leaked: anyone who has it can still
+     read that calendar until you reset it at the provider — see the README's
+     [Today's calendar](../README.md#todays-calendar-optional-off-by-default) section ("If a link may
+     have leaked").
 
 ### A source checkout on macOS
 
@@ -344,6 +353,15 @@ key file. Removing it is the desktop app's settings box, or yours by hand (step 
 `bash scripts/uninstall.sh --remove-signing-identity` also deletes the `Daily Briefing (local) Signing`
 identity from your login keychain. It is opt-in, and it refuses while a schedule record still exists,
 because the scheduled engine is signed with that identity.
+
+`bash scripts/uninstall.sh --remove-keys` also deletes the API keys the app stores: every
+`daily-briefing.app-key` item in your login keychain, one at a time until none is left (at most 256), then
+the state folder's `keys/` folder. It is opt-in, and runs only once the scheduler is dealt with, like the
+rest. Your own key sources — an `apiKeyFile` elsewhere, an item under your own service name, a literal in
+the settings — are left alone: the script never reads your settings. If your keychain is **locked**, macOS
+asks to unlock it and the script waits for your answer; see
+[the locked-Keychain remedy](TROUBLESHOOTING.md#macos-a-locked-keychain). A failure is a `WARN` and a
+non-zero exit, and the files are removed either way. Both flags can be given together.
 
 > **Upgrading from a pre-StartInterval build?** An early build used a repeating `pmset` wake for
 > delivery (since replaced by the interval agent). If you ran that, an orphaned daily wake may still be

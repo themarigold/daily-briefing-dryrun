@@ -9,14 +9,18 @@ import { discoverRepos, DEFAULT_BUDGET, DEFAULT_NETWORK_PROBE_HOSTS, repoLabel, 
 import { shaPrefixMatch } from "./sha";
 import { gitActivity, mapLimit, REPO_SCAN_CONCURRENCY, type RepoProbe } from "./extractor";
 import { reduce } from "./reduce";
-import { generateBriefing, norm, countPipelessRecapEvidence } from "./generator";
+import { generateBriefing, hasBriefingSection, norm, countPipelessRecapEvidence } from "./generator";
 // The output-side DIAGNOSTICS, called near the foot of `runCore`. They live at this layer — not in
 // `generateBriefing` — because the struct is not final until this file stops writing to it.
 import { checkResumeFreshness, checkSuggestionRestatement, checkSuggestionVolume, type PostFinding } from "./postcheck";
 import { diagError } from "./diag";
 import { parseFloor } from "./schedule";
-import { resolveAccount, effectiveAccounts, loadAccountState, recordLimit, recordAuthProbe, clearMark, parseResetInstant, outageReport } from "./account";
-import { withRetry, withHardeningLadder, TIMEOUT_MS } from "./provider";
+import { loadAccountState, recordLimit, recordHourMark, clearMark, parseResetInstant, outageReport, markFor, markFilter, HOUR_MARK_REASONS, type AccountState, type HourMarkReason } from "./account";
+import { FAILOVER_REASONS, aggregateFailureMessage, failoverReason, isRetryableFailure, noticeLines, safeLabel, type EntryKind, type FailoverReason } from "./failover";
+import { observeRun, pruneStatus, quickCheckActive, readProviderStatus, writeProviderStatus, type LabelRecord } from "./providerStatus";
+import { appKeyOverCleartext, droppedLabel, entryRevision, listOrder, resolveProviderList, walkProbeHosts, type ListEntry, type ProviderList } from "./providerList";
+import { withRetry, withEntryRetry, withHardeningLadder, defaultTimeoutMs } from "./provider";
+import { apiAttemptBoundMs, cliAttemptBoundMs } from "./attemptBounds";
 import { type HardenedProvider } from "./harden";
 import { buildProvider, providerLabel } from "./providerFactory";
 import { deriveProbeHosts } from "./providers/endpoint";
@@ -45,12 +49,8 @@ import { appendFile } from "node:fs/promises";
 // Tier B (Stage-2 recap campaigns). The phase module never imports this file (plan §2 / D17; pinned by
 // test/recap-campaigns.imports.test.ts), so this edge cannot close a cycle.
 import { runRecapCampaignsPhase } from "./recapCampaignsPhase";
-import { branchWords, type RecapImpl } from "./recapCampaigns";
-import { REDACTION } from "./transcripts/credentials";
-
-/** A PR branch as a printed `🔀 Merged` line shows it: verbatim, unless `branchWords` — Stage 2's
- *  any-case, before-and-after-the-strip credential decision — redacts it, in which case all of it. */
-const shownBranch = (branch: string): string => (branchWords(branch) === REDACTION ? REDACTION : branch);
+import { shownBranch, type RecapImpl } from "./recapCampaigns";
+import { recordCommitsFor, type RecordCommits } from "./runRecord";
 import { claudeShaped } from "./harden";
 import { scanTranscripts } from "./transcripts/scan";
 import { whySourceFor } from "./transcripts/join";
@@ -61,13 +61,37 @@ export const TRANSCRIPT_READ_MARGIN_MS = 24 * 3_600_000;
 import { isInaccessible, warnFor, type PathIssue, type GuardOpts } from "./protectedPath";
 import { countedIssues, discoveryBlocked, discoverySummary } from "./discoverySummary";
 import { uncommittedFileList, isBranchNotable } from "./git";
-import { ProviderError, type DoneItem, type Provider, type BriefingStruct, type Activity, type Config, type ReducedContext } from "./types";
+import { LostLockError, ProviderError, type Attempt, type DoneItem, type Provider, type BriefingStruct, type Activity, type Config, type PromptVariant, type ReducedContext } from "./types";
+import { redactCredentials } from "./transcripts/credentials";
+import type { CapturedCalendar } from "./summary/input";
 import { resolveUnits, unitForCommit, unitForFiles, repoLabelFor, rootsForRepo, unitKey, subprojectLegend, INFRA_DENYLIST, labelBoundary, type Unit } from "./subprojects";
-import { resolveProbeHosts, waitForNetwork, defaultNetProbe, realSleep } from "./net";
+import { resolveProbeHosts, waitForNetwork, defaultNetProbe, realSleep, type ProbeHost } from "./net";
 import { isFullyAwake } from "./power";
+import { resolveCalendar, type ResolvedCalendar } from "./calendar/config";
+import { CALENDAR_STEP_WORST_MS, calendarFailedResult, createCalendarStep } from "./calendar/pipeline";
+import type { CalendarStep, CalendarStepContext, CalendarStepResult } from "./calendar/step";
 
 export type RunDeps = {
   provider?: Provider;   // default: hardenedProvider(cfg.provider, …) — which wraps a BYOCliProvider
+  /** Provider fallback (P1-M3-T5): the exec an API provider's key command runs through (`resolveApiKey`'s
+   *  `exec`), handed to every `buildProvider` call. Tests whose config holds an app-owned key command inject
+   *  it, so no test reaches the real Keychain tool; production leaves it unset. */
+  keyExec?: typeof import("./proc").run;
+  /** TEST seam (P3-M1-T0): the filesystem the key ladder's KEY-FOLDER test runs on (`resolveApiKey`'s `keyFileFs` — a
+   *  stalled mount, held until released), handed to every `buildProvider` call as `keyExec` is. Production leaves it
+   *  unset: `fs/promises`. */
+  keyFileFs?: import("./strictFile").AsyncFsOps;
+  /** Provider fallback (P1-M8-T1, spec r9 §5 Run lock): the LOCK-ONLY ownership check (`stillOwns`), which `run()`
+   *  passes for a created or reclaimed lock and never for a fail-open one. The walk awaits it inside the attempt
+   *  closure (so every retry and rung is covered), before each mark and status write, and — as the hardened
+   *  provider's `beforeSpawn` — before each internal respawn. `false` throws `LostLockError`. Absent ⇒ no check. */
+  lockStillHeld?: () => Promise<boolean>;
+  /** Provider fallback (P1-M8-T1): lock ownership AND the day marker, re-checked right after the walk, before the
+   *  grouper call and the recap append. `false` ends `runCore` with the quiet `lostLock` result. Absent ⇒ no check. */
+  verifyOwnership?: () => Promise<boolean>;
+  /** TEST seam (P1-M6-T3): overrides the per-attempt deadline (`attemptDeadlineMs`), whose real values are seconds to
+   *  minutes. Production leaves it unset. */
+  attemptDeadlineMs?: number;
   guard?: GuardOpts;     // §5.11 classification injection (tests)
   probe?: RepoProbe;     // repo-readability probe (tests)
   retryDelaysMs?: number[];              // transient-provider retry schedule (tests inject short ones)
@@ -123,6 +147,18 @@ export type RunDeps = {
   recapCallDeadlineMs?: number;
   recapGitBudgetMs?: number;
   recapImpl?: Partial<RecapImpl>;
+  /** v0.3.0 calendar (plan M4 — spec r4 §3): THE CALENDAR STEP's seam (the `scan` pattern). Unset ⇒ the production
+   *  step for `cfg.calendar` (`createCalendarStep`, src/calendar/pipeline.ts) when the block resolves enabled, and NO
+   *  step at all otherwise — so with calendar off nothing runs and the prompt, the struct and the provider call are
+   *  byte-identical to before (test/calendar-off.golden.test.ts). Tests and the calendar eval inject one; whatever it
+   *  does — returns, throws, never resolves — `runCore` bounds it (`CALENDAR_STEP_WORST_MS`) and the briefing is
+   *  delivered with its exit code and stamp unchanged. */
+  calendar?: import("./calendar/step").CalendarStep;
+  /** Which trigger this run is, for the calendar health record (spec §3 "Health": written with the trigger, and the
+   *  app shows the last SCHEDULED read). `main.ts` sets it; absent ⇒ "manual" (never claim a scheduled read). */
+  calendarTrigger?: "scheduled" | "manual";
+  /** TEST seam: the outer bound `runCore` races the calendar step against. Production: CALENDAR_STEP_WORST_MS. */
+  calendarBoundMs?: number;
 };
 
 // The launchd 7:20 job coalesces to fire the moment a slept-through-7:20 laptop wakes — often
@@ -703,13 +739,27 @@ export type CoreResult = {
   /** Set whenever `skipReason === "limited"`. `until` is what the shell prints; `isProbe` says whether
    *  it is a PARSED reset or merely a probe deadline — the message may only say "resets at…" for the
    *  former, because a probe deadline is a one-hour guess the system explicitly does not trust. */
-  /** `exhausted` says whether ANY account remains selectable after this tick's mark — it is the
-   *  difference between "the fallback delivers in ten minutes" and "there is nothing left until the
-   *  reset", and the shell states one or the other. It is COMPUTED (re-resolved against the state as
-   *  written), never assumed: until 2026-08-24 the shell asserted "no other account is available" as a
-   *  hardcoded literal, so the live failover test printed it while the fallback sat unmarked and ready. */
-  limited?: { label: string; until: string; isProbe: boolean; exhausted: boolean };
+  /** Provider fallback (P1-M7-T2, spec r9 §5 step 7 row 1): `exhausted` is now ALWAYS true — a wall with another
+   *  entry left hands off in the same tick, so "the next tick will use another account" is never true and is retired.
+   *  `allOutOfUsage` is set exactly when EVERY entry was benched by, or failed with, `usage`: then `until` is the
+   *  earliest PARSED reset (its own entry's `label`), and `isProbe` is true when any involved usage mark is unparsed. */
+  limited?: { label: string; until: string; isProbe: boolean; exhausted: true; allOutOfUsage?: true };
+  /** Provider fallback (P1-M7-T2, step 7 row 3 with nothing tried): every entry is benched and at least one by an hour
+   *  mark. `until` is the earliest hour-mark end. `main.ts` writes it as the `provider-fail` skip (P1-M7-T3). */
+  paused?: { until: string };
+  /** Provider fallback (P1-M8-T1): set when `verifyOwnership` failed right after the walk — another run holds the lock
+   *  (or the day was stamped). No briefing, no grouper, no recap record; `main.ts` exits quietly (P1-M8-T2). */
+  lostLock?: true;
+  /** Provider fallback (P1-M7-T2, spec r9 §5 "Reporting"): one element per combined-list entry, in list order (a
+   *  dropped entry in its `fallbacks` position). Absent with an injected provider. */
+  attempts?: Attempt[];
   offlineSkipped: boolean;                       // scheduled run, still offline after the grace → provider NOT called; shell returns 0, no stamp
+  /** v0.3.0 calendar: `resolveCalendar`'s fixed-text config warnings (spec §2), present only when there are any.
+   *  ⚠ KEPT OUT OF `warnings` — which is `struct.warnings`, the rendered `⚠` line — on purpose: `audit.coverageGaps`
+   *  scores that line, and a warning that says "calendar" would count as mentioning a repo or unit NAMED `calendar`
+   *  (M4 brief). The shell prints them to stderr with the others, the envelope carries them in its `warnings`
+   *  (`envelopeFrom`), and `calendar status --json`, `config validate` and `doctor` report them. */
+  calendarWarnings?: string[];
   net: { online: boolean; waitedMs: number } | null; // net-gate outcome; null when the gate wasn't reached (empty/blocked)
   struct: BriefingStruct; rawText: string;      // rawText = "" when emptyWindow (contract: model output only)
   promptText: string;                            // "" when emptyWindow
@@ -722,7 +772,8 @@ export type CoreResult = {
    *  the `whys` projection can read it. Absent when the feature is off or degraded to git-only. */
   transcripts?: import("./transcripts/scan").TranscriptEvidence;
   /** The account label that actually produced this briefing, on the SUCCESS path. Set only when
-   *  `provider.accounts` is configured: on a single-account machine there is no choice to record, and
+   *  `provider.accounts` is configured or the combined list has two or more entries (`fallbacks`): on a
+   *  single-entry machine with no `accounts` there is no choice to record, and
    *  logging the synthesised "default" every morning would add a line to briefing.log for nothing.
    *  Exists because the 2026-08-24 live failover test had no way to prove which account had delivered
    *  except the mtime of a session directory under the fallback's config dir — incidental evidence
@@ -741,7 +792,101 @@ export type CoreResult = {
    *  was ever built — so there is no "what the model was shown" to report. `undefined` says that;
    *  `[]` would falsely claim "the model was shown nothing today". G7 treats both as no-op. */
   todaySuppress?: DoneItem[];
+  /** B1-M1-T3 (wave 2): the page's own commit lists for the run record (`src/runRecord.ts`): every window
+   *  commit with its label and repo, and `recapCoverage`'s `missing`. Set ONLY on the return that carries a
+   *  generated struct; absent on every other (the skip returns), so no record is built for a run that wrote
+   *  no page. Never reaches `run --json`: `envelopeFrom` picks its fields one by one. */
+  recordCommits?: RecordCommits;
+  /** A2-M3-T8: what the post-delivery AI summary needs from this run. Set only on the return that carries a generated
+   *  struct, and only when this run built the transport that won: absent with an injected main provider and on a quiet
+   *  day, when no provider ran. Holds provider config, so it stays private: `envelopeFrom` picks its fields one by one. */
+  summarySeed?: SummarySeed;
 };
+
+/** The entry that produced the page. Read from the walk's `Winner`, never from `CoreResult.account`, which is
+ *  conditional. `timeoutMs` is the walk's own value for the entry: item 1's configured timeout (absent when its block
+ *  sets none), and for a fallback always a number, its configured timeout or the transport default. */
+export type SummaryWinnerDescriptor = {
+  provider: Config["provider"];
+  configDir?: string;
+  timeoutMs?: number;
+};
+export type SummarySeed = {
+  winner: SummaryWinnerDescriptor;
+  /** Whether the winning attempt's last send was the locked calendar variant. */
+  morningLocked: boolean;
+  /** The same morning snapshot's redacted unlocked block; `null` when it had none. */
+  calendarCapture: CapturedCalendar;
+};
+
+// `walkProbeHosts` lives in providerList.ts (PR 1 final review round 1, M10: doctor reuses it); re-exported here.
+export { walkProbeHosts } from "./providerList";
+
+/** The entries an offline SCHEDULED tick may still run (spec r9 §5 step 3): the leading loopback entries of the
+ *  eligible list — a local model's failure says nothing about the network — and, from 60 minutes past the morning
+ *  time, every loopback entry, in order. Online, or forced, every eligible entry. */
+export function permittedEntries<E extends { isLoopback: boolean }>(
+  eligible: readonly E[], online: boolean, force: boolean, nowLocalMinutes: number, floorMinutes: number,
+): E[] {
+  if (online || force) return [...eligible];
+  if (nowLocalMinutes >= floorMinutes + 60) return eligible.filter((e) => e.isLoopback);
+  const lead: E[] = [];
+  for (const e of eligible) { if (!e.isLoopback) break; lead.push(e); }
+  return lead;
+}
+
+/** Whether a failover reason is one of the hour-mark reasons (the table's "1 h" rows). */
+function isHourMarkReason(r: FailoverReason): r is FailoverReason & HourMarkReason {
+  return (HOUR_MARK_REASONS as readonly string[]).includes(r);
+}
+
+/** The stand-in `provider` for an entry refused before it was built: never called (the walk throws first), and it
+ *  carries no runtime warnings. */
+const REFUSED_PROVIDER: Provider & { runtimeWarnings: string[] } = {
+  runtimeWarnings: [],
+  generate: async () => { throw new ProviderError("missing-binary", "this entry was refused before it was built"); },
+};
+
+/** One attempt's deadline (spec r9j §5 step 4, hub Q24): an attempt's whole worst case, so it never cuts one that
+ *  today's code would settle — for a CLI entry the key bound, the `--help` probe and its flush, and two spawns each
+ *  bounded by timeout + kill grace + post-exit flush (`cliAttemptBoundMs`, mirroring `recapCallDeadlineMs`); for an API
+ *  entry the key bound, the timeout and a measured transport margin. It fires only on what those bounds cannot see —
+ *  a key read stalled on a dead mount, a runner that never settles. Raced only for owned entries of a combined list of
+ *  two or more (see the attempt closure). */
+export function attemptDeadlineMs(entry: ListEntry): number {
+  const bound = entry.provider.api === undefined ? cliAttemptBoundMs(entry.timeoutMs) : apiAttemptBoundMs(entry.timeoutMs);
+  // Clamped to the largest delay a timer accepts (L1; the proc.ts precedent): past 2^31 - 1 ms, `setTimeout` fires
+  // at once, which would cut every attempt of an entry configured with a huge timeout.
+  return Math.min(bound, MAX_TIMER_MS);
+}
+/** The largest delay `setTimeout` honours; anything above it fires immediately. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** The provider-cost line for a winner, CHOSEN here and rendered with the notices (P1-M9-T3); a list of two or
+ *  more only, so a single-entry briefing is unchanged. An API entry that is not a local model bills its key; a CLI
+ *  given `credential: "env-api-key"` bills the environment's key. Fixed text plus the entry's label only. */
+export function costLine(entry: ListEntry): string | undefined {
+  if (entry.provider.api !== undefined) {
+    return entry.isLoopback ? undefined : `Generated using "${safeLabel(entry.label)}" — API charges may apply.`;
+  }
+  // The wording is the spec's notice line (r9 §5 "Line wording", without its `NOTICE_PREFIX`), P1-M7-T2.
+  return entry.provider.credential === "env-api-key"
+    ? `Generated using "${safeLabel(entry.label)}" — API charges may apply.`
+    : undefined;
+}
+
+/** An app-owned key (`isAppOwnedKey`) must never travel in cleartext (spec r9 §5 step 4, §6): a non-loopback `http:`
+ *  endpoint is refused BEFORE the key is resolved, so nothing is read and nothing is sent. Item 1 included. */
+export function insecureEndpoint(entry: ListEntry): ProviderError | undefined {
+  // The one composition (`appKeyOverCleartext`, src/providerList.ts — B5): the endpoint FIRST (PR 1 final review round
+  // 2, L3), so only a non-loopback `http:` entry — the one case the rule refuses — pays the ownership stat and `keys/`
+  // walk; an https entry never does, every tick.
+  const u = appKeyOverCleartext(entry);
+  if (u === undefined) return undefined;
+  const e = new ProviderError("missing-binary", `${safeLabel(entry.label)}: refused to send an app-owned API key over plain http to ${u.host} — use https`);
+  e.failCause = "insecure-endpoint";
+  return e;
+}
 
 /** The pure pipeline: cfg + injected deps → the computed briefing struct (+ raw model text/context).
  *  Does NO render/write/stamp I/O and makes NO exit-code decisions — run() (the shell) owns those. */
@@ -778,10 +923,11 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // model does not wait 25s for two unreachable hosts before every briefing. `undefined` from the
   // derivation means "no opinion" (an unparseable endpoint), which keeps the anycast default rather
   // than silently disabling the gate on a typo. An explicit config value, `[]` included, still wins.
-  const { hosts: probeHosts, warning: probeWarning } = resolveProbeHosts(
-    cfg.networkProbeHosts,
-    (cfg.provider.api !== undefined ? deriveProbeHosts(cfg.provider.api) : undefined) ?? DEFAULT_NETWORK_PROBE_HOSTS,
-  );
+  // Provider fallback (P1-M6-T1): the combined list is resolved here, before the probe hosts are, because a list of
+  // two or more probes each remote API entry's endpoint too (`walkProbeHosts`). Its warnings are pushed where the
+  // accounts warnings always were, after the empty-window return. A single-entry list keeps today's derivation.
+  const list = resolveProviderList(cfg, homedir());
+  const { hosts: probeHosts, warning: probeWarning } = walkProbeHosts(cfg, list);
   if (probeWarning) warnings.push(probeWarning);
   // §3.6 requires a malformed `transcripts` block to degrade "with a config-blaming warning" at the
   // consumer boundary. Found at C1 with no reader at all: config.ts produced this warning and nothing
@@ -797,12 +943,29 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // `verdictPaths`: a malformed key's warning reaches the struct on every path, and B stays `off`.
   const recapCfg = resolveRecapCampaigns(cfg.recapCampaigns);
   if (recapCfg.warning) warnings.push(recapCfg.warning);
+  // v0.3.0 calendar (spec §2/§3): resolved up front like the blocks above, but its warnings go to
+  // `CoreResult.calendarWarnings`, NOT onto `warnings` (= the rendered ⚠ line) — see that field. The step is the
+  // injected seam, else the production step when the block resolves enabled, else none (calendar off: nothing runs).
+  const calCfg = resolveCalendar(cfg.calendar);
+  const calExtra: { calendarWarnings?: string[] } = calCfg.warnings.length ? { calendarWarnings: [...calCfg.warnings] } : {};
+  const calMaxChars = (cfg.tokenBudget ?? DEFAULT_BUDGET).maxChars;
+  const calendarStep: CalendarStep | undefined = deps.calendar
+    ?? (calCfg.enabled ? createCalendarStep(calCfg, { stateDir: supportDir(), maxChars: calMaxChars }) : undefined);
+  const calendarCtx = (startedAt: number, online: boolean): CalendarStepContext => ({
+    runDate, startedAt, offline: !online, force, owned: deps.provider === undefined, trigger: deps.calendarTrigger ?? "manual",
+  });
+  const runCalendar = (c: CalendarStepContext): Promise<CalendarStepResult | undefined> =>
+    calendarStep === undefined ? Promise.resolve(undefined)
+      : boundCalendarStep(calendarStep, c, calCfg, calMaxChars, deps.calendarBoundMs ?? CALENDAR_STEP_WORST_MS);
   // A4 — transcripts require a claude-shaped CLI, as PRODUCT SCOPE (transcript support is for Claude
   // Code users). The predicate is a filename check and cannot see a proxy; that residual is stated in
   // §3.4, not solved here. A silent no-op would be the worse failure: the user enabled a feature and
   // would never learn why nothing appeared.
-  if (tx.enabled && !claudeShaped(cfg.provider.cli)) {
-    warnings.push(`transcripts.enabled is set, but "${cfg.provider.cli}" is not a Claude Code CLI — transcript evidence is off for this run.`);
+  // Provider fallback (P1-M6-T2): for a list of two or more this moves AFTER the walk and applies only to a non-Claude
+  // CLI WINNER (`notClaudeWarning` below); a single entry keeps it here, where it has always been.
+  const notClaudeWarning = (cli: string) => `transcripts.enabled is set, but "${cli}" is not a Claude Code CLI — transcript evidence is off for this run.`;
+  if (tx.enabled && list.entries.length < 2 && !claudeShaped(cfg.provider.cli)) {
+    warnings.push(notClaudeWarning(cfg.provider.cli));
   }
 
   // (Wake-schedule drift removed with the pmset-wake mechanism — PR #81 replaced RTC-wake scheduling
@@ -881,7 +1044,11 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // Computed BEFORE the provider call and applied to every struct this function can return: the
   // empty-window and blocked paths build their own structs and still get rendered and written, so a
   // recovery day that happens to be an empty-window day must still carry the line.
-  const outage = outageReport(await readLastRunDate(), (await loadAccountState()).lastLimit, clockNow());
+  // The label through `safeLabel` (round 2 L1): the walk records limits for fallback labels too, and the outage line
+  // reaches the struct, both renderers and the envelope. An ordinary label is unchanged. Masked HERE, at the source,
+  // and never in render.ts (round 3 R0): the renderer must commute with redaction (test/envelope-redaction.test.ts).
+  const outageRaw = outageReport(await readLastRunDate(), (await loadAccountState()).lastLimit, clockNow());
+  const outage = outageRaw ? { ...outageRaw, label: safeLabel(outageRaw.label) } : outageRaw;
   const mkStruct = (provider: string): BriefingStruct => ({
     date: runDate, machineScope: hostname(), provider, resume: [], recap: [], suggestions: [], today, windowMerges: windowMergeLines, stateAsOf, morningFloor, warnings,
     ...(outage ? { outage } : {}),
@@ -921,10 +1088,39 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     const summary = discoverySummary(counted, { noRepos: repos.length === 0, home: homedir() });
     if (summary !== undefined) warnings.push(summary);
     const empty = mkStruct("(no window activity)");
+    const quietExtra = summary !== undefined ? { discoverySummary: summary } : {};
+    // v0.3.0 calendar on an EMPTY DAY (spec §3) — never on a BLOCKED run, which never renders and is left exactly as
+    // it was. The calendar is code-rendered and needs no AI call, so the quiet day still shows it; but it reads the
+    // network, so this path first takes the busy day's two gates: the darkwake gate (a darkwake skips without
+    // stamping), then the machine-level network probe. Offline WITH links ⇒ the step says skip without stamping,
+    // so a later tick retries — except under --force. The step's bound starts when the probe resolves.
+    if (!blocked && calendarStep !== undefined) {
+      if (!force && !(await isFullyAwake(deps.powerPlatform, deps.powerProbe))) {
+        return {
+          emptyWindow, blocked, discoveryBlocked: discBlocked, offlineSkipped: true, skipReason: "darkwake",
+          net: null, struct: mkStruct("(skipped: darkwake)"), rawText: "", promptText: "",
+          ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra, ...quietExtra,
+        };
+      }
+      const qnet = await waitForNetwork(deps.netProbe ?? defaultNetProbe(probeHosts), deps.sleep ?? realSleep, deps.netGraceMs, deps.netPollMs);
+      const cal = await runCalendar(calendarCtx(Date.now(), qnet.online));
+      if (cal?.skipOffline === true) {
+        return {
+          emptyWindow, blocked, discoveryBlocked: discBlocked, offlineSkipped: true, skipReason: "offline",
+          net: qnet, struct: mkStruct("(skipped: offline)"), rawText: "", promptText: "",
+          ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra, ...quietExtra,
+        };
+      }
+      if (cal !== undefined) empty.calendar = cal.struct;
+      return {
+        emptyWindow, blocked, discoveryBlocked: discBlocked, offlineSkipped: false, net: qnet, struct: empty, rawText: "", promptText: "",
+        ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra, ...quietExtra,
+      };
+    }
     return {
       emptyWindow, blocked, discoveryBlocked: discBlocked, offlineSkipped: false, net: null, struct: empty, rawText: "", promptText: "",
-      ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
-      ...(summary !== undefined ? { discoverySummary: summary } : {}),
+      ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
+      ...quietExtra,
     };
   }
 
@@ -951,22 +1147,106 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // still produces the recovery outage line — that half is genuinely transport-agnostic and is the one
   // failure mode API users will actually hit.
   const acc = resolveAccounts(cfg.provider.api !== undefined ? undefined : cfg.provider.accounts, homedir());
-  for (const w of acc.warnings) warnings.push(w);
+  // Provider fallback (P1-M6): the combined list's warnings are `resolveAccounts`' (the list reads item 1's logins
+  // through it), plus any `provider.label` and dropped-fallback warnings — so a single-entry config's are unchanged.
+  for (const w of list.warnings) warnings.push(w);
   const accountState = await loadAccountState();
-  const account = resolveAccount(acc.accounts, accountState, clockNow());
+  const item1Label = list.entries[0]!.label;
+  // ── Step 0 (spec r9 §5): the marks, BEFORE any gate. `markFilter` is the walk's reading: an hour mark on the
+  // current item 1 is ignored (it stays in the file); a usage mark still benches it. With an injected provider the
+  // walk is a single entry — the first eligible one — and nothing is ever recorded (see `owned`).
+  const owned = deps.provider === undefined;
+  /** The ownership check (P1-M8-T1): throws `LostLockError` once `lockStillHeld` says the lock is gone. A plain `Error`,
+   *  so the retry wrappers and both ladder rungs rethrow it and the walk stops at once. */
+  const assertOwned = async (): Promise<void> => {
+    if (deps.lockStillHeld !== undefined && !(await deps.lockStillHeld())) throw new LostLockError();
+  };
+  const filtered = markFilter(list.entries, accountState, clockNow(), item1Label);
+  const eligible: ListEntry[] = owned ? filtered.eligible : filtered.eligible.slice(0, 1);
 
-  // No usable account: every configured login is walled off (or the single implicit one is). Skip
-  // WITHOUT constructing a provider or spawning anything — this is a known wall, not an error, so it
-  // takes the same quiet `return 0` path the offline/darkwake skips take rather than the error path,
-  // which would print a failure line every 600s for the length of the outage.
-  if (!account) {
+  /** Every tried entry's outcome, in walk order (P1-M7-T1). `attempts`, the notices and the step 7 rows read it. */
+  const tried: { entry: ListEntry; at: Date; reason?: FailoverReason; error?: ProviderError }[] = [];
+  /** The usage marks this walk wrote, as written (kept in memory: `recordLimit` is non-fatal, and the limited result
+   *  must not depend on whether the write landed — P1-M5 checkpoint). */
+  const usageMarks: { label: string; until: Date; isProbe: boolean }[] = [];
+  /** `CoreResult.attempts` (spec r9 §5 Reporting): one element per combined-list entry in list order, each dropped
+   *  entry in its `fallbacks` position (a whole-list drop last). Owned walks only — absent with an injected provider.
+   *  A winner whose answer had no briefing section is `failed` / `unusable-answer` (step 7 row 2). */
+  const attemptsOf = (wonBy?: ListEntry, wonUnusable = false): Attempt[] | undefined => {
+    if (!owned) return undefined;
+    return listOrder(list).map((item): Attempt => {
+      if ("dropped" in item) return { label: droppedLabel(item.dropped), kind: "invalid", outcome: "dropped", reason: item.dropped.reason };
+      const e = item.entry;
+      const base = { label: e.label, kind: e.provider.api?.kind ?? "cli" };
+      const t = tried.find((x) => x.entry === e);
+      const sk = filtered.skipped.find((x) => x.entry === e);
+      const um = usageMarks.find((m) => m.label === e.label);
+      const a: Attempt = e === wonBy
+        ? (wonUnusable ? { ...base, outcome: "failed", reason: "unusable-answer" } : { ...base, outcome: "won" })
+        : t !== undefined
+          ? { ...base, outcome: "failed", ...(t.reason !== undefined ? { reason: t.reason } : {}),
+              ...(t.error?.httpStatus !== undefined ? { httpStatus: t.error.httpStatus } : {}),
+              ...(t.reason === "usage" && um !== undefined ? { until: um.until.toISOString() } : {}) }
+          : sk !== undefined
+            ? { ...base, outcome: "skipped-by-mark", reason: sk.reason, until: sk.until }
+            : { ...base, outcome: "not-reached" };
+      return a;
+    });   // `listOrder` (shared with the status rows, L8): list order, dropped entries in position
+  };
+  /** Step 7 row 1 (spec r9 §5): when EVERY entry was benched by, or failed with, `usage`, the `limited` payload — the
+   *  earliest PARSED reset with its own label (label and until always from the same entry, the 2026-08-24 rule), else
+   *  the earliest deadline; `isProbe` true when any involved usage mark is unparsed. Undefined for any other state. */
+  const outOfUsage = (): NonNullable<CoreResult["limited"]> | undefined => {
+    const involved: { label: string; until: string; isProbe: boolean }[] = [];
+    for (const e of list.entries) {
+      const um = usageMarks.find((m) => m.label === e.label);
+      const t = tried.find((x) => x.entry === e);
+      if (um !== undefined && t?.reason === "usage") { involved.push({ label: e.label, until: um.until.toISOString(), isProbe: um.isProbe }); continue; }
+      const sk = filtered.skipped.find((x) => x.entry === e);
+      if (t === undefined && sk?.reason === "usage") {
+        involved.push({ label: e.label, until: sk.until, isProbe: accountState.accounts[e.label]?.isProbe ?? true });
+        continue;
+      }
+      return undefined;
+    }
+    if (involved.length === 0) return undefined;
+    const byTime = (a: { until: string }, b: { until: string }) => Date.parse(a.until) - Date.parse(b.until);
+    const parsed = involved.filter((m) => !m.isProbe).sort(byTime);
+    const pick = parsed[0] ?? [...involved].sort(byTime)[0]!;
+    return { label: pick.label, until: pick.until, isProbe: involved.some((m) => m.isProbe), exhausted: true, allOutOfUsage: true };
+  };
+
+  // No eligible entry: every entry is benched by a mark. Skip WITHOUT constructing a provider or spawning
+  // anything — this is a known wall, not an error, so it takes the same quiet `return 0` path the offline/darkwake
+  // skips take rather than the error path, which would print a failure line every 600s for the length of the outage.
+  if (eligible.length === 0) {
+    // Provider fallback (P1-M7-T2, spec r9 §5 step 7): nothing was tried, so row 1 (every mark is usage) is today's
+    // quiet `limited` skip with `allOutOfUsage`, and any hour mark makes it row 3 "paused" until the earliest hour-mark
+    // end. An injected provider keeps today's result below exactly.
+    if (owned) {
+      const usage = outOfUsage();
+      const attempts = attemptsOf()!;
+      if (usage === undefined) {
+        const hourEnds = filtered.skipped.filter((x) => x.reason !== "usage").map((x) => x.until).sort((a, b) => Date.parse(a) - Date.parse(b));
+        return {
+          emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: false, paused: { until: hourEnds[0]! }, attempts,
+          net: null, struct: mkStruct("(skipped: paused)"), rawText: "", promptText: "",
+          ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
+        };
+      }
+      return {
+        emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "limited", limited: usage, attempts,
+        net: null, struct: mkStruct("(skipped: limited)"), rawText: "", promptText: "",
+        ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
+      };
+    }
     // ⚠ label, until and isProbe must come from the SAME account. They did not until 2026-08-24:
     // `label` was read from `lastLimit` (whichever account most recently walled) while `until`/`isProbe`
     // were read from the FIRST account's mark unconditionally — so with a walled primary (resets in 3
     // days) and a later-walled fallback (resets in 9 hours) the shell printed the fallback's NAME beside
     // the primary's RESET, and in the mirror case printed an untrusted probe deadline as a parsed reset.
     // Same falsehood class as the hardcoded clause above, in the same sentence.
-    const reportLabel = accountState.lastLimit?.label ?? effectiveAccounts(acc.accounts)[0]!.label;
+    const reportLabel = accountState.lastLimit?.label ?? item1Label;
     const walled = accountState.accounts[reportLabel];
     const skip = mkStruct("(skipped: limited)");
     return {
@@ -975,10 +1255,10 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
         label: reportLabel,
         until: walled?.limitedUntil ?? "",
         isProbe: walled?.isProbe ?? true,
-        exhausted: true,        // this branch IS "resolveAccount found nothing selectable"
+        exhausted: true,        // this branch IS "no entry is selectable"
       },
       net: null, struct: skip, rawText: "", promptText: "",
-      ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
+      ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
     };
   }
 
@@ -991,7 +1271,7 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // ⚠ A3/T7 — THE OVERLOADED LOCAL, SPLIT. Until this slice one local named `hardened` meant TWO
   // different things at once, and they were the same thing only because the CLI was the only transport:
   //
-  //   "WE OWN THE TRANSPORT (it is not deps.provider)"  → gates limit recording, recordAuthProbe and
+  //   "WE OWN THE TRANSPORT (it is not deps.provider)"  → gates limit recording, the hour marks and
   //                                                       clearMark, i.e. every WRITE to live state.
   //   "WE HAVE LADDER MEMBERS"                          → gates withHardeningLadder.
   //
@@ -1004,24 +1284,18 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // Hence two explicit locals, each used for exactly one question. The comments at each of the four
   // sites below name WHICH question they are asking, because the old comments justified the conflated
   // form and would have read as approval of either meaning.
-  const owned = deps.provider === undefined;
-  const built = owned
-    ? buildProvider(cfg.provider, {
-        timeoutMs: cfg.provider.timeoutMs,          // #8: honor the config timeout knob (both transports)
-        // CLAUDE_CONFIG_DIR selects a CLI LOGIN DIRECTORY. It is passed as a PER-SPAWN env option and
-        // must never be written to process.env (it also resolves the transcript scan root). For an API
-        // provider there is no spawn and no login directory, and `account` is the implicit one by
-        // construction (see resolveAccounts above), so this branch cannot be reached with a configDir —
-        // the guard is spelled out anyway so the invariant is local rather than three screens away.
-        ...(cfg.provider.api === undefined && account.configDir !== undefined
-          ? { env: { CLAUDE_CONFIG_DIR: account.configDir } }
-          : {}),
-      })
-    : undefined;
-  /** Ladder members, or undefined for an API provider AND for an injected one. Answers ONLY the
-   *  "is there a hardening ladder to run" question. */
-  const laddered: HardenedProvider | undefined = built?.laddered;
-  const provider: Provider = deps.provider ?? built!.provider;
+  /** One provider instance PER ENTRY (spec r9 §5), built only when the walk reaches it: the entry's own block (item
+   *  1's logins use `cfg.provider` itself, so the key ladder still sees `accounts` and warns about it as today), its
+   *  own timeout, and for a CLI login its `configDir` as a PER-SPAWN `CLAUDE_CONFIG_DIR` — never written to
+   *  process.env, which also resolves the transcript scan root (config.ts resolveTranscripts). */
+  const buildFor = (entry: ListEntry) => buildProvider(entry.source === "provider" ? cfg.provider : entry.provider, {
+    timeoutMs: entry.source === "provider" ? cfg.provider.timeoutMs : entry.timeoutMs,   // #8: the config knob, both transports
+    ...(entry.provider.api === undefined && entry.configDir !== undefined ? { env: { CLAUDE_CONFIG_DIR: entry.configDir } } : {}),
+    ...(deps.keyExec || deps.keyFileFs
+      ? { api: { ...(deps.keyExec ? { keyExec: deps.keyExec } : {}), ...(deps.keyFileFs ? { keyFileFs: deps.keyFileFs } : {}) } }
+      : {}),
+    ...(deps.lockStillHeld !== undefined ? { beforeSpawn: assertOwned } : {}),
+  });
   const delays = deps.retryDelaysMs ?? PROVIDER_RETRY_DELAYS_MS;
 
   // Gate the provider call on real connectivity (bounded). A scheduled (non-forced) run still offline
@@ -1042,19 +1316,34 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     return {
       emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "darkwake",
       net: null, struct: skip, rawText: "", promptText: "",
-      ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
+      ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
     };
   }
 
-  const net = await waitForNetwork(deps.netProbe ?? defaultNetProbe(probeHosts), deps.sleep ?? realSleep, deps.netGraceMs, deps.netPollMs);
-  if (!net.online && !force) {
+  // ONE probe for the whole walk (P1-M6-T1): used here at walk start and, called once each, for every mid-walk
+  // re-check (the walk below, `onlineNow`). No parallel probe function exists.
+  const netProbe = deps.netProbe ?? defaultNetProbe(probeHosts);
+  const net = await waitForNetwork(netProbe, deps.sleep ?? realSleep, deps.netGraceMs, deps.netPollMs);
+  // Which eligible entries this tick may run (spec r9 §5 step 3). A list of TWO OR MORE lets leading loopback entries
+  // (and, from 60 minutes past the morning time, every loopback entry) run on an offline scheduled tick; a single
+  // entry keeps today's rule exactly — offline and not forced skips.
+  const nowLocal = clockNow();
+  const permitted = list.entries.length >= 2
+    ? permittedEntries(eligible, net.online, force, nowLocal.getHours() * 60 + nowLocal.getMinutes(), fm)
+    : (net.online || force ? eligible : []);
+  if (permitted.length === 0) {
     // scheduled + offline: don't call the provider. struct is unused by the shell (it returns 0 on offlineSkipped).
     const skip = mkStruct("(skipped: offline)");
     return {
       emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "offline", net, struct: skip, rawText: "", promptText: "",
-      ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
+      ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
     };
   }
+
+  // v0.3.0 calendar (spec §3): the step STARTS HERE, when the network gate has resolved, on every platform and source
+  // mix — its link deadlines and its overall bound are measured from this moment — and runs while the transcript scan
+  // starts below. The prompt build awaits it (just before `attempt`). Never throws; bounded by `runCalendar`.
+  const calendarPromise = runCalendar(calendarCtx(Date.now(), net.online));
 
   // Capturing wrapper: record the EXACT prompt built by buildPrompt and the raw model output, so the
   // eval harness can score both without re-running the pipeline. On a retry the last attempt wins —
@@ -1070,8 +1359,11 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // rejection from an in-flight scan would crash the process on a path that is otherwise a clean
   // exit-1. Invariant 8: the transcript feature must never take the briefing down.
   const scanFn = deps.scan ?? scanTranscripts;
+  // Provider fallback (P1-M6-T2): the scan starts if ANY entry is a Claude CLI (which entry wins is not known yet);
+  // its evidence is kept only if the winner is one (below). A single entry: exactly today's gate.
+  const isClaudeCli = (e: ListEntry): boolean => e.provider.api === undefined && claudeShaped(e.provider.cli);
   const scanPromise: Promise<import("./transcripts/scan").ScanOutcome | null> =
-    tx.enabled && claudeShaped(cfg.provider.cli)
+    tx.enabled && (list.entries.length < 2 ? claudeShaped(cfg.provider.cli) : list.entries.some(isClaudeCli))
       ? scanFn({
           root: tx.root,
           // §3.1: [gitWindowStart - margin, now]. The margin covers "started last evening, committed
@@ -1086,105 +1378,371 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
       : Promise.resolve(null);
 
   let promptText = "", rawText = "";
-  const capturing: Provider = {
-    generate: async (prompt) => { promptText = prompt; const t = await provider.generate(prompt); rawText = t; return t; },
+  // A2-M3-T8: which variant `promptText` is. Calendar off, or no block, sends no variant and stays unlocked.
+  let promptVariant = "unlocked" as PromptVariant;
+  // ── The walk (provider fallback, P1-M6/P1-M7, spec r9 §5 steps 4–7). Each PERMITTED entry runs in turn, with its
+  // own provider instance, until one returns a usable briefing. A failure is classified (`failoverReason`), marked per
+  // the reason table, and the walk moves on in the same tick.
+  const cal = await calendarPromise;
+  const multi = list.entries.length >= 2;
+  /** The eligible list's last member is "the last entry" for retries and the ladder (spec r9 §5 step 2), whether or
+   *  not this tick permits it. A single entry, and an injected provider (its eligible list is one entry), is last. */
+  const lastEligible = eligible[eligible.length - 1]!;
+  /** Set when a mid-walk re-check says offline: the rest of the walk runs only the remaining permitted loopback
+   *  entries, then takes the quiet offline skip (spec r9 §5 step 5). */
+  let offlineMidWalk = false;
+  /** The loopback entries an offline walk may still run (PR 1 final review round 1, M5; spec r9 §5 "Re-check before
+   *  moving on": "any remaining PERMITTED loopback entries (step 3)") — `permittedEntries`' own rule, re-read at the
+   *  moment of the offline re-check: before the morning time + 60 min only the eligible list's LEADING loopback
+   *  entries, from then on every one. */
+  let offlinePermitted: ReadonlySet<ListEntry> = new Set();
+  const goOffline = (): void => {
+    offlineMidWalk = true;
+    const t = clockNow();
+    offlinePermitted = new Set(permittedEntries(eligible, false, force, t.getHours() * 60 + t.getMinutes(), fm));
+  };
+  let lastError: ProviderError | undefined;
+  type Winner = {
+    entry: ListEntry; entryBlock: Config["provider"]; entryTimeoutMs: number | undefined;
+    built: ReturnType<typeof buildFor> | undefined; provider: Provider; struct: BriefingStruct; unusable: boolean;
+  };
+  let winner: Winner | undefined;
+  /** An hour mark per the reason table (spec r9 §5 step 5): the "1 h, non-first" rows, and `cli-failure` for a
+   *  Claude CLI entry only. `recordHourMark` itself refuses the current item 1. */
+  const markPerTable = async (entry: ListEntry, reason: FailoverReason): Promise<void> => {
+    const cls = FAILOVER_REASONS[reason].mark;
+    const marks = cls === "hour-non-first" || (cls === "hour-non-first-claude-login" && isClaudeCli(entry));
+    if (marks && isHourMarkReason(reason)) { await assertOwned(); await recordHourMark(entry.label, reason, clockNow(), { item1Label }); }
   };
 
-  // withRetry / generateBriefing may throw ProviderError; it propagates out of runCore so the shell
-  // (run()) can log it and return 1. reduce() ran OUTSIDE this so a reduce bug isn't masked as one.
-  // Carry the pre-provider diagnostics OUT on the error so the shell's catch can still surface them —
-  // pre-refactor run() printed the pipeline warnings AND the net-gate line BEFORE the provider call,
-  // so a failure (especially a network-caused one) must not silently drop them. Attached to any Error
-  // (a generic generate/parse crash gets them too); printing stays the shell's job.
-  let struct: BriefingStruct;
-  // ONE attempt, shared by withRetry and the C1/B6 ladder. The ladder's rungs must be single attempts:
-  // re-running the whole retry schedule per rung would cost 9 provider calls and ~10 minutes rather than
-  // the intended worst case of 5 calls.
-  const attempt = () => generateBriefing(ctx, capturing, {
-    // A3/T10: `providerLabel` returns `cfg.cli` VERBATIM for a CLI run — existing briefing headers are
-    // byte-identical — and `<label> (<model>)` for an API run, because the model is the provenance fact
-    // that changes briefing content and the header is where a reader would look for it.
-    date: runDate, machineScope: hostname(), provider: providerLabel(cfg.provider), warnings, today, windowMerges: windowMergeLines, stateAsOf, morningFloor, todaySuppress,
-  }, units, rootsByRepo);
-  try {
-    // The ladder wraps the withRetry CALL (C1/B6): it only acts once the schedule is exhausted, which is
-    // what moves the "a network failure looks like a usage error" window from t~0.09s — peak
-    // wake-before-wifi hazard — out to t~135s. A plain `Provider` (an injected test double) has no
-    // ladder members, so it runs unwrapped.
-    // LADDER question. `laddered`, not `owned`: an API provider is owned but has nothing to back off
-    // from — no flags were injected, so "would it have worked without our flags?" has no meaning, and
-    // the ladder's rungs would cost two extra HTTP calls per tick to answer it.
-    struct = laddered
-      ? await withHardeningLadder(laddered, () => withRetry(attempt, delays, deps.sleep), attempt, cfg.provider.timeoutMs)
-      : await withRetry(attempt, delays, deps.sleep);
-  } catch (e) {
-    if (e instanceof Error) {
-      // Fold in the provider's DYNAMIC warnings (C1/B8). This is the most valuable case for them:
-      // "hardening was disabled, and then the call failed anyway" — without this the shell logs a bare
-      // ProviderError and the operator never learns hardening was off.
-      (e as ProviderError).warnings = appendUnique([...discIssues.map(warnFor), ...warnings], runtimeWarningsOf(provider));
-      (e as ProviderError).net = net;
+  // ── `provider-status.json` (P1-M7-T4; spec r9 §5 step 4 "Quick check after a failed day", Reporting). Read once per
+  // owned walk; an unreadable file means no entry is in quick-check mode (full retries) and is rebuilt on write.
+  const statusToday = localDateStr(clockNow());
+  const status = owned ? await readProviderStatus() : undefined;
+  /** Quick-check mode: a list of two or more, a non-first entry (the last included; item 1 never), whose record holds
+   *  today's latch at its current revision. */
+  const inQuickCheck = (e: ListEntry): boolean =>
+    owned && multi && e.label !== item1Label && status !== undefined && quickCheckActive(status.labels[e.label], entryRevision(e), statusToday);
+  /** Entries whose failure SETS the latch this walk: retryable, and the probe after it said online (a loopback entry
+   *  counts as online, Q14); never on a forced run. */
+  const latched = new Set<ListEntry>();
+  /** Tried entries whose failure was followed by an OFFLINE re-check: no failed `lastRun` (a wifi drop must never
+   *  read as "not working"). */
+  const unobserved = new Set<ListEntry>();
+  /** Write each tried entry's `lastRun` (and so `failingSince`), set or clear the latch, and prune — ONCE per owned
+   *  walk, single-entry included (Q15); `at` is the entry's own failure or success time (Q22). Non-fatal. */
+  const persistStatus = async (): Promise<void> => {
+    if (!owned || tried.length === 0) return;
+    const labels: Record<string, LabelRecord> = Object.assign(Object.create(null), status?.labels ?? {});
+    for (const t of tried) {
+      if (unobserved.has(t.entry)) continue;
+      const revision = entryRevision(t.entry);
+      const rec = observeRun(labels[t.entry.label], { at: t.at.toISOString(), revision, ok: t.reason === undefined, ...(t.reason !== undefined ? { reason: t.reason } : {}) });
+      if (t.reason === undefined) delete rec.quickCheck;                       // the newest observation is ok
+      else if (latched.has(t.entry)) rec.quickCheck = { localDate: statusToday, revision };
+      if (rec.quickCheck && (rec.quickCheck.revision !== revision || rec.quickCheck.localDate !== statusToday)) delete rec.quickCheck;
+      labels[t.entry.label] = rec;
     }
-    // A usage wall is a KNOWN, timed outage, not a failure: mark the account that hit it and exit by the
-    // same quiet path as the offline/darkwake skips. This tick produces no briefing — the cost of
-    // resolving the account before the call — and the next provider-calling tick selects the fallback.
-    //
-    // ⚠ OWNERSHIP question — `owned`, NOT `laddered`. Recording is gated on THIS run having built the
-    // provider and resolved the account. An injected `deps.provider` means the caller supplied the
-    // transport: the eval harness runs the real pipeline through runCore that way (src/eval/run-case.ts),
-    // so recording here would let a developer's eval write a mark — and a reportable outage — into the
-    // user's live state. Tests inject the same way.
-    // ⚠ A3: gating this on `laddered` instead would silently DROP limit recording for every API run,
-    // which is the exact failure the split exists to prevent — an API key that hits its wall would
-    // produce a bare error line every 600s with no mark, no quiet skip and no recovery report.
-    if (e instanceof ProviderError && e.code === "usage-limit" && owned) {
-      const now = clockNow();
-      // A3: prefer the STRUCTURED reset a transport supplies over text-matching an English CLI
-      // sentence. `parseResetInstant` falls back to a one-hour PROBE mark when it cannot read one, so
-      // an HTTP `retry-after` (or a spend-cap body naming its resume instant) would otherwise be
-      // downgraded to a guess we already have the real answer for. The CLI path never sets `resetAt`,
-      // so its behaviour here is byte-identical to before. A malformed value falls back rather than
-      // producing an Invalid Date that would serialize as null into live state.
-      const fromError = e.resetAt !== undefined && !Number.isNaN(Date.parse(e.resetAt))
-        ? { until: new Date(e.resetAt), isProbe: false }
-        : undefined;
-      const reset = fromError ?? parseResetInstant(e.message, now);
-      await recordLimit(account.label, reset.until, now, { isProbe: reset.isProbe });
-      // Re-resolve against the state AS WRITTEN rather than reasoning about what the mark implies:
-      // this is the only honest answer to "is anything left?", and the shell prints one of two
-      // opposite sentences from it. Costs one extra state read, on the limited path only.
-      const remaining = resolveAccount(acc.accounts, await loadAccountState(), now);
-      const skip = mkStruct("(skipped: limited)");
+    const saved = new Set([...list.entries.map((e) => e.label), ...list.dropped.flatMap((d) => (d.label !== undefined ? [d.label] : []))]);
+    await assertOwned();
+    await writeProviderStatus(pruneStatus({ labels }, saved, clockNow()));
+  };
+
+  for (const entry of permitted) {
+    if (offlineMidWalk && !(entry.isLoopback && offlinePermitted.has(entry))) continue;
+    const isLast = entry === lastEligible;
+    /** The entry's own provider block, for its label and its timeout (item 1's logins: `cfg.provider`, as today). */
+    const entryBlock: Config["provider"] = entry.source === "provider" ? cfg.provider : entry.provider;
+    const entryTimeoutMs = entry.source === "provider" ? cfg.provider.timeoutMs : entry.timeoutMs;
+    const kind: EntryKind = entry.provider.api?.kind ?? "cli";
+    // ⚠ A3/T7 — THE OVERLOADED LOCAL, SPLIT (see the note above `buildFor`): `owned` gates every WRITE to live state;
+    // `laddered` answers only "is there a hardening ladder to run" — an API provider is owned but has no ladder.
+    // `insecure-endpoint` is decided BEFORE the entry is built (P1-M6 checkpoint LOW): a refused entry never constructs
+    // its transport, so it never raises the cleartext construction warning for a request that is never made.
+    const refused = owned ? insecureEndpoint(entry) : undefined;
+    const built = owned && refused === undefined ? buildFor(entry) : undefined;
+    /** Ladder members, or undefined for an API provider AND for an injected one. Answers ONLY the
+     *  "is there a hardening ladder to run" question. */
+    const laddered: HardenedProvider | undefined = built?.laddered;
+    const provider: Provider = deps.provider ?? built?.provider ?? REFUSED_PROVIDER;
+
+    // CALENDAR (spec r4 §6): the option is FORWARDED, never dropped or rewritten, and `promptText` becomes the
+    // variant the provider reports it actually sent (`onPromptSent`, called per spawn — so after a bare retry
+    // it is the unlocked text). A provider that ignores the option never calls back, and then `prompt` — the
+    // unlocked variant — is what it sent. No option (calendar off) ⇒ the one-argument call, as before.
+    // Provider fallback (hub Q24 (3)): the capture is PER ATTEMPT and commits to `promptText`/`rawText` only while the
+    // attempt is not abandoned, so an attempt that lost the deadline race and resolves late can never overwrite the
+    // winner's. An attempt that is never raced is never abandoned, so this is today's capture exactly.
+    const capturingFor = (isAbandoned: () => boolean): Provider => ({
+      generate: async (prompt, opts) => {
+        if (!isAbandoned()) { promptText = prompt; promptVariant = "unlocked"; }
+        const t = opts === undefined
+          ? await provider.generate(prompt)
+          : await provider.generate(prompt, {
+              ...opts,
+              onPromptSent: (sent) => { if (!isAbandoned()) { promptText = sent.text; promptVariant = sent.variant; } opts.onPromptSent?.(sent); },
+            });
+        if (!isAbandoned()) rawText = t;
+        return t;
+      },
+    });
+
+    // ONE attempt, shared by the retry wrapper and the C1/B6 ladder. The ladder's rungs must be single attempts:
+    // re-running the whole retry schedule per rung would cost 9 provider calls and ~10 minutes rather than
+    // the intended worst case of 5 calls.
+    // Provider fallback (P1-M6-T3, hub Q24): ONE AbortController PER ATTEMPT, created inside this closure — never one
+    // per entry, because the retry wrappers and the ladder call it again and a shared, already-aborted controller would
+    // make every later attempt fail at once. The attempt is RACED against its deadline and rejects with
+    // `ProviderError("timeout")` the moment it fires, so the walk never waits on a stalled key read; the signal then
+    // stops the abandoned work from sending later (the transports check it after the key and before the request, and
+    // kill a CLI child).
+    // ⚠ ONLY for an OWNED entry of a combined list of TWO OR MORE (Q24 (2)): a single-entry config and an injected
+    // provider (the eval, tests) call `generateBriefing` exactly as before — no race, no signal, no second billed call.
+    const raced = owned && multi;
+    const deadlineMs = deps.attemptDeadlineMs ?? attemptDeadlineMs(entry);
+    const meta = () => ({
+      // A3/T10: `providerLabel` returns `cfg.cli` VERBATIM for a CLI run — existing briefing headers are
+      // byte-identical — and `<label> (<model>)` for an API run, because the model is the provenance fact
+      // that changes briefing content and the header is where a reader would look for it.
+      date: runDate, machineScope: hostname(), provider: providerLabel(entryBlock), warnings, today, windowMerges: windowMergeLines, stateAsOf, morningFloor, todaySuppress,
+      ...(cal?.promptBlocks ? { calendarPrompt: cal.promptBlocks } : {}),
+    });
+    const attempt = async (): Promise<BriefingStruct> => {
+      await assertOwned();                               // every retry and rung goes through here (P1-M8-T1)
+      if (!raced) return generateBriefing(ctx, capturingFor(() => false), meta(), units, rootsByRepo);
+      const ctl = new AbortController();
+      let abandoned = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          abandoned = true;
+          ctl.abort();
+          reject(new ProviderError("timeout", `${providerLabel(entryBlock)}: the attempt's deadline (${deadlineMs} ms) passed`));
+        }, deadlineMs);
+      });
+      const work = generateBriefing(ctx, capturingFor(() => abandoned), meta(), units, rootsByRepo, { signal: ctl.signal });
+      work.catch(() => { /* the loser of the race: its rejection is the abandoned attempt's, never the run's */ });
+      try { return await Promise.race([work, expired]); }
+      finally { clearTimeout(timer); }
+    };
+
+    /** The ONE network re-check for this entry (spec r9 §5 step 5), one call of the walk's probe — never the grace
+     *  wait, never darkwake. An earlier entry's ladder asks it first (`beforeRungs`) and the move-on then reuses that
+     *  answer, so a failed entry costs at most one probe call. A forced run and a loopback entry are exempt and count
+     *  as online: a local model's failure says nothing about the network (spec r9e). */
+    let recheck: Promise<boolean> | undefined;
+    const onlineNow = (): Promise<boolean> => (recheck ??= force || entry.isLoopback ? Promise.resolve(true) : netProbe());
+    // Retries (spec r9 §5 step 4): the last entry keeps today's `withRetry` and its schedule; an earlier entry gets
+    // `withEntryRetry`'s one short retry. The ladder keeps today's placement for the last entry (after its schedule);
+    // an earlier entry's ladder runs only after its retry also failed fast AND the re-check says online. For a list of
+    // two or more a non-`ProviderError` inside a rung escapes (Q2); a single entry keeps today's swallow.
+    // Quick-check mode (P1-M7-T4): ONE try — no `withEntryRetry` wait, no `withRetry` schedule, no ladder. The
+    // hardened provider's two internal respawns stay: they are inside the attempt, not retries of a provider failure.
+    const quick = inQuickCheck(entry);
+    const run = quick
+      ? attempt
+      : isLast
+      ? () => withRetry(attempt, delays, deps.sleep)
+      : () => withEntryRetry(attempt, deps.sleep ?? realSleep, () => new Date(), kind);
+    /** Set when `beforeRungs` said online and the rungs therefore RAN: their failure may postdate a network drop, so
+     *  the re-check before marking, latching or moving on is then a FRESH probe (P1-M7 checkpoint, codex MED 1). An
+     *  earlier entry therefore costs at most TWO probe calls — the term `earlierEntryTermMs` budgets (runlock.ts). */
+    let rungsRan = false;
+    const beforeRungs = async (): Promise<boolean> => { rungsRan = await onlineNow(); return rungsRan; };
+    const ladderOpts = isLast ? (multi ? { rethrowNonProviderErrors: true } : undefined) : { beforeRungs, rethrowNonProviderErrors: true };
+
+    let struct: BriefingStruct;
+    try {
+      // The ladder wraps the retry CALL (C1/B6): it only acts once the schedule is exhausted, which is
+      // what moves the "a network failure looks like a usage error" window from t~0.09s — peak
+      // wake-before-wifi hazard — out to t~135s. A plain `Provider` (an injected test double) has no
+      // ladder members, so it runs unwrapped. Its `timeoutMs` is the ENTRY's own, never item 1's.
+      // LADDER question. `laddered`, not `owned`: an API provider is owned but has nothing to back off
+      // from — no flags were injected, so "would it have worked without our flags?" has no meaning, and
+      // the ladder's rungs would cost two extra HTTP calls per tick to answer it.
+      // `insecure-endpoint` first: refused before the key is resolved (and before the entry was built), so no attempt starts.
+      if (refused) throw refused;
+      struct = laddered && !quick ? await withHardeningLadder(laddered, run, attempt, entryTimeoutMs, ladderOpts) : await run();
+    } catch (e) {
+      if (e instanceof Error) {
+        // Fold in the provider's DYNAMIC warnings (C1/B8). This is the most valuable case for them:
+        // "hardening was disabled, and then the call failed anyway" — without this the shell logs a bare
+        // ProviderError and the operator never learns hardening was off.
+        // v0.3.0 calendar (fix-round 1): the calendar config warnings too — fixed text, never a configured value. On
+        // success they ride on `CoreResult.calendarWarnings`; a failure has no CoreResult, so they would be lost.
+        (e as ProviderError).warnings = appendUnique([...discIssues.map(warnFor), ...warnings, ...calCfg.warnings], runtimeWarningsOf(provider));
+        (e as ProviderError).net = net;
+      }
+      // A non-`ProviderError` (a bug, a `LostLockError`) stops the run and is reported, as today (spec r9 §5 step 5).
+      // ⚠ OWNERSHIP question — `owned`, NOT `laddered`. Recording is gated on THIS run having built the
+      // provider. An injected `deps.provider` means the caller supplied the transport: the eval harness runs the
+      // real pipeline through runCore that way (src/eval/run-case.ts), so recording here would let a developer's
+      // eval write a mark — and a reportable outage — into the user's live state. Its walk is one entry, and its
+      // error is thrown exactly as before.
+      if (!(e instanceof ProviderError) || !owned) {
+        if (e instanceof ProviderError && cal?.promptBlocks) e.message = calendarSafeProviderMessage(e, providerLabel(entryBlock));
+        throw e;
+      }
+      if (rungsRan) recheck = undefined;               // the pre-rung answer is stale once the rungs ran
+      const reason = failoverReason(e, kind);
+      tried.push({ entry, at: clockNow(), reason, error: e });
+      if (reason === "usage") {
+        // A usage wall is a KNOWN, timed outage, not a failure: mark the entry that hit it AT ONCE — usage is never
+        // re-checked — and move on. Item 1 included.
+        // ⚠ A3: gating this on `laddered` instead of `owned` would silently DROP limit recording for every API run.
+        const now = clockNow();
+        // A3: prefer the STRUCTURED reset a transport supplies over text-matching an English CLI
+        // sentence. `parseResetInstant` falls back to a one-hour PROBE mark when it cannot read one, so
+        // an HTTP `retry-after` (or a spend-cap body naming its resume instant) would otherwise be
+        // downgraded to a guess we already have the real answer for. The CLI path never sets `resetAt`,
+        // so its behaviour here is byte-identical to before. A malformed value falls back rather than
+        // producing an Invalid Date that would serialize as null into live state.
+        const fromError = e.resetAt !== undefined && !Number.isNaN(Date.parse(e.resetAt))
+          ? { until: new Date(e.resetAt), isProbe: false }
+          : undefined;
+        const reset = fromError ?? parseResetInstant(e.message, now);
+        // `reason: "usage"` even for an unparsed wall (`isProbe: true`): it must keep reading as usage (P1-M5-T1).
+        await assertOwned();
+        await recordLimit(entry.label, reset.until, now, { reason: "usage", isProbe: reset.isProbe });
+        usageMarks.push({ label: entry.label, until: reset.until, isProbe: reset.isProbe });
+      } else if (reason !== "insecure-endpoint" && multi) {
+        // Everything else but `insecure-endpoint` (the config, not the provider: nothing was sent, no mark, no
+        // re-check). Spec r9 §5 "A deliberate change": only the table's "1 h" rows mark, so a transient failure (a
+        // timeout, an empty answer) no longer benches a login for an hour. An EARLIER entry is marked only when the
+        // re-check says online (or the entry is exempt from it); offline, nothing is written and only the remaining
+        // permitted loopback entries run. The LAST entry has no move-on: it runs the same one probe round only after a
+        // RETRYABLE failure (P1-M7-T4) — offline, no mark, no latch, no failed lastRun, and the quiet offline skip — and
+        // otherwise is marked at once (an auth, a not-found, an unusable answer: the provider answered). A single entry
+        // is item 1, which no hour mark ever benches, and runs no probe (Q15).
+        const retryable = isRetryableFailure(e, kind);
+        if (isLast && !retryable ? true : await onlineNow()) {
+          await markPerTable(entry, reason);
+          // The latch (a loopback entry counts as online, Q14). Never on a forced run, and never on item 1, which is
+          // never in quick-check mode (P1-M7 checkpoint LOW 10).
+          if (retryable && !force && entry.label !== item1Label) latched.add(entry);
+        } else {
+          goOffline();
+          unobserved.add(entry);
+        }
+      }
+      // v0.3.0 calendar (final harden r3): when the attempt CARRIED a calendar block (either variant), the provider's
+      // own text never leaves this function. An HTTP endpoint that rejects a request can echo it in the error body
+      // (and a CLI its stderr), so the message would carry attendee names and descriptions into briefing.log,
+      // last-skip.json and the envelope — the shell persists `e.message` on all three. A fixed diagnostic instead:
+      // the error kind and, from an HTTP transport, the status. Everything above that READ the message (the limit
+      // parse) has already run; with no calendar block the message is untouched, as before.
+      if (cal?.promptBlocks) e.message = calendarSafeProviderMessage(e, providerLabel(entryBlock));
+      lastError = e;
+      continue;
+    }
+    // A returned answer with no briefing section is `unusable-answer` (spec r9 §5 step 4, one predicate shared with
+    // main.ts): an earlier entry gets no retry and the walk moves on, through the same re-check as a failure; the
+    // last entry takes today's `parse-empty` path below with its own `rawText`. Checked for EVERY owned walk, so a
+    // single entry's headingless answer is recorded as `failed` / `unusable-answer` in `attempts` and its status row
+    // (P1-M7 checkpoint MED 1) — while its run behaves exactly as today: no move-on, `clearMark`, main's parse-empty.
+    const unusable = owned && !hasBriefingSection(rawText);
+    if (unusable && !isLast) {
+      tried.push({ entry, at: clockNow(), reason: "unusable-answer" });
+      if (await onlineNow()) await markPerTable(entry, "unusable-answer");
+      else { goOffline(); unobserved.add(entry); }
+      continue;
+    }
+    tried.push({ entry, at: clockNow(), ...(unusable ? { reason: "unusable-answer" as const } : {}) });
+    winner = { entry, entryBlock, entryTimeoutMs, built, provider, struct, unusable };
+    break;
+  }
+
+  if (winner === undefined) {
+    await persistStatus();
+    const now = clockNow();
+    // Offline — at the start (an eligible entry was withheld) or at a mid-walk re-check — and every permitted loopback
+    // entry has been tried: the quiet offline skip, with no mark for any entry the network may have failed (spec r9
+    // §5 steps 3 and 5). Usage marks written on the way stand: a wall is not a network symptom.
+    if (offlineMidWalk || permitted.length < eligible.length) {
+      const skip = mkStruct("(skipped: offline)");
       return {
-        emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "limited",
-        limited: { label: account.label, until: reset.until.toISOString(), isProbe: reset.isProbe, exhausted: !remaining },
-        net, struct: skip, rawText: "", promptText: "",
-        ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
+        emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "offline", net, struct: skip, rawText: "", promptText: "",
+        ...(owned ? { attempts: attemptsOf()! } : {}),
+        ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
       };
     }
-    // §4a — a NON-limit failure on a FALLBACK account. The likeliest cause is a config dir that was
-    // never logged into, and without this the ladder re-runs against that broken login every 600s for
-    // the whole outage: ~135s of backoff plus a failure line per tick, strictly worse than the defect
-    // this feature exists to fix. A one-hour probe mark backs off without benching it for the week.
-    // Never applies to the first entry — see recordAuthProbe.
-    // OWNERSHIP question again, and for the same reason: this WRITES a probe mark into live state.
-    // Inert for an API provider in practice — `recordAuthProbe` never applies to the first entry and an
-    // API run always has exactly the single implicit account — so the gate is about the injected-provider
-    // case, which is the one that must never write.
-    if (e instanceof ProviderError && owned) await recordAuthProbe(account.label, acc.accounts, clockNow());
-    throw e;
+    // Step 7 (spec r9 §5), in order. Row 1 — every entry benched by or failed with `usage` (any mix of marks and
+    // fresh walls): today's quiet `limited` skip, with `allOutOfUsage` and the earliest parsed reset. Computed from
+    // this walk's marks in memory, never from a re-read: a write that failed (recordLimit is non-fatal) left the file
+    // without the mark (P1-M5 checkpoint).
+    const usage = outOfUsage();
+    if (usage !== undefined) {
+      return {
+        emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: true, skipReason: "limited", limited: usage,
+        attempts: attemptsOf()!, net, struct: mkStruct("(skipped: limited)"), rawText: "", promptText: "",
+        ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
+      };
+    }
+    // Row 2 (the last entry's unusable answer) returned through the winner path above. Row 3 with an attempt: a single
+    // entry throws its own error, as today (P1-M7-T3: its skip detail keeps the `code: ` prefix); a list of two or more
+    // throws ONE aggregate error — the last attempt's code, `attempts`, the warnings and the net outcome, and a message
+    // whose first line is the count (the FAILED notification shows only that line). Never undefined: the last eligible
+    // entry was permitted (nothing was withheld) and every tried entry that did not win threw.
+    const last = lastError ?? new ProviderError("nonzero-exit", "no provider produced a briefing");
+    if (!multi) throw last;
+    const attempts = attemptsOf()!;
+    const agg = new ProviderError(last.code, aggregateFailureMessage(attempts, now), last.warnings);
+    agg.attempts = attempts;
+    agg.net = net;
+    // Each tried entry's own diagnostic, for stderr (and so briefing.log) only — never last-skip.json or the FAILED body
+    // (P1-M7 checkpoint LOW 12). Already calendar-safe (rewritten above when the attempt carried a calendar block);
+    // main.ts redacts and strips control bytes at print.
+    agg.diagnostics = tried.filter((t) => t.error !== undefined).map((t) => `  "${safeLabel(t.entry.label)}": ${t.error!.code}: ${t.error!.message}`);
+    throw agg;
+  }
+  const { entry, entryBlock, entryTimeoutMs, built, provider } = winner;
+  const laddered: HardenedProvider | undefined = built?.laddered;
+  const struct = winner.struct;
+  // Ownership re-check point 1 (P1-M8-T1, spec r9 §5 Run lock): right after the walk, before any mark or status write,
+  // the grouper call and the recap append. Lost (or the day stamped meanwhile): the quiet `lostLock` result — no
+  // briefing, nothing written.
+  if (deps.verifyOwnership !== undefined && !(await deps.verifyOwnership())) {
+    return {
+      emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: false, lostLock: true,
+      net, struct: mkStruct("(skipped: lost lock)"), rawText: "", promptText: "",
+      ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
+    };
+  }
+  // B1-M1-T3: the run record's two commit lists, from `recapCoverage`'s own pieces over the context, units
+  // and roots `generateBriefing` was handed — after the ownership re-check (a lost lock returned above, so
+  // no record exists for a run that writes nothing) and BEFORE the recap-campaigns slot below rewrites
+  // `struct.recap`, so it reads the recap `recapCoverage` read.
+  const recordCommits = recordCommitsFor(ctx, units, rootsByRepo, struct.recap);
+  const attempts = attemptsOf(entry, winner.unusable);
+  // The notices (spec r9 §5 "Line wording"): a combined list of two or more only, and only when there is a line — so
+  // `notices` is ABSENT, never `[]`, for a single-entry config and for a clean walk (`envelopeFrom` copies the struct).
+  // ⚠ Not for the last entry's UNUSABLE answer (step 7 row 2, PR 1 final review round 3, L10): that run delivers
+  // nothing — main.ts takes the parse-empty path — so a "— used <label>" line (or a cost line) in the refused render
+  // that briefing.log and the envelope's markdown carry would claim a delivery that never happened.
+  if (attempts !== undefined && multi && !winner.unusable) {
+    const lines = noticeLines(attempts, entry.label, clockNow(), costLine(entry));
+    if (lines.length > 0) struct.notices = lines;
   }
   // The SUCCESS struct comes from generateBriefing, not from mkStruct — so it needs the outage attached
   // here or the line renders on every path EXCEPT the one that actually delivers a briefing. Caught by
   // the end-to-end recovery test; the unit tests for the formula and the render slot both passed while
   // the two never met.
   if (outage) struct.outage = outage;
+  // The restricted calendar struct (spec §7) — built by the step field by field, never from a `CalEvent`.
+  if (cal !== undefined) struct.calendar = cal.struct;
 
   // Success clears ONLY this account's mark — clearing broadly would erase a walled account's mark the
   // moment the fallback succeeds, so the next tick would retry the wall and stickiness would be gone.
   // OWNERSHIP question. A successful API run must clear its own mark, or a wall recorded yesterday
   // would keep benching the implicit label after the credit was topped up.
-  if (owned) await clearMark(account.label);
+  // A last entry's unusable answer (spec r9 §5 step 4) gets the `unusable-answer` hour mark when it is not item 1, in
+  // place of the clear; it then takes today's `parse-empty` path in main.ts with this `rawText`.
+  if (owned) {
+    await assertOwned();
+    if (winner.unusable && entry.label !== item1Label) await recordHourMark(entry.label, "unusable-answer", clockNow(), { item1Label });
+    else await clearMark(entry.label);
+  }
+  await persistStatus();
 
   // Volatile-state re-check just before returning (see workingTreeDriftWarnings) — merged into the
   // struct's own warnings (surfaced in the rendered briefing), not the pipeline `warnings` the shell prints.
@@ -1229,12 +1787,22 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   const quietSummary = realActivities.some((a) => a.kind === "commit")
     ? undefined
     : discoverySummary(counted, { noRepos: repos.length === 0, home: homedir() });
-  const late = [...drift, ...runtimeWarningsOf(provider), ...(quietSummary !== undefined ? [quietSummary] : [])];
+  // Provider fallback (P1-M6-T2): the not-a-Claude-CLI notice for a list of two or more, now that the winner is known
+  // — only when transcripts are on and the winner is a CLI that is not Claude. Only the WINNER's runtime warnings
+  // reach the struct: `provider` is the winner's instance, the only one built.
+  const winnerNotice = tx.enabled && list.entries.length >= 2 && entry.provider.api === undefined && !claudeShaped(entry.provider.cli)
+    ? [notClaudeWarning(entry.provider.cli)] : [];
+  for (const w of winnerNotice) warnings.push(w);
+  const late = [...drift, ...runtimeWarningsOf(provider), ...winnerNotice, ...(quietSummary !== undefined ? [quietSummary] : [])];
   if (late.length) struct.warnings = appendUnique(struct.warnings ?? [], late);
   if (quietSummary !== undefined) warnings.push(quietSummary);   // r8: after the fold — see above
 
   // ── T4.3: await the scan started before generation. ── T4.4: route EVERY degradation.
-  const scanned = await scanPromise;
+  // Provider fallback (P1-M6-T2): a scan started because SOME entry is a Claude CLI is used only when the winner is one —
+  // its evidence, its degradation lines and its health record all describe a Claude transcript this run did not use.
+  // It is awaited either way, so no scan outlives the run.
+  const rawScan = await scanPromise;
+  const scanned = list.entries.length < 2 || isClaudeCli(entry) ? rawScan : null;
   let transcripts = scanned?.evidence;
   if (scanned) {
     // ⚠ Each trigger's SINK is non-negotiable (§3.8). Routing a degradation to telemetry alone is
@@ -1405,7 +1973,10 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // prompt/raw text are the main call's).
   if (recapCfg.mode !== "off") {
     const commitActs = ctx.repos.flatMap((r) => r.activities).filter((a) => a.kind === "commit");
-    const res = await runRecapCampaignsPhase({
+    const persistRecord = deps.persistRecapRecord ?? ((line: string) => appendFile(recapCampaignsPath(), line + "\n"));
+    let res: Awaited<ReturnType<typeof runRecapCampaignsPhase>>;
+    try {
+    res = await runRecapCampaignsPhase({
       mode: recapCfg.mode,
       struct,
       gateCommits: commitActs.length,
@@ -1420,13 +1991,30 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
       invocation: deps.recapInvocation,
       // The RESOLVED grouper (§4.1 step 2): production reuses the run's own provider instance — no second
       // construction; an injected `deps.provider` with no `deps.grouper` resolves to none.
-      grouper: deps.grouper ?? (owned ? (p: string) => built!.provider.generate(p) : undefined),
+      // P1-M9 checkpoint MED 4: the ownership check IMMEDIATELY before the grouper call — the drift and PR-fact reads
+      // are awaited after the walk's last write, so a takeover in that window must not start a billed call.
+      grouper: ((g) => (g === undefined ? undefined : async (p: string) => { await assertOwned(); return g(p); }))(
+        deps.grouper ?? (owned ? (p: string) => built!.provider.generate(p) : undefined)),
       warningsOf: () => runtimeWarningsOf(provider),
       hardeningOf: () => (laddered ? (laddered.hardeningActive() ? "on" : "off") : "n/a"),
-      timeoutMs: cfg.provider.timeoutMs ?? TIMEOUT_MS,
-      persist: deps.persistRecapRecord ?? ((line: string) => appendFile(recapCampaignsPath(), line + "\n")),
+      // The WINNER's timeout (P1-M6-T2): the grouper reuses the winner's instance — so an unset one is that
+      // instance's own default (`defaultTimeoutMs`: 5 min for an API provider), never a shorter deadline than it waits.
+      timeoutMs: entryTimeoutMs ?? defaultTimeoutMs(entryBlock),
+      // P1-M8 checkpoint HIGH 2: the ownership check in front of the append, so a holder that lost the lock while the
+      // grouper ran appends nothing.
+      persist: async (line: string) => { await assertOwned(); await persistRecord(line); },
       seams: { callDeadlineMs: deps.recapCallDeadlineMs, gitBudgetMs: deps.recapGitBudgetMs, impl: deps.recapImpl },
     });
+    } catch (e) {
+      // The phase never throws except a `LostLockError` (the grouper's `beforeSpawn`, or the check above): the quiet
+      // `lostLock` result, as at re-check point 1 — no briefing, no record.
+      if (!(e instanceof LostLockError)) throw e;
+      return {
+        emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: false, lostLock: true,
+        net, struct: mkStruct("(skipped: lost lock)"), rawText: "", promptText: "",
+        ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
+      };
+    }
     // Step 12, and the ONLY struct write B makes: `applied` (mode `on`, every check passed) returns the
     // candidate's `recap`; every other outcome returns nothing and the page is Stage 1's.
     if (res.recap) struct.recap = res.recap;
@@ -1582,18 +2170,22 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
 
   return {
     emptyWindow: false, blocked: false, discoveryBlocked: false, offlineSkipped: false, net, struct, rawText, promptText,
-    ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc,
-    transcripts,
+    ctx, units, activities, repos, runDate, discIssues, extrIssues, warnings, today, windowStartUtc, ...calExtra,
+    transcripts, recordCommits,
     // Provenance, only when there was a real choice to make — see CoreResult.account.
     // `?.length` not a truthy test: `resolveAccounts([])` returns an ACCEPTED empty array (no warning),
     // and `effectiveAccounts([])` synthesises "default" — so a truthy test logs `account "default"`
     // every morning for a user who emptied the list to turn the feature off.
-    // OWNERSHIP question, for the same reason recordLimit/clearMark/recordAuthProbe are: an injected
+    // OWNERSHIP question, for the same reason recordLimit/clearMark/recordHourMark are: an injected
     // `deps.provider` means the resolved label never reached a spawn, so attributing the output to it
     // would be a claim about a process that never ran. The eval harness calls runCore exactly that way.
     // ⚠ A3: `acc.accounts` is forced to undefined for an API provider (see resolveAccounts above), so
     // this stays absent on an API run — which is correct, because there was no account CHOICE to record.
-    ...(owned && acc.accounts?.length ? { account: account.label } : {}),
+    // Provider fallback (P1-M6-T2): also the WINNER's label whenever the combined list has two or more entries; a
+    // single entry keeps today's gate (only with `accounts`), so its envelope is unchanged.
+    ...(owned && (acc.accounts?.length || list.entries.length >= 2) ? { account: entry.label } : {}),
+    // Provider fallback (P1-M7-T2): one element per combined-list entry; absent with an injected provider.
+    ...(attempts !== undefined ? { attempts } : {}),
     // Purely ADDITIVE, for the eval harness's G7 (`recency`). Exposing the list rather than letting
     // the harness rebuild it from `today` is deliberate: `todaySuppress` carries the resolved unit
     // LABEL (unitForCommit + repoLabelFor) and the merge-derived entries, and a second derivation of
@@ -1603,7 +2195,51 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     // v0.2.1 §2.4.2 (r7): the same value folded into `struct.warnings` above, so a caller reads the
     // summary from one field whichever path produced it.
     ...(quietSummary !== undefined ? { discoverySummary: quietSummary } : {}),
+    ...(owned ? {
+      summarySeed: {
+        winner: {
+          provider: entryBlock,
+          ...(entry.configDir !== undefined ? { configDir: entry.configDir } : {}),
+          ...(entryTimeoutMs !== undefined ? { timeoutMs: entryTimeoutMs } : {}),
+        },
+        morningLocked: promptVariant === "locked",
+        calendarCapture: {
+          unlockedBlock: cal?.promptBlocks ? redactCredentials(cal.promptBlocks.unlocked) : null,
+          hasEvents: (cal?.struct.events.length ?? 0) > 0,
+        },
+      },
+    } : {}),
   };
+}
+
+/** The fixed provider-failure text used when the failed attempt carried a calendar block (final harden r3): the
+ *  configured provider label, the error kind and an HTTP status when the transport supplied one — never a byte of
+ *  the provider's response or output. Exported for the test. */
+export function calendarSafeProviderMessage(e: ProviderError, label: string): string {
+  const status = typeof e.httpStatus === "number" && Number.isInteger(e.httpStatus) ? `, HTTP ${e.httpStatus}` : "";
+  return `${label}: the provider call failed (${e.code}${status}); its response is not recorded because the request carried today's calendar`;
+}
+
+/** Run the calendar step under `runCore`'s OWN bound, whatever the step does (spec §3: "The step never throws and
+ *  always resolves" — held here as this function's property rather than the step's, the `scan` rule): a step that
+ *  throws (synchronously or not) becomes every configured source `malformed`; one that has not answered by
+ *  `boundMs` becomes every source `timeout`. Either way the briefing goes on. The timer is NOT unref'd: while this
+ *  is pending it is the one thing keeping the race honest. */
+async function boundCalendarStep(
+  step: CalendarStep, c: CalendarStepContext, resolved: ResolvedCalendar, maxChars: number, boundMs: number,
+): Promise<CalendarStepResult | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<"timeout">((r) => { timer = setTimeout(() => r("timeout"), Math.max(0, c.startedAt + boundMs - Date.now())); });
+  try {
+    const out = await Promise.race([Promise.resolve().then(() => step(c)).catch(() => "threw" as const), late]);
+    if (out === "timeout" || out === "threw") {
+      try { return calendarFailedResult(resolved, out === "timeout" ? "timeout" : "malformed", c.runDate, Date.now(), maxChars); }
+      catch { return undefined; }
+    }
+    return out;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 // ⚠ A module-level `persistHealth` USED TO SIT HERE and was deleted on 2026-08-11. It had NO
@@ -1613,6 +2249,12 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
 // removed because "persist" and "evaluate" read like separate steps a caller might want: they are
 // deliberately ONE, since the triggers are defined over the merged history, not over a single run.
 // Do not reintroduce a standalone writer; extend `evaluateHealthTriggers` instead.
+
+/** The ownership check before the `transcript-health.json` write (P1-M8 checkpoint LOW 7): `RunDeps.lockStillHeld`,
+ *  the walk's own check, so a holder that lost the run lock writes no health record. */
+async function ownedForHealth(deps: RunDeps): Promise<void> {
+  if (deps.lockStillHeld !== undefined && !(await deps.lockStillHeld())) throw new LostLockError();
+}
 
 /** Merge this run into the day record, then evaluate §3.8's triggers over the RESULT. Returns the
  *  fired codes so the caller can emit each one's warning. Persisting and evaluating are one step
@@ -1625,6 +2267,7 @@ async function evaluateHealthTriggers(
     // Injected writer (tests): still evaluate, against this run merged onto `deps.priorHealth` when
     // one is supplied and an empty history otherwise — `priorHealth` exists precisely so a test can
     // seed history (see RunDeps). Said "an empty history" unconditionally until 2026-08-11.
+    await ownedForHealth(deps);
     await deps.persistHealth(date, counters).catch(() => {});
     const merged = mergeRun(deps.priorHealth ?? emptyHealth(), date, counters);
     return { fired: evaluateTriggers(merged, merged.days.find((d) => d.date === date)), health: merged };
@@ -1636,6 +2279,7 @@ async function evaluateHealthTriggers(
     if (await f.exists()) prior = { ...emptyHealth(), ...(await f.json()) };
   } catch { /* a corrupt record is replaced, not fatal */ }
   const merged = mergeRun(prior, date, counters);
+  await ownedForHealth(deps);
   await Bun.write(path, serialiseHealth(merged)).catch(() => {});
   return { fired: evaluateTriggers(merged, merged.days.find((d) => d.date === date)), health: merged };
 }

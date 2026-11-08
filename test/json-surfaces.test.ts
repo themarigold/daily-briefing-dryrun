@@ -6,7 +6,7 @@ import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off 
 // REPAIRS, i.e. writes); doctor never generates and never stamps; config validate is the SAME
 // validator `loadConfig` uses, pinned by a shared fixture so the two cannot drift.
 import { test, expect, describe, spyOn } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, statSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, statSync, existsSync, readFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -709,7 +709,9 @@ test("SKIP_REASONS covers every non-delivering return in run(), and nothing else
   // ternary (`noConfig ? "no-config" : "config-error"`), and a bare ternary scan instead swept up
   // `interactive ? "cli" : "scheduled"` — the lock's invoker, which is not a skip reason at all.
   // A bare-word literal is only a candidate here; a detail string has spaces and cannot match.
-  for (const call of src.matchAll(/skip\(([^)]*)\)/g)) {
+  // `noteSkip(` too (provider fallback P1-M9-T1): the record writer the parse-empty, write-fail and marker-fail
+  // returns call directly, beside `last-failure.json`.
+  for (const call of src.matchAll(/(?:skip|noteSkip)\(([^)]*)\)/g)) {
     for (const q of call[1]!.matchAll(/"([a-z-]+)"/g)) used.add(q[1]!);
   }
   for (const m of src.matchAll(/reason:\s*"([a-z-]+)"/g)) used.add(m[1]!);
@@ -872,4 +874,247 @@ describe("doctor --json: the discovery-blocked rule (v0.2.1)", () => {
       expect(d.verdict).toBe("ready");
     } finally { env.cleanup(); }
   });
+});
+
+// ── Provider fallback P1-M10-T1: `status --json` `providers` and `lastFailure`; `doctor` `providers` ─────────────────
+describe("P1-M10-T1: provider rows", () => {
+  const LOCAL = { api: { kind: "openai-compatible", model: "llama3", baseUrl: "http://127.0.0.1:9/v1" } };
+  const inAnHour = () => new Date(Date.now() + 3600e3).toISOString();
+  async function seedState(stateDir: string, cfg: Config, extra: { marks?: Record<string, unknown>; status?: Record<string, unknown> }) {
+    const { accountStatePath } = await import("../src/account");
+    const { writeProviderStatus } = await import("../src/providerStatus");
+    mkdirSync(stateDir, { recursive: true });
+    if (extra.marks) writeFileSync(accountStatePath(stateDir), JSON.stringify({ accounts: extra.marks }));
+    if (extra.status) await writeProviderStatus({ labels: extra.status as never });
+    void cfg;
+  }
+
+  test("status --json: one row per entry and per dropped entry, in rowStatus precedence; item 1's hour mark is not 'paused'", async () => {
+    const cfgObj = { repos: ["/r1"], provider: { ...PROV, accounts: [{ label: "A" }, { label: "B", configDir: tmpdir() }] },
+      fallbacks: [{ label: "Usage", ...LOCAL }, { label: "Paused", ...LOCAL }, { label: "Failing", ...LOCAL }, { label: "Working", ...LOCAL }, { label: "Broken" }] };
+    const env = withEnv(cfgObj);
+    try {
+      const cfg = await loadConfig();
+      const { resolveProviderList, entryRevision } = await import("../src/providerList");
+      const list = resolveProviderList(cfg, process.env.HOME ?? "");
+      const rev = (l: string) => entryRevision(list.entries.find((e) => e.label === l)!);
+      const at = new Date(Date.now() - 600e3).toISOString();
+      await seedState(env.stateDir, cfg, {
+        marks: { A: { limitedUntil: inAnHour(), isProbe: true, reason: "auth" }, Usage: { limitedUntil: inAnHour(), isProbe: false, reason: "usage" },
+          Paused: { limitedUntil: inAnHour(), isProbe: true, reason: "not-found" } },
+        status: {
+          A: { revision: rev("A"), lastRun: { at, revision: rev("A"), ok: true } },
+          Failing: { revision: rev("Failing"), lastRun: { at, revision: rev("Failing"), ok: false, reason: "unreachable" }, failingSince: { at, revision: rev("Failing") } },
+          Working: { revision: rev("Working"), lastRun: { at, revision: rev("Working"), ok: true } },
+        },
+      });
+      const s = await statusReport();
+      expect(s.providers.map((p) => [p.label, p.kind, p.status.kind])).toEqual([
+        ["A", "cli", "working"],                        // an hour mark on item 1 is ignored: its newest observation decides
+        ["B", "cli", "not-tested"],
+        ["Usage", "openai-compatible", "out-of-usage"],
+        ["Paused", "openai-compatible", "paused"],
+        ["Failing", "openai-compatible", "not-working"],
+        ["Working", "openai-compatible", "working"],
+        ["Broken", "invalid", "invalid"],
+      ]);
+      expect(s.providers.find((p) => p.label === "Usage")?.until).toBeDefined();
+      expect(s.providers.find((p) => p.label === "Failing")?.failingSince).toBe(at);
+      expect(s.lastFailure).toBeNull();
+    } finally { env.cleanup(); }
+  });
+
+  test("status --json: lastFailure is null without the file and the record with it", async () => {
+    const env = withEnv({ repos: ["/r1"], provider: PROV });
+    try {
+      expect((await statusReport()).lastFailure).toBeNull();
+      const { writeLastFailure } = await import("../src/marker");
+      await writeLastFailure({ localDate: "2026-10-16", reason: "provider-fail", detail: "1 provider failed — open Settings → Providers" });
+      expect((await statusReport()).lastFailure).toEqual({ localDate: "2026-10-16", reason: "provider-fail", detail: "1 provider failed — open Settings → Providers" });
+    } finally { env.cleanup(); }
+  });
+
+  test("doctor --json: a providers array with each entry's key source and mark, and it never spawns a key command", async () => {
+    const env = withEnv({ repos: ["/r1"], provider: PROV,
+      fallbacks: [{ label: "Key", api: { kind: "anthropic", model: "m", baseUrl: "https://api.example/v1", apiKeyCommand: ["/nonexistent/bin/key-helper", "get"] } }, { label: "Local", ...LOCAL }] });
+    try {
+      const { accountStatePath } = await import("../src/account");
+      mkdirSync(env.stateDir, { recursive: true });
+      writeFileSync(accountStatePath(env.stateDir), JSON.stringify({ accounts: { Local: { limitedUntil: inAnHour(), isProbe: false, reason: "usage" } } }));
+      const spawnSpy = spyOn(Bun, "spawn");
+      let d: Awaited<ReturnType<typeof doctorReport>>;
+      try { d = await doctorReport(OFFLINE_DEPS); } finally { spawnSpy.mockRestore(); }
+      expect(spawnSpy.mock.calls.filter((c) => JSON.stringify(c).includes("key-helper"))).toEqual([]);
+      expect(d.providers.map((p) => [p.label, p.kind])).toEqual([["default", "cli"], ["Key", "anthropic"], ["Local", "openai-compatible"]]);
+      const key = d.providers.find((p) => p.label === "Key")!;
+      expect(key.keySource).toEqual({ source: expect.any(String), found: null, detail: expect.any(String), executed: false });
+      expect(d.providers.find((p) => p.label === "Local")?.mark?.reason).toBe("usage");
+      expect(d.providers.find((p) => p.label === "default")?.mark).toBeNull();
+    } finally { env.cleanup(); }
+  });
+
+  test("doctor --json: a DROPPED fallback is 'degraded', not 'blocked' — the run still delivers from item 1", async () => {
+    const env = withEnv({ repos: ["/r1"], provider: PROV, fallbacks: [{ label: "Broken" }] });
+    try {
+      const d = await doctorReport(OFFLINE_DEPS);
+      expect(d.config.valid).toBe(false);                            // the premise: config validate still refuses it
+      expect(d.verdict).toBe("degraded");
+      expect(d.providers.find((p) => p.label === "Broken")?.kind).toBe("invalid");
+    } finally { env.cleanup(); }
+  });
+});
+
+// ── P1-M10 checkpoint: doctor's dropped-fallback rule is ONLY for dropped fallbacks (MED 3), and labels that are keys
+// or calendar links never reach the report surfaces raw (MED 4, hub Q25) ─────────────────────────────────────────────
+describe("P1-M10 checkpoint: doctor verdicts and safe provider labels", () => {
+  const KEY = "sk-ant-api03-Zq9xR2bT7mVwK4pLs8NcYf3HjA6uDe1GiO5rQ0tXzBnMvCwEkPaLyJhUgSdFo2Ii-AbCdEfGhAA";
+  const LINK = "https://calendar.google.com/calendar/ical/me%40example.org/private-0123456789abcdef/basic.ics";
+  const LOCAL = { api: { kind: "openai-compatible", model: "llama3", baseUrl: "http://127.0.0.1:9/v1" } };
+
+  test("a dropped fallback PLUS another config error stays 'blocked' (invalid provider.label; a literal calendar url)", async () => {
+    for (const extra of [{ provider: { ...PROV, label: "" } }, { calendar: { enabled: true, links: [{ id: "work", url: LINK }] } }]) {
+      const env = withEnv({ repos: ["/r1"], provider: PROV, fallbacks: [{ label: "Broken" }], ...extra });
+      try {
+        const d = await doctorReport(OFFLINE_DEPS);
+        expect(d.config.errors.some((e) => e.field.startsWith("fallbacks["))).toBe(true);   // the premise: both kinds of error
+        expect(d.config.errors.some((e) => !e.field.startsWith("fallbacks"))).toBe(true);
+        expect(`${Object.keys(extra)[0]}: ${d.verdict}`).toBe(`${Object.keys(extra)[0]}: blocked`);
+      } finally { env.cleanup(); }
+    }
+  });
+
+  test("status --json and doctor --json show a key- or link-shaped label masked; config validate warns by position and never echoes it", async () => {
+    const env = withEnv({ repos: ["/r1"], provider: PROV,
+      fallbacks: [{ label: `Key ${KEY}`, ...LOCAL }, { label: `Cal ${LINK}`, ...LOCAL }, { label: "Plain local", ...LOCAL }, { label: `Broken ${KEY}` }] });
+    try {
+      const s = JSON.stringify((await statusReport()).providers);
+      const d = await doctorReport(OFFLINE_DEPS);
+      for (const text of [s, JSON.stringify(d.providers)]) {
+        expect(text).not.toContain("Zq9xR2bT7mVwK4pL");
+        expect(text).not.toContain("calendar.google.com");
+        expect(text).toContain("Plain local");                       // an ordinary label is untouched
+      }
+      const raw = JSON.parse(readFileSync(join(env.cfgHome, "daily-briefing", "config.json"), "utf8"));
+      const v = validateCandidate(raw);
+      const labelWarnings = v.warnings.filter((w) => w.message.includes("reports show it masked"));
+      expect(labelWarnings.map((w) => w.field)).toEqual(["fallbacks[0]", "fallbacks[1]"]);
+      expect(JSON.stringify(v)).not.toContain("Zq9xR2bT7mVwK4pL");
+      expect(JSON.stringify(v)).not.toContain("calendar.google.com");
+    } finally { env.cleanup(); }
+  });
+
+  test("an ordinary config gets no label warning", () => {
+    const v = validateCandidate({ repos: ["/r1"], provider: { ...PROV, accounts: [{ label: "Claude login 1" }, { label: "Work", configDir: tmpdir() }] }, fallbacks: [{ label: "Local model", ...LOCAL }] });
+    expect(v.warnings.filter((w) => w.message.includes("reports show it masked"))).toEqual([]);
+  });
+});
+
+test("P1-M10 checkpoint (Q25 (3)): a key-shaped LOGIN label is warned by its accounts position; item 1's own label by provider.label", () => {
+  const KEY = "sk-ant-api03-Zq9xR2bT7mVwK4pLs8NcYf3HjA6uDe1GiO5rQ0tXzBnMvCwEkPaLyJhUgSdFo2Ii-AbCdEfGhAA";
+  const v1 = validateCandidate({ repos: ["/r1"], provider: { ...PROV, accounts: [{ label: "Login 1" }, { label: `Login ${KEY}`, configDir: tmpdir() }] } });
+  expect(v1.valid).toBe(true);                                       // a warning, never an error (requirement 9)
+  expect(v1.warnings.filter((w) => w.message.includes("reports show it masked")).map((w) => w.field)).toEqual(["provider.accounts[1]"]);
+  const v2 = validateCandidate({ repos: ["/r1"], provider: { ...PROV, label: `Main ${KEY}` } });
+  expect(v2.warnings.filter((w) => w.message.includes("reports show it masked")).map((w) => w.field)).toEqual(["provider.label"]);
+  // The notes never echo it (`normalized` is the caller's own config handed back, by design, so it is not checked).
+  expect(JSON.stringify([v1.warnings, v1.errors, v2.warnings, v2.errors])).not.toContain("Zq9xR2bT7mVwK4pL");
+});
+
+describe("PR 1 final review round 1: doctor's gate and verdict follow the run", () => {
+  const LOCAL = { api: { kind: "openai-compatible", model: "llama3", baseUrl: "http://127.0.0.1:9/v1" } };
+  test("M10: a loopback item 1 with a remote fallback reports the network gate the WALK uses (enabled), single-entry unchanged", async () => {
+    const env = withEnv({ repos: ["/r1"], provider: { ...LOCAL },
+      fallbacks: [{ label: "Remote", api: { kind: "anthropic", model: "m", baseUrl: "https://api.anthropic.com" } }] });
+    try {
+      const d = await doctorReport(OFFLINE_DEPS);
+      expect(d.network.enabled).toBe(true);
+      expect(d.network.hostsConfigured).toBeGreaterThan(0);
+    } finally { env.cleanup(); }
+    // Single entry: a loopback API item 1 alone disables the gate, exactly as before.
+    const env2 = withEnv({ repos: ["/r1"], provider: { ...LOCAL } });
+    try { expect((await doctorReport(OFFLINE_DEPS)).network).toMatchObject({ enabled: false, hostsConfigured: 0 }); } finally { env2.cleanup(); }
+    const env3 = withEnv({ repos: ["/r1"], provider: PROV });
+    try { expect((await doctorReport(OFFLINE_DEPS)).network.hostsConfigured).toBe(2); } finally { env3.cleanup(); }
+  });
+
+  test("M11: an openai-compatible item 1 with NO baseUrl stays 'blocked' even when its only config errors are dropped fallbacks", async () => {
+    const env = withEnv({ repos: ["/r1"], provider: { api: { kind: "openai-compatible", model: "m" } }, fallbacks: [{ label: "Broken" }] });
+    try {
+      const d = await doctorReport(OFFLINE_DEPS);
+      expect(d.config.errors.every((e) => e.field.startsWith("fallbacks"))).toBe(true);   // the premise
+      expect(d.verdict).toBe("blocked");
+    } finally { env.cleanup(); }
+  });
+});
+
+test("round 2 L4: an item 1 without a baseUrl is 'blocked' only when NO valid fallback survives", async () => {
+  const env = withEnv({ repos: ["/r1"], provider: { api: { kind: "openai-compatible", model: "m" } },
+    fallbacks: [{ label: "Broken" }, { label: "Local", api: { kind: "openai-compatible", model: "llama3", baseUrl: "http://127.0.0.1:9/v1" } }] });
+  try {
+    const d = await doctorReport(OFFLINE_DEPS);
+    expect(d.config.errors.every((e) => e.field.startsWith("fallbacks"))).toBe(true);   // the premise
+    expect(d.verdict).toBe("degraded");                                                // the walk moves on to Local
+  } finally { env.cleanup(); }
+});
+
+// ── PR 1 final review round 3 ──────────────────────────────────────────────────────────────────────────────────────
+describe("PR 1 final review round 3: provider rows carry their position (M1); one path for drop warnings (L6)", () => {
+  const KEY = "sk-ant-api03-Zq9xR2bT7mVwK4pLs8NcYf3HjA6uDe1GiO5rQ0tXzBnMvCwEkPaLyJhUgSdFo2Ii-AbCdEfGhAA";
+  const LOCAL = { api: { kind: "openai-compatible", model: "llama3", baseUrl: "http://127.0.0.1:9/v1" } };
+  const LINK = "https://calendar.google.com:99999/calendar/ical/abc%40group.calendar.google.com/private-0123456789abcdef0123456789abcdef/basic.ics";
+
+  test("M1: status and doctor rows carry index (display position as written), source and fallbackIndex — two masked labels and a duplicate stay joinable", async () => {
+    const env = withEnv({ repos: ["/r1"], provider: { ...PROV, accounts: [{ label: "A" }, { label: "B", configDir: tmpdir() }] },
+      fallbacks: [{ label: `Key ${KEY}`, ...LOCAL }, { label: "Broken" }, { label: `Other ${KEY}x`, ...LOCAL }, { label: "A", ...LOCAL }] });
+    try {
+      const s = await statusReport();
+      const d = await doctorReport(OFFLINE_DEPS);
+      for (const rows of [s.providers, d.providers] as { label: string; index: number; source: string; fallbackIndex?: number }[][]) {
+        expect(rows.map((r) => [r.index, r.source, r.fallbackIndex ?? null])).toEqual([
+          [0, "provider", null], [1, "provider", null],
+          [2, "fallback", 0], [3, "fallback", 1], [4, "fallback", 2], [5, "fallback", 3],
+        ]);
+        // The premise: two rows read the same masked text, and the duplicate-label row reads its twin's label.
+        expect(rows[2]!.label).toBe(rows[4]!.label);
+        expect(rows[5]!.label).toBe(rows[0]!.label);
+      }
+    } finally { env.cleanup(); }
+  });
+
+  test("M1: a whole-list drop (fallbacks not an array) is one fallback row with no fallbackIndex, after item 1", async () => {
+    const env = withEnv({ repos: ["/r1"], provider: PROV, fallbacks: { label: "not a list" } });
+    try {
+      const rows = (await statusReport()).providers;
+      expect(rows.map((r) => [r.index, r.source, "fallbackIndex" in r])).toEqual([[0, "provider", false], [1, "fallback", false]]);
+    } finally { env.cleanup(); }
+  });
+
+  test("L6: config validate's dropped-entry error goes through the same scrub as the status row's reason", async () => {
+    const env = withEnv({ repos: ["/r1"], provider: PROV, fallbacks: [{ label: "Cal", api: { kind: "openai-compatible", model: "m", baseUrl: LINK } }] });
+    try {
+      const raw = JSON.parse(readFileSync(join(env.cfgHome, "daily-briefing", "config.json"), "utf8"));
+      const v = validateCandidate(raw);
+      const err = v.errors.find((e) => e.field === "fallbacks[0]");
+      expect(err?.message).toContain("is not a valid URL");                 // the premise: the warning quotes the value
+      expect(err?.message).not.toContain("private-0123456789abcdef");
+      const row = (await statusReport()).providers.find((p) => p.status.kind === "invalid");
+      expect(row?.status).toEqual({ kind: "invalid", reason: err!.message });
+    } finally { env.cleanup(); }
+  });
+});
+
+// PR 1 final review round 4 M3: a structurally broken `provider.accounts` ("— account failover disabled") collapses
+// item 1 to ONE row while the written list has N logins, so `index` is not the written position there (and `--index`
+// refuses that config). Pinned as the documented collapsed shape; docs/gui-seam.md §1 tells the app not to join then.
+test("round 4 M3: accounts [A, A] + one fallback — status and doctor rows collapse item 1, and the warning says why", async () => {
+  const env = withEnv({ repos: ["/r1"], provider: { ...PROV, accounts: [{ label: "A" }, { label: "A" }] },
+    fallbacks: [{ label: "Key", api: { kind: "anthropic", model: "m", apiKeyEnv: "K" } }] });
+  try {
+    const s = await statusReport();
+    const d = await doctorReport(OFFLINE_DEPS);
+    for (const rows of [s.providers, d.providers] as { index: number; source: string; fallbackIndex?: number }[][]) {
+      expect(rows.map((r) => [r.index, r.source, "fallbackIndex" in r ? r.fallbackIndex : "absent"])).toEqual([[0, "provider", "absent"], [1, "fallback", 0]]);
+    }
+    expect(d.config.warnings.some((w) => w.field === "provider.accounts" && w.message.includes("account failover disabled"))).toBe(true);
+  } finally { env.cleanup(); }
 });

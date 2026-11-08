@@ -36,8 +36,17 @@
  *
  * Which schedule phase applies, whether today was delivered, what a skip means: that is
  * `schedule_state::derive`, in Rust. This model RENDERS `scheduleState.statusLine`, its tone and a
- * skip's own `detail` line. The one comparison it makes is the briefing's OWN date (from its title
- * line) against the local date, to label an older briefing as not today's.
+ * skip's own `detail` line. It compares two dates against the local date it is given (`today`):
+ * the briefing's OWN date (from its title line), to label an older briefing as not today's, and
+ * `status --json`'s `lastFailure.localDate`, to show the failure banner only for today's record.
+ *
+ * ## The failure banner (provider fallback P3-M6-T1, spec §5 "Unresolved failure")
+ *
+ * `lastFailure` is the engine's durable record of a failure-class skip; later quiet skips cannot erase
+ * it, unlike `last-skip.json`, and the engine deletes it on delivery. It rides the snapshot's raw
+ * `status` envelope (no Rust struct change). While it names `today`, Today shows it — unless Rust's
+ * phase says today was delivered (a record the engine could not delete never outlives the delivery),
+ * or today's skip banner already shows the same detail.
  */
 import { renderMarkdown, blockText, type Block } from "./briefing-md";
 import { renderStruct, type BriefingStruct } from "./briefing-struct";
@@ -70,6 +79,8 @@ export interface Banner {
 }
 
 export interface TodayModel {
+  /** The identity of the displayed file, from its Rust read (never recomputed from text). */
+  pageIdentity?: { pageHash: string; pageVersion: string };
   /** `scheduleState.statusLine` — the tray's words — and its tone; null before the first snapshot. */
   status: { text: string; tone: Tone } | null;
   /** Engine-authored explanations (a skip's `detail`, a config error), verbatim, plus read errors. */
@@ -146,6 +157,14 @@ export function todayModel(input: {
     }
     if (p.phase === "config-error") banners.push({ tone: "bad", text: p.detail });
   }
+  const failure = lastFailureOf(snapshot);
+  const deliveredToday =
+    state !== null &&
+    (state.phase.phase === "delivered" || (state.phase.phase === "config-error" && state.phase.deliveredToday));
+  if (failure !== null && failure.localDate === today && !deliveredToday && !banners.some((b) => b.text === failure.detail)) {
+    const text = failure.detail === "" ? `${FAILURE_BANNER_LEAD} (${failure.reason})` : `${FAILURE_BANNER_LEAD}\n${failure.detail}`;
+    banners.push({ tone: "bad", text });
+  }
   if (latest.state === "error") banners.push({ tone: "bad", text: latest.message });
 
   const source = chooseSource(latest.state === "loaded" ? latest.file : null, lastRun);
@@ -156,6 +175,8 @@ export function todayModel(input: {
     status: state === null ? null : { text: state.statusLine, tone: tone(state) },
     banners,
     source,
+    ...(latest.state === "loaded" && latest.file.pageHash !== undefined && latest.file.pageVersion !== undefined
+      ? { pageIdentity: { pageHash: latest.file.pageHash, pageVersion: latest.file.pageVersion } } : {}),
     staleDate: date !== null && date !== today ? date : null,
     quiet,
     quietWithWarning: quiet && blocks.some((b) => b.kind === "warnings"),
@@ -179,10 +200,81 @@ export function envelopeOf(payload: unknown): RunEnvelope | null {
   };
 }
 
+/** `status --json`'s `lastFailure` (`docs/gui-seam.md`: `{localDate, reason, detail}` or `null`). */
+export interface LastFailure {
+  localDate: string;
+  reason: string;
+  detail: string;
+}
+
+/** `lastFailure` from the raw `status --json` envelope; `null` when absent (an older engine) or malformed. */
+function lastFailureOf(snapshot: Snapshot | null): LastFailure | null {
+  const status = snapshot?.status;
+  if (typeof status !== "object" || status === null) return null;
+  const f = (status as { lastFailure?: unknown }).lastFailure;
+  if (typeof f !== "object" || f === null || Array.isArray(f)) return null;
+  const { localDate: day, reason, detail } = f as Record<string, unknown>;
+  if (typeof day !== "string" || typeof reason !== "string" || typeof detail !== "string") return null;
+  return { localDate: day, reason, detail };
+}
+
+export const FAILURE_BANNER_LEAD = "An attempt today failed, and no briefing has been delivered since.";
+
 /** `latestBriefingMtime` from the raw `status --json` envelope — the key Today re-reads on. */
 export function latestMtime(snapshot: Snapshot | null): string | null {
   const status = snapshot?.status;
   if (typeof status !== "object" || status === null) return null;
   const m = (status as { latestBriefingMtime?: unknown }).latestBriefingMtime;
   return typeof m === "string" ? m : null;
+}
+
+/** `latestMtime`, with `undefined` when the status itself is unknown (a failed read). */
+export function knownMtime(snapshot: Snapshot | null): string | null | undefined {
+  const status = snapshot?.status;
+  return typeof status === "object" && status !== null ? latestMtime(snapshot) : undefined;
+}
+
+
+/** Summary signals are parsed only by the ordered per-App reader, never from Today's raw watcher prop. */
+export interface SummaryStatus {
+  enabled: boolean;
+  warnings: ("summary-unavailable" | "summary-text-omitted" | "summary-usage-limit" | "summary-config-invalid")[];
+}
+export interface SummaryRevision {
+  pageHash: string;
+  pageVersion: string;
+  revision: number;
+  state: "pending" | "ready" | "unavailable";
+}
+
+/** Same lenient boundary as Rust's StatusView: malformed status is off; unknown warnings are dropped. */
+export function summaryStatusFromStatus(status: unknown): SummaryStatus {
+  const fallback: SummaryStatus = { enabled: false, warnings: [] };
+  if (typeof status !== "object" || status === null) return fallback;
+  const value = (status as { aiSummaryStatus?: unknown }).aiSummaryStatus;
+  if (typeof value !== "object" || value === null) return fallback;
+  const { enabled, warnings } = value as { enabled?: unknown; warnings?: unknown };
+  if (typeof enabled !== "boolean" || !Array.isArray(warnings)) return fallback;
+  const codes: SummaryStatus["warnings"] = [];
+  for (const code of warnings) {
+    if ((code === "summary-unavailable" || code === "summary-text-omitted" || code === "summary-usage-limit" || code === "summary-config-invalid") && !codes.includes(code)) codes.push(code);
+  }
+  return { enabled, warnings: codes };
+}
+
+export function summaryStatusOf(snapshot: Snapshot | null): SummaryStatus {
+  return summaryStatusFromStatus(snapshot?.status);
+}
+
+export function summaryRevisionOf(snapshot: Snapshot | null): SummaryRevision | null {
+  const status = snapshot?.status;
+  if (typeof status !== "object" || status === null) return null;
+  const value = (status as { latestSummaryRevision?: unknown }).latestSummaryRevision;
+  if (typeof value !== "object" || value === null) return null;
+  const { pageHash, pageVersion, revision, state } = value as Record<string, unknown>;
+  if (typeof pageHash !== "string" || !/^[a-f0-9]{64}$/.test(pageHash)
+    || typeof pageVersion !== "string" || !/^[a-f0-9]{64}$/.test(pageVersion)
+    || (state !== "pending" && state !== "ready" && state !== "unavailable")
+    || typeof revision !== "number" || revision !== (state === "pending" ? 0 : 1)) return null;
+  return { pageHash, pageVersion, revision, state };
 }

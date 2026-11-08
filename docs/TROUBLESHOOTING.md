@@ -188,6 +188,7 @@ Start with `daily-briefing schedule status`:
 | Line | What to look for |
 | --- | --- |
 | `registered:` | `no` means nothing is scheduled: run `daily-briefing schedule install` (or set up background delivery in the app). `unknown` means the check could not run, which says nothing either way: over SSH there is no desktop session to ask, and on Linux your user's systemd manager may be out of reach from that shell. Run it again from a terminal in your desktop session; `schedule status --json` gives the reason as `registeredReason`. |
+| `⚠ Probably switched off …` | macOS only, under `registered: no` when the plist is on disk: launchd cannot find the job, which is what you see when the background item is switched off in **System Settings › General › Login Items & Extensions**. Switch it on there; reinstalling does not turn it back on (`schedule install` warns the same way). A job unloaded by hand looks the same, hence "probably". `schedule status --json` carries it as `registeredHint: "login-items-off"`, and the app's Schedule screen shows the same sentence. |
 | `owner:` | `app` or `cli`. Only one may own the trigger; the other is refused rather than replacing it. |
 | `morning time:` | `not yet reached` means it is earlier than your morning time ([`morningTime`](CONFIG.md#morningtime)), so ticks do nothing yet. |
 | `ticks today:` | how many times the scheduler woke the engine today. `none recorded` after your morning time means the scheduler is not reaching it. |
@@ -205,12 +206,17 @@ Start with `daily-briefing schedule status`:
 | `below-floor` | it was earlier than `morningTime`. |
 | `offline` | the network did not come up within the wait; the next tick retries. |
 | `darkwake` | the Mac was in a brief maintenance wake; the next real wake delivers. |
-| `limited` | the AI account is at its usage limit; the detail says until when, when the provider stated it. |
+| `limited` | every provider is out of usage. With [`fallbacks`](CONFIG.md#fallbacks) a wall hands off to the next entry in the same tick, so this means nothing is left; the detail's first line says until when, when every provider stated a reset. |
 | `blocked` | no activity, and a repository could not be read — or no repository was found at all and a folder listed in `discoverRoots` could not be read or found (on macOS, usually [folder access](#macos-repos-in-protected-folders-desktop--documents--downloads--icloud)). The day is not used up; when it can, the detail names the folders. |
-| `provider-fail` | the AI call failed after retries; the detail says how. |
+| `provider-fail` | the AI call failed after retries; the detail says how. With two or more providers its first line is "N providers failed — open Settings → Providers", or "paused after failures until <time>" when every provider is benched for an hour after a failure. See [provider fallback](#provider-fallback-skipped-not-tried-and-paused). |
 | `no-config`, `config-error` | the config is missing or invalid: `daily-briefing doctor --json`. |
 | `concurrent` | another run was still going. |
 | `parse-empty`, `marker-fail`, `crashed` | the run failed after calling the AI; the log has the detail. Please report it. |
+| `write-fail` | the briefing was generated but `briefing-latest.md` could not be saved (disk full, or the state folder's permissions changed). Today is not marked done, so the next check tries again; free space or fix the folder's permissions. |
+
+A failure-class skip (`provider-fail`, `parse-empty`, `write-fail`, `marker-fail`, `crashed`) is also kept in
+`last-failure.json` in the state folder until a briefing is delivered, so a later quiet skip (offline, concurrent,
+limited) does not hide it; `status --json` reports it as `lastFailure`.
 
 **Logs:**
 
@@ -235,6 +241,84 @@ empty to keep Bun's crash upload off, and nothing was sent.
   [CLI not found](#cli-not-found-or-no-ai-cli-found-on-path).
 - **Repositories in protected folders on macOS:** the run reports `blocked`; see
   [folder access](#macos-repos-in-protected-folders-desktop--documents--downloads--icloud).
+
+## Provider fallback: skipped, not tried and paused
+
+With [`fallbacks`](CONFIG.md#fallbacks) (or more than one login in `provider.accounts`), a run tries the providers
+in order — item 1's logins, then each fallback — and uses the first that delivers a briefing. A briefing that came
+from a list of two or more opens with lines above its title, each starting `ℹ︎`:
+
+| Line | Meaning |
+| --- | --- |
+| `ℹ︎ Skipped "<label>": <reason> — used "<winner>"` | that entry was tried and failed (reasons below); the next one delivered. |
+| `ℹ︎ Not tried "<label>": out of usage until <time>` | the entry hit its usage limit on an earlier run and is benched until the reset. |
+| `ℹ︎ Not tried "<label>": paused until <time> after <reason>` | the entry failed recently and is benched for an hour. "after earlier failures" means a mark written by an older version. |
+| `ℹ︎ Not tried "<label>": invalid entry — <reason>, fix it in Settings` | the entry is not a valid provider entry; `daily-briefing config validate --json` names the problem. |
+| `ℹ︎ Generated using "<label>" — API charges may apply.` | the briefing came from a remote API entry, or a CLI entry whose `credential` is `"env-api-key"`. |
+
+The reasons, and whether an entry is benched for an hour after one (item 1 never is, and a failure followed by a
+network check that says offline benches nothing):
+
+| Reason | When | Benched |
+| --- | --- | --- |
+| out of usage | the provider's usage limit (a CLI's message, an HTTP 429 usage wall, 402, a spend cap) | until the reset, or an hour when no reset was stated; item 1 too |
+| rate-limited | a transient HTTP 429, after retries | no |
+| key or login rejected | HTTP 401 or 403 | an hour |
+| key couldn't be read | no key could be resolved, including a locked or timed-out Keychain read ([a locked Keychain](#macos-a-locked-keychain)) | an hour |
+| CLI not installed | the CLI is not on PATH, or exited 127 with a "not found" message | an hour |
+| model or endpoint not found | HTTP 404 | an hour |
+| prompt too long for this model | an HTTP 413, or a 400 that names the prompt length | no |
+| request rejected | any other HTTP 4xx, or a refused redirect | no |
+| unreachable | an HTTP 5xx, a network error, a timeout, a non-JSON answer | no |
+| empty answer | the provider answered nothing, after retries | no |
+| answer wasn't a usable briefing | the answer had no briefing section | an hour |
+| unrecognised CLI failure | a CLI exited non-zero for no recognised cause | an hour, for a Claude Code login only |
+| refused to send the key over plain http | an app-owned key with a non-loopback `http:` endpoint: nothing was sent — use `https` | no |
+
+When no provider delivers, the run reports one of three things:
+
+- **every provider is out of usage** — a quiet `limited` skip. Its detail opens "No briefing yet today — every
+  provider is out of usage until <time>. It will arrive once one resets, if your Mac is awake." (the time only when
+  every provider stated its reset);
+- **the last one returned no usable briefing** — `parse-empty`, its detail opening `"<label>" returned no usable
+  briefing — open Settings → Providers`;
+- **anything else** — `provider-fail`: "N providers failed — open Settings → Providers", one line per entry after
+  it, or "paused after failures until <time>" when every provider is benched and none could be tried.
+
+With two or more providers, an entry other than the first (a later login or a fallback) whose retries all failed
+today with a retryable reason — unreachable (but not a timeout), rate-limited, an empty answer, an unrecognised CLI
+failure — while the network check said online (a local model counts as online) gets one quick try, with no retry
+wait and no hardening fallback, on later runs that day, until it works again, its settings change or the day ends.
+A `--force` run never puts an entry into this mode; Run now can, including one started before your morning time.
+
+**An older background engine uses only your first provider.** Moving on to the next provider during a run is
+new: a background schedule that runs an older engine copy uses only item 1 and its logins. When your list has two
+or more valid entries and the scheduled engine is older, the desktop app's Schedule screen says so. For a schedule
+the app set up, **Update background engine** there fixes it; for one installed from the command line, install a
+newer `daily-briefing` and run `daily-briefing schedule install` again (from a source checkout,
+`bash scripts/install.sh`).
+
+## macOS: a locked Keychain
+
+The API keys the app stores live in your login keychain ([Keys the app stores](PROVIDERS.md#keys-the-app-stores)).
+It is normally unlocked while you are logged in; it locks when its settings say so (lock after a period of
+inactivity, or when sleeping — the login keychain's settings in Keychain Access) and can stay locked after a
+password change. While it is locked:
+
+- **A scheduled run** cannot read the key. The read waits on an unlock dialog, so the engine stops it after
+  5 seconds and skips that entry as **key couldn't be read** (the next provider is tried; a later entry is paused
+  for an hour). The dialog — `security` asking to use your keychain — **stays on screen** after the run has moved
+  on, for you to find.
+- **Adding or removing a key** with the engine's `daily-briefing provider key set | key migrate | key delete |
+  key delete-all --json` gives up after about 10 seconds and answers `write-failed` with `reason: "timeout"`: "the
+  Keychain did not answer in time — unlock your keychain, then retry". The desktop app's key settings run these
+  same commands and show the same remedy.
+- **`bash scripts/uninstall.sh --remove-keys`** has no time limit: it waits until you answer the dialog.
+
+The remedy: unlock the keychain — enter your login password in that dialog, or unlock the login keychain in
+Keychain Access — then retry. A paused entry is tried again once its hour is up, or at once after
+`daily-briefing provider reset --index <n> --json` (`<n>` is the entry's 0-based position, item 1's logins
+first, then `fallbacks`).
 
 ## Removing the background scheduler by hand
 
@@ -290,7 +374,7 @@ registered until you press **Finish**. With it on, the desktop app opens when yo
 running to show and announce the morning briefing. It opens the app and nothing else: the briefing
 itself is generated by the background scheduler, which is separate. If you set up the engine from a
 terminal and never went through the app's setup, there is no login item until you turn it on under
-**Settings › This app › Start at login**.
+**Settings › General › This app › Start at login**.
 
 On macOS it is listed in **System Settings › General › Login Items & Extensions**. The app records its
 own bundle identifier in the login item so that macOS should list it as **Daily Briefing** with the
@@ -301,7 +385,7 @@ Turning it off and on again in the app replaces it with the labelled one.
 
 To turn it off:
 
-- **In the app** (preferred): **Settings › This app › Start at login › Turn off.** The app then offers
+- **In the app** (preferred): **Settings › General › This app › Start at login › Turn off.** The app then offers
   to switch the engine's own notifications on, so you still hear about the briefing without the app
   running.
 - **In System Settings:** switch it off under Login Items & Extensions. On macOS 13 and later this may
@@ -318,9 +402,81 @@ it off stops scheduled delivery, so remove the schedule from the app's Schedule 
 On Linux the login item is `~/.config/autostart/Daily Briefing.desktop`, and the same app setting
 removes it.
 
+## Today's calendar
+
+`daily-briefing calendar status` shows each calendar source and its **last scheduled read** ("not yet",
+"ok at 07:21", or what failed), and `daily-briefing calendar test` reads every source now. Each line in the
+briefing's **▶ Today's calendar** section that names a source says what went wrong in fixed words, never
+the link's address; the heading gains `(incomplete)` when any source failed.
+
+### "the link was refused — it may have been reset; add it again"
+
+The calendar's host answered 401, 403, 404 or 410: the secret address was reset (by you, or by your
+organisation), the calendar was deleted, or sharing was turned off. Copy the current address from the
+provider and add it again (Settings → Calendar in the app, or
+`daily-briefing calendar add-link --id <id>` with the address on standard input).
+
+### Resetting a link that may have leaked
+
+Whoever has a private calendar link can read that calendar until it is reset. If one may have leaked — in
+a screenshot, a shared settings file, a pasted log — reset it at the provider: in Google Calendar, open the
+calendar's settings, find **Secret address in iCal format** and click **Reset**; in Outlook, stop
+publishing the calendar and publish it again; in iCloud, turn the calendar's public sharing off and on.
+Then add the new address. Uninstalling removes the tool's own copy of every link, but only a reset stops
+the old address from working.
+
+### Google Workspace: no "Secret address in iCal format"
+
+A Workspace administrator can turn the secret address off for the whole organisation, and then the
+calendar's settings do not show it. Ask the administrator, or add the account to Calendar on your Mac
+and use the Mac Calendar app source (macOS 14 or later).
+
+### iCloud: a declined invitation still shows
+
+An iCloud shared link is a Public Calendar: its events carry no attendees and no replies, so the tool
+cannot see that you declined, and it treats every event on the link as not accepted (no description reaches
+the AI). Use the Mac Calendar app source for iCloud calendars if that matters.
+
+### Calendar permission on the Mac (`not-granted`, `denied`, `write-only`)
+
+The Mac Calendar app source reads through **Daily Briefing Calendar Reader**, which needs full Calendar
+access (EventKit offers no read-only access; the reader never writes). A scheduled run never asks, so
+access is granted only when you are there:
+
+- **`not-granted`**: access was never asked for. Click **Allow access** in Settings → Calendar, or run
+  `daily-briefing calendar connect mac`, and answer the dialog. It names **Daily Briefing Calendar
+  Reader**, not the app you are in. Installing the reader signs it with the local signing identity,
+  which may show a keychain prompt first.
+- **`denied`** or **`restricted`**: macOS remembers the answer and does not ask again. Open System
+  Settings → Privacy & Security → Calendars and turn on **Daily Briefing Calendar Reader** (`restricted`
+  means a device policy decides, not you).
+- **`write-only`**: the reader has "Add Events Only" access, which cannot read. Choose **Full Access**
+  for it in the same Calendars pane (its **Options…** button). Asking again does not help: macOS keeps
+  the stored answer and shows no dialog.
+
+To remove the access, turn the reader off in that pane. Uninstalling removes the reader itself (all of
+`<state dir>/calendar/`), not the system's record of the permission.
+
+### `helper-missing`, `helper-outdated`, `identity-unknown`
+
+- **`helper-missing`** ("the calendar reader is not installed"): the Mac Calendar app source has no
+  installed reader. Click **Allow access** in Settings → Calendar, or run `daily-briefing calendar connect
+  mac`. The reader ships inside the desktop app, and `connect mac` looks for it next to the engine it
+  runs as. A command-line-only install (the release binary or Homebrew) does not carry it yet, so `connect
+  mac` run from that binary reports `helper-missing` even when the desktop app is installed too. Use
+  **Allow access** in the desktop app's Settings → Calendar instead (scheduled runs then use the installed
+  reader whichever binary they run), or use a private calendar link: links work without the reader.
+- **`helper-outdated`**: the installed reader is older than the one this version ships. It still reads.
+  Click **Update the calendar reader** in Settings → Calendar, or run `daily-briefing calendar connect
+  mac`, to install the current copy. Scheduled runs never update it, because signing it can show a
+  keychain prompt.
+- **`identity-unknown`**: the tool could not tell which attendee on this calendar is you, so it cannot see
+  whether you accepted or declined, and treats invitations as not accepted. Add your address to the link's
+  `owner`, or to `calendar.emails` ([CONFIG.md](CONFIG.md#calendar)).
+
 ## Still stuck
 
-Open an issue on [GitHub](https://github.com/themarigold/daily-briefing/issues) with the output of
+Open an issue on [GitHub](https://github.com/norn-app/daily-briefing/issues) with the output of
 `daily-briefing doctor --json` and `daily-briefing schedule status`. Issues are public, and both
 outputs carry local paths: before you post, replace your username or home folder (with `~`), the names
 of private repositories, any private host name, and anything else you would not post publicly (a

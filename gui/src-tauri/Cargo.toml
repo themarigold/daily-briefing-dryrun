@@ -1,6 +1,6 @@
 [package]
 name = "daily-briefing-gui"
-version = "0.2.1"
+version = "0.3.0"
 description = "Desktop shell for the daily-briefing engine"
 authors = ["themarigold"]
 license = "MIT"
@@ -95,7 +95,6 @@ tauri-plugin-notification = "=2.4.0"
 # and the real legs are VM-gated (§12c). `=2.5.1` is the newest 2.x release (tauri `^2.8.2` — no
 # 2.x asks for the 2.10 floor, so the newest is the tightest available under the pin).
 tauri-plugin-autostart = "=2.5.1"
-#
 # ⚠ WHAT B7'S TWO PLUGINS COST IN THE LOCK, MEASURED: SIXTEEN new entries, each read and
 # dispositioned in the B7 review (lens 2 audited all sixteen; none opens a socket — cited as
 # reviewed-in-B7-review rather than re-derived here):
@@ -116,6 +115,25 @@ tauri-plugin-autostart = "=2.5.1"
 #   * `redox_users` 0.4.6 — dirs-sys's Redox-OS arm; dead code on every target this app builds.
 #   * `tauri-winrt-notification` 0.7.3 / `winreg` 0.10.1 — the notification plugin's Windows arm;
 #     dead code on macOS.
+#
+# ⚠ B2-M3-T9's plugin, REGISTERED with NOTHING GRANTED: the notification plugin's posture. `ClipboardExt` resolves managed
+# plugin state, so the Rust-side write needs `init()`, which makes its commands live, and the capability grants none of
+# them. Every real write goes through `src/actions.rs`'s injectable `ClipboardSink`; no test writes to the clipboard.
+# `=2.3.3` is the newest 2.x whose `tauri` requirement (`^2.10`, read from the crates.io index) holds under the `=2.11.5`
+# pin: 2.4.0 onward ask for `^2.12`.
+#
+# ⚠ THE COMMANDS IT REGISTERS, READ FROM THIS LOCKED CRATE (`src/lib.rs`, `generate_handler!`; `build.rs`, `COMMANDS`):
+# `write_text`, `read_text`, `read_image`, `write_image`, `write_html`, `clear`. SIX, not B2 `:107`'s seven: upstream's v2
+# branch has `write_secret`, this release does not. B2-M4-T12 pins the refusal of these six by name.
+#
+# What it costs in the lock, MEASURED: 31 new entries and no version moved (two existing dependency lines gain a version
+# because `foldhash` and `quick-xml` now each have a second one). Reachable on macOS: the plugin, `arboard` 3.7.0 (which
+# also turns on `objc2-core-graphics`) and `image`'s TIFF decoder for it (`tiff`, `fax`, `half`, `quick-error`, `weezl`,
+# `zune-core`, `zune-jpeg`). `crunchy` is in the lock but not in that build: `half` needs it only for `target_arch =
+# "spirv"`. The rest is the Linux/Windows arms: `wl-clipboard-rs`, `x11rb*`, `wayland-*`, `clipboard-win`, `error-code`,
+# `gethostname`, `os_pipe`, `tree_magic_mini` and that one's `nom`/`petgraph` set. The release size is measured by the
+# orchestrator (plan §1.4).
+tauri-plugin-clipboard-manager = "=2.3.3"
 #
 # ⛔ `tauri-plugin-shell` IS DELIBERATELY ABSENT FROM EVERY TABLE IN THIS FILE (T8). B1 had it here
 # and the webview spoke to it directly. Two measured properties killed that: only the FIRST scope
@@ -155,6 +173,13 @@ serde = { version = "=1.0.229", features = ["derive"] }
 # digits and an untouched save would stop being a no-op. The feature only selects serde_json's
 # exact parser; it adds no dependency (`Cargo.lock` is byte-identical with and without it).
 serde_json = { version = "=1.0.151", features = ["preserve_order", "float_roundtrip"] }
+# Canonical latest-page identity, with default features. Already locked transitively, but this edge
+# newly links it into the release binary: its other lock consumers are `tauri-codegen` (build time)
+# and `wry` on Android.
+sha2 = "=0.10.9"
+# The stored AI summary text check runs the formatting predicates the engine's validator runs
+# (`src/summary.rs`, `src/summary/validate.ts`). Already locked, and a dev-dependency below too.
+regex = "=1.13.1"
 # The sidecar spawn. tokio rather than `std::process` because the stdout/stderr pipes are read
 # concurrently with the wait (stderr streams to the webview line by line while stdout is collected
 # whole), and because `kill_on_drop` lets the invocation future OWN its child: dropping the future
@@ -191,6 +216,12 @@ notify = "=8.2.0"
 # libc is already in `Cargo.lock` as a transitive dependency of tokio and tauri, so this adds no
 # crate to the graph — only a direct edge.
 libc = "=0.2.189"
+# ⚠ THE BRIEFING REDESIGN, WAVE 2 (C-M3-T9): Join re-validates a meeting link before Rust opens it
+# (`src/calendar_details.rs`, `joinable`): https, no userinfo, no written port, the host lowercased
+# and in punycode. `url` 2.5.8 was ALREADY in `Cargo.lock` (through tauri and the opener plugin), so
+# this adds a direct edge, not a crate. Checked: tauri-2.11.5/src/lib.rs:83 has `pub use url::Url;`,
+# and Cargo.lock has one `url` package at 2.5.8. Keep the direct dependency for this module's use.
+url = "=2.5.8"
 
 # ⚠ PHASE E M5b: THE LOGIN ITEM'S BRANDING, macOS ONLY, AND NO NEW CRATE. `src/autostart.rs`'s
 # `brand_launch_agent` parses the LaunchAgent plist `tauri-plugin-autostart` writes and adds
@@ -202,6 +233,12 @@ libc = "=0.2.189"
 # equivalent key and does not compile it.
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "=1.10.1"
+# ⚠ THE BRIEFING REDESIGN, WAVE 3 (B2-M4-T11): `src/editor.rs` asks LaunchServices whether an editor is installed, through
+# `NSWorkspace.URLForApplicationWithBundleIdentifier`, without opening anything. Both crates were ALREADY in `Cargo.lock`
+# at 0.3.2, so these are edges, not crates. Defaults stay off: AppKit's default list would enable optional crates, among
+# them `objc2-core-video`, which is not in the lock. AppKit's `NSWorkspace` feature brings the Foundation features it needs.
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSWorkspace"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSURL", "NSString"] }
 
 [dev-dependencies]
 # `tauri/test` provides MockRuntime + the IPC harness the capability tests drive. It is a

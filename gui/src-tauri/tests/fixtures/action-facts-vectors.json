@@ -1,0 +1,93 @@
+{
+  "actionFacts": [
+    {
+      "repoKey": "ra0d7f8a155a8",
+      "path": "/fixture/repo",
+      "remotes": [{ "name": "origin", "transport": "network", "github": { "owner": "org", "repo": "repo" }, "vcs": false, "push": false, "configSection": true, "url": true, "legacy": false, "defaultBranch": "main" }],
+      "branches": [
+        { "name": "feature/contract", "upstreamRemote": "origin", "upstreamBranch": "feature/contract", "pushRemote": null, "remoteFactsUnknown": false, "checkoutPath": "/fixture/repo", "refFormatOk": true, "tip": "296668832012f4afb26ce5268da8abbc6b46f15d" },
+        { "name": "main", "upstreamRemote": null, "upstreamBranch": null, "pushRemote": null, "remoteFactsUnknown": false, "checkoutPath": null, "refFormatOk": true, "tip": "8ebf2e6a6ab5eeacbe540e27fc57ea4491c29192" }
+      ],
+      "pushDefault": null, "pushesToUpstream": false,
+      "legacyNames": [],
+      "omittedRemotes": false,
+      "reachableRemotes": [
+        { "sha": "5fab0a23333646c2d75a5f4af52588518f1fc197", "remotes": ["origin"] },
+        { "sha": "0ff71b6ae1c9cde114cc944903d1f7fe9e8f4eb9", "remotes": ["origin"] },
+        { "sha": "296668832012f4afb26ce5268da8abbc6b46f15d", "remotes": [] }
+      ],
+      "remoteBranches": [
+        { "remote": "origin", "name": "feature/contract", "sha": "0ff71b6ae1c9cde114cc944903d1f7fe9e8f4eb9" },
+        { "remote": "origin", "name": "main", "sha": "8ebf2e6a6ab5eeacbe540e27fc57ea4491c29192" }
+      ],
+      "prEvidence": [{ "number": 12, "sha": "5fab0a23333646c2d75a5f4af52588518f1fc197", "remote": "origin", "method": "merge" }],
+      "roots": [
+        { "root": "", "project": "032fa4562bc7b051317d2a37a7291db8", "labelKeys": ["repo"], "displayLabel": "Repo" },
+        { "root": "apps/gui", "project": "9fbb6e9f98a6074f844482cda9171850", "labelKeys": ["gui"], "displayLabel": "GUI" }
+      ],
+      "cardKeys": ["gui", "repo"],
+      "statInputs": [
+        { "path": "/fixture/gitconfig", "stamp": { "mtimeNs": "1700000000000000000", "size": "46", "kind": "file", "target": null } },
+        { "path": "/fixture/home/.gitconfig", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } },
+        { "path": "/fixture/inc-target.config", "stamp": { "mtimeNs": "1700000000000000000", "size": "21", "kind": "file", "target": null } },
+        { "path": "/fixture/inc.config", "stamp": { "mtimeNs": "1700000000000000000", "size": "17", "kind": "symlink", "target": "inc-target.config" } },
+        { "path": "/fixture/repo/.git/branches", "stamp": { "mtimeNs": "1700000000000000000", "size": "64", "kind": "dir", "target": null } },
+        { "path": "/fixture/repo/.git/config", "stamp": { "mtimeNs": "1700000000000000000", "size": "300", "kind": "file", "target": null } },
+        { "path": "/fixture/repo/.git/config.worktree", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } },
+        { "path": "/fixture/repo/.git/remotes", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } },
+        { "path": "/fixture/xdg/git/config", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }
+      ]
+    }
+  ],
+  "reply": {
+    "schemaVersion": 1,
+    "scope": "all",
+    "checkedAt": "2026-01-11T00:00:00.000Z",
+    "record": { "accepted": true, "windowStartUtc": "2026-01-01T00:00:00.000Z" },
+    "windowStartUtc": "2026-01-01T00:00:00.000Z",
+    "repoViews": [
+      { "key": "ra0d7f8a155a8", "name": "repo", "state": "ok", "noRemote": false, "uncommitted": { "count": 0 }, "storeKey": "s59cf34725cbc", "treeKey": "ta0d7f8a155a8" }
+    ],
+    "labels": [
+      { "key": "repo", "repoKey": "ra0d7f8a155a8", "state": "ok", "rows": [], "notMatched": 0, "prNumbers": [], "onlyHere": 0 },
+      {
+        "key": "gui", "repoKey": "ra0d7f8a155a8", "state": "ok",
+        "rows": [
+          { "kind": "pr", "number": 12, "title": "", "commits": [
+            { "sha": "5fab0a23333646c2d75a5f4af52588518f1fc197", "token": "5fab0a23333646c2d75a5f4af52588518f1fc197" }
+          ] },
+          { "kind": "branch", "name": "feature/contract", "push": { "state": "partly", "notPushed": 1 }, "commits": [
+            { "sha": "296668832012f4afb26ce5268da8abbc6b46f15d", "token": "296668832012f4afb26ce5268da8abbc6b46f15d" },
+            { "sha": "0ff71b6ae1c9cde114cc944903d1f7fe9e8f4eb9", "token": "0ff71b6ae1c9cde114cc944903d1f7fe9e8f4eb9" }
+          ] }
+        ],
+        "notMatched": 0, "prNumbers": [12], "onlyHere": 1
+      }
+    ],
+    "branchLines": [{ "key": "gui", "name": "feature/contract", "state": "live", "notPushed": 1, "neverPushed": false, "behind": 0 }],
+    "pushCards": [
+      { "repoKey": "ra0d7f8a155a8", "storeKey": "s59cf34725cbc", "firstLabel": "repo", "repoName": "repo", "branches": [{ "name": "feature/contract", "commits": 1 }], "onDefault": null }
+    ],
+    "tile": { "commits": 1, "branches": 1 },
+    "hidden": { "complete": true, "perLabel": { "repo": 0, "gui": 0 } }
+  },
+  "spanningRepos": {
+    "actionFacts": [
+      { "repoKey": "radc32726946d", "path": "/fixture/a", "remotes": [{ "name": "origin", "transport": "network", "github": { "owner": "org", "repo": "a" }, "vcs": false, "push": false, "configSection": true, "url": true, "legacy": false, "defaultBranch": "main" }], "branches": [{ "name": "a-work", "upstreamRemote": "origin", "upstreamBranch": "a-work", "pushRemote": null, "remoteFactsUnknown": false, "checkoutPath": null, "refFormatOk": true, "tip": "468dc1b8c716cdb00cb46f76c5aaf649f7479aa9" }, { "name": "main", "upstreamRemote": null, "upstreamBranch": null, "pushRemote": null, "remoteFactsUnknown": false, "checkoutPath": null, "refFormatOk": true, "tip": "0142b8b9f4dc3defb2866e055f3dce0ae3498187" }], "pushDefault": null, "pushesToUpstream": false, "legacyNames": [], "omittedRemotes": false, "reachableRemotes": [{ "sha": "468dc1b8c716cdb00cb46f76c5aaf649f7479aa9", "remotes": ["origin"] }], "remoteBranches": [{ "remote": "origin", "name": "a-work", "sha": "468dc1b8c716cdb00cb46f76c5aaf649f7479aa9" }, { "remote": "origin", "name": "main", "sha": "0142b8b9f4dc3defb2866e055f3dce0ae3498187" }], "prEvidence": [], "roots": [{ "root": "", "project": "891e7dbd0dff73d5bf7c8bff7aa28af5", "labelKeys": ["gui"], "displayLabel": "GUI" }], "cardKeys": ["gui"], "statInputs": [{ "path": "/fixture/a/.git/branches", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }, { "path": "/fixture/a/.git/config", "stamp": { "mtimeNs": "1700000000000000000", "size": "100", "kind": "file", "target": null } }, { "path": "/fixture/a/.git/config.worktree", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }, { "path": "/fixture/a/.git/remotes", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }, { "path": "/fixture/gitconfig", "stamp": { "mtimeNs": "1700000000000000000", "size": "46", "kind": "file", "target": null } }, { "path": "/fixture/home/.gitconfig", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }, { "path": "/fixture/xdg/git/config", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }] },
+      { "repoKey": "r94693eee2b63", "path": "/fixture/b", "remotes": [{ "name": "origin", "transport": "network", "github": { "owner": "org", "repo": "b" }, "vcs": false, "push": false, "configSection": true, "url": true, "legacy": false, "defaultBranch": "main" }], "branches": [{ "name": "main", "upstreamRemote": null, "upstreamBranch": null, "pushRemote": null, "remoteFactsUnknown": false, "checkoutPath": null, "refFormatOk": true, "tip": "5dd9db23a66093874ec4b80ae70bb0317e03be7d" }], "pushDefault": null, "pushesToUpstream": false, "legacyNames": [], "omittedRemotes": false, "reachableRemotes": [{ "sha": "5dd9db23a66093874ec4b80ae70bb0317e03be7d", "remotes": ["origin"] }], "remoteBranches": [{ "remote": "origin", "name": "main", "sha": "5dd9db23a66093874ec4b80ae70bb0317e03be7d" }], "prEvidence": [], "roots": [{ "root": "", "project": "a58e734191a11b73b3cd08ab1121c11d", "labelKeys": [], "displayLabel": null }], "cardKeys": [], "statInputs": [{ "path": "/fixture/b/.git/branches", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }, { "path": "/fixture/b/.git/config", "stamp": { "mtimeNs": "1700000000000000000", "size": "100", "kind": "file", "target": null } }, { "path": "/fixture/b/.git/config.worktree", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }, { "path": "/fixture/b/.git/remotes", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }, { "path": "/fixture/gitconfig", "stamp": { "mtimeNs": "1700000000000000000", "size": "46", "kind": "file", "target": null } }, { "path": "/fixture/home/.gitconfig", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }, { "path": "/fixture/xdg/git/config", "stamp": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }] }
+    ],
+    "reply": { "schemaVersion": 1, "scope": "all", "checkedAt": "2026-01-11T00:00:00.000Z", "record": { "accepted": true, "windowStartUtc": "2026-01-01T00:00:00.000Z" }, "windowStartUtc": "2026-01-01T00:00:00.000Z", "repoViews": [{ "key": "radc32726946d", "name": "a", "state": "ok", "noRemote": false, "uncommitted": { "count": 0 }, "storeKey": "s7a3f67ce452e", "treeKey": "tadc32726946d" }, { "key": "r94693eee2b63", "name": "b", "state": "ok", "noRemote": false, "uncommitted": { "count": 0 }, "storeKey": "scdba2eb86a6d", "treeKey": "t94693eee2b63" }], "labels": [{ "key": "gui", "repoKey": "radc32726946d", "state": "ok", "rows": [{ "kind": "branch", "name": "a-work", "push": { "state": "pushed", "notPushed": 0 }, "commits": [{ "sha": "468dc1b8c716cdb00cb46f76c5aaf649f7479aa9", "token": "468dc1b8c716cdb00cb46f76c5aaf649f7479aa9" }] }, { "kind": "default", "name": "main", "push": { "state": "pushed", "notPushed": 0 }, "commits": [{ "sha": "5dd9db23a66093874ec4b80ae70bb0317e03be7d", "token": null, "subject": "b main" }] }], "notMatched": 0, "prNumbers": [], "onlyHere": 0 }], "branchLines": [], "pushCards": [], "tile": { "commits": 0, "branches": 0 }, "hidden": { "complete": true, "perLabel": { "gui": 1 } } }
+  },
+  "stampVectors": [
+    { "name": "a file", "bytes": 42, "mtimeSeconds": 1700000000, "expected": { "mtimeNs": "1700000000000000000", "size": "42", "kind": "file", "target": null } },
+    { "name": "a symlink", "linkTo": "somewhere/else", "expected": { "kind": "symlink", "target": "somewhere/else" } },
+    { "name": "a directory", "expected": { "kind": "dir", "target": null } },
+    { "name": "a missing path", "expected": { "mtimeNs": "0", "size": "0", "kind": "missing", "target": null } }
+  ],
+  "expectedTargets": ["pr", "branch", "commit", "compare", "editor", "copy"],
+  "expectedSinks": {
+    "open": ["https://github.com/org/repo/pull/12"],
+    "copy": ["git -C '/fixture/repo' push -- 'origin' 'feature/contract'"],
+    "editor": [["/usr/bin/open", "-b", "com.microsoft.VSCode", "/fixture/repo/apps/gui"]]
+  }
+}

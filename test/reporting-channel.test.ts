@@ -18,7 +18,7 @@ const POLICY = readFileSync(`${ROOT}SECURITY.md`, "utf8");
 const CONTRIBUTING = readFileSync(`${ROOT}CONTRIBUTING.md`, "utf8");
 
 /** GitHub's private-reporting form for the public repository. */
-const PRIVATE_FORM = "https://github.com/themarigold/daily-briefing/security/advisories/new";
+const PRIVATE_FORM = "https://github.com/norn-app/daily-briefing/security/advisories/new";
 
 /** The body of a `## ` section, up to the next `## ` heading. */
 function section(md: string, heading: string): string {

@@ -1,6 +1,6 @@
 {
   "name": "daily-briefing",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Local-first morning briefing CLI for developers who work with AI coding assistants \u2014 reads your git history, tells you where you left off and what to do next. BYO AI, no telemetry of its own.",
   "keywords": [
     "cli",
@@ -13,10 +13,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/themarigold/daily-briefing"
+    "url": "https://github.com/norn-app/daily-briefing"
   },
   "bugs": {
-    "url": "https://github.com/themarigold/daily-briefing/issues"
+    "url": "https://github.com/norn-app/daily-briefing/issues"
   },
   "license": "MIT",
   "type": "module",

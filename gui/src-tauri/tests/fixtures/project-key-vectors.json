@@ -1,0 +1,7 @@
+[
+  { "repo": "/fixture/repo", "root": "", "project": "032fa4562bc7b051317d2a37a7291db8" },
+  { "repo": "/fixture/repo", "root": "apps/gui", "project": "9fbb6e9f98a6074f844482cda9171850" },
+  { "repo": "/fixture/other", "root": "apps/gui", "project": "aae08ed4c73ce95741829f57e093c867" },
+  { "repo": "/fixture/repo", "root": "apps/other", "project": "84b8238877dde88ab61e3213f56d6b31" },
+  { "repo": "/fixture/équipe", "root": "apps/界面", "project": "e24b986a3b6fa54df6c45f25efab7408" }
+]

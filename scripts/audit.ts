@@ -19,7 +19,8 @@ import { stripControl, stripControlLines } from "../src/render";
 import { redactCredentials } from "../src/transcripts/credentials";
 import { resolveUnits } from "../src/subprojects";
 import type { Config } from "../src/types";
-import { featuresLine, extractCitedShas, missingSameDay, coverageGaps, unresolvedFromBatch, unreachableFromRevList, factsFromActivities, lastBriefing, buildAuditPrompt, sameDayCommits, branchLinesFromBriefing, branchAtGeneration, branchAxisLine, generationInstant, regenFailureMessage, groundingVerdict, degradedReadLine, unreadableReposLine, groundTruthUnavailableLine, classifyReadFailure, gitUnavailableLine, bucketPathIssues, accessDeniedLine, bucketFailures, degradationLines, evalRow, collectDegradation, auditFilesToPrune, auditMayCarryRawTurn, HARDENING_OFF_NOTICE, quotationsIn, groundTruthForQuotations, type ReadFailure } from "../src/audit";
+import { featuresLine, extractCitedShas, missingSameDay, coverageGaps, unresolvedFromBatch, unreachableFromRevList, factsFromActivities, lastBriefing, buildAuditPrompt, sameDayCommits, branchLinesFromBriefing, branchAtGeneration, branchAxisLine, generationInstant, regenFailureMessage, groundingVerdict, degradedReadLine, unreadableReposLine, groundTruthUnavailableLine, classifyReadFailure, gitUnavailableLine, bucketPathIssues, accessDeniedLine, bucketFailures, degradationLines, evalRow, collectDegradation, auditFilesToPrune, auditMayCarryRawTurn, HARDENING_OFF_NOTICE, quotationsIn, groundTruthForQuotations, calendarJudgeViews, CALENDAR_JUDGE_RESIDUAL_NOTICE, type ReadFailure } from "../src/audit";
+import type { PromptVariant } from "../src/types";
 import { parseWhy } from "../src/transcripts/frame";
 import { discoverDepth1 } from "../src/transcripts/discover";
 import { readJsonl, emptyTally } from "../src/transcripts/reader";
@@ -523,6 +524,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   // Which account judged. The instrument may change between audits (the judge inherits failover); it
   // may not change INVISIBLY, so this rides into the report alongside the posture line.
   let judgeAccountLabel: string | undefined;
+  // v0.3.0 calendar (M6a, user-directed — spec r4 §10): with a calendar section in the briefing, BOTH judge
+  // prompts are built — titles (locked) and times only (unlocked), in the briefing text and the CALENDAR
+  // ground truth — and handed to the provider through `calendarVariants`, which picks at SPAWN time from the
+  // argv it is about to run (src/harden.ts `calendarVariantFor`; HTTP is always locked). `prompt` itself is the
+  // unlocked one, so a provider that ignores the option can only send times. No section ⇒ `null` ⇒ the
+  // one-argument call this always made, byte for byte. `judgeVariant` is the variant the LAST attempt sent.
+  const calViews = calendarJudgeViews(briefing);
+  let judgeVariant: PromptVariant | undefined;
   if (!noJudge) {
     console.error("Running adversarial judge via claude (one LLM call)…");
     const retroNote = retro
@@ -556,9 +565,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       // HTTP analogue — which is why judgeCfg is built the same way and simply carries no extra argv.
       const judgeProvider = buildProvider(judgeCfg, { timeoutMs: 240_000, ...(judgeAcct.env ? { env: judgeAcct.env } : {}) }).provider;
       judgeProviders.push(judgeProvider);
-      judged = await withRetry(() => judgeProvider.generate(
-        buildAuditPrompt({ whyGroundTruth, briefing, gitFacts: `${retroNote}${gitFactsText}\n\nCOMMITS ON ${bDate} (same-day, excluded from the briefing window):\n${dayText}`, popup, popupConfigured, deterministic }),
-      ), [5_000, 15_000]);
+      const judgePrompt = (view?: { briefing: string; calendar: string }) => buildAuditPrompt({
+        whyGroundTruth, briefing: view?.briefing ?? briefing,
+        gitFacts: `${retroNote}${gitFactsText}\n\nCOMMITS ON ${bDate} (same-day, excluded from the briefing window):\n${dayText}`,
+        popup, popupConfigured, deterministic, ...(view ? { calendar: view.calendar } : {}),
+      });
+      judged = await withRetry(() => {
+        if (calViews === null) return judgeProvider.generate(judgePrompt());
+        const unlocked = judgePrompt(calViews.unlocked);
+        return judgeProvider.generate(unlocked, {
+          calendarVariants: { locked: judgePrompt(calViews.locked), unlocked },
+          onPromptSent: (sent) => { judgeVariant = sent.variant; },
+        });
+      }, [5_000, 15_000]);
     } catch (e) {
       // Merge `e` as well as the provider, matching eval.ts. Harmless today — the judge bypasses core, so
       // nothing attaches `.warnings` to its errors — but the two scripts should not disagree about where
@@ -613,6 +632,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     // deployed config actually enables, so a watch can no longer be opened on a dark feature silently.
     `- ${featuresLine(cfg, resolveTranscripts(cfg.transcripts, homedir()))}`,
     `- provider hardening during this audit's judge call: ${auditPosture.replace(/^judge posture: /, "")}`,
+    // v0.3.0 calendar (M6a): which calendar view the judge read, and residual 16a when it was the unlocked one.
+    // A report line, deliberately NOT in `deterministic` — it is no defect, so it must not move flagCount or
+    // the EVAL row, and it is decided only after the judge prompt was sent.
+    // Unreported (a provider that ignores the option) counts as unlocked: `prompt` is the only text it can send.
+    ...(calViews === null || noJudge ? []
+      : judgeVariant === "locked" ? ["- calendar: the judge was LOCKED and saw the calendar section in full (titles included)."]
+      : [`- ${CALENDAR_JUDGE_RESIDUAL_NOTICE}`]),
     // The "clean:" line is suppressed by DEFECTS, not by informational notes — otherwise a day whose
     // only entry is an FYI loses its clean verdict while flagCount correctly reads 0, and the report
     // contradicts its own EVAL row.

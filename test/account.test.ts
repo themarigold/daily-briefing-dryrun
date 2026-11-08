@@ -65,8 +65,8 @@ describe("resolveAccount — pure selection", () => {
 describe("state file — five writes, read-modify-write, atomicity", () => {
   test("marking B leaves A's mark intact (a whole-file overwrite passes everything else)", async () => {
     const d = await dir();
-    await recordLimit("primary", new Date(NOW.getTime() + 3 * 86400e3), NOW, { stateDir: d });
-    await recordLimit("fallback", new Date(NOW.getTime() + 2 * 86400e3), NOW, { stateDir: d, report: false });
+    await recordLimit("primary", new Date(NOW.getTime() + 3 * 86400e3), NOW, { reason: "usage", stateDir: d });
+    await recordLimit("fallback", new Date(NOW.getTime() + 2 * 86400e3), NOW, { reason: "usage", stateDir: d, report: false });
     const s = await loadAccountState(d);
     expect(Object.keys(s.accounts).sort()).toEqual(["fallback", "primary"]);
     await rm(d, { recursive: true, force: true });
@@ -74,7 +74,7 @@ describe("state file — five writes, read-modify-write, atomicity", () => {
 
   test("a success clears ONLY the succeeding account's mark", async () => {
     const d = await dir();
-    await recordLimit("primary", new Date(NOW.getTime() + 3 * 86400e3), NOW, { stateDir: d });
+    await recordLimit("primary", new Date(NOW.getTime() + 3 * 86400e3), NOW, { reason: "usage", stateDir: d });
     await clearMark("fallback", d);                       // the account that just succeeded
     expect((await loadAccountState(d)).accounts.primary).toBeDefined();
     await rm(d, { recursive: true, force: true });
@@ -82,7 +82,7 @@ describe("state file — five writes, read-modify-write, atomicity", () => {
 
   test("report:false marks the account but writes NO lastLimit", async () => {
     const d = await dir();
-    await recordLimit("fallback", new Date(NOW.getTime() + PROBE_MS), NOW, { stateDir: d, report: false, isProbe: true });
+    await recordLimit("fallback", new Date(NOW.getTime() + PROBE_MS), NOW, { reason: "earlier-failure", stateDir: d, report: false, isProbe: true });
     const s = await loadAccountState(d);
     expect(s.accounts.fallback?.isProbe).toBe(true);
     expect(s.lastLimit).toBeUndefined();
@@ -91,7 +91,7 @@ describe("state file — five writes, read-modify-write, atomicity", () => {
 
   test("clearLastLimit removes the cause but keeps the marks", async () => {
     const d = await dir();
-    await recordLimit("primary", new Date(NOW.getTime() + 3 * 86400e3), NOW, { stateDir: d });
+    await recordLimit("primary", new Date(NOW.getTime() + 3 * 86400e3), NOW, { reason: "usage", stateDir: d });
     await clearLastLimit(d);
     const s = await loadAccountState(d);
     expect(s.lastLimit).toBeUndefined();
@@ -110,7 +110,7 @@ describe("state file — five writes, read-modify-write, atomicity", () => {
   // account could never be marked and a walled login would be retried every 600s forever.
   test("a __proto__ label is stored and honoured like any other", async () => {
     const d = await dir();
-    await recordLimit("__proto__", new Date(NOW.getTime() + 3 * 86400e3), NOW, { stateDir: d });
+    await recordLimit("__proto__", new Date(NOW.getTime() + 3 * 86400e3), NOW, { reason: "usage", stateDir: d });
     const s2 = await loadAccountState(d);
     expect(s2.accounts["__proto__"]).toBeDefined();
     expect(resolveAccount([{ label: "__proto__" }], s2, NOW)).toBeUndefined();
@@ -119,7 +119,7 @@ describe("state file — five writes, read-modify-write, atomicity", () => {
 
   test("clamped at WRITE to now + 8 days", async () => {
     const d = await dir();
-    await recordLimit("primary", new Date(NOW.getTime() + 400 * 86400e3), NOW, { stateDir: d });
+    await recordLimit("primary", new Date(NOW.getTime() + 400 * 86400e3), NOW, { reason: "usage", stateDir: d });
     const until = Date.parse((await loadAccountState(d)).accounts.primary!.limitedUntil);
     expect(until).toBe(NOW.getTime() + MAX_MARK_MS);
     expect(clampUntil(new Date(NOW.getTime() + 400 * 86400e3), NOW)).toBe(new Date(NOW.getTime() + MAX_MARK_MS).toISOString());
@@ -147,8 +147,8 @@ describe("state file — five writes, read-modify-write, atomicity", () => {
   test("atomic write leaves no partial file for a concurrent reader", async () => {
     const d = await dir();
     await Promise.all([
-      recordLimit("a", new Date(NOW.getTime() + 86400e3), NOW, { stateDir: d }),
-      recordLimit("b", new Date(NOW.getTime() + 86400e3), NOW, { stateDir: d }),
+      recordLimit("a", new Date(NOW.getTime() + 86400e3), NOW, { reason: "usage", stateDir: d }),
+      recordLimit("b", new Date(NOW.getTime() + 86400e3), NOW, { reason: "usage", stateDir: d }),
       loadAccountState(d), loadAccountState(d),
     ]);
     const s = await loadAccountState(d);          // never a parse error, whichever writer won

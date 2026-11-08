@@ -41,6 +41,12 @@
 //! watcher. The one stated exception is `a_missing_state_dir_is_promoted_when_it_appears`: it has no
 //! state directory to settle, and nothing its setup wrote is interesting. See that function for the
 //! measurements.
+//!
+//! ⚠ AND ONLY OVER A CLOCK THAT CANNOT CROSS A BOUNDARY INSIDE IT — the same lesson from the
+//! clock's side, MEASURED. Before the floor the loop re-derives at every wall-clock minute and
+//! announces the new countdown, so an absence check on the real, moving clock fails a correct
+//! watcher whenever a minute falls inside its window. Every absence or exact-count test here runs
+//! on a frozen, hand or held clock; [`live_clock`] is for tests that only wait for a payload.
 
 mod common;
 
@@ -76,8 +82,63 @@ const PATIENCE: Duration = Duration::from_secs(15);
 /// (It governs those sleeps only — the `wait_quiet` settle windows are a different question, "has
 /// the burst finished", and still carry per-test values.) It bounds only how slow a mutant may be
 /// and still be caught — never a correct watcher, as long as the check runs over a directory the
-/// backend is quiet about (see [`settle_backend`]).
+/// backend is quiet about (see [`settle_backend`]) and a clock that cannot cross a boundary inside
+/// it (see [`live_clock`]).
 const ABSENCE_WINDOW: Duration = Duration::from_millis(1_500);
+
+/// How long a wait that can only be satisfied by the BACKEND DELIVERING an event may take. Longer
+/// than [`PATIENCE`] because what bounds it is `fseventsd`, a single process shared by the whole
+/// host, not this test's CPU. MEASURED 2026-10-19 (a standalone FSEvents probe): single-event
+/// latency 0.03-7 s on a quiet host, isolated spikes past 30 s, and NO delivery at all for 240 s
+/// while one shell loop churned ~14k file ops/s elsewhere on the same volume. A liveness mutant
+/// (a loop that ignores every event) still fails every wait that uses this — just later.
+const BACKEND_PATIENCE: Duration = Duration::from_secs(45);
+
+/// A DIAGNOSIS for a backend-dependent wait that timed out — never a pass condition, and only ever
+/// built on a failing path (inside an assert's message). Opens a throwaway stream on a fresh
+/// directory, writes one file, and REPORTS WHAT IT SAW within 20 s — an observation, not a verdict:
+/// one sample taken after the failed wait cannot prove a cause, so the text says which way it
+/// points and what it cannot rule out (review of ca0307b84: a loaded host measured control
+/// latencies of 6.5-9 s, and a stall during the wait can clear before this check).
+fn backend_control() -> String {
+    const WITHIN: Duration = Duration::from_secs(20);
+    let scratch = ScratchDir::new("backend-control");
+    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let Ok(mut control) = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    }) else {
+        return "control: the notify backend could not start a fresh stream".to_string();
+    };
+    if control
+        .watch(&scratch.path, RecursiveMode::Recursive)
+        .is_err()
+    {
+        return "control: the notify backend refused a watch on a fresh directory".to_string();
+    }
+    let started = Instant::now();
+    if let Err(e) = std::fs::write(scratch.join("control"), "x\n") {
+        return format!("control: could not write the control file ({e})");
+    }
+    while started.elapsed() < WITHIN {
+        if let Ok(Ok(event)) = rx.recv_timeout(Duration::from_millis(20)) {
+            if event.paths.iter().any(|p| p.ends_with("control")) {
+                return format!(
+                    "control: a fresh stream, checked after this failure, received its event in \
+                     {:?} — the backend was delivering at check time, which points at the stream \
+                     under test (a stall during the wait that has since cleared looks the same)",
+                    started.elapsed()
+                );
+            }
+        }
+    }
+    format!(
+        "control: a fresh stream, checked after this failure, received nothing within {WITHIN:?} — \
+         the notify backend was not delivering at check time, which points at the environment (on \
+         macOS, sustained file churn elsewhere on the host stalls fseventsd; measured 2026-10-19). \
+         A broken watcher cannot be ruled out on a host this loaded: re-run with no other suite \
+         running before concluding either way"
+    )
+}
 
 /// The sentinel [`settle_backend`] writes and removes. Deliberately NOT one of `WATCHED_NAMES` and
 /// not under `briefings/`, so an event for it that outlives the drain is inert rather than a change.
@@ -146,7 +207,7 @@ fn settle_backend(state: &Path) {
     let sentinel = state.join(SETTLE_SENTINEL);
     std::fs::write(&sentinel, "settling\n").expect("write the settling sentinel");
 
-    let deadline = Instant::now() + PATIENCE;
+    let deadline = Instant::now() + BACKEND_PATIENCE;
     let mut published = false;
     while !published && Instant::now() < deadline {
         if let Ok(Ok(event)) = rx.recv_timeout(Duration::from_millis(20)) {
@@ -161,9 +222,10 @@ fn settle_backend(state: &Path) {
     // routed through `TempState::new`.
     assert!(
         published,
-        "settle_backend: the sentinel's creation under {state:?} never arrived within {PATIENCE:?} \
-         — the FSEvents backend is not delivering, which would also break the waits in the test \
-         this was called from"
+        "settle_backend: the sentinel's creation under {state:?} never arrived within \
+         {BACKEND_PATIENCE:?} — this helper's own stream received nothing, which would also break the \
+         waits in the test this was called from. {}",
+        backend_control()
     );
 
     std::fs::remove_file(&sentinel).expect("remove the settling sentinel");
@@ -1105,6 +1167,12 @@ fn file_only(quiet: Duration, ceiling: Duration) -> WatchOptions {
 
 /// [`app_timings`] on the REAL local clock — for the engine-backed tests, whose fake engine dates
 /// things by the machine's own `date` and whose payloads are derived at `now_local`.
+///
+/// ⚠ ONLY FOR A TEST THAT WAITS FOR A PAYLOAD — NEVER UNDER AN ABSENCE CHECK OR AN EXACT COUNT. A
+/// moving clock is not quiet: before the floor the loop re-derives at every wall-clock minute and
+/// announces the new `minutesUntilFloor`, as it should, so a window that straddles a minute sees
+/// an event no file caused. A test that counts holds the real local time still instead (see
+/// `one_debounced_event_carries_the_state_the_files_describe`).
 fn live_clock() -> WatchOptions {
     WatchOptions {
         clock: Arc::new(now_local),
@@ -1235,11 +1303,12 @@ fn the_resolved_spelling_is_learned_after_the_directory_appears() {
         file_only(Duration::from_millis(60), Duration::from_millis(200)),
     );
     assert_eq!(w.arms(), 1);
-    let seen = write_until_observed(&state, &sink, "2026-01-01", PATIENCE);
+    let seen = write_until_observed(&state, &sink, "2026-01-01", BACKEND_PATIENCE);
     w.stop();
     assert!(
         seen,
-        "no event arrived through the resolved spelling {resolved:?}"
+        "no event arrived through the resolved spelling {resolved:?} — {}",
+        backend_control()
     );
 }
 
@@ -1260,21 +1329,41 @@ fn one_debounced_event_carries_the_state_the_files_describe() {
     // ordering only: `engine.sh` lands in the PARENT, and no parent-level path except the state
     // directory itself can ever be interesting.)
     settle_backend(&state);
+    // ⚠ THE MACHINE'S REAL LOCAL TIME, HELD STILL — a CORRECTION, MEASURED. This test used to run
+    // on `live_clock()`, and a moving clock is not quiet: before the floor the payload carries
+    // `minutesUntilFloor`, so at every wall-clock minute the loop re-derives and RIGHTLY announces
+    // the new countdown (`the_countdown_to_the_floor_is_kept_current_without_reading`). A minute
+    // boundary inside the absence window below was therefore an event no file caused — the Linux
+    // CI failure (observed 1, no rescan, reported 1.6 s past a wall-clock minute at 06:25 UTC,
+    // which is before the fake engine's 07:20 floor on a UTC runner). Launched one second before a
+    // minute it failed 4 of 4 on macOS, and the event was a pure re-derive (one engine read, one
+    // re-derive, `waiting-for-floor`); launched five seconds after one it passed. Held at the
+    // instant the test starts, the clock crosses nothing, so the absence check runs over a clock as
+    // quiet as the settled directory — and the payload is still derived at today's real date, which
+    // the `last-run` written below must match.
+    let held = now_local();
     let mut w = start(
         WatchTargets::new(&state),
         source,
         sink.clone(),
-        live_clock(),
+        WatchOptions {
+            clock: Arc::new({
+                let held = held.clone();
+                move || held.clone()
+            }),
+            ..app_timings()
+        },
     );
 
     // ⚠ THE FIRST PASS IS NOT A CHANGE. The loop has taken the watch and done its first read; a
     // loop that also recorded a change would serve it one quiet period (plus two fake-engine
     // spawns) later. The window below is an ABSENCE check, so its length cannot fail a correct
-    // watcher OVER A DIRECTORY THE BACKEND IS QUIET ABOUT — which is what the `settle_backend`
-    // above is for, and without which this exact assertion is the one that flaked. It only bounds
-    // how slow a mutant may be and still be caught. The one thing no settling can stop — FSEvents
-    // coalescing events onto the scratch dir into a RESCAN notice the loop rightly serves — is
-    // discounted, and only that (round 2, B-M4; `assert_discounting_rescans`).
+    // watcher OVER A DIRECTORY THE BACKEND IS QUIET ABOUT AND A CLOCK THAT HOLDS STILL — which is
+    // what the `settle_backend` and the held clock above are for, and without either of which this
+    // exact assertion is the one that flaked. It only bounds how slow a mutant may be and still be
+    // caught. The one thing no settling can stop — FSEvents coalescing events onto the scratch dir
+    // into a RESCAN notice the loop rightly serves — is discounted, and only that (round 2, B-M4;
+    // `assert_discounting_rescans`).
     std::thread::sleep(ABSENCE_WINDOW);
     let (announced, reads) = (sink.n(), w.reads());
     let rescans = w.rescans_counted();
@@ -1291,19 +1380,20 @@ fn one_debounced_event_carries_the_state_the_files_describe() {
         "the first pass must read the engine exactly once",
     );
 
-    let today = now_local().local_date;
+    let today = held.local_date;
     let before = sink.n();
     std::fs::write(state.join("last-run"), format!("{today}\n")).expect("marker");
     std::fs::write(state.join("briefing-latest.md"), "# Today\n").expect("briefing");
 
-    let seen = sink.wait_for(before + 1, PATIENCE);
+    let seen = sink.wait_for(before + 1, BACKEND_PATIENCE);
     // Let the coalescer settle so a second, spurious event would be visible.
     let total = sink.wait_quiet(Duration::from_millis(800), PATIENCE);
     w.stop();
 
     assert!(
         seen > before,
-        "no `state:changed` arrived within {PATIENCE:?}"
+        "no `state:changed` arrived within {BACKEND_PATIENCE:?} — {}",
+        backend_control()
     );
     // ⚠ A REGISTERED TOLERANCE OF ONE, NOT AN EXACT 1, and not a vacuous bound either. The two
     // writes are 0 ms apart, but the backend may hand them over in two deliveries, and a delivery
@@ -1364,7 +1454,7 @@ fn twenty_rapid_writes_coalesce_to_a_bounded_number_of_events() {
     }
     let burst = started.elapsed();
 
-    sink.wait_for(1, PATIENCE);
+    sink.wait_for(1, BACKEND_PATIENCE);
     sink.wait_quiet(Duration::from_millis(800), PATIENCE);
     // Stopped BEFORE anything is counted (round 2, R4): the loop thread is joined, so a batch a
     // real rescan started cannot land between the two reads below and break their pairing.
@@ -1379,7 +1469,11 @@ fn twenty_rapid_writes_coalesce_to_a_bounded_number_of_events() {
         "MEASURED: 20 writes in {burst:?} → {events} state:changed event(s), {reads} engine \
          read(s) (one of them the first pass's), {rescans} real rescan(s); bound {bound}"
     );
-    assert!(events >= 1, "the burst produced no events at all");
+    assert!(
+        events >= 1,
+        "the burst produced no events at all — {}",
+        backend_control()
+    );
     // The bound is on what the BURST costs; a real rescan notice can add at most one batch of its
     // own (round 2, R4 — `assert_discounting_rescans`'s arithmetic, here on an upper bound only).
     // ⚠ That allowance means this bound alone cannot prove coalescing (round 3, G3-4): the EXACT
@@ -1430,11 +1524,12 @@ fn a_deleted_and_recreated_state_dir_recovers_without_a_restart() {
     sink.wait_quiet(Duration::from_millis(1_000), PATIENCE);
 
     // The real proof: a write INSIDE the recreated directory reaches the sink.
-    let seen = write_until_observed(&state, &sink, "2026-02-02", PATIENCE);
+    let seen = write_until_observed(&state, &sink, "2026-02-02", BACKEND_PATIENCE);
     w.stop();
     assert!(
         seen,
-        "a write into the RECREATED directory was never observed; the watch was not re-taken"
+        "a write into the RECREATED directory was never observed; the watch was not re-taken — {}",
+        backend_control()
     );
 }
 
@@ -1467,11 +1562,12 @@ fn a_state_dir_replaced_by_a_symlink_is_rewatched() {
         "the directory's identity changed and the watch was not re-taken"
     );
     sink.wait_quiet(Duration::from_millis(1_000), PATIENCE);
-    let seen = write_until_observed(&state, &sink, "2026-03-03", PATIENCE);
+    let seen = write_until_observed(&state, &sink, "2026-03-03", BACKEND_PATIENCE);
     w.stop();
     assert!(
         seen,
-        "a write through the replacing symlink was never observed"
+        "a write through the replacing symlink was never observed — {}",
+        backend_control()
     );
 }
 
@@ -1499,8 +1595,9 @@ fn a_symlinked_state_dir_retargeted_is_rewatched() {
         app_timings(),
     );
     assert!(
-        write_until_observed(&state, &sink, "2026-04-04", PATIENCE),
-        "the symlinked state dir was not watched at all"
+        write_until_observed(&state, &sink, "2026-04-04", BACKEND_PATIENCE),
+        "the symlinked state dir was not watched at all — {}",
+        backend_control()
     );
 
     let tmp = scratch.join("state.tmp");
@@ -1511,11 +1608,12 @@ fn a_symlinked_state_dir_retargeted_is_rewatched() {
         "the symlink was re-pointed and the watch was not re-taken"
     );
     sink.wait_quiet(Duration::from_millis(1_000), PATIENCE);
-    let seen = write_until_observed(&state, &sink, "2026-05-05", PATIENCE);
+    let seen = write_until_observed(&state, &sink, "2026-05-05", BACKEND_PATIENCE);
     w.stop();
     assert!(
         seen,
-        "a write into the NEW symlink target was never observed"
+        "a write into the NEW symlink target was never observed — {}",
+        backend_control()
     );
 }
 
@@ -1543,11 +1641,12 @@ fn a_missing_state_dir_is_promoted_when_it_appears() {
         w.wait_until(PATIENCE, |w| w.arms() >= 1),
         "the state directory appeared and the watcher did not promote itself"
     );
-    let seen = write_until_observed(&state, &sink, "2026-06-06", PATIENCE);
+    let seen = write_until_observed(&state, &sink, "2026-06-06", BACKEND_PATIENCE);
     w.stop();
     assert!(
         seen,
-        "a write into the promoted directory was never observed"
+        "a write into the promoted directory was never observed — {}",
+        backend_control()
     );
 }
 
@@ -1635,7 +1734,11 @@ fn the_watcher_never_writes_into_the_directory_it_watches() {
     // because an idle watcher never reaches the emit path at all. `expected` is the tree as the
     // TEST left it; everything after this line is the watcher's doing.
     let expected = tree_hash(&state);
-    assert!(sink.wait_for(1, PATIENCE) >= 1, "the cycle never ran");
+    assert!(
+        sink.wait_for(1, BACKEND_PATIENCE) >= 1,
+        "the cycle never ran — {}",
+        backend_control()
+    );
     sink.wait_quiet(Duration::from_millis(400), PATIENCE);
     w.stop();
 
@@ -2436,12 +2539,19 @@ fn live_payloads_carry_the_engines_current_schedule_answer() {
             std::fs::write(unloaded_flag(&scratch.path, "engine.sh"), "x").expect("unload");
         }
         std::fs::write(state.join("last-tick"), format!("{second}\n")).expect("tick");
-        let seen = sink.wait_for_payload(PATIENCE, check);
+        let seen = sink.wait_for_payload(BACKEND_PATIENCE, check);
         w.stop();
+        // ⚠ RE-JUDGED AFTER THE STOP. `stop()` joins the loop, and a read in flight at the deadline
+        // is emitted DURING the join, after the last poll above — while the message below reads
+        // `sink.last()` AFTER the stop. So a payload that satisfied `check` could be printed as the
+        // evidence of failure. This test pins WHAT the payload says, not how fast it arrives; a
+        // wrong-content watcher still never produces a matching payload, early or late.
+        let seen = seen.or_else(|| sink.wait_for_payload(Duration::ZERO, check));
         assert!(
             seen.is_some(),
-            "{name}: no live payload carried the engine's current answer: {:?}",
-            sink.last()
+            "{name}: no live payload carried the engine's current answer: {:?} — {}",
+            sink.last(),
+            backend_control()
         );
         let seen = seen.expect("checked");
         assert_eq!(seen["scheduleStale"], false, "{name}: {seen}");
@@ -3022,10 +3132,11 @@ fn a_panicking_watcher_says_live_updates_stopped() {
         app_timings(),
     );
     std::fs::write(state.join("last-run"), "2026-09-16\n").expect("a change");
-    let stopped = sink.wait_for_payload(PATIENCE, |v| v["updatesStopped"] == true);
+    let stopped = sink.wait_for_payload(BACKEND_PATIENCE, |v| v["updatesStopped"] == true);
     let ended = w.wait_until(PATIENCE, StateWatcher::has_stopped);
     w.stop();
-    let stopped = stopped.expect("a panicking watcher ended silently");
+    let stopped = stopped
+        .unwrap_or_else(|| panic!("a panicking watcher ended silently — {}", backend_control()));
     assert!(ended, "the loop did not end");
     let error = stopped["error"].as_str().unwrap_or_default();
     assert!(
@@ -3191,6 +3302,49 @@ fn a_snapshot_built_from_both_envelopes_derives_the_state_once() {
     );
 }
 
+/// Provider fallback P3-M6-T1: `status --json`'s `lastFailure` reaches the webview INSIDE the raw
+/// `status` envelope — no Rust struct carries it (the plan's chosen simplification) — so Today's
+/// failure banner reads it from `Snapshot.status`. Pinned through every way a snapshot is made or
+/// re-made, and on the wire, so a future struct-ification cannot silently drop it.
+#[test]
+fn last_failure_rides_the_raw_status_envelope_to_the_webview() {
+    let now = frozen_now();
+    let failure = serde_json::json!({
+        "localDate": "2026-09-16", "reason": "provider-fail",
+        "detail": "3 providers failed — open Settings → Providers"
+    });
+    let status = serde_json::json!({
+        "configExists": true,
+        "morningTime": { "value": "07:20", "minutes": 440, "warning": null },
+        "lastSkip": null,
+        "lastFailure": failure,
+    });
+    let schedule = serde_json::json!({
+        "recordPresent": true, "unitPresent": true, "registered": true, "intervalSec": 600,
+        "lastTickState": "absent"
+    });
+    let built = Snapshot::build(Some(status.clone()), Some(schedule.clone()), &now, None);
+    let stale =
+        Snapshot::with_stale_schedule(Some(status.clone()), schedule, &now, Some("x".into()));
+    let next_day = Now {
+        local_date: "2026-09-17".into(),
+        minutes: 0,
+        epoch_secs: now.epoch_secs + 15 * 3_600,
+    };
+    for snapshot in [built.clone(), stale, built.rederive(&next_day)] {
+        let wire = serde_json::to_value(&snapshot).expect("serialises");
+        assert_eq!(wire["status"]["lastFailure"], failure, "{snapshot:?}");
+    }
+    // A cleared record (the engine deleted it on delivery) arrives as the engine's own null.
+    let cleared = with(status, serde_json::json!({ "lastFailure": null }));
+    let wire =
+        serde_json::to_value(Snapshot::build(Some(cleared), None, &now, None)).expect("serialises");
+    assert!(wire["status"]["lastFailure"].is_null());
+    assert!(wire["status"]
+        .as_object()
+        .is_some_and(|o| o.contains_key("lastFailure")));
+}
+
 /// ⚠ L8: `lastSkip` COMES FROM `status` ONLY. A schedule envelope — possibly a cached one from an
 /// earlier read — that still carries a skip the engine has since cleared must not resurrect it.
 #[test]
@@ -3269,4 +3423,48 @@ fn a_stale_schedule_half_withholds_its_per_read_facts() {
         later.schedule_state.as_ref().and_then(|s| s.ticks_today),
         None
     );
+}
+
+/// Checkpoint P3-M6, carried item D: the scheduled binary's MEASURED version is a per-read fact of
+/// `schedule status` too. A cached envelope (this read failed) withholds it with the tick counts, so
+/// `olderEngineWarning` cannot fire on a version measured at another moment — the screen already
+/// says the schedule details come from an earlier check.
+#[test]
+fn a_stale_schedule_half_withholds_the_measured_engine_version() {
+    let now = local("2026-09-16", 9, 0, 0);
+    let (status, schedule) = envelopes(None, "2026-09-16T15:55:00.000Z", "2026-09-16");
+    let row = |index: u64, kind: &str| {
+        serde_json::json!({
+            "index": index, "source": if index == 0 { "provider" } else { "fallback" },
+            "label": format!("entry {index}"), "kind": kind, "status": { "kind": "ok" },
+        })
+    };
+    let status = with(
+        status,
+        serde_json::json!({ "providers": [row(0, "claude-cli"), row(1, "anthropic")] }),
+    );
+    let ancient = with(
+        schedule,
+        serde_json::json!({ "scheduledEngineVersion": "0.0.1" }),
+    );
+    // Control: read fresh, two valid entries on an ancient scheduled engine do warn.
+    let fresh = Snapshot::build(Some(status.clone()), Some(ancient.clone()), &now, None);
+    let st = fresh.schedule_state.as_ref().expect("a state");
+    assert!(st.older_engine_warning, "premise: {st:?}");
+    assert_eq!(st.scheduled_engine_version.as_deref(), Some("0.0.1"));
+    // The same envelope, cached: withheld, and no warning.
+    let stale =
+        Snapshot::with_stale_schedule(Some(status), ancient.clone(), &now, Some("x".into()));
+    let st = stale.schedule_state.as_ref().expect("a state");
+    assert_eq!(st.scheduled_engine_version, None, "{st:?}");
+    assert!(!st.older_engine_warning, "{st:?}");
+    let wire = serde_json::to_value(st).expect("serialises");
+    assert_eq!(wire["olderEngineWarning"], false, "{wire}");
+    assert_eq!(
+        stale.schedule,
+        Some(ancient),
+        "the raw envelope is kept as it was"
+    );
+    let later = stale.rederive(&local("2026-09-16", 9, 1, 0));
+    assert!(!later.schedule_state.expect("a state").older_engine_warning);
 }

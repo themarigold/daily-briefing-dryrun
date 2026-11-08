@@ -29,12 +29,12 @@ import { loadConfig } from "./config";
 import { updateCheckPath } from "./marker";
 
 /** The one URL. No query string, so nothing about this install can ride in it. */
-export const UPDATE_CHECK_URL = "https://api.github.com/repos/themarigold/daily-briefing/releases/latest";
+export const UPDATE_CHECK_URL = "https://api.github.com/repos/norn-app/daily-briefing/releases/latest";
 /** Where a newer release is shown when the API's own `html_url` is missing or not this project's. */
-export const RELEASES_PAGE = "https://github.com/themarigold/daily-briefing/releases/latest";
+export const RELEASES_PAGE = "https://github.com/norn-app/daily-briefing/releases/latest";
 /** An `html_url` is reported only when it points at THIS project's releases — the URL is printed and
  *  shown as a link, so a value that could send the user anywhere else is replaced, never relayed. */
-const RELEASE_URL_PREFIX = "https://github.com/themarigold/daily-briefing/releases/";
+const RELEASE_URL_PREFIX = "https://github.com/norn-app/daily-briefing/releases/";
 
 /** The whole check — request, body read and all — is capped here (plan E11: 5 s). */
 export const UPDATE_CHECK_TIMEOUT_MS = 5_000;

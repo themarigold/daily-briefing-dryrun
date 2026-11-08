@@ -29,12 +29,13 @@ import { test, expect } from "bun:test";
 import { Glob } from "bun";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { OPT_IN_FILES } from "./fixtures/spawn-guard";
 import ts from "typescript";
 
 const TEST_DIR = new URL("./", import.meta.url).pathname;
 /** Sibling surface the walk below also follows into: test files import `../scripts/*` directly
  *  (`test/audit-main.test.ts:21`, `test/inspect-whys.test.ts:13`) and those modules reach the same
- *  sinks — `scripts/audit.ts:64` calls `supportDir()`, `scripts/eval.ts:135` calls `resolveForScript()`. */
+ *  sinks — `scripts/audit.ts:64` calls `supportDir()`, `scripts/eval.ts`'s `main()` calls `resolveForScript()`. */
 const SCRIPTS_DIR = resolve(TEST_DIR, "../scripts") + "/";
 const SELF = "isolation.meta.test.ts";
 
@@ -238,7 +239,6 @@ const STATE_TRIGGERS: Trigger[] = [
   { token: "accountStatePath(", why: "src/account.ts:40 — stateDir DEFAULTS to supportDir()." },
   { token: "loadAccountState(", why: "src/account.ts:89 — stateDir is OPTIONAL; omitting it reads the real account-state.json." },
   { token: "recordLimit(", why: "src/account.ts:146 — stateDir OPTIONAL; omitting it REWRITES the real account-state.json (the corruption class this test exists for)." },
-  { token: "recordAuthProbe(", why: "src/account.ts:174 — stateDir OPTIONAL; rewrites the real account-state.json." },
   { token: "clearMark(", why: "src/account.ts:158 — stateDir OPTIONAL; rewrites the real account-state.json." },
   { token: "clearLastLimit(", why: "src/account.ts:186 — stateDir OPTIONAL; rewrites the real account-state.json." },
   { token: "resolveForScript(", why: "src/account.ts:361 — the script-side account resolver; reaches the same store." },
@@ -248,6 +248,12 @@ const STATE_TRIGGERS: Trigger[] = [
   { token: "lastSkipPath(", why: "src/marker.ts — <state>/last-skip.json; resolves via supportDir()." },
   { token: "writeLastSkip(", why: "src/marker.ts — WRITES <state>/last-skip.json. No stateDir parameter exists." },
   { token: "clearLastSkip(", why: "src/marker.ts — UNLINKS <state>/last-skip.json." },
+  // Provider fallback P1-M9-T1: the day's unresolved failure, same shape as last-skip.json.
+  { token: "lastFailurePath(", why: "src/marker.ts — <state>/last-failure.json; resolves via supportDir()." },
+  { token: "writeLastFailure(", why: "src/marker.ts — WRITES <state>/last-failure.json. No stateDir parameter exists." },
+  { token: "clearLastFailure(", why: "src/marker.ts — UNLINKS <state>/last-failure.json." },
+  { token: "readLastFailure(", why: "src/marker.ts — reads the real <state>/last-failure.json." },
+  { token: "engineOwnedPaths(", why: "src/json.ts — every engine-owned state path (P1-M10-T2); resolves via supportDir()." },
   { token: "readLastSkip(", why: "src/marker.ts — reads <state>/last-skip.json." },
   { token: "runLockPath(", why: "src/runlock.ts — <state>/run.lock; stateDir DEFAULTS to supportDir()." },
   { token: "acquireRunLock(", why: "src/runlock.ts — CREATES <state>/run.lock when `path` is omitted, and can unlink an existing one." },
@@ -283,6 +289,30 @@ const STATE_TRIGGERS: Trigger[] = [
   { token: "autoUpdateCheck(", why: "src/updateCheck.ts — the automatic path; reads the config and <state>/update-check.json, and rewrites the latter, when `path` is omitted." },
   { token: "readUpdateCheckState(", why: "src/updateCheck.ts — READS <state>/update-check.json when `path` is omitted." },
   { token: "writeUpdateCheckState(", why: "src/updateCheck.ts — WRITES <state>/update-check.json when `path` is omitted." },
+  // ── Provider fallback (P1-M2-T2)'s state-dir sink. Added WITH the code, same policy as the blocks above.
+  { token: "providerStatusPath(", why: "src/marker.ts — <state>/provider-status.json (P1-M5-T2); resolves via supportDir()." },
+  { token: "readProviderStatus(", why: "src/providerStatus.ts — READS <state>/provider-status.json when `path` is omitted." },
+  { token: "writeProviderStatus(", why: "src/providerStatus.ts — WRITES <state>/provider-status.json when `path` is omitted." },
+  // ── B1-M1-T3 (wave 2)'s state-dir sink: the morning run's record for the live git check. Added WITH the code.
+  { token: "runRecordPath(", why: "src/marker.ts — <state>/run-record.json, the morning run's record for the live git check; resolves via supportDir()." },
+  { token: "writeRunRecord(", why: "src/runRecord.ts — WRITES <state>/run-record.json when `path` is omitted." },
+  { token: "readRunRecord(", why: "src/runRecord.ts — READS <state>/run-record.json when `path` is omitted." },
+  { token: "recordHourMark(", why: "src/account.ts — stateDir OPTIONAL (P1-M5-T1); omitting it REWRITES the real account-state.json, as recordLimit( does." },
+  { token: "keysDir(", why: "src/marker.ts — <state>/keys, the app-owned key folder; resolves via supportDir(). `isAppOwnedKey` (src/providerList.ts) defaults to it, and PR 2's key store writes there." },
+  // ── Provider fallback PR 2 (P2-M1-T1)'s entry point. Added WITH the code, same policy as the blocks above.
+  { token: "providerMain(", why: "src/providerCli.ts — `provider reset`/`test` REWRITE <state>/account-state.json and provider-status.json and take <state>/run.lock, all through supportDir() (no stateDir parameter), and `test` of a Claude CLI entry builds it through buildProvider( with no stateDir, so it writes <state>/provider-cwd (P2-M4-T2); `key set`/`key migrate`/`key delete-all` sweep and write <state>/keys through keysDir() unless `keyStore.dir` is injected." },
+  { token: "removeMark(", why: "src/account.ts — stateDir OPTIONAL (P2-M1-T2); omitting it REWRITES the real account-state.json, as clearMark( does." },
+  // ── Provider fallback P2-M2-T2's state-dir sinks: the file key store. Added WITH the code, same policy as the blocks
+  // above — every one defaults its `dir` to `keysDir()`, i.e. supportDir(). The `appKey*` dispatchers reach the file
+  // store on every platform but darwin, so a test driving them off darwin writes <state>/keys.
+  { token: "fileKeySet(", why: "src/keyStore.ts — CREATES <state>/keys (chmod 0700) and WRITES <state>/keys/<id>.key when `dir` is omitted." },
+  { token: "fileKeyDelete(", why: "src/keyStore.ts — UNLINKS <state>/keys/<id>.key and that id's dead-pid `.<id>.<pid>.<seq>.tmp` files when `dir` is omitted." },
+  { token: "fileKeyDeleteAll(", why: "src/keyStore.ts — UNLINKS every <state>/keys/k-*.key when `dir` is omitted." },
+  { token: "appKeySet(", why: "src/keyStore.ts — off darwin, fileKeySet( (writes <state>/keys) when `dir` is omitted." },
+  { token: "appKeyDelete(", why: "src/keyStore.ts — off darwin, fileKeyDelete( (unlinks under <state>/keys) when `dir` is omitted." },
+  { token: "appKeyDeleteAll(", why: "src/keyStore.ts — off darwin, fileKeyDeleteAll( (empties <state>/keys) when `dir` is omitted." },
+  // ── Provider fallback P2-M2-T3's state-dir sink: the dead-pid temp sweep. Added WITH the code, same policy.
+  { token: "sweepDeadTemps(", why: "src/keyStore.ts — UNLINKS dead-pid `.<keyId>.<pid>.<seq>.tmp` files in <state>/keys when `dir` is omitted (on every platform)." },
 ];
 
 /** Does this source name the trigger? Call-shape tokens (`name(`) also match an ALIASED import
@@ -374,8 +404,73 @@ test("every state-touching test file isolates DAILY_BRIEFING_STATE_DIR", async (
   // 98d4514db, + dispatch.help-anywhere, git.show-signature, credentials.gaps and
   // credentials.anthropic-keys — the round-1 note here said 172 and the round-3 one 173, each written
   // before a later file landed); files floored two below (round-4 harden B4-L4: it sat three below).
-  expect(files.length).toBeGreaterThanOrEqual(172);
-  expect(STATE_TRIGGERS.length).toBeGreaterThanOrEqual(46);
+  // dba calendar M1, 2026-10-09: re-measured at THIS commit by raising each floor until it failed and
+  // reading the reported value — files 187 (185 at M0, whose checkpoint review found the floors left at
+  // their Phase E values; + calendar-config and calendar-link-url), STATE_TRIGGERS 48 (unchanged — M1
+  // adds no sink: the link ladder takes `stateDir` with no default — floor stays 46), touching 63 (M1's two
+  // files touch no state); files and touching floored two below.
+  // dba calendar M2a, 2026-10-09: re-measured the same way — files 189 (+ calendar-link-fetch and
+  // calendar-link-scrub), STATE_TRIGGERS 48 (unchanged; floor stays 46), touching 63 (unchanged: neither new
+  // file touches state; floor stays 61); files floored two below.
+  // dba calendar M3a, 2026-10-09: re-measured the same way — files 192 (+ calendar-reconcile, calendar-clean and
+  // calendar-budget), STATE_TRIGGERS 48 (unchanged; floor stays 46), touching 63 (unchanged: the three are pure and
+  // touch no state; floor stays 61); files floored two below.
+  // dba calendar post-M3b merge, 2026-10-09: re-measured on the merged tree (M2b + M3b + the M3a checkpoint) by
+  // reading the value each floor assertion receives (logged in a disposable copy of the tree) — files 195 (+ calendar-parse, calendar-prompt, calendar-variants), STATE_TRIGGERS 48 (unchanged;
+  // floor stays 46), touching 64 (+1: M3b's calendar-variants drives `runCore(`, and isolates); files and touching
+  // floored two below.
+  // dba calendar M2c, 2026-10-09: re-measured the same way — files 197 (+ calendar-ics, calendar-link-parse),
+  // STATE_TRIGGERS 48 (unchanged; floor stays 46), touching 64 (unchanged: neither new file touches state; floor stays
+  // 62); files floored two below.
+  // dba calendar PR 1 integration, 2026-10-09: re-measured on the merged tree (W1 + chunk B + W2) by reading the value each floor assertion receives
+  // (logged in a disposable copy) — files 203, STATE_TRIGGERS 48 (unchanged; floor stays 46), touching 68; files and
+  // touching floored two below.
+  // Provider fallback P1-M2-T2, 2026-10-16: + the `keysDir(` trigger, and strictFile, preload.guard and
+  // providerList since the calendar note. Re-measured by reading the value each floor assertion receives
+  // (logged in a disposable copy) — files 211, STATE_TRIGGERS 49, touching 71 (providerList names
+  // `supportDir(` and `keysDir(`, and isolates). ALL THREE floored two below.
+  // Provider fallback P1-M5-T1, 2026-10-16: + the `recordHourMark(` trigger and the files since P1-M2-T2.
+  // Re-measured the same way (logged in a disposable copy) — files 218, STATE_TRIGGERS 50, touching 75. ALL THREE
+  // floored two below.
+  // Provider fallback P1-M5-T2, 2026-10-16: + `providerStatusPath(`, `readProviderStatus(`, `writeProviderStatus(` and
+  // providerStatus.test.ts. Re-measured the same way — files 219, STATE_TRIGGERS 53, touching 76. ALL THREE floored
+  // two below.
+  // Provider fallback P1-M7-T1, 2026-10-16: − the `recordAuthProbe(` trigger (the function is retired: the walk
+  // writes per-reason hour marks through `recordHourMark(`, already a trigger), + the walk test files since P1-M5-T2.
+  // Re-measured the same way (logged in a disposable copy) — files 227, STATE_TRIGGERS 52, touching 84. ALL THREE
+  // floored two below.
+  // Provider fallback P1-M9-T1, 2026-10-16: + the four `last-failure.json` triggers and the files since P1-M7-T1.
+  // Re-measured the same way (logged in a disposable copy) — files 233, STATE_TRIGGERS 56, touching 90. ALL THREE
+  // floored two below.
+  // Provider fallback P1-M10-T2, 2026-10-16: + the `engineOwnedPaths(` trigger and the files since P1-M9-T1. Re-measured
+  // the same way (logged in a disposable copy) — files 235, STATE_TRIGGERS 57, touching 92. ALL THREE floored two below.
+  // Provider fallback P2-M1-T1, 2026-10-16: + the `providerMain(` trigger, providerCli.test.ts and the files since
+  // P1-M10-T2. Re-measured the same way (logged in a disposable copy) — files 239, STATE_TRIGGERS 58, touching 96. ALL
+  // THREE floored two below.
+  // Provider fallback P2-M1-T2, 2026-10-16: + the `removeMark(` trigger and provider.reset.test.ts. Re-measured the same
+  // way — files 240, STATE_TRIGGERS 59, touching 97. ALL THREE floored two below.
+  // Provider fallback P2-M2-T2, 2026-10-17: + the six file-key-store triggers (`fileKeySet(` … `appKeyDeleteAll(`), and
+  // keyStore.mac, keyStore.backstop (P2-M2-T1) and keyStore.linux. Re-measured by reading the value each floor
+  // assertion receives (logged in a disposable copy) — files 243, STATE_TRIGGERS 65, touching 98 (+ keyStore.linux,
+  // which drives fileKeySet( and isolates). ALL THREE floored two below.
+  // Provider fallback P2-M2-T3, 2026-10-17: + the `sweepDeadTemps(` trigger and provider.key-cli.test.ts. Re-measured
+  // by reading the value each floor assertion receives (logged in a disposable copy) — files 244, STATE_TRIGGERS 66,
+  // touching 99. ALL THREE floored two below.
+  // Provider fallback P2-M3-T1, 2026-10-17: + provider.migrate.test.ts (no new trigger: migrate is reached through
+  // `providerMain(`). Re-measured by reading the value each floor assertion receives (logged in a disposable copy) —
+  // files 245, STATE_TRIGGERS 66 (unchanged; floor stays 64), touching 100; files and touching floored two below.
+  // Provider fallback P2-M3-T2, 2026-10-17: + provider.scrub.test.ts (no new trigger: scrub-backup is reached through
+  // `providerMain(`). Re-measured by reading the value each floor assertion receives (logged in a disposable copy) —
+  // files 246, STATE_TRIGGERS 66 (unchanged; floor stays 64), touching 101; files and touching floored two below.
+  // Provider fallback PR 2 final harden round 1, 2026-10-18 (B8): + the files since P2-M3-T2 (P2-M4, P2-M5) and
+  // keyStore.child-bound.test.ts. Re-measured at THIS commit by reading the value each floor assertion receives (logged
+  // in a disposable copy) — files 248, STATE_TRIGGERS 66 (unchanged; floor stays 64), touching 104; files and touching
+  // floored two below.
+  // Provider fallback PR 2 final harden round 3, 2026-10-18 (L4): re-measured after the round's changes by reading the
+  // value each floor assertion receives (logged in a disposable copy) — files 248, STATE_TRIGGERS 66, touching 104, all
+  // unchanged since round 1 (no new test file; the round's tests joined files already counted). The floors stay.
+  expect(files.length).toBeGreaterThanOrEqual(246);
+  expect(STATE_TRIGGERS.length).toBeGreaterThanOrEqual(64);
 
   const touching: string[] = [];
   const offenders: string[] = [];
@@ -413,7 +508,17 @@ test("every state-touching test file isolates DAILY_BRIEFING_STATE_DIR", async (
   // Phase E final harden (2026-10-02, round-4 harden B4-L4): re-measured at 59 — 57 on main at 98d4514db
   // (replayed there), + dispatch.help-anywhere (new) and clip-redacts-first (round 1 gave it a `runCore(`
   // test; it isolates) — measured by diffing the two sets; floored two below.
-  expect(touching.length).toBeGreaterThanOrEqual(57);
+  // dba calendar M1, 2026-10-09: re-measured at 63 (see the M1 note above; 63 at M0 too); floored two below.
+  // dba calendar M2a, 2026-10-09: re-measured at 63 (unchanged); the floor stays.
+  // dba calendar M3a, 2026-10-09: re-measured at 63 (unchanged); the floor stays.
+  // dba calendar post-M3b merge, 2026-10-09: re-measured at 64 (see the note above); floored two below.
+  // dba calendar M2c, 2026-10-09: re-measured at 64 (unchanged); the floor stays.
+  // Provider fallback P2-M2-T2, 2026-10-17: re-measured at 98 (see the P2-M2-T2 note above); floored two below.
+  // Provider fallback P2-M2-T3, 2026-10-17: re-measured at 99 (see the P2-M2-T3 note above); floored two below.
+  // Provider fallback P2-M3-T1, 2026-10-17: re-measured at 100 (see the P2-M3-T1 note above); floored two below.
+  // Provider fallback P2-M3-T2, 2026-10-17: re-measured at 101 (see the P2-M3-T2 note above); floored two below.
+  // Provider fallback PR 2 final harden round 1, 2026-10-18: re-measured at 104 (see the B8 note above); floored two below.
+  expect(touching.length).toBeGreaterThanOrEqual(102);
   expect(offenders).toEqual([]);
 });
 
@@ -561,8 +666,11 @@ test("no test file DISARMS the isolation for the files that follow it", async ()
   // sites hide a state-dir matcher that stopped matching, and the reverse. Measured when it joined:
   // 19 state-dir sites (its floor stays at 15) and 14 config-dir sites, every one a guarded
   // save/restore. The config floor sits three below the measurement.
-  expect(sites.get("DAILY_BRIEFING_STATE_DIR")).toBeGreaterThanOrEqual(15);
-  expect(sites.get("XDG_CONFIG_HOME")).toBeGreaterThanOrEqual(11);
+  // dba calendar post-M3b merge, 2026-10-09: re-measured (the value each floor assertion receives, read in a
+  // disposable copy of the tree) at 25 state-dir sites and 17 config-dir sites — both had grown since they were last floored without a
+  // re-floor, so each sat 10 and 6 below; floored three below, as this scanner's rule states.
+  expect(sites.get("DAILY_BRIEFING_STATE_DIR")).toBeGreaterThanOrEqual(22);
+  expect(sites.get("XDG_CONFIG_HOME")).toBeGreaterThanOrEqual(14);
   expect(offenders).toEqual([]);
 });
 
@@ -649,8 +757,15 @@ const FORBIDDEN_BINARIES = ["launchctl", "systemctl", "schtasks", "security", "c
  *   • no quote in the prefix class, so `bash -c 'launchctl unload x'` did not match either;
  *   • no path prefix, so `/bin/launchctl`, `/usr/bin/security` and `/usr/bin/codesign` all passed.
  *  `;` is now also a terminator (`"launchctl;"` was neither `\s` nor end-of-string). */
-const commandUse = (literal: string, bin: string): boolean =>
-  new RegExp(`(?:^|[;&|(\\n'"\`]\\s*|\\bsudo\\s+)(?:[\\w.-]*/)*${bin}(?:\\s|$|[;&|)'"\`])`).test(literal);
+const commandUse = (literal: string, bin: string): boolean => {
+  // NFKC first (PR 1 final review round 1, L4): `/usr/bin/ſecurity` (U+017F) folds to the tool's name, and is the
+  // same file on APFS's default volume. Case is folded only for a PATH spelling (`/usr/bin/Security`, also the same
+  // file there): a case-folded bare word would flag prose such as "Privacy & Security" in command position.
+  const text = literal.normalize("NFKC");
+  const bare = new RegExp(`(?:^|[;&|(\\n'"\`]\\s*|\\bsudo\\s+)(?:[\\w.-]*/)*${bin}(?:\\s|$|[;&|)'"\`])`);
+  const pathed = new RegExp(`(?:^|[;&|(\\n'"\`]\\s*|\\bsudo\\s+)(?:[\\w.-]*/)+${bin}(?:\\s|$|[;&|)'"\`])`, "i");
+  return bare.test(text) || pathed.test(text);
+};
 
 /** String literals of a source, contents only. */
 function literals(src: string): string[] {
@@ -679,6 +794,8 @@ const REACH_ALLOW: Record<string, string> = {
  * INSTALLER_REDIRECTABLE rule below, which demands proof (`DBA_TEST_*`) rather than granting trust.
  */
 const REACH_CONDITIONAL: Record<string, string> = {
+  "providerList.test.ts":
+    "`isAppOwnedKey`'s cases name other spellings of the Keychain binary as argv DATA handed to a pure predicate (bare `security`, `/usr/bin/../bin/security`, `/usr/local/bin/security`), to pin that the SERVICE decides (hub Q19); the real argv comes from SECURITY_BIN. Exempt ONLY while the file spawns nothing at all — asserted below.",
   "schedule.install.test.ts":
     "the suite's only installer exerciser: every forbidden-binary literal is an ASSERTION about argv recorded by an injected fake exec. Exempt ONLY while the file spawns nothing at all — asserted below.",
 };
@@ -730,7 +847,12 @@ test("no test spawns a privileged machine-wide binary", async () => {
   // Phase E (M5, 2026-10-01): re-measured at 168 `testFiles()` (+ the four docs tests); floored two below.
   // Phase E final harden (2026-10-02): re-measured at 174 `testFiles()` (round 1 said 172, round 3 173);
   // floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(172);
+  // dba calendar M1, 2026-10-09: re-measured at 187 `testFiles()` (scanner 1's count); floored two below.
+  // dba calendar M2a, 2026-10-09: re-measured at 189 `testFiles()` (scanner 1's count); floored two below.
+  // dba calendar M3a, 2026-10-09: re-measured at 192 `testFiles()` (scanner 1's count); floored two below.
+  // dba calendar post-M3b merge, 2026-10-09: re-measured at 195 `testFiles()` (scanner 1's count); floored two below.
+  // dba calendar M2c, 2026-10-09: re-measured at 197 `testFiles()` (scanner 1's count); floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(201);
   const offenders: string[] = [];
   const conditional: string[] = [];
   for (const f of files) {
@@ -758,6 +880,39 @@ test("no test spawns a privileged machine-wide binary", async () => {
   // exemption reads as a considered decision while covering nothing.
   expect(Object.keys(REACH_CONDITIONAL).sort()).toEqual(conditional.sort());
   expect(offenders).toEqual([]);
+});
+
+/** PR 1 final review round 1 (L4): a test file that IMPORTS the app's key-name constants (`SECURITY_BIN`,
+ *  `APP_KEY_SERVICE`) holds the real tool's argv in a variable, which no literal scan can see — so it must PROVE it
+ *  spawns nothing at all, by the same `SPAWN_RE` the conditional exemption above uses. That includes `Bun.$` and a
+ *  `$\`…\`` tag, which the run-wide spawn guard does not see (measured; test/fixtures/spawn-guard.ts). Exempt: this
+ *  file (the scanner) and the spawn guard's own opt-in files, which spawn look-alike paths on purpose. */
+// ANY mention, not only a named import (round 2 L5): a namespace import (`names.SECURITY_BIN`), a dynamic import and a
+// re-export all reach the constants.
+const KEY_CONSTANT_IMPORT_RE = /\b(?:SECURITY_BIN|APP_KEY_SERVICE)\b/;
+function keyConstantSpawners(files: { name: string; src: string }[]): string[] {
+  return files
+    .filter((f) => f.name !== SELF && !OPT_IN_FILES.includes(f.name) && KEY_CONSTANT_IMPORT_RE.test(f.src))
+    .flatMap((f) => { const m = SPAWN_RE.exec(f.src); return m ? [`${f.name} imports the app's key-name constants and contains \`${m[0]}\` — drive the tool through an injected exec, never a spawn`] : []; });
+}
+
+test("a test file that imports SECURITY_BIN or APP_KEY_SERVICE spawns nothing (Bun.$ included)", async () => {
+  const files = await testFiles();
+  const withSrc = files.map((name) => ({ name, src: readFileSync(resolve(TEST_DIR, name), "utf8") }));
+  expect(withSrc.filter((f) => KEY_CONSTANT_IMPORT_RE.test(f.src)).length).toBeGreaterThanOrEqual(5);   // a floor
+  expect(keyConstantSpawners(withSrc)).toEqual([]);
+  // Non-vacuity: the predicate catches each spawn form, and leaves an importer with none alone.
+  const imp = 'import { SECURITY_BIN } from "../src/providerList";\n';
+  for (const body of ["await Bun.$`${SECURITY_BIN} x`;", "await $`x`;", "Bun.spawn([SECURITY_BIN]);", 'import { spawnSync } from "node:child_process";']) {
+    expect(keyConstantSpawners([{ name: "x.test.ts", src: imp + body }]).length).toBe(1);
+  }
+  expect(keyConstantSpawners([{ name: "x.test.ts", src: imp + "const k = keyExec([SECURITY_BIN]);" }])).toEqual([]);
+  // Round 2 L5: every way a file can reach the constants — a namespace import, a dynamic import, a re-export.
+  for (const src of ['import * as names from "../src/appKeyNames";\nawait Bun.$`${names.SECURITY_BIN} x`;',
+    'const { APP_KEY_SERVICE } = await import("../src/providerList");\nBun.spawn(["x", APP_KEY_SERVICE]);',
+    'export { SECURITY_BIN } from "../src/providerList";\nimport { spawnSync } from "node:child_process";']) {
+    expect(keyConstantSpawners([{ name: "x.test.ts", src }]).length).toBe(1);
+  }
 });
 
 test("the conditional exemption is a real condition — a spawn in an exempt file is caught", () => {
@@ -797,6 +952,34 @@ test("the conditional exemption is a real condition — a spawn in an exempt fil
   }
 });
 
+/** The JSON fixtures under test/fixtures/ (PR 1 final review round 5, L4): config and envelope shapes the suite feeds
+ *  to the engine — a key command or a CLI path in one is argv a run would spawn, so they are scanned like test code. */
+function fixtureJsonFiles(): string[] {
+  return [...new Glob("fixtures/**/*.json").scanSync({ cwd: TEST_DIR })].sort();
+}
+/** The never-reach offenders among JSON texts: every string literal judged by `commandUse`. */
+function jsonReachOffenders(texts: Record<string, string>): string[] {
+  const out: string[] = [];
+  for (const [f, text] of Object.entries(texts)) {
+    for (const bin of FORBIDDEN_BINARIES) {
+      const hit = literals(text).find((l) => commandUse(l, bin));
+      if (hit !== undefined) out.push(`${f} names \`${bin}\` in command position ("${hit.slice(0, 60)}")`);
+    }
+  }
+  return out;
+}
+
+test("round 5 L4: no JSON fixture names a privileged machine-wide binary in command position", () => {
+  const files = fixtureJsonFiles();
+  expect(files.length).toBeGreaterThanOrEqual(5);                   // measured at 5 (PR 1 final review round 5)
+  expect(jsonReachOffenders(Object.fromEntries(files.map((f) => [f, readFileSync(resolve(TEST_DIR, f), "utf8")])))).toEqual([]);
+  // Not vacuous: the same check flags a fixture that carries the tool as a key command, bare or pathed.
+  const KEYCHAIN_TOOL = "sec" + "urity";
+  expect(jsonReachOffenders({ "a.json": JSON.stringify({ apiKeyCommand: [`/usr/bin/${KEYCHAIN_TOOL}`, "find-generic-password", "-w"] }) }).length).toBe(1);
+  expect(jsonReachOffenders({ "b.json": JSON.stringify({ argv: ["sh", "-c", `${KEYCHAIN_TOOL} dump-keychain`] }) }).length).toBe(1);
+  expect(jsonReachOffenders({ "c.json": JSON.stringify({ label: "Privacy & Security" }) })).toEqual([]);
+});
+
 test("the never-reach matcher is not vacuous", () => {
   // The guard above passes today because the suite is clean, which is indistinguishable from a matcher
   // that matches nothing. These pin the discrimination it claims: command position fails, prose does not.
@@ -805,6 +988,10 @@ test("the never-reach matcher is not vacuous", () => {
   expect(commandUse("cd /tmp && codesign --verify x", "codesign")).toBe(true);
   expect(commandUse("sudo systemctl restart x", "systemctl")).toBe(true);
   expect(commandUse("a security invariant now", "security")).toBe(false);
+  // L4: the long-s spelling and a case-varied PATH are caught; case-varied prose is not.
+  expect(commandUse(`/usr/bin/${String.fromCharCode(0x17f)}ecurity find-generic-password`, "security")).toBe(true);
+  expect(commandUse("/usr/bin/Security find-generic-password", "security")).toBe(true);
+  expect(commandUse("System Settings → Privacy & Security", "security")).toBe(false);
   expect(commandUse("§4e's whole security argument", "security")).toBe(false);
   expect(literals('const a = "launchctl unload"; // x').at(0)).toBe("launchctl unload");
   // The reproduced misses. A multi-line shell script — `literals()` returns the whole template as ONE
@@ -818,6 +1005,89 @@ test("the never-reach matcher is not vacuous", () => {
   // …without losing the prose discrimination, including across a line break.
   expect(commandUse("the codesigning story\nand more prose", "codesign")).toBe(false);
   expect(commandUse("insecurity is not security-relevant", "security")).toBe(false);
+});
+
+// ── scanner 2b: macOS `open` (calendar v0.3.0, plan M0) ──────────────────────────────────────────────
+//
+// The calendar's Mac source is a signed helper app that LaunchServices starts with `open -g -j -n -W
+// <copy> --args …` (spec r4 §4.1), and the helper reads the user's real calendar once granted. A test that
+// runs the real `open` can launch that helper — or Calendar.app — against the developer's live account,
+// so the spec asks for an isolation meta-test forbidding it (§10).
+//
+// ⚠ WHY NOT JUST ADD `open` TO FORBIDDEN_BINARIES. Measured at M0 (2026-10-09): with `open` in that list,
+// `commandUse` flagged 9 files, none of which launches anything — the word starts ordinary literals
+// ("open the PR for feature/auth" in seven suggestion fixtures, "open PR" in render.test.ts), and
+// verify-dist-local.test.ts names a PATH stub "open" whose whole job is to prove its script never calls
+// it. An allowlist of nine prose files would teach readers to wave entries through. So this check is
+// narrower, matching only LAUNCH-SHAPED uses:
+//   • in a string literal, `open` in command position followed by an option (`open -a …`, `open --args`)
+//     or by a path ending in `.app`; or `/usr/bin/open` anywhere;
+//   • in code, `"open"` (or a path ending `/open`) as argv[0]: the first element of an array literal, or
+//     the first argument of a spawn/exec call.
+// Residual, stated: `open <file>` with neither an option nor a `.app` path (it would open the file in its
+// default app), and an argv[0] built at run time, are not seen. The helper trigger itself always passes
+// options, which is the case this exists for.
+const OPEN_LAUNCH_RE = new RegExp(
+  String.raw`(?:^|[;&|(\n'"\x60]\s*|\b(?:sudo|exec|env|nohup|command|xargs|then|do)\s+)(?:[\w.-]*\/)*open\s+(?:-{1,2}[A-Za-z]|[^\s;&|'"\x60]*\.app\b)`,
+);
+const openLaunch = (literal: string): boolean => OPEN_LAUNCH_RE.test(literal) || /\/usr\/bin\/open\b/.test(literal);
+const OPEN_ARGV0_RE = /(?:\[|\b(?:spawn|spawnSync|execFile|execFileSync|exec|execSync)\s*\()\s*(["'`])(?:[\w.-]*\/)*open\1\s*[,\])]/;
+
+/** Files allowed to carry a launch-shaped `open` as DATA, with the property that makes it data. */
+const OPEN_ALLOW: Record<string, string> = {
+  [SELF]: "this file IS the scanner: the shapes above appear here as patterns and probe strings, never as a spawn.",
+};
+
+/** Files whose LITERALS are exempt — and only their literals: the argv[0] rule still applies to them, so a
+ *  real `spawn(["open", …])` added to one is still caught. Measured at M0: exactly one file needs this. */
+const OPEN_LITERAL_ALLOW: Record<string, string> = {
+  "verify-dist-local.test.ts":
+    "its `open` literals are probe strings for its OWN command-position scanner over scripts/verify-dist-local.sh (\"/usr/bin/open x\", \"x=$(/usr/bin/open -a y)\", …), and the script it runs finds a PATH stub named `open` first — which exists to prove the script never calls it.",
+};
+
+test("no test launches an app through macOS `open`", async () => {
+  const files = await testFiles();
+  // dba calendar M1, 2026-10-09: re-measured at 187 `testFiles()` (scanner 1's count; M0 copied scanner 1's
+  // stale 172 here); floored two below.
+  // dba calendar M2a, 2026-10-09: re-measured at 189 `testFiles()` (scanner 1's count); floored two below.
+  // dba calendar M3a, 2026-10-09: re-measured at 192 `testFiles()` (scanner 1's count); floored two below.
+  // dba calendar post-M3b merge, 2026-10-09: re-measured at 195 `testFiles()` (scanner 1's count); floored two below.
+  // dba calendar M2c, 2026-10-09: re-measured at 197 `testFiles()` (scanner 1's count); floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(201);
+  const offenders: string[] = [];
+  const literalExempted: string[] = [];
+  for (const f of files) {
+    if (f in OPEN_ALLOW) continue;
+    const src = sourceWithHelpers(f);
+    const lit = literals(src).find(openLaunch);
+    if (lit !== undefined) {
+      if (f in OPEN_LITERAL_ALLOW) literalExempted.push(f);
+      else offenders.push(`${f} carries a launch-shaped \`open\` ("${lit.slice(0, 60)}") — drive it through an injected exec seam instead`);
+    }
+    const argv0 = OPEN_ARGV0_RE.exec(src);
+    if (argv0) offenders.push(`${f} spawns \`open\` as argv[0] (\`${argv0[0]}\`) — drive it through an injected exec seam instead`);
+  }
+  // Every literal exemption must still cover something; a stale one reads as a decision while guarding nothing.
+  expect(literalExempted.sort()).toEqual(Object.keys(OPEN_LITERAL_ALLOW).sort());
+  expect(offenders).toEqual([]);
+});
+
+test("the `open` matcher sees launches and not the prose that sank the plain command-position rule", () => {
+  for (const launch of [
+    "open -g -j -n -W /x/Calendar Reader.app --args read", "open -a Calendar", "open --args x", "open /Applications/Calendar.app",
+    "cd /tmp && open -a Calendar", "bash -c 'open -a Calendar'", "set -e\nopen -W x.app\n", "/usr/bin/open x", "sudo open -a x",
+  ]) expect(`${JSON.stringify(launch)} → ${openLaunch(launch)}`).toBe(`${JSON.stringify(launch)} → true`);
+  // The measured false positives of `commandUse(l, "open")`, every one of them prose or a stub's name.
+  for (const prose of [
+    "open the PR for feature/auth", "open the PR", "open PR", "open the quant_stocks PR", "open the PR for ai_news",
+    "open ${q}:quant_stocks/live/graduation.py", "open", "reopen -a x", "opener -a x", "an open question",
+  ]) expect(`${JSON.stringify(prose)} → ${openLaunch(prose)}`).toBe(`${JSON.stringify(prose)} → false`);
+  for (const spawn of ['Bun.spawn(["open", "-a", "Calendar"])', "spawnSync('open', ['-a', x])", 'run(["/usr/bin/open", p])', "execFile(`open`, args)"]) {
+    expect(`${spawn} → ${OPEN_ARGV0_RE.test(spawn)}`).toBe(`${spawn} → true`);
+  }
+  for (const data of ['sh(join(bin, "open"), [x])', 'called(r, "open")', '["open the PR", x]', 'LOG("open")']) {
+    expect(`${data} → ${OPEN_ARGV0_RE.test(data)}`).toBe(`${data} → false`);
+  }
 });
 
 /** `scripts/uninstall.sh` reads `DBA_TEST_DIR` and `DBA_TEST_PLIST` (its `SUPPORT=`/`PLIST=` lines) and falls
@@ -897,24 +1167,36 @@ test("scripts/install.sh: every codesign it runs carries --timestamp=none (read 
  *  the same file-union residual stated above. Seen failing once before it was relied on: a disposable copy
  *  of the tree with a fixture test that passed the flag and omitted the variable turned it red. */
 const IDENTITY_FLAG = "--remove-signing-identity";
+/** Provider fallback P2-M5-T4: the identity rule's twin. `scripts/uninstall.sh --remove-keys` DELETES every
+ *  app-owned API key item (service `daily-briefing.app-key`) from the keychain named by DBA_TEST_KEYCHAIN when it
+ *  is set and from the LOGIN keychain otherwise; the script refuses the flag under DBA_TEST_DIR without that
+ *  variable, and this is the suite-side half, in the same shape and with the same file-union residual. Seen failing
+ *  once before it was relied on, the same way: a disposable copy with a fixture test that passed the flag and
+ *  omitted the variable turned it red. */
+const KEYS_FLAG = "--remove-keys";
 
-test("any test passing --remove-signing-identity also sets DBA_TEST_KEYCHAIN", async () => {
-  const files = await testFiles();
-  const users: string[] = [];
-  const offenders: string[] = [];
-  for (const f of files) {
-    if (f === SELF) continue;   // names the flag as data, in the constant above
-    const src = sourceWithHelpers(f);
-    if (!src.includes(IDENTITY_FLAG)) continue;
-    users.push(f);
-    if (!src.includes("DBA_TEST_KEYCHAIN")) {
-      offenders.push(`${f} passes ${IDENTITY_FLAG} without DBA_TEST_KEYCHAIN — uninstall.sh would delete the identity from the LOGIN keychain`);
+for (const [flag, deletes] of [
+  [IDENTITY_FLAG, "the identity"],
+  [KEYS_FLAG, "every app-owned API key"],
+] as const) {
+  test(`any test passing ${flag} also sets DBA_TEST_KEYCHAIN`, async () => {
+    const files = await testFiles();
+    const users: string[] = [];
+    const offenders: string[] = [];
+    for (const f of files) {
+      if (f === SELF) continue;   // names the flags as data, in the constants above
+      const src = sourceWithHelpers(f);
+      if (!src.includes(flag)) continue;
+      users.push(f);
+      if (!src.includes("DBA_TEST_KEYCHAIN")) {
+        offenders.push(`${f} passes ${flag} without DBA_TEST_KEYCHAIN — uninstall.sh would delete ${deletes} from the LOGIN keychain`);
+      }
     }
-  }
-  // The exerciser exists; without it this rule would pass over an empty set.
-  expect(users).toContain("uninstall.test.ts");
-  expect(offenders).toEqual([]);
-});
+    // The exerciser exists; without it this rule would pass over an empty set.
+    expect(users).toContain("uninstall.test.ts");
+    expect(offenders).toEqual([]);
+  });
+}
 
 // ── scanner 3: the config dir ───────────────────────────────────────────────────────────────────────
 
@@ -943,6 +1225,22 @@ const CONFIG_TRIGGERS: Trigger[] = [
   // Phase E (E11): the automatic update check calls loadConfig() itself unless one is injected, and a test
   // driving it unisolated would be enabled or disabled by the developer's own `updateCheck` setting.
   { token: "autoUpdateCheck(", why: "src/updateCheck.ts — reads the real user config via loadConfig() unless `loadConfig` is injected." },
+  // Provider fallback PR 2 (P2-M1-T1): `provider reset` resolves its target against the SAVED config, read through
+  // configPath() unless `configFile` is injected.
+  // P2-M3-T1: `provider key migrate --index n` is the second reader through this same entry point — it reads the saved
+  // config's literal `apiKey` (and stores it in the key store) — so a test driving it unisolated would migrate the
+  // DEVELOPER'S OWN key. Its entry point IS `providerMain(` (migrate has no export of its own), so this one token
+  // covers it; a second entry with the same token could never be the first hit.
+  // P2-M3-T2: `provider key scrub-backup` is the third, and the first WRITER: it reads the saved config and REWRITES
+  // `<config>.bak` beside it (configPath() + ".bak", gui/src-tauri/src/config_save.rs:705), so a test driving it
+  // unisolated would rewrite the DEVELOPER'S OWN settings backup. Its entry point is again `providerMain(` (no export
+  // of its own), so this token covers it, as for migrate.
+  { token: "providerMain(", why: "src/providerCli.ts — `provider reset`, `provider test` (its run lock's staleness inputs, P2-M4-T2) and `provider key migrate` read the real user config via configPath() unless `configFile` is injected (migrate reads a literal key out of it); `provider key scrub-backup` reads it and REWRITES the real config.json.bak beside it." },
+  // P2-M3-T1 checkpoint (LOW 6): `providerMain(` misses the other way in. `dispatch([… "provider", "key", "migrate" …])`
+  // reaches the same providerMain through src/main.ts's provider arm (a dynamic import, so no `providerMain(` token in
+  // the test) whenever `providerCli` is not injected — and then reads the developer's own config and stores its key.
+  // Broad on purpose: dispatch's other arms read the config too, and a false hit only asks for the fixture import.
+  { token: "dispatch(", why: "src/main.ts — dispatch's `provider` arm runs src/providerCli.ts `providerMain` (reset, key migrate, key scrub-backup — which rewrites config.json.bak) against the real user config via configPath() unless `providerCli` is injected; its other arms read it too." },
 ];
 
 const CONFIG_ALLOW: Record<string, string> = {
@@ -977,7 +1275,21 @@ test("every config-writing test file redirects XDG_CONFIG_HOME", async () => {
   // one is injected). Re-measured at 8 — the set had grown to 7 since A3 without a re-floor, and
   // test/update-check.test.ts (which redirects XDG_CONFIG_HOME) is the eighth. Floored AT the
   // measurement, per the same reasoning.
-  expect(touching.length).toBeGreaterThanOrEqual(8);
+  // dba calendar post-M3b merge, 2026-10-09: re-measured at 9; floored AT the measurement.
+  // Provider fallback P2-M1-T1, 2026-10-16: + the `providerMain(` trigger. Re-measured at 15 (logged in a disposable
+  // copy; the set had grown since the calendar note without a re-floor); floored AT the measurement.
+  // Provider fallback P2-M1-T2, 2026-10-16: + provider.reset.test.ts. Re-measured at 16; floored AT the measurement.
+  // Provider fallback P2-M3-T1, 2026-10-17: + provider.migrate.test.ts. Re-measured at 18 (logged in a disposable copy:
+  // 17 without it — provider.key-cli.test.ts had joined at P2-M2-T3 without a re-floor); floored AT the measurement.
+  // Provider fallback P2-M3-T1 checkpoint, 2026-10-17: + the `dispatch(` trigger. Re-measured at 23 (logged in a
+  // disposable copy: 18 without it; the five it adds — dispatch.help-anywhere, dispatch.json, dispatch.schedule,
+  // dispatch and keep-awake — all import the fixture already); floored AT the measurement.
+  // Provider fallback P2-M3-T2, 2026-10-17: + provider.scrub.test.ts (through `providerMain(`). Re-measured at 24
+  // (logged in a disposable copy; 23 at P2-M3-T1's checkpoint); floored AT the measurement.
+  // Provider fallback PR 2 final harden round 3, 2026-10-18 (L4): re-measured at 25 (logged in a disposable copy, after
+  // the round's changes) — provider.test-cmd.test.ts had joined through `providerMain(` at P2-M4 without a re-floor;
+  // floored AT the measurement.
+  expect(touching.length).toBeGreaterThanOrEqual(25);
   expect(offenders).toEqual([]);
 });
 
@@ -994,7 +1306,12 @@ test("every config-writing test file redirects XDG_CONFIG_HOME", async () => {
 // So this scanner asserts the property at the source:
 //   R1  nothing under src/schedule/ may spawn a process AT ALL — the only way out is the `exec`
 //       parameter, whose default is the one `proc.run` reference allowed by R3.
-//   R2  the scheduler binaries may appear in command position ONLY in src/schedule/install.ts.
+//   R2  the scheduler binaries may appear in command position ONLY in the files of R2's owner table
+//       (src/schedule/install.ts, and src/keyStore.ts for `security` through the SECURITY_BIN constant), plus a
+//       data-only allowance (src/appKeyNames.ts, which may NAME `security` as a constant and holds nothing but
+//       `export const X = "<literal>";` statements). The constant itself is used in src/ only by its owners and
+//       by one re-export (R2's SECURITY_BIN_USERS), and the key store follows R1/R3's shape (no spawn; one
+//       proc.run, as its default exec — "R1/R3 for keyStore.ts").
 //   R3  src/schedule/install.ts references proc's `run` exactly once, in the default-exec definition.
 //   R4  `unitDir` consults DBA_TEST_UNIT_DIR, so unit writes are redirectable at all.
 //
@@ -1016,8 +1333,8 @@ async function srcFiles(): Promise<string[]> {
   return out.sort();
 }
 
-/** The ONE file allowed to name the scheduler binaries, because driving them is its entire purpose —
- *  and it may do so only under R1 and R3. */
+/** The scheduler module: the first entry of R2's owner table (`SRC_BINARY_OWNERS`), because driving the
+ *  binaries is its entire purpose — and it may do so only under R1 and R3. */
 const SCHED_OWNER = "schedule/install.ts";
 
 test("R1: nothing under src/schedule/ spawns a process — the injected exec is the only way out", async () => {
@@ -1034,21 +1351,246 @@ test("R1: nothing under src/schedule/ spawns a process — the injected exec is 
   expect(offenders).toEqual([]);
 });
 
-test("R2: the scheduler binaries are named in command position ONLY by src/schedule/install.ts", async () => {
-  const offenders: string[] = [];
-  let ownerNamed = 0;
-  for (const f of await srcFiles()) {
-    const src = stripComments(readFileSync(resolve(SRC_DIR, f), "utf8"));
-    const lits = literals(src);
-    const named = SCHED_BINARIES.filter((b) => lits.some((l) => commandUse(l, b)));
-    if (named.length === 0) continue;
-    if (f === SCHED_OWNER) { ownerNamed = named.length; continue; }
-    offenders.push(`src/${f} names ${named.join(", ")} in command position — scheduler registration belongs in src/${SCHED_OWNER}, behind its injected exec`);
+/** R2's OWNER TABLE (provider-fallback P1-M1-T2): the files allowed to name a scheduler binary in command
+ *  position, each with its written reason and the binaries it may name. An entry is a decision, so it carries
+ *  the reason it is safe; one whose reason no longer holds should be deleted, not tolerated. `via` names the
+ *  src/appKeyNames.ts constant an owner reaches its binary through instead of a literal (the key store, P2-M2-T1):
+ *  such an entry is live while the file imports that constant, since no literal scan can see an argv built from it. */
+const KEY_STORE_OWNER = "keyStore.ts";
+const SRC_BINARY_OWNERS: Record<string, { why: string; may: readonly string[]; via?: string }> = {
+  [SCHED_OWNER]: {
+    why: "driving the scheduler binaries is the module's entire purpose, and it may do so only under R1 (no spawn) and R3 (one proc.run, as the injected exec's default).",
+    may: SCHED_BINARIES,
+  },
+  [KEY_STORE_OWNER]: {
+    why: "the app-owned key store (spec r9 §6): every Keychain call is built from SECURITY_BIN and leaves through an injected exec whose default — the backstopped proc.run, refused under DBA_TEST_UNIT_DIR without a scratch keychain — is its one proc.run reference; no direct spawn (asserted by \"R1/R3 for keyStore.ts\").",
+    may: ["security"],
+    via: "SECURITY_BIN",
+  },
+};
+
+/** Does `src` (comments stripped) import `constant` from ./appKeyNames? What keeps a `via` owner entry live. */
+const importsKeyConstant = (src: string, constant: string): boolean =>
+  new RegExp(`import\\s*\\{[^}]*\\b${constant}\\b[^}]*\\}\\s*from\\s*["']\\./appKeyNames["']`).test(src);
+
+/** R2's stale entries: an owner or data entry that no longer names (or, for a `via` owner, imports) what it may. */
+function r2Stale(sources: Record<string, string>, named: Record<string, string[]>): string[] {
+  return [...Object.keys(SRC_BINARY_OWNERS), ...Object.keys(SRC_BINARY_NAME_DATA)].filter((f) => {
+    if (f in named) return false;
+    const via = SRC_BINARY_OWNERS[f]?.via;
+    return !(via !== undefined && sources[f] !== undefined && importsKeyConstant(stripComments(sources[f]!), via));
+  });
+}
+
+/** The src/ files allowed to mention SECURITY_BIN at all (R2's constant route). The binary reached through the constant
+ *  is invisible to R2's literal scan, so the constant's users are a closed list: the file that defines it, the owners
+ *  that reach it (`via`), and a RE-EXPORT, which may hold it only in its import and its `export { … }`. */
+const SECURITY_BIN_USERS: Record<string, { why: string; reexportOnly?: true }> = {
+  "appKeyNames.ts": { why: "defines it, as data (R2's data-only allowance)." },
+  "providerList.ts": { why: "re-exports it beside APP_KEY_SERVICE, so callers import the Keychain names from one module; it never builds an argv from it.", reexportOnly: true },
+  [KEY_STORE_OWNER]: { why: "R2's owner: builds every Keychain call from it." },
+};
+function securityBinOffenders(sources: Record<string, string>): string[] {
+  const out: string[] = [];
+  for (const [f, raw] of Object.entries(sources)) {
+    const src = stripComments(raw);
+    const uses = [...src.matchAll(/\bSECURITY_BIN\b/g)].length;
+    if (uses === 0) continue;
+    const entry = SECURITY_BIN_USERS[f];
+    if (entry === undefined) { out.push(`src/${f} mentions SECURITY_BIN — only R2's owners may reach the Keychain tool (SECURITY_BIN_USERS)`); continue; }
+    if (entry.reexportOnly && !(uses === 2 && importsKeyConstant(src, "SECURITY_BIN") && /export\s*\{[^}]*\bSECURITY_BIN\b[^}]*\}\s*;/.test(src))) {
+      out.push(`src/${f} may only import and re-export SECURITY_BIN, and now uses it ${uses} time(s)`);
+    }
   }
+  return out;
+}
+
+/** R2's NARROW allowance: files that may NAME a binary as data and do nothing else. Each may hold only
+ *  `export const X = "<literal>";` statements (`DATA_ONLY_RE`), checked on every run, so the allowance cannot
+ *  become a spawn, an import or any other code:
+ *  a file that wants to spawn the binary needs an owner entry above, and R1/R3-style seams with it. */
+const SRC_BINARY_NAME_DATA: Record<string, { why: string; may: readonly string[] }> = {
+  "appKeyNames.ts": {
+    why: "holds the Keychain tool's absolute path as a constant (SECURITY_BIN), so src/providerList.ts and src/keyStore.ts build every argv from one name and tests can import it without holding a literal the never-reach scanner would see.",
+    may: ["security"],
+  },
+};
+
+/** What a data-only allowance may contain, after `stripComments`: `export const NAME = "…";` (or `'…'`)
+ *  statements and whitespace, nothing else. */
+const DATA_ONLY_RE = /^\s*(?:export\s+const\s+[A-Za-z_$][\w$]*\s*=\s*(?:"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')\s*;\s*)*$/;
+
+/** R2's judgement over `sources` (path relative to src/ → raw text). Pure, so its discrimination is pinned
+ *  below against fixture text, without a filesystem. */
+function r2Scan(sources: Record<string, string>): { offenders: string[]; named: Record<string, string[]> } {
+  const offenders: string[] = [];
+  const named: Record<string, string[]> = {};
+  for (const [f, raw] of Object.entries(sources)) {
+    const src = stripComments(raw);
+    const lits = literals(src);
+    const hits = SCHED_BINARIES.filter((b) => lits.some((l) => commandUse(l, b)));
+    if (hits.length === 0) continue;
+    named[f] = hits;
+    const owner = SRC_BINARY_OWNERS[f], data = SRC_BINARY_NAME_DATA[f];
+    const entry = owner ?? data;
+    const outside = entry ? hits.filter((b) => !entry.may.includes(b)) : hits;
+    if (outside.length > 0) {
+      offenders.push(`src/${f} names ${outside.join(", ")} in command position — scheduler registration belongs in src/${SCHED_OWNER}, behind its injected exec${entry ? " (this file's R2 entry does not cover these)" : ""}`);
+      continue;
+    }
+    // An ALLOWLIST: once comments are stripped, a data entry is nothing but `export const X = "<literal>";`
+    // statements. A denylist (no spawn, no import) still let any other code ride the allowance.
+    if (data && !DATA_ONLY_RE.test(src)) {
+      offenders.push(`src/${f} is a data-only R2 allowance and now holds something other than \`export const X = "<literal>";\` statements — move the code elsewhere, or give the file an owner entry`);
+    }
+  }
+  return { offenders, named };
+}
+
+test("R2: the scheduler binaries are named in command position ONLY by the owner table's files (and data-only names)", async () => {
+  const sources: Record<string, string> = {};
+  for (const f of await srcFiles()) sources[f] = readFileSync(resolve(SRC_DIR, f), "utf8");
+  const { offenders, named } = r2Scan(sources);
   expect(offenders).toEqual([]);
   // ⚠ NOT VACUOUS: the owner must actually name several of them, or the matcher has stopped matching
   // and this test would pass over an empty set. Measured at 7 at this commit; floored two below.
-  expect(ownerNamed).toBeGreaterThanOrEqual(5);
+  expect(named[SCHED_OWNER]?.length ?? 0).toBeGreaterThanOrEqual(5);
+  // Every entry names a real file that still names what it is allowed to: a stale entry reads as a
+  // considered decision while covering nothing.
+  expect(r2Stale(sources, named)).toEqual([]);
+  // The constant route: SECURITY_BIN's users are the closed list, and each is still a user.
+  expect(securityBinOffenders(sources)).toEqual([]);
+  expect(Object.keys(SECURITY_BIN_USERS).filter((f) => !/\bSECURITY_BIN\b/.test(stripComments(sources[f] ?? "")))).toEqual([]);
+});
+
+test("R2's constant route discriminates: a via owner is live only while it imports the constant; a stray user is red", () => {
+  // Fixture TEXT only, never a spawn (REACH_ALLOW[SELF]).
+  const imp = 'import { APP_KEY_SERVICE, SECURITY_BIN } from "./appKeyNames";\n';
+  const real: Record<string, string> = {};
+  for (const f of [SCHED_OWNER, "appKeyNames.ts"]) real[f] = readFileSync(resolve(SRC_DIR, f), "utf8");
+  const named = r2Scan(real).named;
+  expect(r2Stale({ ...real, [KEY_STORE_OWNER]: imp + "export const c = [SECURITY_BIN];\n" }, named)).toEqual([]);
+  expect(r2Stale({ ...real, [KEY_STORE_OWNER]: "export const c = 1;\n" }, named)).toEqual([KEY_STORE_OWNER]);
+  expect(r2Stale({ ...real, [KEY_STORE_OWNER]: '// import { SECURITY_BIN } from "./appKeyNames";\n' }, named)).toEqual([KEY_STORE_OWNER]);
+  expect(securityBinOffenders({ "apiKey.ts": imp + "run([SECURITY_BIN]);\n" }).length).toBe(1);
+  expect(securityBinOffenders({ "providerList.ts": imp + "export { APP_KEY_SERVICE, SECURITY_BIN };\n" })).toEqual([]);
+  expect(securityBinOffenders({ "providerList.ts": imp + "export { APP_KEY_SERVICE, SECURITY_BIN };\nconst a = [SECURITY_BIN];\n" }).length).toBe(1);
+  expect(securityBinOffenders({ [KEY_STORE_OWNER]: imp + "const a = [SECURITY_BIN, SECURITY_BIN];\n" })).toEqual([]);
+});
+
+test("R1/R3 for keyStore.ts: no direct spawn, and proc.run is referenced exactly ONCE, as the default exec", () => {
+  const src = stripComments(readFileSync(resolve(SRC_DIR, KEY_STORE_OWNER), "utf8"));
+  const spawn = SPAWN_RE.exec(src);
+  expect(spawn?.[0] ?? "no spawn").toBe("no spawn");
+  expect(/import\s*\{[^}]*\brun\b[^}]*\}\s*from\s*["']\.\/proc["']/.test(src)).toBe(true);
+  // Every reference to the identifier outside its import — a call, or the value handed to the backstop.
+  const body = src.replace(/import\s*\{[^}]*\}\s*from\s*["']\.\/proc["']\s*;?/, " ");
+  const refs = [...body.matchAll(/(?<![\w.$])run(?![\w$])/g)];
+  expect(`proc.run references in src/${KEY_STORE_OWNER} = ${refs.length}`).toBe(`proc.run references in src/${KEY_STORE_OWNER} = 1`);
+  const defAt = body.indexOf("const defaultKeyExec");
+  expect(`the single run reference is inside defaultKeyExec: ${defAt >= 0 && refs[0]!.index > defAt && refs[0]!.index < defAt + 300}`)
+    .toBe("the single run reference is inside defaultKeyExec: true");
+  // …and that default is the BACKSTOPPED one: the refusal wraps proc.run itself.
+  expect(body.slice(defAt, defAt + 300)).toMatch(/backstopped\s*\(\s*run\b/);
+});
+
+/** P2-M2-T2 checkpoint, carried item 4 (P2-M2-T3): an exec handed to the key store REPLACES its default, the backstop
+ *  included (src/keyStore.ts `KeyStoreDeps.exec`), so a src/ file that hands it proc's `run` would reach the Keychain
+ *  tool even under DBA_TEST_UNIT_DIR. Cheap form, checked rather than trusted: a src/ file that imports the key store
+ *  may not import proc's `run` at all (named, aliased or through a namespace import), so it has no `run` to pass. A
+ *  file that one day needs both revisits this rule rather than an allowance. */
+const KEY_STORE_IMPORT_RE = /from\s*["'](?:\.\.?\/)+(?:[\w-]+\/)*keyStore["']|import\s*\(\s*["'](?:\.\.?\/)+(?:[\w-]+\/)*keyStore["']\s*\)/;
+const PROC_RUN_IMPORT_RE = /import\s*\{[^}]*\brun\b[^}]*\}\s*from\s*["'](?:\.\.?\/)+(?:[\w-]+\/)*proc["']|import\s*\*\s*as\s+[\w$]+\s+from\s*["'](?:\.\.?\/)+(?:[\w-]+\/)*proc["']|import\s*\(\s*["'](?:\.\.?\/)+(?:[\w-]+\/)*proc["']\s*\)/;
+function keyStoreRunOffenders(sources: Record<string, string>): string[] {
+  return Object.entries(sources)
+    .filter(([f, raw]) => f !== KEY_STORE_OWNER && KEY_STORE_IMPORT_RE.test(stripComments(raw)) && PROC_RUN_IMPORT_RE.test(stripComments(raw)))
+    .map(([f]) => `src/${f} imports the key store AND proc's run — a run handed to the store as \`exec\` bypasses its backstop; leave KeyStoreDeps.exec undefined`);
+}
+
+test("no src/ file that uses the key store can hand it proc's run (the store's backstopped default is the only exec)", async () => {
+  const sources: Record<string, string> = {};
+  for (const f of await srcFiles()) sources[f] = readFileSync(resolve(SRC_DIR, f), "utf8");
+  // Not vacuous: the command module imports the store (measured at 1 importer, src/providerCli.ts, at P2-M2-T3).
+  expect(Object.keys(sources).filter((f) => f !== KEY_STORE_OWNER && KEY_STORE_IMPORT_RE.test(stripComments(sources[f]!)))).toContain("providerCli.ts");
+  expect(keyStoreRunOffenders(sources)).toEqual([]);
+  // The predicate discriminates (fixture TEXT only).
+  const store = 'import { appKeySet } from "./keyStore";\n';
+  for (const proc of ['import { run } from "./proc";\n', 'import { run as r } from "./proc";\n', 'import * as proc from "./proc";\n',
+    'const { run } = await import("./proc");\n', 'import { type RunOpts, run } from "../proc";\n']) {
+    expect(`${JSON.stringify(proc)} → ${keyStoreRunOffenders({ "x.ts": store + proc }).length}`).toBe(`${JSON.stringify(proc)} → 1`);
+  }
+  expect(keyStoreRunOffenders({ "x.ts": 'const k = await import("../keyStore");\nimport { run } from "./proc";\n' }).length).toBe(1);
+  expect(keyStoreRunOffenders({ "x.ts": store + 'import type { RunResult } from "./proc";\n' })).toEqual([]);
+  expect(keyStoreRunOffenders({ "x.ts": 'import { run } from "./proc";\n' })).toEqual([]);
+  expect(keyStoreRunOffenders({ "x.ts": store + '// import { run } from "./proc";\n' })).toEqual([]);
+  expect(keyStoreRunOffenders({ [KEY_STORE_OWNER]: store + 'import { run } from "./proc";\n' })).toEqual([]);
+});
+
+/** P2-M2 milestone checkpoint LOW 3: the import rule above leaves two routes by which a production exec could still
+ *  reach the store — `src/main.ts` handing `providerMain` a deps object (whose `keyStore` might carry one), and
+ *  `src/providerCli.ts` building an `exec` itself. So: every `providerMain` reference in main.ts is a call with exactly
+ *  one plain argument (and there is one), and providerCli.ts names no `exec` at all — no `exec:` property, no
+ *  `{ exec }` shorthand, no quoted `"exec"` key (a method call such as a RegExp's `.exec(` is not a bare name). */
+function keyStoreDepsOffenders(sources: Record<string, string>): string[] {
+  const out: string[] = [];
+  const main = stripComments(sources["main.ts"] ?? "");
+  const refs = [...main.matchAll(/(?<![\w$])providerMain(?![\w$])/g)];
+  if (refs.length === 0) out.push("src/main.ts never calls providerMain — this check would be vacuous");
+  for (const m of refs) {
+    if (!/^providerMain\s*\(\s*[\w$]+\s*\)/.test(main.slice(m.index))) {
+      out.push("src/main.ts passes providerMain more than its argv — production must hand the provider CLI no deps (no keyStore exec)");
+    }
+  }
+  const cli = stripComments(sources["providerCli.ts"] ?? "");
+  if (/(?<![\w$.])exec(?![\w$])|["'`]exec["'`]/.test(cli)) {
+    out.push("src/providerCli.ts names `exec` — it must never build an exec for the key store (its backstopped default is the only one)");
+  }
+  return out;
+}
+
+test("production hands the key store no exec: main.ts calls providerMain(argv) alone, providerCli.ts builds no exec", () => {
+  const real = { "main.ts": readFileSync(resolve(SRC_DIR, "main.ts"), "utf8"), "providerCli.ts": readFileSync(resolve(SRC_DIR, "providerCli.ts"), "utf8") };
+  expect(keyStoreDepsOffenders(real)).toEqual([]);
+  // The predicate discriminates (fixture TEXT only).
+  const cliOk = 'const r = await appKeySet(t, c.keyStore ?? {});\nconst m = /x/.exec(s);\n';
+  const mainOk = 'return (await import("./providerCli")).providerMain(args);\n';
+  expect(keyStoreDepsOffenders({ "main.ts": mainOk, "providerCli.ts": cliOk })).toEqual([]);
+  expect(keyStoreDepsOffenders({ "main.ts": mainOk + "// providerMain(args, { keyStore: { exec: run } })\n", "providerCli.ts": cliOk + "// exec: run\n" })).toEqual([]);
+  for (const bad of ["providerMain(args, deps)", "providerMain(args, { keyStore: { exec: run } })", "providerMain(...xs)", "providerMain()",
+    "const pm = mod.providerMain;"]) {
+    expect(`${bad} → ${keyStoreDepsOffenders({ "main.ts": bad, "providerCli.ts": cliOk }).length}`).toBe(`${bad} → 1`);
+  }
+  expect(keyStoreDepsOffenders({ "main.ts": "", "providerCli.ts": cliOk }).length).toBe(1);
+  for (const bad of ["appKeySet(t, { ...c.keyStore, exec: run })", "const exec = run;\nappKeySet(t, { exec });", 'appKeySet(t, { ["exec"]: run })',
+    "appKeySet(t, { exec })"]) {
+    expect(`${bad} → ${keyStoreDepsOffenders({ "main.ts": mainOk, "providerCli.ts": bad }).length}`).toBe(`${bad} → 1`);
+  }
+});
+
+test("R2 discriminates: the same text is red outside the table and green in an entry; a data entry cannot spawn or import", () => {
+  // Fixture TEXT only: these strings are this file's subject matter (REACH_ALLOW[SELF]), never a spawn.
+  const named = 'export const B = "/usr/bin/security";\n';
+  const owner = 'const defaultExec = (a: string[]) => run(a);\nexport const A = ["launchctl", "bootout"];\n';
+  const scan = (sources: Record<string, string>) => r2Scan(sources).offenders.map((o) => o.split(" ")[0]);
+  expect(scan({ "providerList.ts": named })).toEqual(["src/providerList.ts"]);
+  expect(scan({ [SCHED_OWNER]: named + owner })).toEqual([]);
+  expect(scan({ "appKeyNames.ts": named })).toEqual([]);
+  // A data entry: only what it may name, no spawn, no import.
+  expect(scan({ "appKeyNames.ts": 'export const L = "launchctl";\n' })).toEqual(["src/appKeyNames.ts"]);
+  expect(scan({ "appKeyNames.ts": named + "export const go = () => Bun.spawn([B]);\n" })).toEqual(["src/appKeyNames.ts"]);
+  expect(scan({ "appKeyNames.ts": 'import { run } from "./proc";\n' + named })).toEqual(["src/appKeyNames.ts"]);
+  // An ALLOWLIST, not a denylist (checkpoint LOW): anything but `export const X = "<literal>";` is refused,
+  // so a code path that neither spawns nor imports cannot ride the allowance either.
+  for (const extra of [
+    "export const f = () => B;\n", "export let L = \"x\";\n", "const P = \"x\";\nexport { P };\n",
+    "export const T = `x`;\n", "export const J = B + \"x\";\n", "globalThis.x = 1;\n",
+  ]) {
+    expect(`${JSON.stringify(extra)} → ${scan({ "appKeyNames.ts": named + extra }).join(",")}`).toBe(`${JSON.stringify(extra)} → src/appKeyNames.ts`);
+  }
+  // …while comments, a second constant and single quotes stay green.
+  expect(scan({ "appKeyNames.ts": "/** the tool */\n" + named + "// service\nexport const S = 'daily-briefing.app-key';\n" })).toEqual([]);
+  // Prose and comments are not command position.
+  expect(scan({ "providerList.ts": "// calls /usr/bin/security later\nexport const s = 'a security note';\n" })).toEqual([]);
 });
 
 test("R3: install.ts reaches proc.run exactly ONCE, as the default exec", () => {
@@ -1073,6 +1615,115 @@ test("R4: unit writes are redirectable — unitDir consults DBA_TEST_UNIT_DIR be
   const guardAt = fn.indexOf("DBA_TEST_UNIT_DIR");
   const darwinAt = fn.indexOf("LaunchAgents");
   expect(`override precedes the real path: ${guardAt >= 0 && guardAt < darwinAt}`).toBe("override precedes the real path: true");
+});
+
+// ── scanner 4, extended to src/calendar/ (calendar v0.3.0, plan M2a; deferred from the M0 checkpoint) ──
+//
+// The calendar module will drive a privileged helper (W3: `open`/`launchctl` to trigger the Calendar Reader)
+// and already runs the user's `urlCommand` (M1). R1's reasoning holds here word for word: a guard that only
+// watches the tests is watching the wrong file, because the way this breaks is a future edit adding a bare
+// spawn to SRC. So the same two properties, at the source:
+//   R5  nothing under src/calendar/ spawns a process directly (SPAWN_RE, the shared definition — so a
+//       `new Worker(` counts too) unless CALENDAR_SPAWN_ALLOW names the file and why. EMPTY at M2a; M2b's
+//       Worker-or-subprocess decision added the first entry (the `calendar-parse` runner), with its reason.
+//   R6  the one sanctioned way out, proc's `run`, is reached only by the files CALENDAR_PROC_SEAM names, and
+//       there only as the FALLBACK of an injected exec (`opts.exec ?? run`) — never called directly. R3's
+//       shape: a direct `run(` would be a path around the seam that R5 cannot see, because it is not a spawn.
+// Seen RED on a disposable copy of the tree before being committed: a `Bun.spawn(` in a calendar module fails
+// R5, and a second module importing proc — or the seam file calling `run(` directly — fails R6.
+
+/** Files under src/calendar/ allowed to spawn directly, each with the reason. A stale entry fails. */
+const CALENDAR_SPAWN_ALLOW: Record<string, string> = {
+  "calendar/parse-runner.ts": "M2b's hard bound on parse work (spec §3): it re-invokes the engine binary as `<engine> calendar-parse` and SIGKILLs it at the deadline. A Worker is not used — under the product's unchanged `bun build --compile` a worker module is not embedded (measured). Not through proc.run, which hands the child the parent's whole env (API key, `urlEnv` link URLs) and has no stdout cap: this spawn passes an EMPTY env and cwd `/` (Bun would load a `.env` / `bunfig.toml` preload from the parent's cwd), discards stderr unread and caps stdout. Its one `Bun.spawn(` is in `spawnChild`; tests inject the argv (`command`), never the spawn.",
+};
+
+/** Files under src/calendar/ allowed to reach src/proc.ts, each with the reason. A stale entry fails. */
+const CALENDAR_PROC_SEAM: Record<string, string> = {
+  "calendar/link-url.ts": "the `urlCommand` rung of the link-URL ladder (M1): `(opts.exec ?? run)(argv, …)`, the exec injectable through `LinkUrlOpts.exec`.",
+  "calendar/mac-source.ts": "the Mac Calendar Reader's trigger (W3 M10c): `mkfifo` and LaunchServices `open -g -j -n -W <copy> --args …` as argv to `deps.exec ?? run`, the exec injectable through `ReaderDeps.exec` (`CalendarReadDeps.macExec`, `CalendarCliDeps.macExec`). Tests inject a fake that plays the helper; scanner 2b keeps them from launching anything.",
+};
+
+test("R5: nothing under src/calendar/ spawns a process directly", async () => {
+  const files = (await srcFiles()).filter((f) => f.startsWith("calendar/"));
+  // Floor: measured 6 modules at M2a (config, link-fetch, link-scrub, link-url, render-contract, types);
+  // floored two below, per this file's policy. If this drops, the glob broke rather than the code tidying up.
+  // dba calendar post-M3b merge, 2026-10-09: re-measured at 13 modules (+ budget, clean, parse-job, parse-runner,
+  // prompt, reconcile and the vendored ical.d.ts); floored two below.
+  // dba calendar M2c, 2026-10-09: re-measured at 15 (+ ics, link-parse); floored two below.
+  // dba calendar PR 1 integration, 2026-10-09: re-measured at 21 (chunk A's pipeline, step, health, cli and the rest); floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(19);
+  const offenders: string[] = [];
+  const spawning: string[] = [];
+  for (const f of files) {
+    const m = SPAWN_RE.exec(stripComments(readFileSync(resolve(SRC_DIR, f), "utf8")));
+    if (!m) continue;
+    spawning.push(f);
+    if (!(f in CALENDAR_SPAWN_ALLOW)) offenders.push(`src/${f} contains \`${m[0]}\` — calendar effects leave through an injected exec (default src/proc.ts run()), never a direct spawn; or name the file in CALENDAR_SPAWN_ALLOW with its reason`);
+  }
+  expect(offenders).toEqual([]);
+  expect(`stale CALENDAR_SPAWN_ALLOW: ${Object.keys(CALENDAR_SPAWN_ALLOW).filter((f) => !spawning.includes(f)).join(", ") || "none"}`)
+    .toBe("stale CALENDAR_SPAWN_ALLOW: none");
+});
+
+test("R6: src/calendar/ reaches proc.run only through the allowlisted seam, as an injected exec's fallback", async () => {
+  const files = (await srcFiles()).filter((f) => f.startsWith("calendar/"));
+  const offenders: string[] = [];
+  const reaching: string[] = [];
+  for (const f of files) {
+    const src = stripComments(readFileSync(resolve(SRC_DIR, f), "utf8"));
+    // Any specifier naming src/proc.ts — static, dynamic or re-export; strings survive the strip.
+    if (!/["'](?:\.\.\/)+proc(?:\.ts)?["']/.test(src)) continue;
+    reaching.push(f);
+    if (!(f in CALENDAR_PROC_SEAM)) { offenders.push(`src/${f} imports src/proc.ts — only ${Object.keys(CALENDAR_PROC_SEAM).map((k) => `src/${k}`).join(", ")} may, behind an injected exec`); continue; }
+    const direct = [...src.matchAll(/(?<![\w.$])run\s*\(/g)].length;
+    if (direct > 0) offenders.push(`src/${f} calls proc's run( directly ${direct} time(s) — it may only be the fallback of an injected exec (\`exec ?? run\`)`);
+    if (!/\?\?\s*run\b/.test(src)) offenders.push(`src/${f} imports src/proc.ts but never uses run as an injected exec's fallback (\`exec ?? run\`)`);
+  }
+  expect(offenders).toEqual([]);
+  expect(`stale CALENDAR_PROC_SEAM: ${Object.keys(CALENDAR_PROC_SEAM).filter((f) => !reaching.includes(f)).join(", ") || "none"}`)
+    .toBe("stale CALENDAR_PROC_SEAM: none");
+});
+
+// ── scanner 4, the Mac reader's ATTENDED-ONLY calls (calendar v0.3.0, plan M10b checkpoint) ─────────────────────
+//
+// Installing and signing the reader copy touches the login keychain (a prompt), and the `request` mode raises the
+// Calendars dialog: spec r4 §4.1 allows both only in an attended flow (`calendar connect mac`, which Settings'
+// "Allow access" runs). A scheduled run reaches `src/calendar/` through the pipeline, so the property is pinned
+// here as the set of src files that may name each call — a new caller (the pipeline, core, a doctor check) fails.
+const ATTENDED_ONLY: Record<string, string[]> = {
+  "installReaderCopy(": ["calendar/cli.ts", "calendar/reader-install.ts"],
+  "requestMacAccess(": ["calendar/cli.ts", "calendar/mac-source.ts"],
+  "signManagedCopy(": ["calendar/reader-install.ts", "schedule/install.ts"],
+};
+
+test("the reader's install, signing and access request are named only by the attended flow", async () => {
+  const offenders: string[] = [];
+  const seen: Record<string, string[]> = {};
+  for (const f of await srcFiles()) {
+    const src = stripComments(readFileSync(resolve(SRC_DIR, f), "utf8"));
+    for (const [call, allowed] of Object.entries(ATTENDED_ONLY)) {
+      if (!src.includes(call)) continue;
+      (seen[call] ??= []).push(f);
+      if (!allowed.includes(f)) offenders.push(`src/${f} names ${call} — attended only (spec r4 §4.1): allowed in ${allowed.join(", ")}`);
+    }
+  }
+  expect(offenders).toEqual([]);
+  // Not vacuous: every allowed file still names its call.
+  for (const [call, allowed] of Object.entries(ATTENDED_ONLY)) expect(`${call} ${(seen[call] ?? []).sort().join(",")}`).toBe(`${call} ${[...allowed].sort().join(",")}`);
+  // The request MODE itself is named only inside `requestMacAccess` — no path around it (final review r1).
+  const mac = stripComments(readFileSync(resolve(SRC_DIR, "calendar/mac-source.ts"), "utf8"));
+  const req = mac.slice(mac.indexOf("export async function requestMacAccess("));
+  const reqBody = req.slice(0, req.indexOf("\n}\n") + 2);
+  expect((mac.match(/runReader\(\s*"request"/g) ?? []).length).toBe(1);
+  expect((reqBody.match(/runReader\(\s*"request"/g) ?? []).length).toBe(1);
+  for (const f of (await srcFiles()).filter((x) => x !== "calendar/mac-source.ts")) {
+    const src = stripComments(readFileSync(resolve(SRC_DIR, f), "utf8"));
+    expect(`${f}: ${/runReader\(\s*["'`]request/.test(src)}`).toBe(`${f}: false`);
+  }
+  // And the CLI names them only inside `connect`.
+  const cli = stripComments(readFileSync(resolve(SRC_DIR, "calendar/cli.ts"), "utf8"));
+  const connect = cli.slice(cli.indexOf("async function connect("), cli.indexOf("async function enableMacSource("));
+  for (const call of ["installReaderCopy(", "requestMacAccess("]) expect(cli.split(call).length - 1).toBe(connect.split(call).length - 1);
 });
 
 test("no test names a REAL unit directory — those writes go through DBA_TEST_UNIT_DIR", async () => {
@@ -1107,10 +1758,13 @@ test("no test names a REAL unit directory — those writes go through DBA_TEST_U
 //
 // ⚠ WHAT THIS PIN DOES NOT PROVE: that the allowlisted files actually clean up after themselves. That is
 // a claim about their BODIES — an `afterEach`, an `afterAll`, an `rm` in a `finally` — and it was verified
-// by MEASUREMENT during #488 (a full run then left exactly one TMPDIR entry, `dba-isolated-state-*`; since 2026-09-19 it leaves the
-// `dba-isolated-*` baselines from fixtures/isolate-state.ts, two until Batch 2 added `dba-isolated-units-*`, three since), not by
-// this scan, which only reads lines. All the scan pins is that a NEW unwrapped site cannot appear outside
-// the list. If an allowlisted file's cleanup were deleted tomorrow this test would still be green.
+// by MEASUREMENT during #488 (a full run then left exactly one TMPDIR entry, `dba-isolated-state-*`; from 2026-09-19 it left the
+// `dba-isolated-*` baselines from fixtures/isolate-state.ts, two until Batch 2 added `dba-isolated-units-*`, three since; since
+// 2026-10-19 every one of them is made inside the per-process run root of fixtures/run-tmp.ts, which test/preload.ts removes
+// last, so a completed run leaves none — measured file by file for a 13-file sample on 2026-10-19, and pinned end to end for one
+// probe file by test/run-tmp.test.ts), not by this scan, which only reads lines. All the scan pins is that a NEW unwrapped site
+// cannot appear outside the list. If an allowlisted file's cleanup were deleted tomorrow this test would still be green — and,
+// since the run root now goes at run end regardless, so would a full run's TMPDIR: its dirs would pile up only until then.
 //
 // Two conventions differ from the scanners above, both on purpose:
 //   • it walks every `.ts` under test/, not only `*.test.ts` — the registration contract binds fixtures
@@ -1197,7 +1851,8 @@ const TMP_SELF_CLEANING: Record<string, string> = {
   "test/core.api-provider.test.ts": "an `afterAll` removes the file-scope `stateDir` (test/core.api-provider.test.ts:67-72) and each of the three per-test dirs (:268, :356, :378) goes in a `finally` (:284-285, :372-373, :405-406).",
   "test/tick-heartbeat.test.ts": "an `afterEach` removes the per-test dir (test/tick-heartbeat.test.ts:14-16).",
   "test/run-lock.test.ts": "both dirs are removed by `env.cleanup()` (test/run-lock.test.ts:55-56), which every test calls from a `finally`.",
-  "test/fixtures/isolate-state.ts": "DELIBERATELY never registered and never removed: its three baselines (`dba-isolated-state-*`, `dba-isolated-config-*`, `dba-isolated-units-*`) are the only TMPDIR entries a full run is expected to leave, and the reason is recorded in test/fixtures/isolate-state.ts (\"deliberately NOT removed afterwards\") and test/preload.ts's run-end hook comment. Registering them would delete the process-wide state, config and unit dirs mid-drain.",
+  "test/fixtures/run-tmp.ts": "the per-process run root (`dba-run-*`): TMPDIR itself for the rest of the process, so it is not a direct child of `tmpdir()` and cannot be registered. test/preload.ts removes it with `removeTree` as the LAST step of its run-wide afterAll (after the drain and every check), and sweeps a dead earlier run's root at start (`sweepDeadRunRoots`); test/run-tmp.test.ts pins both from a child run.",
+  "test/fixtures/isolate-state.ts": "never registered: draining its three baselines (`dba-isolated-state-*`, `dba-isolated-config-*`, `dba-isolated-units-*`) would delete the process-wide state, config and unit dirs mid-drain. They are made INSIDE the run root (it imports fixtures/run-tmp.ts first) and go with it at the very end of test/preload.ts's afterAll, after every check; see the comment in test/fixtures/isolate-state.ts (\"Neither the variables nor the baselines\").",
 };
 
 /** Files excluded from the scan outright, each with the reason. Distinct from the list above: these are
@@ -1243,7 +1898,20 @@ test("every mkdtemp under tmpdir() in test/ is registered for run-end removal", 
   // Phase E (M4, 2026-10-01): re-measured at 181 `testSources()` (+ update-check.test.ts); floored two below.
   // Phase E final harden (2026-10-02): re-measured at 191 `testSources()` (187 on main at 98d4514db, +
   // the four test files named at scanner 1; round 1 said 189, round 3 190); floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(189);
+  // dba calendar M1, 2026-10-09: re-measured at 205 `testSources()` (M0's test files and fixtures, M1's two
+  // test files, and what landed on main since); floored two below.
+  // dba calendar M2a, 2026-10-09: re-measured at 207 `testSources()` (+ calendar-link-fetch and
+  // calendar-link-scrub); floored two below. (Live sites measured at 304, two of them calendar-link-fetch's,
+  // both wrapped; the sites floor below keeps its own measured-minus-largest-file rule and is not re-derived
+  // here.)
+  // dba calendar M3a, 2026-10-09: re-measured at 211 `testSources()` (+ calendar-reconcile, calendar-clean,
+  // calendar-budget and the fixture test/fixtures/calendar/invite-corpus.ts); floored two below.
+  // dba calendar post-M3b merge, 2026-10-09: re-measured at 215 `testSources()` (+ calendar-parse, calendar-prompt,
+  // calendar-variants and the fixture test/fixtures/calendar-heavy-feed.ts); floored two below.
+  // dba calendar M2c, 2026-10-09: re-measured at 218 `testSources()` (+ calendar-ics, calendar-link-parse and the fixture
+  // test/fixtures/calendar-user-feed.ts); floored two below.
+  // dba calendar PR 1 integration, 2026-10-09: re-measured at 224 `testSources()`; floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(222);
 
   const offenders: string[] = [];
   const unwrapped: Record<string, number> = {};
@@ -1296,7 +1964,12 @@ test("every mkdtemp under tmpdir() in test/ is registered for run-end removal", 
   // Phase E (M3, 2026-10-01): re-measured at 268 live sites (+6 this milestone: release-check's three and
   // uninstall's two fixture/stub dirs, maintenance's stub dir; the rest added on main since), still at most
   // 32 in one file (subprojects.test.ts), so 268 − 32 = 236.
-  expect(sites).toBeGreaterThanOrEqual(236);
+  // dba calendar post-M3b merge, 2026-10-09: re-measured at 310 live sites (it had grown from 268 without a
+  // re-derivation since Phase E M3), still at most 32 in one file (subprojects.test.ts), so 310 − 32 = 278.
+  // dba calendar M2c, 2026-10-09: re-measured at 312 (+1 calendar-parse's cwd test, +1 calendar-link-parse's stdin
+  // spy), still at most 32 in one file, so 312 − 32 = 280.
+  // dba calendar PR 1 integration, 2026-10-09: re-measured at 325, still at most 32 in one file (subprojects.test.ts), so 325 − 32 = 293.
+  expect(sites).toBeGreaterThanOrEqual(293);
   expect(offenders).toEqual([]);
 
   // A stale entry reads as a considered decision while covering nothing — and a file that no longer
@@ -2030,7 +2703,12 @@ test("every child bun that runs an entry point is handed the isolated env", asyn
   // Phase E (M5, 2026-10-01): re-measured at 168 (scanner 1's count); floored two below.
   // Phase E final harden (2026-10-02): re-measured at 174 (scanner 1's count; round 1 said 172, round 3
   // 173); floored two below.
-  expect(files.length).toBeGreaterThanOrEqual(172);
+  // dba calendar M1, 2026-10-09: re-measured at 187 (scanner 1's count); floored two below.
+  // dba calendar M2a, 2026-10-09: re-measured at 189 (scanner 1's count); floored two below.
+  // dba calendar M3a, 2026-10-09: re-measured at 192 (scanner 1's count); floored two below.
+  // dba calendar post-M3b merge, 2026-10-09: re-measured at 195 (scanner 1's count); floored two below.
+  // dba calendar M2c, 2026-10-09: re-measured at 197 (scanner 1's count); floored two below.
+  expect(files.length).toBeGreaterThanOrEqual(201);
   // The names that stand for an entry without its path. If these stop being read, every
   // `join(SCRIPTS, "x.ts")` and `bun run audit` spawn silently drops out of the scan.
   expect(ENTRY_NAMES).toEqual(expect.arrayContaining(["audit", "eval", "inspect-whys", "main", "start"]));
@@ -2056,7 +2734,11 @@ test("every child bun that runs an entry point is handed the isolated env", asyn
   // Re-measured at 7 in 7 once src/proc.ts `run()` calls were read: audit-main (through its import of
   // scripts/audit.ts, whose regeneration runs `bun run src/main.ts run --force`) and
   // proc.incomplete-read.
-  expect(sites).toBeGreaterThanOrEqual(7);
+  // dba calendar post-M3b merge, 2026-10-09: re-measured at 17 sites in 14 files (it had grown from 7 without a
+  // re-floor; calendar-parse, dispatch.help-anywhere and recap-campaigns.replay hold two each); floored AT the
+  // measurement, as this scanner's rule states.
+  // dba calendar PR 1 integration, 2026-10-09: re-measured at 18; floored AT the measurement.
+  expect(sites).toBeGreaterThanOrEqual(18);
   // The two shapes that carry the rest. dispatch.json names its entry through a `const entry` binding,
   // so it is found only if the declaration walk works; diag.credential-redaction spells the path
   // literally and hands the child a fresh env.

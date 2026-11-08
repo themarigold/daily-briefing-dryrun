@@ -688,8 +688,9 @@ describe("release.yml: bundle legs", () => {
       }
     }
     // Sixteen full smoke runs, each executing several freshly written scripts: macOS scans every new
-    // executable on first exec (~0.2 s each, measured 2026-10-01), so the 5 s default is too tight.
-  }, 90_000);
+    // executable on first exec (~0.2 s each, measured 2026-10-01; a median of 0.7 s at load 6-9, 2026-11-05).
+    // Nothing here asserts wall time. It takes 17 s alone and went past 90 s beside a compile and other suites.
+  }, 180_000);
 
   // The AppImage half (user-directed 2026-10-01, "B: try AppImage, else .deb"): the layout the conf sets
   // up, checked on the extracted AppImage, each broken variant refused by name.
@@ -902,7 +903,9 @@ describe("release.yml: bundle legs", () => {
     const bad = run("aarch64-apple-darwin", "x86_64-apple-darwin");
     expect(bad.code).toBe(1);
     expect(bad.err).toContain("the macos-test leg builds x86_64-apple-darwin natively, but this runner's host is 'aarch64-apple-darwin'");
-  });
+    // Six first execs of freshly written stubs, and nothing here asserts wall time. On macOS a first exec took a median
+    // of 0.7 s at load 6-9 (the second, 4 ms), and this test took up to 7.5 s against bun's 5 s default.
+  }, 60_000);
 
   test("the Intel leg also builds the aarch64 sidecar size-budget.json records: after the host sidecar, before gui-tests", () => {
     const host = mac.steps.findIndex((s) => s.run === "bash scripts/build-sidecar.sh");
@@ -1108,6 +1111,8 @@ describe("ci.yml (public)", () => {
 // parsed YAML drops comments), and cross-checked against the parsed `uses` values so no step escapes the
 // line scan. The monorepo's own CI runs the same actions and is held to the same form where it exists.
 const MONO_CI = `${ROOT}../.github/workflows/daily-briefing-ci.yml`;
+// Saves the Actions cache MONO_CI's cargo leg restores (test/ci-cargo-gate.test.ts holds the two in step).
+const MONO_CARGO_CACHE = `${ROOT}../.github/workflows/daily-briefing-cargo-cache.yml`;
 const ACTION_PIN = /^\s*(?:- )?uses: ([\w.-]+\/[\w.-]+)@([0-9a-f]{40}) # (v\d+\.\d+\.\d+)$/;
 const DOCKER_PIN = /^\s*(?:- )?uses: (docker:\/\/[\w./-]+):([\w.-]+)@sha256:[0-9a-f]{64}$/;
 /** A `uses:` line's problem, or null when it is a pin in one of the two accepted forms. */
@@ -1116,8 +1121,8 @@ const pinProblem = (line: string): string | null =>
 /** Every line whose key is `uses:` (a YAML comment line starts with `#`, so it never matches). */
 const usesLines = (text: string): string[] => text.split("\n").filter((l) => /^\s*(?:- )?uses:/.test(l));
 
-describe("action pins (release.yml, ci.yml, and the monorepo's daily-briefing-ci.yml)", () => {
-  const files = [workflowFile("release.yml"), workflowFile("ci.yml"), ...(IN_MONOREPO ? [MONO_CI] : [])];
+describe("action pins (release.yml, ci.yml, and the monorepo's daily-briefing-ci.yml and daily-briefing-cargo-cache.yml)", () => {
+  const files = [workflowFile("release.yml"), workflowFile("ci.yml"), ...(IN_MONOREPO ? [MONO_CI, MONO_CARGO_CACHE] : [])];
 
   test("the matcher accepts exactly the two pinned forms (negative controls)", () => {
     const sha = "11d5960a326750d5838078e36cf38b85af677262";
@@ -1134,7 +1139,10 @@ describe("action pins (release.yml, ci.yml, and the monorepo's daily-briefing-ci
   });
 
   test("every uses: in every file is pinned, and the line scan saw every parsed step", () => {
-    if (IN_MONOREPO) expect(existsSync(MONO_CI), `${MONO_CI} is missing from a monorepo checkout`).toBe(true);
+    if (IN_MONOREPO) {
+      expect(existsSync(MONO_CI), `${MONO_CI} is missing from a monorepo checkout`).toBe(true);
+      expect(existsSync(MONO_CARGO_CACHE), `${MONO_CARGO_CACHE} is missing from a monorepo checkout`).toBe(true);
+    }
     for (const f of files) {
       const text = readFileSync(f, "utf8");
       const lines = usesLines(text);
@@ -1143,7 +1151,9 @@ describe("action pins (release.yml, ci.yml, and the monorepo's daily-briefing-ci
       // Same refs in the same order: a `uses` written any other way (a flow mapping, a quoted key) would
       // show up here as a parsed ref the line scan never checked.
       expect(lines.map((l) => /uses: (\S+)/.exec(l)![1])).toEqual(parsed);
-      expect(parsed.length).toBeGreaterThan(3);
+      // Each monorepo workflow is one job running three actions (checkout, setup-bun, cache); the public
+      // files run more.
+      expect(parsed.length).toBeGreaterThanOrEqual(f === MONO_CI || f === MONO_CARGO_CACHE ? 3 : 4);
     }
   });
 
@@ -1159,7 +1169,8 @@ describe("action pins (release.yml, ci.yml, and the monorepo's daily-briefing-ci
       }
     }
     // Non-vacuity: the actions this pipeline runs today are all reached.
-    expect([...seen.keys()].sort()).toEqual(["actions/checkout", "actions/download-artifact", "actions/upload-artifact", "docker://rhysd/actionlint", "oven-sh/setup-bun"]);
+    // actions/cache: the monorepo's cargo cache only (the public workflows cache nothing).
+    expect([...seen.keys()].sort()).toEqual([...(IN_MONOREPO ? ["actions/cache"] : []), "actions/checkout", "actions/download-artifact", "actions/upload-artifact", "docker://rhysd/actionlint", "oven-sh/setup-bun"]);
   });
 
   test("every cargo test/build in every file is --locked (a resolution change fails, never rewrites Cargo.lock)", () => {
@@ -1173,22 +1184,26 @@ describe("action pins (release.yml, ci.yml, and the monorepo's daily-briefing-ci
         }
       }
     }
-    // release.yml's two legs, ci.yml's gui and cargo-macos, and the monorepo's cargo job.
-    expect(n).toBe(IN_MONOREPO ? 5 : 4);
+    // release.yml's two legs, ci.yml's gui and cargo-macos, and the monorepo's cargo leg and cache build.
+    expect(n).toBe(IN_MONOREPO ? 6 : 4);
   });
 });
 
 // ── E6: the private monorepo's own CI (monorepo only: the export does not carry it) ─────────────────
-test.skipIf(!IN_MONOREPO)("daily-briefing-ci.yml (monorepo): an ubuntu cargo test job with exactly the one --skip", () => {
+test.skipIf(!IN_MONOREPO)("daily-briefing-ci.yml (monorepo): an ubuntu cargo test leg with exactly the one --skip", () => {
   const p = `${ROOT}../.github/workflows/daily-briefing-ci.yml`;
   expect(existsSync(p), `${p} is missing from a monorepo checkout`).toBe(true);
   const M = Bun.YAML.parse(readFileSync(p, "utf8")) as Workflow;
-  const cargo = M.jobs.cargo!;
-  expect(cargo["runs-on"]).toBe("ubuntu-22.04");
-  expect(cargo.defaults?.run?.["working-directory"]).toBe("daily_briefing_application/gui");
-  const r = runs(cargo);
-  expect(r).toContain("bash scripts/build-sidecar.sh");
-  expect(r).toContain(`cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --skip ${SKIP}`);
+  // One job runs every suite (minutes, 2026-10-16); the cargo leg is its steps that run in gui/.
+  expect(Object.keys(M.jobs)).toEqual(["check"]);
+  const check = M.jobs.check!;
+  expect(check["runs-on"]).toBe("ubuntu-22.04");
+  const r = runs(check);
+  const inGui = (cmd: string) => check.steps.find((s) => s.run === cmd)?.["working-directory"];
+  expect(inGui("bash scripts/build-sidecar.sh")).toBe("daily_briefing_application/gui");
+  const cargoTest = `cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --skip ${SKIP}`;
+  expect(r).toContain(cargoTest);
+  expect(inGui(cargoTest)).toBe("daily_briefing_application/gui");
   expect(Object.values(M.jobs).flatMap((j) => runs(j)).join("\n").match(/--skip [\w-]+/g)).toEqual([`--skip ${SKIP}`]);
   // No macOS job in the private monorepo (billed at a multiple).
   expect(Object.values(M.jobs).map((j) => j["runs-on"]).filter((o) => String(o).startsWith("macos"))).toEqual([]);
@@ -1205,6 +1220,66 @@ test.skipIf(!IN_MONOREPO)("daily-briefing-ci.yml (monorepo): permissions are con
   expect(M.permissions).toEqual({ contents: "read" });
   for (const [jn, job] of Object.entries(M.jobs)) expect(`${jn}: ${JSON.stringify(job.permissions)}`).toBe(`${jn}: undefined`);
   const checkouts = Object.entries(M.jobs).flatMap(([jn, j]) => j.steps.filter((s) => s.uses?.startsWith("actions/checkout@")).map((s) => [jn, s] as const));
-  expect(checkouts.map(([jn]) => jn)).toEqual(["check", "gui", "cargo"]);
+  expect(checkouts.map(([jn]) => jn)).toEqual(["check"]);
   for (const [jn, s] of checkouts) expect(`${jn}: ${s.with?.["persist-credentials"]}`).toBe(`${jn}: false`);
+  // The cargo cache workflow is held to the same form.
+  const K = Bun.YAML.parse(readFileSync(MONO_CARGO_CACHE, "utf8")) as Workflow;
+  expect(K.permissions).toEqual({ contents: "read" });
+  for (const [jn, job] of Object.entries(K.jobs)) {
+    expect(`${jn}: ${JSON.stringify(job.permissions)}`).toBe(`${jn}: undefined`);
+    for (const s of job.steps.filter((s) => s.uses?.startsWith("actions/checkout@"))) expect(`${jn}: ${s.with?.["persist-credentials"]}`).toBe(`${jn}: false`);
+  }
+});
+
+// ── v0.3.0 calendar (plan M11): the Mac Calendar Reader in the macOS legs and the public CI ─────────────────────
+test("bundle-macos builds the Calendar Reader before Build, size-gates it and smokes it from the staged app", () => {
+  const mac = J["bundle-macos"]!;
+  const i = mac.steps.findIndex((s) => s.name === "Calendar Reader (universal)");
+  expect(i).toBeGreaterThan(-1);
+  const step = mac.steps[i]!.run!;
+  expect(step).toContain("bash ../reader/build.sh");
+  // Tauri never signs a bundle.macOS.files entry: in signed mode the step re-signs the reader for notarization.
+  expect(step).toContain('if [ "$SIGNING" = signed ]; then');
+  expect(step).toContain("--options runtime --timestamp");
+  expect(step).toContain("--entitlements ../reader/Reader.entitlements --identifier local.daily-briefing.calendar");
+  expect(i).toBeGreaterThan(mac.steps.findIndex((s) => s.name?.startsWith("Import signing identity")));
+  // No id: it is outside the marker's enumerated derivation, and its failure skips Build (→ build-failed).
+  expect(mac.steps[i]!.id).toBeUndefined();
+  expect(i).toBeLessThan(indexOfId(mac, "build"));
+  const size = mac.steps[indexOfId(mac, "size")]!.run!;
+  expect(size).toContain('bun ../scripts/check-size-budget.ts "../reader/build/Daily Briefing Calendar Reader.app" reader-universal-apple-darwin || rc=1');
+  const smoke = mac.steps[indexOfId(mac, "smoke")]!.run!;
+  expect(smoke).toContain('reader="$app/Contents/Resources/Daily Briefing Calendar Reader.app"');
+  expect(smoke).toContain('no arm64 slice');
+  expect(smoke).toContain('no x86_64 slice');
+  expect(smoke).toContain('--verify --strict "$reader"');
+  expect(smoke).toContain('bash ../reader/smoke.sh "$RUNNER_TEMP/reader-smoke/Daily Briefing Calendar Reader.app"');
+  expect(smoke).toContain(`the Calendar Reader: no 'Authority=$IDENTITY' line (signed mode)`);
+});
+
+test("the public ci.yml's cargo-macos job builds and smokes the Calendar Reader", () => {
+  const C = parse("ci.yml");
+  const step = C.jobs["cargo-macos"]!.steps.find((s) => s.name === "Calendar Reader (universal build + FIFO smoke)");
+  expect(step?.run).toContain('bash ../reader/build.sh "$RUNNER_TEMP/reader"');
+  expect(step?.run).toContain('bash ../reader/smoke.sh "$RUNNER_TEMP/reader/Daily Briefing Calendar Reader.app"');
+});
+
+test("no heredoc inside $(...) in a shell script holds an apostrophe — macOS /bin/bash 3.2 cannot parse that", () => {
+  // Measured 2026-10-12: one apostrophe in a comment inside nesting-probe.sh's `$(… <<'PY' … PY)` made bash 3.2 fail
+  // to parse the WHOLE script, while the bash 5 every Linux CI runs accepted it. A text check, so Linux catches it.
+  const offenders: string[] = [];
+  // (Bun's Glob takes no `/` inside braces — `{scripts,gui/scripts}/**` matches NOTHING — so scan all and filter.)
+  const scripts = [...new Glob("**/*.sh").scanSync({ cwd: ROOT })].filter((p) => !/(^|\/)(node_modules|target)\//.test(p));
+  expect(scripts).toContain("gui/scripts/nesting-probe.sh");
+  for (const rel of scripts) {
+    const lines = readFileSync(`${ROOT}${rel}`, "utf8").split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const open = /\$\(.*<<-?\s*['"]?(\w+)['"]?/.exec(lines[i]!);
+      if (!open) continue;
+      for (let j = i + 1; j < lines.length && lines[j]!.trim() !== open[1]; j++) {
+        if (lines[j]!.includes("'")) offenders.push(`${rel}:${j + 1}`);
+      }
+    }
+  }
+  expect(offenders).toEqual([]);
 });

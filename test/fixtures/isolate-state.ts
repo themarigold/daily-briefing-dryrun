@@ -27,8 +27,11 @@
 // changes nothing when the variable is set explicitly). That is the exact hazard this fixture exists to
 // remove, so it must win over the ambient environment.
 //
-// It is deliberately NOT removed afterwards — the point is that the real location is unreachable for the
-// whole process, and restoring it mid-run would reopen the hole. "The whole process" is exact: a child
+// Neither the variables nor the baselines are ever restored or removed by THIS module — the point is that
+// the real location is unreachable for the whole process, and restoring it mid-run would reopen the hole.
+// The baselines are made inside the process's run root (fixtures/run-tmp.ts, imported first below), which
+// test/preload.ts removes as the LAST step of its run-wide afterAll, after every check that reads them; the
+// variables keep pointing into it, never back at the real locations. "The whole process" is exact: a child
 // spawned WITHOUT an `env` option gets the process's STARTUP environment, not these values (measured,
 // bun 1.3.14), so it is not covered; pass `env: { ...process.env, … }`. isolation.meta.test.ts's scanner 6
 // enforces that for the child `bun` spawns of src/main.ts or a scripts/*.ts entry it can read; its header
@@ -57,6 +60,8 @@
 // recorded; a READ while cleared is recorded and RE-ARMS the variable to its baseline, so the fallback is
 // never resolved and one clear fails one test rather than every test after it. test/preload.ts fails the
 // test (or the run) that saw a record; without the preload, nothing reports, but nothing leaks either.
+// FIRST: points TMPDIR at this process's private run root, so the baselines below are made inside it.
+import "./run-tmp";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,8 +91,9 @@ function armTripwire(name: string, baseline: string): void {
 
 const STATE_BASELINE = mkdtempSync(join(tmpdir(), "dba-isolated-state-"));
 const CONFIG_BASELINE = mkdtempSync(join(tmpdir(), "dba-isolated-config-"));
-// The third baseline, made the same way and, like the other two, never registered for run-end removal
-// (scanner 5 allows this file's unwrapped mkdtemp calls; see its TMP_SELF_CLEANING entry).
+// The third baseline, made the same way and, like the other two, never registered for run-end removal: all
+// three go with the run root (scanner 5 allows this file's unwrapped mkdtemp calls; see its TMP_SELF_CLEANING
+// entry).
 const UNITS_BASELINE = mkdtempSync(join(tmpdir(), "dba-isolated-units-"));
 armTripwire("DAILY_BRIEFING_STATE_DIR", STATE_BASELINE);
 armTripwire("XDG_CONFIG_HOME", CONFIG_BASELINE);

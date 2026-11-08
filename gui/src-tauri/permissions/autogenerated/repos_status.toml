@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-repos-status"
+description = "Enables the repos_status command without any pre-configured scope."
+commands.allow = ["repos_status"]
+
+[[permission]]
+identifier = "deny-repos-status"
+description = "Denies the repos_status command without any pre-configured scope."
+commands.deny = ["repos_status"]

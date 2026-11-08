@@ -1,6 +1,6 @@
 // test/generator.test.ts
 import { test, expect } from "bun:test";
-import { buildPrompt, parseBriefing, generateBriefing, orderResumeByRank, norm, activityLine } from "../src/generator";
+import { buildPrompt, parseBriefing, generateBriefing, orderResumeByRank, norm, activityLine, hasBriefingSection, section as sectionOf } from "../src/generator";
 import { rankUnits, type Unit } from "../src/subprojects";
 import type { ReducedContext, Provider, Activity } from "../src/types";
 import { STAGE1_LIST_CAP } from "../src/reduce";
@@ -607,4 +607,20 @@ test("⚠ SUGGESTIONS must not restate a RESUME bullet — the day-21/24 shape B
   // …and nothing here may ask for volume.
   const clause = p.slice(p.indexOf("must NOT restate a RESUME bullet"));
   expect(clause.slice(0, 250)).not.toMatch(/write (more|several|at least (two|three))/i);
+});
+
+// ── P1-M3-T3: the ONE section predicate (provider fallback, spec r9 §5 step 4) ──────────────────────────
+
+test("hasBriefingSection agrees with main.ts's old inline check on a section-free text, RECAP only, and a full briefing", () => {
+  // The expression main.ts carried inline before P1-M3-T3, copied here as the oracle.
+  const oldParsedEmpty = (raw: string) => ["RESUME", "RECAP", "SUGGESTIONS"].every((h) => sectionOf(raw, h).length === 0);
+  const texts = [
+    "I could not write a briefing today.\nSorry.",
+    "## RECAP\n- [repo] did a thing\n",
+    "## RESUME\n- [a] pick up the parser\n\n## RECAP\n- [a] merged #12\n\n## SUGGESTIONS\n- [a] add a test\n",
+    "## NOTES\n- an unrelated section is not a briefing section\n",
+    "",
+  ];
+  for (const t of texts) expect(`${JSON.stringify(t.slice(0, 20))} → ${hasBriefingSection(t)}`).toBe(`${JSON.stringify(t.slice(0, 20))} → ${!oldParsedEmpty(t)}`);
+  expect(texts.map(hasBriefingSection)).toEqual([false, true, true, false, false]);
 });

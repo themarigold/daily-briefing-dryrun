@@ -4,11 +4,11 @@
 // reader already knows how to read, the LAZY key resolution, and the `durationMs` stamp. Keeping them
 // here is what lets `anthropic.ts` and `openaiCompatible.ts` each be a request-shape and a
 // response-shape and nothing else — which is the whole argument for two implementations over one.
-import type { Provider, ProviderApi } from "../types";
+import type { GenerateOpts, Provider, ProviderApi } from "../types";
 import { ProviderError } from "../types";
 import { resolveApiKey, type ResolvedApiKey, type ResolveApiKeyOpts } from "../apiKey";
 import { endpointUrl, isLoopbackHost } from "./endpoint";
-import { TIMEOUT_MS } from "../provider";
+import { API_TIMEOUT_MS } from "../provider";
 
 export type ApiProviderOpts = {
   timeoutMs?: number;
@@ -69,7 +69,8 @@ export abstract class ApiTransport implements Provider {
   /** The label that reaches `BriefingStruct.provider` and every error message. */
   abstract get label(): string;
 
-  protected timeoutMs(): number { return this.opts.timeoutMs ?? TIMEOUT_MS; }
+  /** A configured timeout wins; else the HTTP default (`defaultTimeoutMs` of an api block, src/provider.ts). */
+  protected timeoutMs(): number { return this.opts.timeoutMs ?? API_TIMEOUT_MS; }
 
   /** Resolved ONCE and shared — a value memo would re-read a file and re-spawn a keychain helper on
    *  every concurrent call. A promise memo, for the same reason `hardenedProvider`'s capability probe
@@ -92,20 +93,32 @@ export abstract class ApiTransport implements Provider {
    *  never says "install a CLI" — see the misnomer note in http.ts's mapStatus. */
   protected missingKey(): ProviderError {
     const named = this.api.apiKeyEnv ?? this.api.apiKeyFile ?? this.api.apiKeyCommand?.[0];
-    return new ProviderError(
+    const e = new ProviderError(
       "missing-binary",
       `${this.label}: no API key. ${named !== undefined
         ? `The configured source (${named}) produced nothing`
         : "Set provider.api.apiKeyEnv, apiKeyFile, apiKeyCommand or apiKey"} — see the warnings above for which source was tried.`,
     );
+    // Provider fallback: the walk reads this as `key-unavailable` (spec r9 §5), whatever the message says.
+    e.failCause = "key-missing";
+    return e;
   }
 
-  async generate(prompt: string): Promise<string> {
+  /** ⚠ CALENDAR (v0.3.0, spec r4 §6): an HTTP transport is ALWAYS locked — the request reaches a model with
+   *  no tools to act on what it reads — so it sends `calendarVariants.locked` whenever one is supplied, and
+   *  `prompt` (the unlocked text, the only one there is) otherwise. `onPromptSent` hears which, just before
+   *  the request; guarded so a recording hook can never fail the call. */
+  async generate(prompt: string, opts?: GenerateOpts): Promise<string> {
+    const locked = opts?.calendarVariants?.locked;
+    const text = locked ?? prompt;
+    if (opts?.onPromptSent) {
+      try { opts.onPromptSent({ variant: locked !== undefined ? "locked" : "unlocked", text }); } catch { /* never fail the call */ }
+    }
     // Stamp every ProviderError with how long the attempt took, exactly as BYOCliProvider.generate
     // does: the B6 ladder's fail-fast gate reads `durationMs`, and an unstamped error is invisible to it.
     const startedAt = performance.now();
     try {
-      return await this.send(prompt);
+      return await this.send(text, opts?.signal);
     } catch (e) {
       if (e instanceof ProviderError && e.durationMs === undefined) e.durationMs = Math.round(performance.now() - startedAt);
       throw e;
@@ -130,5 +143,34 @@ export abstract class ApiTransport implements Provider {
     this.runtimeWarnings.push(`${this.label}: the model stopped at its output-token limit${limit !== undefined ? ` (max_tokens ${limit})` : ""}, so this result was cut off at the end — raise provider.api.maxTokens`);
   }
 
-  protected abstract send(prompt: string): Promise<string>;
+  /** The production call: the request, then the answer's text — `empty-output` when it carries none. */
+  protected abstract send(prompt: string, signal?: AbortSignal): Promise<string>;
+
+  /** The production REQUEST — the key read, the body, the headers, the POST — answering the parsed JSON of a 2xx, or
+   *  throwing the `ProviderError` production would. `send` extracts the text from it; `probe` stops here. `probe:
+   *  true` only swaps in the dialect's probe-size output limit where the dialect requires one (Anthropic). */
+  protected abstract request(prompt: string, opts: { signal?: AbortSignal; probe?: boolean }): Promise<Record<string, unknown> | null>;
+
+  /**
+   * Provider fallback P2-M4-T1 (spec r9 §6 "provider test"): ONE production request, accepted on ANY parsed 2xx —
+   * BEFORE content extraction, so an answer with no message content (which `send` turns into `empty-output`) is still
+   * "key accepted": the key and the endpoint are what a Test proves, not the model's prose. Resolves on acceptance;
+   * rejects with the request's `ProviderError` (stamped with `durationMs`, as `generate` does), for `failoverReason`.
+   * No retry, no truncation warning, no `onPromptSent`. `generate` is untouched by it.
+   */
+  async probe(prompt: string, signal?: AbortSignal): Promise<void> {
+    const startedAt = performance.now();
+    try {
+      await this.request(prompt, { probe: true, ...(signal ? { signal } : {}) });
+    } catch (e) {
+      if (e instanceof ProviderError && e.durationMs === undefined) e.durationMs = Math.round(performance.now() - startedAt);
+      throw e;
+    }
+  }
+
+  /** Provider fallback (P1-M3-T5): the attempt's deadline passed — send nothing. Called after the key resolves
+   *  (a Keychain read can outlive the deadline) and again immediately before the request. */
+  protected throwIfAborted(signal: AbortSignal | undefined): void {
+    if (signal?.aborted) throw new ProviderError("timeout", `${this.label}: the attempt's deadline passed before the request was sent`);
+  }
 }

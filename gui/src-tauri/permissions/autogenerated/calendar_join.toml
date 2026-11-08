@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-calendar-join"
+description = "Enables the calendar_join command without any pre-configured scope."
+commands.allow = ["calendar_join"]
+
+[[permission]]
+identifier = "deny-calendar-join"
+description = "Denies the calendar_join command without any pre-configured scope."
+commands.deny = ["calendar_join"]

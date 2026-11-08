@@ -1,5 +1,6 @@
 // src/providers/endpoint.ts — A3. Endpoint arithmetic shared by the two transports, the key ladder,
-// the network-probe derivation and `init`.
+// the network-probe derivation and `init` — and, since provider-fallback P2-M3-T1, the plain-http rule for
+// app-owned keys (`cleartextRemote`).
 //
 // EXTRACTED AT FOUR CONSUMERS, not speculatively: `apiKey.ts` (a loopback endpoint needs no key at all
 // and must not warn about one), `core.ts` (the derived networkProbeHosts fallback), `config.ts`'s
@@ -64,6 +65,31 @@ export function isLoopbackHost(hostname: string): boolean {
   if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true;
   const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   return v4 !== null && Number(v4[1]) === 127;
+}
+
+/** Does this api config need NO key at all? Only an `openai-compatible` endpoint on this machine (Ollama, LM Studio, a
+ *  local vLLM): the transport omits the `Authorization` header and refuses a missing key only off this machine.
+ *
+ *  ONE predicate for every place that rule is applied (follow-up 4, 2026-10-19 — extracted at three inline spellings,
+ *  behaviour unchanged): the key ladder's "no key found" warning (`localNoKey`, src/apiKey.ts), the transport's
+ *  missing-key refusal (src/providers/openaiCompatible.ts), doctor's anomaly (src/json.ts), and the `keyOptional`
+ *  field of every `config validate` row (src/json.ts), which the desktop app's Add reads instead of deciding it. */
+export function keyOptional(api: ProviderApi): boolean {
+  const u = endpointUrl(api);
+  return api.kind === "openai-compatible" && u !== undefined && isLoopbackHost(u.hostname);
+}
+
+/** The endpoint when it is plain `http:` to a host other than this machine — the one endpoint a key the app stores
+ *  is refused over (spec r9 §5 step 4, §6) — else `undefined` (https, loopback http, or no usable endpoint).
+ *
+ *  ONE predicate for every place that rule is applied (provider-fallback P2-M3-T1 checkpoint): the run-time refusal
+ *  (`insecureEndpoint`, src/core.ts), `provider key migrate`'s refusal to store a key the app could then never save
+ *  (src/providerCli.ts), and P2-M5-T2's `config validate` rule. Two spellings of it would let migrate store a key that
+ *  the run then refuses on every tick. Returns the URL so a caller that may name the host can; the provider CLI never
+ *  prints it. */
+export function cleartextRemote(api: ProviderApi): URL | undefined {
+  const u = endpointUrl(api);
+  return u !== undefined && u.protocol === "http:" && !isLoopbackHost(u.hostname) ? u : undefined;
 }
 
 /** The default port for a URL that names none — `URL.port` is `""` for the scheme default. */

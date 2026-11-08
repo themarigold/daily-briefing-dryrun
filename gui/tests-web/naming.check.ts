@@ -33,6 +33,7 @@ import { REDACTED_API_KEY } from "../src/lib/files";
 import { storedTimeNote } from "../src/lib/morning-time";
 import { SECTIONS, type Draft } from "../src/lib/settings-model";
 import { todayModel } from "../src/lib/today";
+import type { Os } from "../src/lib/platform";
 import {
   draftFromConfig,
   emptyDraft,
@@ -40,7 +41,9 @@ import {
   loginItemNote,
   saveGateBlocker,
   stepBlocker,
+  stepHeading,
   STEP_ORDER,
+  type StepCtx,
   type WizardDraft,
 } from "../src/lib/wizard";
 import SettingsForm from "../src/routes/SettingsForm.svelte";
@@ -113,8 +116,22 @@ function modelText(): Scanned[] {
   out.push({ where: "wizard loginItemNote", text: loginItemNote({ kind: "failed", detail: "x" }, null) ?? "" });
   out.push({ where: "wizard firstWakeSentence", text: firstWakeSentence("07:20") });
   out.push({ where: "wizard floorNote", text: draftFromConfig('{"morningTime":"7:5"}')?.floorNote ?? "" });
+  // Design 2026-10-31 D1: the step headings left the template for `stepHeading` — every one it can show.
+  for (const [where, ctx] of HEADING_CTXS) {
+    for (const step of STEP_ORDER) {
+      const heading = stepHeading(step, ctx);
+      if (heading !== null) out.push({ where: `wizard stepHeading(${step}, ${where})`, text: heading });
+    }
+  }
   return out;
 }
+
+/** Every OS × access state `stepHeading` distinguishes (unknown, known in scope, known out of scope). */
+const HEADING_CTXS: [string, StepCtx][] = (["macos", "linux", "windows", "other"] as Os[]).flatMap((os): [string, StepCtx][] => [
+  [`${os}, unknown`, { os, accessKnown: false, accessInScope: false }],
+  [`${os}, in`, { os, accessKnown: true, accessInScope: true }],
+  [`${os}, out`, { os, accessKnown: true, accessInScope: false }],
+]);
 
 /* ── 2. the components' static template text, from the AST ────────────────────────────────────── */
 
@@ -277,6 +294,7 @@ describe('v0.2.1 §3.1: the setting is called "Morning time" — never "floor", 
       "routes/SettingsForm.svelte",
       "routes/Today.svelte",
       "routes/TodayView.svelte",
+      "lib/RunControls.svelte",
     ]) {
       expect({ rel, scanned: components.includes(rel) }).toEqual({ rel, scanned: true });
     }
@@ -289,10 +307,13 @@ describe('v0.2.1 §3.1: the setting is called "Morning time" — never "floor", 
     expect(BANNED.some((b) => b.re.test(joined))).toBe(true);
     expect(joined.replace(/\s+/g, " ")).toContain(KEPT_SENTENCE);
     expect(scanned(joined)).toEqual([]);
-    expect(said(/^routes\/Wizard\.svelte$/, "Step 6 of 7 — your morning time")).toBe(true);
+    expect(said(/^wizard stepHeading\(floor, macos, unknown\)$/, "Step 6 of 8 — your morning time")).toBe(true);
+    expect(said(/^wizard stepHeading\(floor, linux, unknown\)$/, "Step 5 of 7 — your morning time")).toBe(true);
+    expect(all.filter((s) => s.where.startsWith("wizard stepHeading(")).length).toBe(88);
     expect(said(/^Settings morningTime\.label$/, "Morning time")).toBe(true);
     expect(said(/^wizard stepBlocker\(floor\)$/, "Choose a morning time.")).toBe(true);
-    expect(said(/^routes\/TodayView\.svelte$/, "your morning time has passed")).toBe(true);
+    // The Run now hint, by its own wording (design 2026-10-24: Run now runs before the morning time too).
+    expect(said(/^lib\/RunControls\.svelte$/, "Generates today's briefing now, if it has not been generated yet")).toBe(true);
     expect(said(/^SettingsForm \(config-full\)$/, "Morning time")).toBe(true);
     expect(said(/^TodayView \(no briefing yet\)$/, "No briefing yet")).toBe(true);
     expect(said(/^Wizard \(step 1\)$/, "Set up Daily Briefing")).toBe(true);
@@ -340,9 +361,58 @@ describe("v0.2.1 §3.5: Wizard.svelte's own text names the Mac only where the st
       .map((t) => t.replace(/\s+/g, " ").trim())
       .filter((t) => /\bMac\b|macOS/.test(t));
     expect(said).toEqual([
-      "Step 4 of 7 — macOS folder access",
       "These three are macOS-protected and start UNTICKED on purpose: nothing should trigger a permission dialog you did not choose. Tick one only if your repositories live there — the next step then walks you through the grant.",
       "Some folders you chose are ones macOS protects. The engine cannot read them — and your briefing is quietly thinner — until access is granted. This is the same panel the Schedule screen carries, so you can redo any of it later.",
     ]);
+  });
+
+  test("the step headings (design 2026-10-31 D1, now `stepHeading`'s) name the Mac only on the access step, which Linux and Windows never reach (r6)", () => {
+    const macHeadings = HEADING_CTXS.flatMap(([where, ctx]) =>
+      STEP_ORDER.map((step) => ({ where, step, heading: stepHeading(step, ctx) })).filter((h) => h.heading !== null && /\bMac\b|macOS/.test(h.heading)),
+    );
+    expect(macHeadings).toEqual([
+      { where: "macos, unknown", step: "access", heading: "Step 4 of 8 — macOS folder access" },
+      { where: "macos, in", step: "access", heading: "Step 4 of 8 — macOS folder access" },
+      { where: "other, unknown", step: "access", heading: "Step 4 of 8 — macOS folder access" },
+      { where: "other, in", step: "access", heading: "Step 4 of 8 — macOS folder access" },
+    ]);
+    // Linux and Windows: every heading they can show, and none names the Mac.
+    for (const os of ["linux", "windows"] as const) {
+      for (const [where, ctx] of HEADING_CTXS.filter(([w]) => w.startsWith(`${os},`))) {
+        const shown = STEP_ORDER.map((step) => stepHeading(step, ctx)).filter((h): h is string => h !== null);
+        expect({ where, count: shown.length }).toEqual({ where, count: 7 });
+        expect({ where, mac: shown.filter((h) => /\bMac\b|macOS/.test(h)) }).toEqual({ where, mac: [] });
+      }
+    }
+  });
+});
+
+describe("design 2026-10-31 D1: no step number is spelled outside `stepHeading` (M4 sweep)", () => {
+  // The models' strings and the components' static template text. `stepHeading`'s own outputs are the one place a
+  // step number is spelled, so they are set aside from the number scan (and still scanned for "Optional step"). The
+  // server-rendered markup is not scanned for numbers: it is where `stepHeading` and the welcome line's interpolated
+  // `stepNumber` legitimately show one.
+  const isHeading = (s: Scanned) => s.where.startsWith("wizard stepHeading(");
+  const texts = (): Scanned[] => [...modelText(), ...componentText()];
+  const STEP_NUMBER = /step\s+\d/i;
+
+  test('no scanned model string or template text spells "step N", and none says "Optional step"', () => {
+    const all = texts();
+    const numbered = all.filter((s) => !isHeading(s) && STEP_NUMBER.test(s.text)).map((s) => `${s.where}: ${JSON.stringify(s.text.slice(0, 200))}`);
+    expect(numbered).toEqual([]);
+    const optional = all.filter((s) => /optional step/i.test(s.text)).map((s) => `${s.where}: ${JSON.stringify(s.text.slice(0, 200))}`);
+    expect(optional).toEqual([]);
+  });
+
+  test("the scan is not vacuous, and it can fail", () => {
+    const all = texts();
+    // It reaches the wizard's template, its joined text, and every heading `stepHeading` can show.
+    expect(all.some((s) => s.where === "routes/Wizard.svelte (joined)" && s.text.includes("only if you say yes in step"))).toBe(true);
+    expect(all.filter(isHeading).length).toBe(88);
+    expect(all.filter(isHeading).every((s) => STEP_NUMBER.test(s.text))).toBe(true);
+    // The old header and the old calendar line would have been caught.
+    for (const old of ["Step 1 of 7 — what this is", "Optional step — your calendar", "only if you say yes in step\n          5, turn it on"]) {
+      expect({ old, caught: STEP_NUMBER.test(old) || /optional step/i.test(old) }).toEqual({ old, caught: true });
+    }
   });
 });

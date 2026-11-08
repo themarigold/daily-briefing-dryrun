@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-engine-calendar-test"
+description = "Enables the engine_calendar_test command without any pre-configured scope."
+commands.allow = ["engine_calendar_test"]
+
+[[permission]]
+identifier = "deny-engine-calendar-test"
+description = "Denies the engine_calendar_test command without any pre-configured scope."
+commands.deny = ["engine_calendar_test"]

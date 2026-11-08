@@ -26,7 +26,7 @@
   import { scheduleInstall, type EngineOutcome } from "./engine";
   import { describeFailure } from "./files";
   import ForeignOwnerDialog from "./ForeignOwnerDialog.svelte";
-  import { afterInstall, armsVerify, type Stage } from "./install-flow";
+  import { afterInstall, armsVerify, installBusy, type Stage } from "./install-flow";
 
   interface Props {
     /** Rendered on the primary button. */
@@ -53,6 +53,12 @@
      * again beside the new scheduler.
      */
     onended?: () => void;
+    /**
+     * Design 2026-10-31 r6 §3: whether the control is busy (`installBusy`: the call running, or the foreign-owner
+     * dialog open), reported on every stage change — including the return to idle after Keep. The wizard holds
+     * Back, Finish and "Finish setup later" on it; the Schedule screen passes nothing.
+     */
+    onbusy?: (busy: boolean) => void;
   }
   let {
     label = "Install / repair scheduler",
@@ -61,10 +67,15 @@
     onstarted,
     onfinished,
     onended,
+    onbusy,
   }: Props = $props();
 
   let stage = $state<Stage>("idle");
   let message = $state("");
+
+  $effect(() => {
+    onbusy?.(installBusy(stage));
+  });
 
   async function install(takeOver: boolean): Promise<void> {
     onstarted?.();

@@ -45,6 +45,7 @@ const TOKENS: Record<string, { token: string; secret: string }> = {
            secret: "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U" },
   "env-assignment": { token: "API_TOKEN=s3cr3tvalue1234", secret: "s3cr3tvalue1234" },
   "auth-header": { token: "Authorization: Bearer abcdef1234567890", secret: "abcdef1234567890" },
+  "url-userinfo": { token: "https://user:UrlPasswordMark@host/repo", secret: "UrlPasswordMark" },
 };
 
 /** Two commits that share a tier-3 phrase led by the token, on DIFFERENT files — two file atoms, so

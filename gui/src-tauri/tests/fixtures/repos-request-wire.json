@@ -1,0 +1,7 @@
+{
+  "stdinMaxBytes": 262144,
+  "wires": [
+    "{\"scope\":\"all\",\"pageDate\":\"2026-10-24\",\"labels\":[{\"key\":\"daily_briefing_application\",\"tokens\":[\"abc1234\",\"DEADBEEF\"]},{\"key\":\"\",\"tokens\":[\"0123456789abcdef0123456789abcdef01234567\"]},{\"key\":\"ünï €\",\"tokens\":[]}],\"branches\":[{\"key\":\"daily_briefing_application\",\"name\":\"feat/dba-\\\"x\\\"\"}]}",
+    "{\"scope\":\"uncommitted\",\"pageDate\":\"2026-01-31\",\"labels\":[],\"branches\":[]}"
+  ]
+}

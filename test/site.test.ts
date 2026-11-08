@@ -1352,7 +1352,7 @@ test("every file under site/ is strict UTF-8: no malformed byte, no byte-order m
 test("the page has the sections the plan names, and its downloads point at the latest release", () => {
   const html = readSiteText(PAGE);
   for (const id of ["what", "sample", "download", "privacy", "links"]) expect(html).toContain(`id="${id}"`);
-  expect(html).toContain('href="https://github.com/themarigold/daily-briefing/releases/latest"');
+  expect(html).toContain('href="https://github.com/norn-app/daily-briefing/releases/latest"');
   // The sample is invented, and says so.
   expect(html).toMatch(/invented example/i);
 });

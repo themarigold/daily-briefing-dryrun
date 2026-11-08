@@ -27,6 +27,13 @@ use daily_briefing_gui_lib::schedule_state::{
     SkipReason, StatePaths, StatusView, TickLine, TickProblem, FUTURE_TICK_SKEW_SECS,
     MAX_INTERVAL_SECS, SKIP_REASONS,
 };
+use daily_briefing_gui_lib::schedule_state::{
+    older_engine_warning, sentinel_guard, version_older, APP_VERSION,
+    FIRST_SAME_RUN_SWITCHING_VERSION, SENTINEL_INTRODUCED_IN, UNSET_UNTIL_RELEASE,
+};
+use daily_briefing_gui_lib::schedule_state::{
+    AiSummaryStatus, LatestSummaryRevision, SummaryState, SummaryWarningCode,
+};
 
 /* ── fixtures ─────────────────────────────────────────────────────────────────────────────────── */
 
@@ -81,6 +88,8 @@ fn status() -> StatusView {
         last_skip: None,
         last_tick: None,
         latest_briefing_mtime: None,
+        latest_summary_revision: None,
+        ai_summary_status: AiSummaryStatus::default(),
         morning_time: MorningTime {
             value: "07:20".into(),
             minutes: 440,
@@ -90,7 +99,156 @@ fn status() -> StatusView {
             state_dir: Some("/tmp/state".into()),
             ..Default::default()
         },
+        providers: Vec::new(),
     }
+}
+
+/* ── the summary members (A2-M4-T12, R5-M4) ───────────────────────────────────────────────────── */
+
+/// The fixture envelope with the two summary members removed, then set to whatever is under test.
+fn status_wire() -> serde_json::Value {
+    let mut wire = serde_json::to_value(status()).unwrap();
+    let object = wire.as_object_mut().unwrap();
+    object["engineVersion"] = serde_json::json!("0.1.1-distinctive");
+    object["lastRunDate"] = serde_json::json!(TODAY);
+    object.remove("latestSummaryRevision");
+    object.remove("aiSummaryStatus");
+    wire
+}
+
+/// Through both of serde_json's entry points: a `Value` is production's path, and text a second
+/// entry point.
+fn decode_status(wire: &serde_json::Value) -> StatusView {
+    let from_value: StatusView = serde_json::from_value(wire.clone())
+        .unwrap_or_else(|e| panic!("{wire} must not fail the status parse: {e}"));
+    let from_text: StatusView = serde_json::from_str(&wire.to_string()).unwrap();
+    assert_eq!(from_value, from_text);
+    from_value
+}
+
+#[test]
+fn a_malformed_summary_member_reads_as_absent_and_fails_nothing_else() {
+    use serde_json::json;
+    let hash = "a".repeat(64);
+    let version = "b".repeat(64);
+    let without = decode_status(&status_wire());
+    assert_eq!(without.latest_summary_revision, None);
+    assert_eq!(without.ai_summary_status, AiSummaryStatus::default());
+    assert!(!without.ai_summary_status.enabled);
+    let revision = |page_hash: &str,
+                    page_version: &str,
+                    revision: serde_json::Value,
+                    state: &str| {
+        json!({"pageHash": page_hash, "pageVersion": page_version, "revision": revision, "state": state})
+    };
+    let shapes = [
+        json!(null),
+        json!(true),
+        json!(7),
+        json!("two"),
+        json!([]),
+        json!({}),
+    ];
+    let bad_revisions = [
+        json!({"pageHash": hash}),
+        json!({"pageHash": hash, "pageVersion": version, "revision": 1}),
+        json!({"pageHash": hash, "pageVersion": version, "state": "ready"}),
+        revision(&hash.to_uppercase(), &version, json!(1), "ready"),
+        revision(&hash, &version[1..], json!(1), "ready"),
+        revision(&hash, &format!("{version}0"), json!(1), "ready"),
+        revision("../x", &version, json!(1), "ready"),
+        revision(&hash, &version, json!("1"), "ready"),
+        revision(&hash, &version, json!(1.0), "ready"),
+        revision(&hash, &version, json!(2), "ready"),
+        revision(&hash, &version, json!(-1), "ready"),
+        revision(&hash, &version, json!(0), "ready"),
+        revision(&hash, &version, json!(0), "unavailable"),
+        revision(&hash, &version, json!(1), "pending"),
+        revision(&hash, &version, json!(1), "Ready"),
+        revision(&hash, &version, json!(1), "summary-nope"),
+    ];
+    for value in shapes.iter().chain(&bad_revisions) {
+        let mut wire = status_wire();
+        wire["latestSummaryRevision"] = value.clone();
+        assert_eq!(decode_status(&wire), without, "{value}");
+    }
+    let bad_statuses = [
+        json!({"enabled": true}),
+        json!({"warnings": ["summary-config-invalid"]}),
+        json!({"enabled": "yes", "warnings": []}),
+        json!({"enabled": 1, "warnings": []}),
+        json!({"enabled": true, "warnings": "summary-usage-limit"}),
+        json!({"enabled": true, "warnings": {"0": "summary-usage-limit"}}),
+    ];
+    for value in shapes.iter().chain(&bad_statuses) {
+        let mut wire = status_wire();
+        wire["aiSummaryStatus"] = value.clone();
+        assert_eq!(decode_status(&wire), without, "{value}");
+    }
+}
+
+#[test]
+fn the_summary_members_decode_with_fixed_codes_only() {
+    use serde_json::json;
+    let hash = "a".repeat(64);
+    let version = "b".repeat(64);
+    for (state_text, state, number) in [
+        ("pending", SummaryState::Pending, 0),
+        ("ready", SummaryState::Ready, 1),
+        ("unavailable", SummaryState::Unavailable, 1),
+    ] {
+        let mut wire = status_wire();
+        wire["latestSummaryRevision"] = json!({
+            "pageHash": hash, "pageVersion": version, "revision": number, "state": state_text,
+            "aNewerEngineMember": true,
+        });
+        assert_eq!(
+            decode_status(&wire).latest_summary_revision,
+            Some(LatestSummaryRevision {
+                page_hash: hash.clone(),
+                page_version: version.clone(),
+                revision: number,
+                state,
+            })
+        );
+    }
+    let mut wire = status_wire();
+    wire["aiSummaryStatus"] = json!({
+        "enabled": true,
+        "warnings": [
+            "summary-usage-limit", "summary-nope", 7, null, {"code": "summary-unavailable"},
+            "AI summary setting is invalid; AI summaries are off.", "summary-usage-limit",
+            "summary-config-invalid", "summary-text-omitted", "summary-unavailable",
+        ],
+    });
+    let decoded = decode_status(&wire);
+    assert_eq!(
+        decoded.ai_summary_status,
+        AiSummaryStatus {
+            enabled: true,
+            warnings: vec![
+                SummaryWarningCode::SummaryUsageLimit,
+                SummaryWarningCode::SummaryConfigInvalid,
+                SummaryWarningCode::SummaryTextOmitted,
+                SummaryWarningCode::SummaryUnavailable,
+            ],
+        }
+    );
+    // Off with the invalid-setting code, the engine's reply for a malformed `aiSummary` block.
+    wire["aiSummaryStatus"] = json!({"enabled": false, "warnings": ["summary-config-invalid"]});
+    let off = decode_status(&wire);
+    assert!(!off.ai_summary_status.enabled);
+    assert_eq!(
+        off.ai_summary_status.warnings,
+        vec![SummaryWarningCode::SummaryConfigInvalid]
+    );
+    // The decoded model written back, as `status-model.json` is, reads the same and spells the codes.
+    let written = serde_json::to_value(&decoded).unwrap();
+    assert_eq!(
+        written["aiSummaryStatus"]["warnings"][0],
+        "summary-usage-limit"
+    );
+    assert_eq!(decode_status(&written), decoded);
 }
 
 fn schedule() -> ScheduleView {
@@ -114,6 +272,7 @@ fn schedule() -> ScheduleView {
         record_file_present: true,
         registered_reason: None,
         remove_steps: Some(REMOVE_STEPS.into()),
+        scheduled_engine_version: Some("0.1.1".into()),
     }
 }
 
@@ -135,7 +294,42 @@ fn skip(reason: &str, local_date: &str, detail: Option<&str>) -> LastSkip {
         local_date: local_date.into(),
         reason: reason.into(),
         detail: detail.map(str::to_string),
+        all_out_of_usage: false,
     }
+}
+
+/// Provider fallback P3-M5-T1 (spec r9 §5, requirement 11): `last-skip.json`'s `allOutOfUsage`, as
+/// `status --json`'s `lastSkip` carries it (`src/marker.ts` `LastSkip`), reaches the Rust record
+/// under its engine spelling; an absent field — every older engine, and every skip but step 7 row
+/// 1 — reads as `false`, never as a parse failure of the record.
+#[test]
+fn the_skip_record_carries_all_out_of_usage_from_the_wire() {
+    let walled: LastSkip = serde_json::from_value(serde_json::json!({
+        "iso": "2026-09-16T16:00:00.000Z",
+        "localDate": TODAY,
+        "reason": "limited",
+        "detail": "No briefing yet today — every provider is out of usage. It will arrive once one resets, if your Mac is awake.\nskipped: …",
+        "allOutOfUsage": true,
+    }))
+    .expect("an all-out-of-usage record parses");
+    assert!(walled.all_out_of_usage, "{walled:?}");
+
+    let plain: LastSkip = serde_json::from_value(serde_json::json!({
+        "iso": "2026-09-16T16:00:00.000Z",
+        "localDate": TODAY,
+        "reason": "limited",
+        "detail": "skipped: …",
+    }))
+    .expect("a plain limited record parses");
+    assert!(!plain.all_out_of_usage, "{plain:?}");
+
+    // Through `StatusView` too — the path the watcher actually takes.
+    let status: StatusView = serde_json::from_value(serde_json::json!({
+        "configExists": true,
+        "lastSkip": { "iso": "", "localDate": TODAY, "reason": "limited", "allOutOfUsage": true },
+    }))
+    .expect("status parses");
+    assert!(status.last_skip.is_some_and(|s| s.all_out_of_usage));
 }
 
 /// The discriminant only — what "exactly one state" is asserted over.
@@ -607,8 +801,9 @@ fn rows() -> Vec<Row> {
                 "limited",
                 TODAY,
                 Some(
-                    "skipped: account \"work\" is at its usage limit until 2026-09-16T18:00:00Z — \
-                     the next tick will use another account",
+                    "No briefing yet today — every provider is out of usage until 11:00. It will arrive \
+                     once one resets, if your Mac is awake.\nskipped: account \"work\" is at its usage limit \
+                     until 2026-09-16T18:00:00Z — no other account is available; will retry next interval",
                 ),
             )),
             schedule: Some(schedule()),
@@ -625,8 +820,9 @@ fn rows() -> Vec<Row> {
                 "limited",
                 TODAY,
                 Some(
-                    "skipped: account \"work\" is unavailable — no other account is available; \
-                     will retry next interval",
+                    "No briefing yet today — every provider is out of usage. It will arrive once one \
+                     resets, if your Mac is awake.\nskipped: account \"work\" is unavailable — no other \
+                     account is available; will retry next interval",
                 ),
             )),
             schedule: Some(schedule()),
@@ -896,8 +1092,10 @@ fn an_unparseable_heartbeat_is_null_ticks_never_zero() {
 /// time; it renders the engine's line, which names one only for a PARSED limit.
 #[test]
 fn a_probe_limit_carries_no_reset_time() {
-    let probe_line = "skipped: account \"work\" is unavailable — no other account is available; \
-                      will retry next interval";
+    // Provider fallback P1-M9-T2 (Q6): the engine's two-line detail for an all-out-of-usage skip.
+    let probe_line = "No briefing yet today — every provider is out of usage. It will arrive once one \
+                      resets, if your Mac is awake.\nskipped: account \"work\" is unavailable — no other \
+                      account is available; will retry next interval";
     let status = StatusView {
         last_tick: Some(tick("2026-09-16T16:05:00.000Z", TODAY, 11)),
         ..status()
@@ -1250,6 +1448,10 @@ fn the_wire_shape_is_camel_case_throughout() {
         "recordFilePresent",
         "registeredReason",
         "removeSteps",
+        // Provider fallback (P3-M6-T2): the older-background-engine warning and the MEASURED
+        // version it reads.
+        "scheduledEngineVersion",
+        "olderEngineWarning",
     ] {
         assert!(
             wire.get(key).is_some(),
@@ -1972,5 +2174,295 @@ trait TickLocalDate {
 impl TickLocalDate for daily_briefing_gui_lib::schedule_state::ScheduleState {
     fn lastick_local_date(&self) -> Option<String> {
         self.last_tick.as_ref().map(|t| t.local_date.clone())
+    }
+}
+
+/* ── the older-background-engine warning (provider fallback spec §6, P3-M6-T2) ──────────────── */
+
+/// A `status --json` `providers` row, as the engine writes it (`src/json.ts`): a resolved entry's
+/// `kind` is its provider kind; a dropped entry's is `"invalid"`.
+fn provider_row(index: u64, kind: &str) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "index": index,
+        "source": if index == 0 { "provider" } else { "fallback" },
+        "label": format!("entry {index}"),
+        "kind": kind,
+        "status": { "kind": if kind == "invalid" { "invalid" } else { "ok" } },
+    });
+    if index > 0 {
+        row["fallbackIndex"] = serde_json::json!(index - 1);
+    }
+    row
+}
+
+/// The fixture status with `providers` set, parsed from JSON — the path a real envelope takes, so
+/// the count is read through the same deserializer the watcher uses.
+fn status_with_rows(rows: Vec<serde_json::Value>) -> StatusView {
+    let mut wire = serde_json::to_value(status()).expect("the fixture serialises");
+    wire["providers"] = serde_json::Value::Array(rows);
+    serde_json::from_value(wire).expect("a status with providers parses")
+}
+
+fn scheduled(owner: &str, version: Option<&str>) -> ScheduleView {
+    ScheduleView {
+        owner: Some(owner.into()),
+        invoker: Some(owner.into()),
+        // The install-time RECORD says this app's version; the binary answers something else.
+        installed_engine_version: Some(APP_VERSION.into()),
+        engine_version: Some(APP_VERSION.into()),
+        scheduled_engine_version: version.map(str::to_string),
+        ..schedule()
+    }
+}
+
+/// A version older than every version this crate can carry (any release bumps past 0.2.1).
+const ANCIENT: &str = "0.0.1";
+
+/// Q18: one valid entry plus a DROPPED one behaves single-entry on old and new engines alike, so
+/// the dropped row does not count toward "two or more" and the warning never shows.
+#[test]
+fn a_dropped_row_does_not_count_toward_the_older_engine_warning() {
+    let one_valid_one_dropped = status_with_rows(vec![
+        provider_row(0, "claude-cli"),
+        provider_row(1, "invalid"),
+    ]);
+    assert_eq!(one_valid_one_dropped.valid_provider_entries(), 1);
+    let state = derive(
+        &one_valid_one_dropped,
+        None,
+        Some(&scheduled("app", Some(ANCIENT))),
+        &at_0910(),
+    );
+    assert!(
+        !state.older_engine_warning,
+        "a valid entry plus a dropped one is single-entry: {state:?}"
+    );
+
+    // Control: two VALID entries on the same ancient engine do warn, so the case above is
+    // silent because of the count, not because the warning cannot fire.
+    let two_valid = status_with_rows(vec![
+        provider_row(0, "claude-cli"),
+        provider_row(1, "anthropic"),
+    ]);
+    assert_eq!(two_valid.valid_provider_entries(), 2);
+    let state = derive(
+        &two_valid,
+        None,
+        Some(&scheduled("app", Some(ANCIENT))),
+        &at_0910(),
+    );
+    assert!(state.older_engine_warning, "{state:?}");
+}
+
+/// The count is read leniently: a `providers` that is not an array, or a row with no `kind`, is
+/// not evidence of an entry — and it must not take the whole status envelope down with it (a
+/// wrong type would otherwise fail `StatusView`'s parse and blank the Schedule screen).
+#[test]
+fn a_malformed_providers_value_counts_nothing_and_still_parses() {
+    for garbage in [
+        serde_json::json!("two"),
+        serde_json::json!({ "0": {} }),
+        serde_json::json!(null),
+        serde_json::json!([1, "x", {}, { "kind": 7 }]),
+    ] {
+        let mut wire = serde_json::to_value(status()).unwrap();
+        wire["providers"] = garbage.clone();
+        let parsed: StatusView = serde_json::from_value(wire)
+            .unwrap_or_else(|e| panic!("{garbage} must not fail the status parse: {e}"));
+        assert_eq!(parsed.valid_provider_entries(), 0, "{garbage}");
+        assert_eq!(parsed.engine_version.as_deref(), Some("0.1.1"), "{garbage}");
+    }
+    // An older engine sends no `providers` at all: zero entries, so no warning.
+    let mut wire = serde_json::to_value(status()).unwrap();
+    wire.as_object_mut().unwrap().remove("providers");
+    let parsed: StatusView = serde_json::from_value(wire).unwrap();
+    assert_eq!(parsed.valid_provider_entries(), 0);
+}
+
+/// A semver compare, not a string one: `0.2.10` is NEWER than `0.2.9`. Pre-releases sort below
+/// their release; build metadata is ignored; anything that is not a version compares as unknown.
+#[test]
+fn the_engine_version_compare_is_semver() {
+    let cases: &[(&str, &str, Option<bool>)] = &[
+        ("0.2.9", "0.2.10", Some(true)),
+        ("0.2.10", "0.2.9", Some(false)),
+        ("0.9.0", "0.10.0", Some(true)),
+        ("1.0.0", "0.99.99", Some(false)),
+        ("0.2.1", "0.2.1", Some(false)),
+        ("0.3.0-rc.1", "0.3.0", Some(true)),
+        ("0.3.0", "0.3.0-rc.1", Some(false)),
+        ("0.3.0-rc.2", "0.3.0-rc.10", Some(true)),
+        ("0.3.0-alpha", "0.3.0-alpha.1", Some(true)),
+        ("0.3.0-1", "0.3.0-alpha", Some(true)),
+        ("0.2.1+build.5", "0.2.1", Some(false)),
+        ("0.2", "0.2.1", None),
+        ("v0.2.1", "0.2.1", None),
+        ("0.2.1", UNSET_UNTIL_RELEASE, None),
+        ("", "0.2.1", None),
+        ("0.02.1x", "0.2.1", None),
+    ];
+    for (version, than, want) in cases {
+        assert_eq!(
+            (version, than, version_older(version, than)),
+            (version, than, *want),
+        );
+    }
+}
+
+/// The lower-of rule: the bar is the LOWER of the threshold constant and the app's own version, so
+/// an app that is itself older than the constant never warns about an engine as new as itself; the
+/// sentinel means "the app's own version".
+#[test]
+fn the_older_engine_bar_is_the_lower_of_the_threshold_and_the_app() {
+    // (threshold, app, scheduled) → warns
+    let cases: &[(&str, &str, &str, bool)] = &[
+        // The constant is above the app: the app's version is the bar.
+        ("0.3.0", "0.2.1", "0.2.1", false),
+        ("0.3.0", "0.2.1", "0.2.0", true),
+        // The app is above the constant: the constant is the bar — an engine at or past the first
+        // switching release is fine even though it is older than this app.
+        ("0.2.2", "0.3.0", "0.2.5", false),
+        ("0.2.2", "0.3.0", "0.2.2", false),
+        ("0.2.2", "0.3.0", "0.2.1", true),
+        // The sentinel: the app's own version, so a build from `main` never warns about its own
+        // engine, and does about an older one.
+        (UNSET_UNTIL_RELEASE, "0.2.1", "0.2.1", false),
+        (UNSET_UNTIL_RELEASE, "0.2.1", "0.2.0", true),
+        (UNSET_UNTIL_RELEASE, "0.2.10", "0.2.9", true),
+    ];
+    for &(threshold, app, engine, want) in cases {
+        let got = older_engine_warning(2, Some(engine), threshold, app);
+        assert_eq!(
+            (threshold, app, engine, got),
+            (threshold, app, engine, want)
+        );
+    }
+    // An unknown scheduled version, or one that is not a version, is not evidence of age.
+    assert!(!older_engine_warning(2, None, UNSET_UNTIL_RELEASE, "0.2.1"));
+    assert!(!older_engine_warning(
+        2,
+        Some("run"),
+        UNSET_UNTIL_RELEASE,
+        "0.2.1"
+    ));
+}
+
+/// Requirement 9: a single-entry list behaves as before — no warning, however old the engine.
+#[test]
+fn a_single_entry_list_never_warns() {
+    for count in [0, 1] {
+        assert!(
+            !older_engine_warning(count, Some(ANCIENT), UNSET_UNTIL_RELEASE, "0.2.1"),
+            "{count} entries"
+        );
+        assert!(
+            !older_engine_warning(count, Some(ANCIENT), "0.3.0", "0.3.0"),
+            "{count} entries"
+        );
+    }
+    let single = status_with_rows(vec![provider_row(0, "claude-cli")]);
+    let state = derive(
+        &single,
+        None,
+        Some(&scheduled("cli", Some(ANCIENT))),
+        &at_0910(),
+    );
+    assert!(!state.older_engine_warning, "{state:?}");
+    assert_eq!(state.scheduled_engine_version.as_deref(), Some(ANCIENT));
+}
+
+/// Both owners get the warning — unlike `engineUpdateAvailable`, which is app-owned only — and the
+/// state carries the MEASURED version (`scheduledEngineVersion`), not the install-time record.
+#[test]
+fn the_older_engine_warning_shows_for_both_owners_with_the_measured_version() {
+    let two = StatusView {
+        // This app's engine, as `status --json` reports it — the version the record was made with.
+        engine_version: Some(APP_VERSION.into()),
+        ..status_with_rows(vec![
+            provider_row(0, "claude-cli"),
+            provider_row(1, "claude-cli"),
+        ])
+    };
+    for owner in ["app", "cli"] {
+        let state = derive(
+            &two,
+            None,
+            Some(&scheduled(owner, Some(ANCIENT))),
+            &at_0910(),
+        );
+        assert!(state.older_engine_warning, "{owner}: {state:?}");
+        assert_eq!(
+            state.scheduled_engine_version.as_deref(),
+            Some(ANCIENT),
+            "{owner}"
+        );
+        assert_eq!(
+            state.installed_engine_version.as_deref(),
+            Some(APP_VERSION),
+            "{owner}: the record is carried too, unchanged — it is just not what the warning reads"
+        );
+        // The record matches the app, so the existing update prompt stays quiet: the warning keys
+        // on what the binary answers now.
+        assert!(!state.engine_update_available, "{owner}");
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["scheduledEngineVersion"], ANCIENT, "{owner}: {wire}");
+        assert_eq!(wire["olderEngineWarning"], true, "{owner}: {wire}");
+    }
+    // The measured version at the app's own: no warning, whatever the record says.
+    let current = ScheduleView {
+        installed_engine_version: Some(ANCIENT.into()),
+        ..scheduled("cli", Some(APP_VERSION))
+    };
+    let state = derive(&two, None, Some(&current), &at_0910());
+    assert!(!state.older_engine_warning, "{state:?}");
+    // No schedule envelope: nothing measured, no warning.
+    let state = derive(&two, None, None, &at_0910());
+    assert!(!state.older_engine_warning && state.scheduled_engine_version.is_none());
+}
+
+/// ⚠ THE RELEASE STEP CANNOT FORGET THE SENTINEL. While `FIRST_SAME_RUN_SWITCHING_VERSION` is still
+/// `UNSET_UNTIL_RELEASE`, this crate's version may not move past `SENTINEL_INTRODUCED_IN` (the crate
+/// version when the sentinel landed, measured from `Cargo.toml`). Every release bumps the version,
+/// so a release that leaves the sentinel in place fails here. The release step sets the constant to
+/// the first released version containing PR 1 (plan "Build conventions"; spec §6).
+#[test]
+fn the_threshold_sentinel_is_replaced_before_any_release() {
+    if let Err(why) = sentinel_guard(
+        FIRST_SAME_RUN_SWITCHING_VERSION,
+        env!("CARGO_PKG_VERSION"),
+        SENTINEL_INTRODUCED_IN,
+    ) {
+        panic!("{why}");
+    }
+    assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
+}
+
+/// The guard itself, on every case — so a guard that always passes is caught here, not at a release.
+#[test]
+fn the_sentinel_guard_fires_once_the_version_moves_past_it() {
+    // (threshold, crate version, introduced in) → passes
+    let cases: &[(&str, &str, &str, bool)] = &[
+        (UNSET_UNTIL_RELEASE, "0.2.1", "0.2.1", true),
+        (UNSET_UNTIL_RELEASE, "0.2.2", "0.2.1", false),
+        (UNSET_UNTIL_RELEASE, "0.2.10", "0.2.9", false),
+        (UNSET_UNTIL_RELEASE, "0.3.0-rc.1", "0.2.1", false),
+        (UNSET_UNTIL_RELEASE, "garbage", "0.2.1", false),
+        // A concrete constant passes at any later version: the release step's own assertion owns it.
+        ("0.2.2", "0.2.2", "0.2.1", true),
+        ("0.2.2", "0.4.0", "0.2.1", true),
+        // A constant that is neither the sentinel nor a version is a typo, not a threshold.
+        ("0.2", "0.2.1", "0.2.1", false),
+        ("unset", "0.2.1", "0.2.1", false),
+    ];
+    for (threshold, version, introduced, passes) in cases {
+        assert_eq!(
+            (
+                threshold,
+                version,
+                introduced,
+                sentinel_guard(threshold, version, introduced).is_ok()
+            ),
+            (threshold, version, introduced, *passes),
+        );
     }
 }

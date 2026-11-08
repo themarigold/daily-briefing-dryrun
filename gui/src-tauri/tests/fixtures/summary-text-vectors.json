@@ -1,0 +1,880 @@
+{
+  "text": [
+    {
+      "text": "quant_stocks",
+      "accepted": true
+    },
+    {
+      "text": "daily_briefing_application",
+      "accepted": true
+    },
+    {
+      "text": "snake_case",
+      "accepted": true
+    },
+    {
+      "text": "#683 merged",
+      "accepted": true
+    },
+    {
+      "text": "main.ts:189,",
+      "accepted": true
+    },
+    {
+      "text": "2 * 3 * 4",
+      "accepted": true
+    },
+    {
+      "text": "main.rs",
+      "accepted": true
+    },
+    {
+      "text": "README.md",
+      "accepted": true
+    },
+    {
+      "text": "setup.py",
+      "accepted": true
+    },
+    {
+      "text": "example.com",
+      "accepted": true
+    },
+    {
+      "text": "main.ts:189",
+      "accepted": true
+    },
+    {
+      "text": "src/main.ts:189",
+      "accepted": true
+    },
+    {
+      "text": "main.rs:5",
+      "accepted": true
+    },
+    {
+      "text": "CAFE",
+      "accepted": true
+    },
+    {
+      "text": "cafe",
+      "accepted": true
+    },
+    {
+      "text": "added",
+      "accepted": true
+    },
+    {
+      "text": "20260716",
+      "accepted": true
+    },
+    {
+      "text": "1234567",
+      "accepted": true
+    },
+    {
+      "text": "2026-11-03",
+      "accepted": true
+    },
+    {
+      "text": "PR #683",
+      "accepted": true
+    },
+    {
+      "text": "Done at main.rs:5;",
+      "accepted": true
+    },
+    {
+      "text": "(main.rs:5)",
+      "accepted": true
+    },
+    {
+      "text": "foo.py:1.)",
+      "accepted": true
+    },
+    {
+      "text": "a_b",
+      "accepted": true
+    },
+    {
+      "text": "Use a * b",
+      "accepted": true
+    },
+    {
+      "text": "🦀 shipped",
+      "accepted": true
+    },
+    {
+      "text": "  trimmed text  ",
+      "accepted": true
+    },
+    {
+      "text": "**x**",
+      "accepted": false
+    },
+    {
+      "text": "__x__",
+      "accepted": false
+    },
+    {
+      "text": "*x*",
+      "accepted": false
+    },
+    {
+      "text": "# x",
+      "accepted": false
+    },
+    {
+      "text": "## x",
+      "accepted": false
+    },
+    {
+      "text": "- x",
+      "accepted": false
+    },
+    {
+      "text": "* x",
+      "accepted": false
+    },
+    {
+      "text": "1. x",
+      "accepted": false
+    },
+    {
+      "text": "[a](b)",
+      "accepted": false
+    },
+    {
+      "text": "![a](b)",
+      "accepted": false
+    },
+    {
+      "text": "`x`",
+      "accepted": false
+    },
+    {
+      "text": "__init__",
+      "accepted": false
+    },
+    {
+      "text": "www.x.org",
+      "accepted": false
+    },
+    {
+      "text": "www.x.org:1",
+      "accepted": false
+    },
+    {
+      "text": "http://example.com",
+      "accepted": false
+    },
+    {
+      "text": "https://example.com",
+      "accepted": false
+    },
+    {
+      "text": "evil.com:443",
+      "accepted": false
+    },
+    {
+      "text": "WWW.x.org:1",
+      "accepted": false
+    },
+    {
+      "text": "See HTTPS://example.com",
+      "accepted": false
+    },
+    {
+      "text": "(https://x)",
+      "accepted": false
+    },
+    {
+      "text": "x+scheme:value",
+      "accepted": false
+    },
+    {
+      "text": "mailto:dev@example.com",
+      "accepted": false
+    },
+    {
+      "text": "file:/tmp/x",
+      "accepted": false
+    },
+    {
+      "text": "x=www.x.org",
+      "accepted": false
+    },
+    {
+      "text": "evil.ORG:1",
+      "accepted": false
+    },
+    {
+      "text": "x.dev:1",
+      "accepted": false
+    },
+    {
+      "text": "main.rs:0",
+      "accepted": false
+    },
+    {
+      "text": "main.rs:01",
+      "accepted": false
+    },
+    {
+      "text": "main.rs:-1",
+      "accepted": false
+    },
+    {
+      "text": "main.rs:5/no",
+      "accepted": false
+    },
+    {
+      "text": "a1b2",
+      "accepted": false
+    },
+    {
+      "text": "A1B2",
+      "accepted": false
+    },
+    {
+      "text": "deadbeef",
+      "accepted": false
+    },
+    {
+      "text": "DEADBEEF",
+      "accepted": false
+    },
+    {
+      "text": "[A1B2]",
+      "accepted": false
+    },
+    {
+      "text": "(DEADBEEF),",
+      "accepted": false
+    },
+    {
+      "text": "'a1b2'",
+      "accepted": false
+    },
+    {
+      "text": "On branch topic",
+      "accepted": false
+    },
+    {
+      "text": "Detached HEAD at topic",
+      "accepted": false
+    },
+    {
+      "text": "[app] On branch topic",
+      "accepted": false
+    },
+    {
+      "text": "[app] Detached HEAD at topic",
+      "accepted": false
+    },
+    {
+      "text": "• [app] On branch topic",
+      "accepted": false
+    },
+    {
+      "text": "  • Detached HEAD at topic",
+      "accepted": false
+    },
+    {
+      "text": "- [app] On branch topic",
+      "accepted": false
+    },
+    {
+      "text": "<x>",
+      "accepted": false
+    },
+    {
+      "text": "x > y",
+      "accepted": false
+    },
+    {
+      "text": "x\ny",
+      "accepted": false
+    },
+    {
+      "text": "x\ry",
+      "accepted": false
+    },
+    {
+      "text": "x\ty",
+      "accepted": false
+    },
+    {
+      "text": "x\u0000y",
+      "accepted": false
+    },
+    {
+      "text": "xy",
+      "accepted": false
+    },
+    {
+      "text": "xy",
+      "accepted": false
+    },
+    {
+      "text": "x y",
+      "accepted": false
+    },
+    {
+      "text": "x y",
+      "accepted": false
+    },
+    {
+      "text": "x​y",
+      "accepted": false
+    },
+    {
+      "text": "x󠀁y",
+      "accepted": false
+    },
+    {
+      "text": "x󠀠y",
+      "accepted": false
+    },
+    {
+      "text": "x󠁿y",
+      "accepted": false
+    },
+    {
+      "text": "﻿text",
+      "accepted": false
+    },
+    {
+      "text": "line\n",
+      "accepted": false
+    },
+    {
+      "text": "",
+      "accepted": false
+    },
+    {
+      "text": "   ",
+      "accepted": false
+    },
+    {
+      "text": "evil.org:443",
+      "accepted": false
+    },
+    {
+      "text": "evil.net:443",
+      "accepted": false
+    },
+    {
+      "text": "evil.io:443",
+      "accepted": false
+    },
+    {
+      "text": "evil.dev:443",
+      "accepted": false
+    },
+    {
+      "text": "evil.co:443",
+      "accepted": false
+    },
+    {
+      "text": "evil.ai:443",
+      "accepted": false
+    },
+    {
+      "text": "evil.edu:443",
+      "accepted": false
+    },
+    {
+      "text": "evil.gov:443",
+      "accepted": false
+    },
+    {
+      "text": "Kwww.x.org",
+      "accepted": true
+    },
+    {
+      "text": "\u212awww.x.org",
+      "accepted": false
+    },
+    {
+      "text": "\u017fwww.x",
+      "accepted": false
+    },
+    {
+      "text": "x\u00a0www.x.org",
+      "accepted": false
+    },
+    {
+      "text": "\u00a0x\u00a0",
+      "accepted": true
+    },
+    {
+      "text": "\u3000x",
+      "accepted": true
+    },
+    {
+      "text": "x\u1680y",
+      "accepted": true
+    },
+    {
+      "text": "\u2003x",
+      "accepted": true
+    },
+    {
+      "text": "note:",
+      "accepted": true
+    },
+    {
+      "text": "Fixed: it",
+      "accepted": true
+    },
+    {
+      "text": "Fixed: the login bug",
+      "accepted": true
+    },
+    {
+      "text": "Note: tests pass",
+      "accepted": true
+    },
+    {
+      "text": "Status: done",
+      "accepted": true
+    },
+    {
+      "text": "a:b",
+      "accepted": false
+    },
+    {
+      "text": "1:2",
+      "accepted": true
+    },
+    {
+      "text": "2026:x",
+      "accepted": true
+    },
+    {
+      "text": "\u00e9:x",
+      "accepted": true
+    },
+    {
+      "text": "\u00e9a:x",
+      "accepted": false
+    },
+    {
+      "text": "x:1",
+      "accepted": false
+    },
+    {
+      "text": "foo.c:1",
+      "accepted": true
+    },
+    {
+      "text": "foo.C:1",
+      "accepted": true
+    },
+    {
+      "text": "foo.COM:1",
+      "accepted": false
+    },
+    {
+      "text": "a.b.c.com:1",
+      "accepted": false
+    },
+    {
+      "text": "a.com:1.py:2",
+      "accepted": false
+    },
+    {
+      "text": "a.py:1.com:2",
+      "accepted": false
+    },
+    {
+      "text": ".py:1",
+      "accepted": false
+    },
+    {
+      "text": "-.py:1",
+      "accepted": true
+    },
+    {
+      "text": "_.py:1",
+      "accepted": true
+    },
+    {
+      "text": "?.py:1",
+      "accepted": false
+    },
+    {
+      "text": "foo.py:1:",
+      "accepted": true
+    },
+    {
+      "text": "foo.py:1,,;",
+      "accepted": true
+    },
+    {
+      "text": "foo.py:1x",
+      "accepted": false
+    },
+    {
+      "text": "(foo.py:1",
+      "accepted": true
+    },
+    {
+      "text": "(main.rs:5)x",
+      "accepted": false
+    },
+    {
+      "text": "www.",
+      "accepted": true
+    },
+    {
+      "text": "www. x",
+      "accepted": true
+    },
+    {
+      "text": "wwww.x",
+      "accepted": true
+    },
+    {
+      "text": "awww.x",
+      "accepted": true
+    },
+    {
+      "text": "_www.x",
+      "accepted": false
+    },
+    {
+      "text": "-www.x",
+      "accepted": false
+    },
+    {
+      "text": "Www.x",
+      "accepted": false
+    },
+    {
+      "text": "WwW.x",
+      "accepted": false
+    },
+    {
+      "text": "_x_",
+      "accepted": true
+    },
+    {
+      "text": "__ x__",
+      "accepted": true
+    },
+    {
+      "text": "__x __",
+      "accepted": true
+    },
+    {
+      "text": "**x y**",
+      "accepted": false
+    },
+    {
+      "text": "** x**",
+      "accepted": true
+    },
+    {
+      "text": "*x *",
+      "accepted": true
+    },
+    {
+      "text": "x*y*z",
+      "accepted": false
+    },
+    {
+      "text": "a*b",
+      "accepted": true
+    },
+    {
+      "text": "2*3*4",
+      "accepted": false
+    },
+    {
+      "text": "#x",
+      "accepted": true
+    },
+    {
+      "text": "# ",
+      "accepted": true
+    },
+    {
+      "text": "#",
+      "accepted": true
+    },
+    {
+      "text": "- ",
+      "accepted": true
+    },
+    {
+      "text": "-x",
+      "accepted": true
+    },
+    {
+      "text": "*",
+      "accepted": true
+    },
+    {
+      "text": "1.x",
+      "accepted": true
+    },
+    {
+      "text": "1. ",
+      "accepted": true
+    },
+    {
+      "text": "01. x",
+      "accepted": false
+    },
+    {
+      "text": "x. y",
+      "accepted": true
+    },
+    {
+      "text": "[a] (b)",
+      "accepted": true
+    },
+    {
+      "text": "[a]()",
+      "accepted": false
+    },
+    {
+      "text": "[](b)",
+      "accepted": false
+    },
+    {
+      "text": "![](b)",
+      "accepted": false
+    },
+    {
+      "text": "(a)[b]",
+      "accepted": true
+    },
+    {
+      "text": "[a]\u00a0(b)",
+      "accepted": true
+    },
+    {
+      "text": "<",
+      "accepted": false
+    },
+    {
+      "text": ">",
+      "accepted": false
+    },
+    {
+      "text": "&lt;",
+      "accepted": true
+    },
+    {
+      "text": "abcd",
+      "accepted": true
+    },
+    {
+      "text": "abc1",
+      "accepted": false
+    },
+    {
+      "text": "a1b",
+      "accepted": true
+    },
+    {
+      "text": "ab12",
+      "accepted": false
+    },
+    {
+      "text": "1234",
+      "accepted": true
+    },
+    {
+      "text": "12345678",
+      "accepted": true
+    },
+    {
+      "text": "abcdefg",
+      "accepted": true
+    },
+    {
+      "text": "abcdef",
+      "accepted": true
+    },
+    {
+      "text": "ABCDEFG",
+      "accepted": true
+    },
+    {
+      "text": "abcdef0123456789abcdef0123456789abcdef01",
+      "accepted": false
+    },
+    {
+      "text": "abcdef0123456789abcdef0123456789abcdef012",
+      "accepted": true
+    },
+    {
+      "text": "a1b2,c3",
+      "accepted": false
+    },
+    {
+      "text": "(a1b2)",
+      "accepted": false
+    },
+    {
+      "text": "((a1b2))",
+      "accepted": false
+    },
+    {
+      "text": "a(1)b2",
+      "accepted": false
+    },
+    {
+      "text": "'a1b2",
+      "accepted": false
+    },
+    {
+      "text": "\"a1b2\"",
+      "accepted": false
+    },
+    {
+      "text": "{a1b2}",
+      "accepted": false
+    },
+    {
+      "text": "*a1b2*",
+      "accepted": false
+    },
+    {
+      "text": "_a1b2_",
+      "accepted": false
+    },
+    {
+      "text": "a1b2.",
+      "accepted": false
+    },
+    {
+      "text": "a1b2:",
+      "accepted": false
+    },
+    {
+      "text": "a1b2!?",
+      "accepted": false
+    },
+    {
+      "text": "xa1b2",
+      "accepted": true
+    },
+    {
+      "text": "a1b2x",
+      "accepted": true
+    },
+    {
+      "text": "On branch",
+      "accepted": true
+    },
+    {
+      "text": "On branch ",
+      "accepted": true
+    },
+    {
+      "text": "on branch x",
+      "accepted": true
+    },
+    {
+      "text": "x On branch y",
+      "accepted": true
+    },
+    {
+      "text": "[a][b] On branch x",
+      "accepted": false
+    },
+    {
+      "text": "\u2022 On branch x",
+      "accepted": false
+    },
+    {
+      "text": "\u25e6On branch x",
+      "accepted": false
+    },
+    {
+      "text": "\u25aa [x]  On branch y",
+      "accepted": false
+    },
+    {
+      "text": "\u2013 On branch x",
+      "accepted": true
+    },
+    {
+      "text": "[a]\u00a0On branch x",
+      "accepted": false
+    },
+    {
+      "text": "Detached HEAD at",
+      "accepted": true
+    },
+    {
+      "text": "x\u0085y",
+      "accepted": false
+    },
+    {
+      "text": "\u0085x",
+      "accepted": false
+    },
+    {
+      "text": "\u180ex",
+      "accepted": false
+    },
+    {
+      "text": "\u00a0On branch x",
+      "accepted": false
+    },
+    {
+      "text": "www.x.py:1",
+      "accepted": false
+    },
+    {
+      "text": "www.x.rs:5",
+      "accepted": false
+    },
+    {
+      "text": "x=www.y.py:2",
+      "accepted": false
+    },
+    {
+      "text": "defaced",
+      "accepted": false
+    },
+    {
+      "text": "DEFACED",
+      "accepted": false
+    },
+    {
+      "text": "deadbee",
+      "accepted": false
+    },
+    {
+      "text": "abcdeff",
+      "accepted": false
+    },
+    {
+      "text": "mailto: dev@example.com",
+      "accepted": true
+    },
+    {
+      "text": "javascript: alert(1)",
+      "accepted": true
+    },
+    {
+      "text": "tel: +15551234567",
+      "accepted": true
+    },
+    {
+      "text": "2https://evil.example/x",
+      "accepted": true
+    },
+    {
+      "text": "https:\u200a//evil.example/login",
+      "accepted": true
+    }
+  ]
+}

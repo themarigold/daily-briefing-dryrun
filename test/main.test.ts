@@ -533,6 +533,38 @@ test("run() interactive is floor-exempt: delivers + stamps before the morning fl
   } finally { cleanup(); }
 });
 
+// (b2n) `run --now` (the app's Run now, a non-TTY spawn) is exempt from the floor ONLY: below the floor it delivers and
+// stamps, a second `--now` the same day is still `already-ran`, and it is not "interactive" — the lock's invoker stays
+// `scheduled`, exactly as a non-TTY run without the flag records it.
+test("run() runNow is floor-exempt only: delivers below the floor, a second one is already-ran, invoker unchanged", async () => {
+  const cleanup = withEnv({ morningTime: "07:20", repos: [repoWithTodayCommit], provider: PROV });
+  const { runLockPath } = await import("../src/runlock");
+  let calls = 0;
+  const invokers: string[] = [];
+  const provider = { generate: async () => { calls++; invokers.push(JSON.parse(readFileSync(runLockPath(), "utf8")).invoker); return RAW; } };
+  try {
+    expect(await runT(false, { now: BEFORE_FLOOR, runNow: true, provider })).toBe(0);
+    expect(calls).toBe(1);                       // reached the provider below the floor
+    expect(await alreadyRanToday()).toBe(true);  // delivered → day stamped
+    expect(invokers).toEqual(["scheduled"]);     // not interactive: the non-TTY derivation, unchanged
+    expect(await runT(false, { now: BEFORE_FLOOR, runNow: true, provider })).toBe(0);
+    expect(calls).toBe(1);                       // the once-per-day guard still applies
+    expect((await readLastSkip())?.reason).toBe("already-ran");
+    expect((await readLastSkip())?.detail).toBeUndefined(); // gate before the lock, not the post-lock race guard
+  } finally { cleanup(); }
+});
+
+// (b2s) the contrast: the SCHEDULED tick (no flag, not interactive) below the floor still skips `below-floor`.
+test("run() scheduled tick below the floor still records below-floor (runNow absent)", async () => {
+  const cleanup = withEnv({ morningTime: "07:20", repos: [repoWithTodayCommit], provider: PROV });
+  let called = false;
+  try {
+    expect(await runT(false, { now: BEFORE_FLOOR, provider: { generate: async () => { called = true; return RAW; } } })).toBe(0);
+    expect(called).toBe(false);
+    expect((await readLastSkip())?.reason).toBe("below-floor");
+  } finally { cleanup(); }
+});
+
 // (b3) interactive + already-ran-today → a human gets a one-liner, not the scheduled agent's silent exit.
 test("run() interactive + already ran today: prints a one-liner and does not regenerate", async () => {
   const cleanup = withEnv({ morningTime: "07:20", repos: [repoWithTodayCommit], provider: PROV });
@@ -594,6 +626,23 @@ test("run(force=false) with no network → skip: exit 0, no stamp, logs skip", a
     expect(code).toBe(0);
     expect(await alreadyRanToday()).toBe(false);       // no stamp → retry next tick
     expect(cap.err.join("\n")).toMatch(/no network/i); // observable (not silent)
+  } finally { cap.restore(); cleanup(); }
+});
+
+test("run() runNow with no network stays non-force: skips offline below the floor without calling the provider", async () => {
+  const cleanup = withEnv({ morningTime: "07:20", repos: [repoWithTodayCommit], provider: PROV });
+  const cap = captureConsole();
+  let called = false;
+  try {
+    const code = await runT(false, {
+      now: BEFORE_FLOOR, runNow: true, interactive: false, powerPlatform: "linux",
+      provider: { generate: async () => { called = true; return RAW; } },
+      netProbe: async () => false, netGraceMs: 30, netPollMs: 10,
+    });
+    expect(code).toBe(0);
+    expect((await readLastSkip())?.reason).toBe("offline");
+    expect(called).toBe(false);
+    expect(await alreadyRanToday()).toBe(false);
   } finally { cap.restore(); cleanup(); }
 });
 
@@ -904,11 +953,13 @@ test("run() writes no archive when the run fails before a briefing is ever gener
 describe("limitedSkipMessage", () => {
   const base = { label: "primary", until: "2026-08-27T05:00:00.000Z", isProbe: false };
 
-  test("a fallback remains ⇒ says the next tick will use it, and does NOT claim exhaustion", () => {
-    const m = limitedSkipMessage({ ...base, exhausted: false });
+  // Provider fallback P1-M7-T2 (spec r9 §5 "Retired"): INVERTED. A wall with a fallback left hands off in the same
+  // tick, so `exhausted` is always true and the "next tick will use another account" wording is gone for good.
+  test("the retired wording: no limited line ever promises that the next tick will use another account", () => {
+    const m = limitedSkipMessage({ ...base, exhausted: true });
     expect(m).toContain('account "primary" is at its usage limit until 2026-08-27T05:00:00.000Z');
-    expect(m).toContain("the next tick will use another account");
-    expect(m).not.toContain("no other account is available");
+    expect(m).not.toContain("the next tick will use another account");
+    expect(limitedSkipMessage(undefined)).not.toContain("the next tick will use another account");
   });
 
   test("nothing left ⇒ says so", () => {
@@ -916,7 +967,7 @@ describe("limitedSkipMessage", () => {
   });
 
   // A probe deadline is a one-hour guess; printing it as a reset claims knowledge the system lacks.
-  // It also does not prove a usage LIMIT — recordAuthProbe writes a probe mark for a fallback whose
+  // It also does not prove a usage LIMIT — the walk's recordHourMark writes a probe mark for a fallback whose
   // config dir was never logged into — so the cause must not be named either.
   test("a PROBE mark states neither a reset time nor a cause", () => {
     const m = limitedSkipMessage({ label: "fallback", until: "2026-08-24T18:00:00.000Z", isProbe: true, exhausted: true });

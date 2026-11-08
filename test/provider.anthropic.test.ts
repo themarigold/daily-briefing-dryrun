@@ -5,10 +5,10 @@
 // `src/`. That is what makes these tests evidence about production rather than about a mock.
 import { test, expect, afterEach } from "bun:test";
 import { startFakeApi, okJson, status, slow, badJson, sse, type FakeApiHandler } from "./helpers/fakeApi";
-import { AnthropicApiProvider, ANTHROPIC_DEFAULT_MAX_TOKENS, ANTHROPIC_VERSION } from "../src/providers/anthropic";
+import { AnthropicApiProvider, ANTHROPIC_DEFAULT_MAX_TOKENS, ANTHROPIC_PROBE_MAX_TOKENS, ANTHROPIC_VERSION } from "../src/providers/anthropic";
 import { USAGE_WALL_RETRY_AFTER_MS, MAX_RESPONSE_BYTES, DIAG_CHARS, mapStatus, retryAfterMs, parseRegainAccess, postJson } from "../src/providers/http";
 import { PROVIDER_RETRY_DELAYS_MS } from "../src/core";
-import { withRetry } from "../src/provider";
+import { withRetry, API_TIMEOUT_MS } from "../src/provider";
 import { ProviderError, API_LABEL_ANTHROPIC, type ProviderApi } from "../src/types";
 import { isPostureWarning, posturePhrase, API_TRUNCATION_SENTINEL } from "../src/eval/posture";
 import { guardNetworkForThisFile } from "./helpers/netGuard";
@@ -100,6 +100,22 @@ test("maxTokens is honoured when configured", async () => {
   expect((JSON.parse(s.requests[0]!.bodyText) as Record<string, unknown>).max_tokens).toBe(777);
 });
 
+test("with no maxTokens configured the request asks for 16000 — room for a whole briefing; the probe's cap is unchanged", async () => {
+  // Archived briefings run 24-32 KB, about 6,000-8,000 tokens; at the old 4096 they were cut off (design 2026-10-24).
+  const s = await serve(okJson(textBody("out")));
+  await mk(s.origin).generate("p");
+  expect((JSON.parse(s.requests[0]!.bodyText) as Record<string, unknown>).max_tokens).toBe(16_000);
+  expect(ANTHROPIC_DEFAULT_MAX_TOKENS).toBe(16_000);
+  expect(ANTHROPIC_PROBE_MAX_TOKENS).toBe(16);
+});
+
+test("with no timeoutMs given the request timeout is the 5-minute API default; a given one wins", () => {
+  const ceiling = (p: AnthropicApiProvider) => (p as unknown as { timeoutMs(): number }).timeoutMs();
+  expect(API_TIMEOUT_MS).toBe(300_000);
+  expect(ceiling(new AnthropicApiProvider(api("http://127.0.0.1:1"), { env: { K: SENTINEL } }))).toBe(300_000);
+  expect(ceiling(new AnthropicApiProvider(api("http://127.0.0.1:1"), { timeoutMs: 7_000, env: { K: SENTINEL } }))).toBe(7_000);
+});
+
 // ── the response ──────────────────────────────────────────────────────────────────────────────────
 
 test("multi-block content concatenates IN ORDER; non-text blocks are ignored, not fatal", async () => {
@@ -118,10 +134,10 @@ test("multi-block content concatenates IN ORDER; non-text blocks are ignored, no
   expect(await mk(s.origin).generate("p")).toBe("ABC");
 });
 
-test("stop_reason max_tokens returns the text AND adds exactly ONE truncation warning", async () => {
+test("stop_reason max_tokens returns complete tokens AND adds exactly ONE truncation warning", async () => {
   const s = await serve(okJson(textBody("partial briefing", { stop_reason: "max_tokens" })));
   const p = mk(s.origin, { maxTokens: 32 });
-  expect(await p.generate("prompt")).toBe("partial briefing");
+  expect(await p.generate("prompt")).toBe("partial ");
   const truncation = p.runtimeWarnings.filter((w) => w.includes(API_TRUNCATION_SENTINEL));
   expect(truncation).toHaveLength(1);
   expect(truncation[0]).toContain("32");
@@ -489,4 +505,120 @@ test("⚠ a redirecting endpoint: nothing reaches the Location, and the failure 
   expect(sleeps).toEqual([]);
   expect(endpoint.requests).toHaveLength(5);
   expect(elsewhere.requests).toEqual([]);
+});
+
+// ── P1-M3-T1: the transport-boundary tags `failCause` and `retryAfterMs` (provider fallback) ─────────
+
+test("a transient 429 carries retryAfterMs from its header; the wall cases are unchanged", async () => {
+  const now = new Date("2026-10-16T07:20:00Z");
+  const h = (s: string) => new Headers({ "retry-after": s });
+  expect(mapStatus(429, h("20"), "{}", now, "anthropic")).toEqual({ code: "nonzero-exit", retryAfterMs: 20_000 });
+  expect(mapStatus(429, h("20"), "{}", now, "openai-compatible")).toEqual({ code: "nonzero-exit", retryAfterMs: 20_000 });
+  // A bare 429 on the openai side: transient, and nothing to carry.
+  expect(mapStatus(429, new Headers(), "{}", now, "openai-compatible")).toEqual({ code: "nonzero-exit" });
+  // The walls keep their exact shape: no retryAfterMs, no failCause.
+  expect(mapStatus(429, new Headers(), "{}", now, "anthropic")).toEqual({ code: "usage-limit" });
+  expect(mapStatus(429, h(String(USAGE_WALL_RETRY_AFTER_MS / 1000 + 1)), "{}", now, "anthropic").code).toBe("usage-limit");
+  // End to end, on the thrown error.
+  const s = await serve(status(429, { type: "error", error: { type: "rate_limit_error", message: "slow down" } }, { "retry-after": "20" }));
+  const e = await mk(s.origin).generate("p").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.retryAfterMs, e.failCause]).toEqual(["nonzero-exit", 20_000, undefined]);
+  expect(e.cause).toBeUndefined();
+});
+
+test("prompt-too-long: a 413, and a 400 whose body names the prompt length — two 400s differing only by body classify differently", () => {
+  const now = new Date();
+  const body = (message: string) => JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } });
+  expect(mapStatus(413, new Headers(), body("request_too_large"), now, "anthropic")).toEqual({ code: "missing-binary", failCause: "prompt-too-long" });
+  expect(mapStatus(400, new Headers(), body("prompt is too long: 215000 tokens > 200000 maximum"), now, "anthropic"))
+    .toEqual({ code: "missing-binary", failCause: "prompt-too-long" });
+  expect(mapStatus(400, new Headers(), body("messages.0.content: field required"), now, "anthropic")).toEqual({ code: "missing-binary" });
+  // The spend-cap 400 is still a wall.
+  expect(mapStatus(400, new Headers(), body("You have reached your specified API usage limits."), now, "anthropic").code).toBe("usage-limit");
+});
+
+test("prompt-too-long rides on the thrown error, and e.cause is untouched", async () => {
+  const s = await serve(status(413, { type: "error", error: { type: "request_too_large", message: "too big" } }));
+  const e = await mk(s.origin).generate("p").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.failCause, e.httpStatus]).toEqual(["missing-binary", "prompt-too-long", 413]);
+  expect(e.cause).toBeUndefined();
+});
+
+test("a missing key carries key-missing, and sends nothing", async () => {
+  const s = await serve(okJson(textBody("out")));
+  const e = await new AnthropicApiProvider(api(s.origin, { apiKeyEnv: "ABSENT_VAR" }), { env: {} }).generate("x").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.failCause]).toEqual(["missing-binary", "key-missing"]);
+  expect(e.cause).toBeUndefined();
+  expect(s.requests).toHaveLength(0);
+});
+
+test("a refused redirect carries redirect-refused", async () => {
+  const elsewhere = await serve(okJson(textBody("followed")));
+  const endpoint = await serve(() => new Response(null, { status: 307, headers: { location: `${elsewhere.origin}/v1/messages` } }));
+  const e = await mk(endpoint.origin).generate("p").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.failCause]).toEqual(["missing-binary", "redirect-refused"]);
+  expect(e.cause).toBeUndefined();
+});
+
+// ── PR 1 final review round 3 ──────────────────────────────────────────────────────────────────────────────────────
+test("round 3 L7: an absurd retry-after (out of Date's range) is a wall with NO resetAt on both kinds — never a RangeError", () => {
+  const now = new Date("2026-10-16T12:00:00Z");
+  for (const kind of ["anthropic", "openai-compatible"] as const) {
+    const m = mapStatus(429, new Headers({ "retry-after": "99999999999999" }), "", now, kind);
+    expect(`${kind}: ${m.code} ${m.resetAt ?? "none"}`).toBe(`${kind}: usage-limit none`);
+  }
+});
+
+test("round 3 L7: through the transport, the absurd retry-after is a ProviderError (the walk moves on), not a RangeError", async () => {
+  const s = await serve(status(429, { error: { type: "rate_limit_error", message: "slow down" } }, { "retry-after": "99999999999999" }));
+  let e: unknown;
+  try { await mk(s.origin).generate("p"); } catch (x) { e = x; }
+  expect(e).toBeInstanceOf(ProviderError);
+  expect((e as ProviderError).code).toBe("usage-limit");
+});
+
+test("round 3 L8: an HTTP-date retry-after is one of RFC 9110's three forms; Date.parse's lenient readings are refused", () => {
+  const now = new Date("1994-11-06T08:48:37Z");
+  expect(retryAfterMs("Sun, 06 Nov 1994 08:49:37 GMT", now)).toBe(60_000);     // IMF-fixdate
+  expect(retryAfterMs("Sunday, 06-Nov-94 08:49:37 GMT", now)).toBe(60_000);    // RFC 850
+  expect(retryAfterMs("Sun Nov  6 08:49:37 1994", now)).toBe(60_000);          // asctime — GMT, whatever the local zone
+  for (const junk of ["1.5", "Oct 17", "10/17/2026", "2026-10-17T00:00:00Z", "Sun, 06 Nov 1994 08:49:37", "Sun, 06 Nov 1994 08:49:37 PST"]) {
+    expect(`${junk}: ${retryAfterMs(junk, now)}`).toBe(`${junk}: undefined`);
+  }
+});
+
+test("round 3 L8: an asctime retry-after is GMT in a non-UTC zone too (a child process: bun test runs in UTC)", async () => {
+  // In-process the zone cannot be switched and put back (see test/in10-stash-suggestions.test.ts, `ageIn`), and the
+  // test runner's own zone is UTC, where local and GMT agree — so the zone-sensitive case runs in a child.
+  const code = `const { retryAfterMs } = await import(${JSON.stringify(new URL("../src/providers/http.ts", import.meta.url).pathname)});
+console.log(JSON.stringify([Intl.DateTimeFormat().resolvedOptions().timeZone, retryAfterMs("Sun Nov  6 08:49:37 1994", new Date("1994-11-06T08:48:37Z"))]));`;
+  const p = Bun.spawn([process.execPath, "-e", code], { env: { ...process.env, TZ: "America/Los_Angeles" }, stdout: "pipe", stderr: "pipe" });
+  const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+  await p.exited;
+  expect(`${p.exitCode} ${err}`).toBe("0 ");
+  expect(JSON.parse(out.trim().split("\n").at(-1)!)).toEqual(["America/Los_Angeles", 60_000]);
+});
+
+// PR 1 final review round 5 (post-cap) M1, requirement 9: both WALL verdicts and `resetAt` read `retry-after` exactly as
+// origin/main did (lenient `Date.parse`); the strict RFC 9110 parse decides only the carried transient wait.
+test("round 5 M1: the wall verdicts are origin/main's, header for header", () => {
+  const now = new Date("2026-10-16T12:00:00Z");
+  const h = (v: string) => new Headers({ "retry-after": v });
+  const in2h = new Date(now.getTime() + 2 * 3600e3);
+  const plus0000 = (d: Date) => d.toUTCString().replace("GMT", "+0000");
+  const m = (v: string, kind: "anthropic" | "openai-compatible") => mapStatus(429, h(v), "", now, kind);
+  expect(m("30s", "anthropic").code).toBe("usage-limit");                                   // unparseable: absent, a wall
+  expect(m("abc", "anthropic").code).toBe("usage-limit");
+  for (const kind of ["anthropic", "openai-compatible"] as const) {
+    const iso = m(in2h.toISOString(), kind);
+    expect(`${kind}: ${iso.code} ${iso.resetAt}`).toBe(`${kind}: usage-limit ${in2h.toISOString()}`);
+    const p = m(plus0000(in2h), kind);
+    expect(`${kind}: ${p.code} ${p.resetAt}`).toBe(`${kind}: usage-limit ${in2h.toISOString()}`);
+  }
+  const soon = m(plus0000(new Date(now.getTime() + 30e3)), "anthropic");
+  expect([soon.code, soon.retryAfterMs]).toEqual(["nonzero-exit", undefined]);            // retried; no strict wait carried
+  const imf = m(new Date(now.getTime() + 30e3).toUTCString(), "anthropic");
+  expect([imf.code, imf.retryAfterMs]).toEqual(["nonzero-exit", 30_000]);                 // an RFC date: the wait rides along
+  expect(() => m("99999999999999", "anthropic")).not.toThrow();
+  expect(m("99999999999999", "openai-compatible")).toEqual({ code: "usage-limit" });
 });

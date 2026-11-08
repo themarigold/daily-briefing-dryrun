@@ -15,15 +15,16 @@ import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off 
 // Each plant is proven to be cut by the clip (the shared matcher misses the clipped prefix) before the
 // assertion that it is gone.
 import { test, expect, describe } from "bun:test";
-import { recapCoverage } from "../src/generator";
+import { buildPrompt, recapCoverage } from "../src/generator";
 import { renderBriefing } from "../src/render";
-import { redactStruct } from "../src/json";
+import { envelopeFrom, redactEnvelope, redactStruct } from "../src/json";
 import { composeResumptionNote, type Unit } from "../src/subprojects";
 import { matchesCredential, redactCredentials, redactCredentialsAnyCase, REDACTION } from "../src/transcripts/credentials";
 import type { ReducedContext, Activity, BriefingStruct, Config, Provider } from "../src/types";
 import { BYOCliProvider } from "../src/provider";
 import { firstLine } from "../src/harden";
 import { gitUnavailableLine, groundTruthUnavailableLine } from "../src/audit";
+import { reduce, STAGE1_TEXT_CAP } from "../src/reduce";
 import { runCore } from "../src/core";
 import { buildRepo, branchCommit, mergeBranchWith } from "./fixtures/build-repo";
 
@@ -44,6 +45,23 @@ const struct = (over: Partial<BriefingStruct>): BriefingStruct =>
 const leak = (tok: string) => tok.slice(4, 11);
 
 describe("the not-shown subject is redacted before it is clipped", () => {
+  test("a commit subject's URL password never reaches the morning page", () => {
+    const password = "SECRETMARK" + "p".repeat(80);
+    const subject = `fix https://user:${password}@host/repo`;
+    expect(subject.slice(0, 71)).toContain("SECRETMARK"); // the clip would leave a password prefix
+    expect(matchesCredential(subject.slice(0, 71))).toBe(false); // no @ survives the naive clip
+    const ctx = ctxOf(commit("aaa1111", "a.ts", "shown one"), commit("bbb2222", "b.ts", subject));
+    const recap = [{ repo: "personal_code", text: "did one", evidence: "aaa1111" }];
+    const cov = recapCoverage(recap, ctx, UNITS)!;
+    expect(cov.notShown).toHaveLength(1);
+    expect(cov.notShown[0]!.subject).toBe(`fix https://${REDACTION}@host/repo`);
+    const page = redactCredentials(renderBriefing(struct({ recap, recapCoverage: cov })));
+    expect(page).toContain(`bbb2222 fix https://${REDACTION}@host/repo`);
+    expect(page).toContain("What you did");
+    expect(page).not.toContain("SECRETMARK");
+    expect(page).not.toContain(password);
+  });
+
   for (const tok of [GH, AWS]) {
     test(`${tok.slice(0, 4)}…: the prefix the clip leaves reaches neither channel`, () => {
       const subject = `${FILL}${tok} rotated and more words after it`;
@@ -204,5 +222,50 @@ describe("the redactors take a NON-string without throwing (defence in depth)", 
       expect(redactCredentialsAnyCase(v)).toBe(v);
     }
     expect(redactCredentials(`x ${GH}`)).toBe(`x ${REDACTION}`);          // a string is still redacted
+  });
+});
+
+
+describe("Stage-1 raw subject clipping preserves the downstream redaction boundary", () => {
+  test("reduce → recapCoverage → renderBriefing and run JSON envelope with a password across 200", () => {
+    const password = "SECRETMARK" + "p".repeat(700);
+    const subject = `fix https://user:${password}@host/repo`;
+    expect(subject.slice(0, STAGE1_TEXT_CAP)).toContain("SECRETMARK");
+    expect(matchesCredential(subject.slice(0, STAGE1_TEXT_CAP))).toBe(false);
+    const acts = [commit("aaa1111", "a.ts", "shown one"), commit("bbb2222", "b.ts", subject)];
+    const ctx = reduce(acts, { maxChars: 800 });
+    expect(ctx.note).toContain("context trimmed"); // stage 1, no summaries-only fallback
+    expect(ctx.repos[0]!.activities).toHaveLength(2);
+    const recap = [{ repo: "personal_code", text: "did one", evidence: "aaa1111" }];
+    const cov = recapCoverage(recap, ctx, UNITS)!;
+    expect(cov.notShown).toHaveLength(1);
+    const result = struct({ recap, recapCoverage: cov });
+    const markdown = redactCredentials(renderBriefing(result));
+    expect(markdown).toContain("bbb2222 fix https://");
+    const envelope = redactEnvelope(envelopeFrom({
+      struct: result, ctx, units: UNITS, activities: acts, repos: ["/r"],
+      runDate: "2026-10-24", windowStartUtc: "2026-10-23T00:00:00Z", rawText: "", promptText: "",
+      blocked: false, discoveryBlocked: false, emptyWindow: false, offlineSkipped: false,
+      net: null, discIssues: [], extrIssues: [], warnings: [], today: [],
+    }, markdown, 0));
+    expect(envelope.delivered).toBe(true);
+    for (const out of [markdown, JSON.stringify(envelope)]) {
+      expect(out).not.toContain("SECRETMARK");
+      expect(out).not.toContain(password);
+    }
+    expect(ctx.repos[0]!.activities[1]!.text).toBe("fix https://");
+    expect(acts[1]!.text).toBe(subject); // no mutation of source evidence
+  });
+
+  test("the provider prompt still receives intact raw credentials that fit", () => {
+    const subject = "fix https://user:SECRETMARK@host/repo";
+    const intact = commit("aaa1111", "a.ts", subject);
+    const ctx = reduce([intact], { maxChars: 800 });
+    expect(ctx.repos[0]!.activities[0]!.text).toBe(subject);
+    expect(buildPrompt(ctx, UNITS)).toContain(subject);
+    const trimmed = reduce([intact, commit("bbb2222", "b.ts", "x".repeat(1500))], { maxChars: 800 });
+    expect(trimmed.note).toContain("context trimmed");
+    expect(trimmed.repos[0]!.activities).toHaveLength(2);
+    expect(buildPrompt(trimmed, UNITS)).toContain(subject);
   });
 });

@@ -1,10 +1,19 @@
 // src/provider.ts
-import type { Provider, Config } from "./types";
-import { ProviderError } from "./types";
+import type { Provider, Config, GenerateOpts } from "./types";
+import { LostLockError, ProviderError } from "./types";
+import { isRetryableFailure, type EntryKind } from "./failover";
 import { drain, raceFlush, sinkText } from "./stream";
-import { redactCredentials } from "./transcripts/credentials";
+import { dropTrailingPartialToken, redactCredentials } from "./transcripts/credentials";
 
+/** A command-line provider's default per-attempt timeout (`provider.timeoutMs` unset). */
 export const TIMEOUT_MS = 120_000;
+/** An HTTP API provider's default request timeout (anthropic, openai-compatible): five minutes, so a long briefing
+ *  reply (up to `ANTHROPIC_DEFAULT_MAX_TOKENS`) is not cut by the clock first. A configured timeout always wins. */
+export const API_TIMEOUT_MS = 300_000;
+/** The default timeout for a provider block with no `timeoutMs` of its own — by transport. The ONE choice every
+ *  effective-timeout derivation makes (the transport's own ceiling, the provider list, the run lock), so the bounds
+ *  derived from it can never assume a shorter call than the transport will wait for. */
+export const defaultTimeoutMs = (p: { api?: unknown }): number => (p.api !== undefined ? API_TIMEOUT_MS : TIMEOUT_MS);
 /** SIGTERM → this long → SIGKILL (a TERM-ignoring child can't hang the run).
  *  EXPORTED because `runlock.ts` derives its staleness window from the holder's real worst case, and
  *  a single attempt's true ceiling is `timeoutMs + KILL_GRACE_MS`, not `timeoutMs`. Importing it there
@@ -108,6 +117,49 @@ export async function withRetry<T>(
   }
 }
 
+/** An earlier walk entry's one retry waits this long (spec r9 §5). */
+export const ENTRY_RETRY_DELAY_MS = 5_000;
+/** …and only when the failed attempt took less than this: a slow failure did real work, and the next entry
+ *  is the better bet. */
+export const ENTRY_RETRY_FAST_MS = 60_000;
+/** A transient 429's `retry-after` up to this long is waited instead of the fixed delay; longer, the entry
+ *  moves on with no retry. */
+export const ENTRY_RETRY_MAX_AFTER_MS = 30_000;
+
+/**
+ * Provider fallback (P1-M3-T4): an EARLIER walk entry's retry, beside an unchanged `withRetry` (which stays the
+ * last entry's schedule and the audit judge's, `scripts/audit.ts`). At most ONE retry, and only when the
+ * failure is retryable (`isRetryableFailure`: unreachable but not a timeout, rate-limited, empty answer, CLI
+ * failure) and the attempt took under `ENTRY_RETRY_FAST_MS`. It waits `ENTRY_RETRY_DELAY_MS`, or a parsed
+ * `retryAfterMs` when that is at most `ENTRY_RETRY_MAX_AFTER_MS`; a longer one moves on. Anything that is not a
+ * `ProviderError` (a `LostLockError`, a bug) is rethrown at once.
+ */
+export async function withEntryRetry<T>(
+  fn: () => Promise<T>, sleeper: (ms: number) => Promise<void>, now: () => Date, kind: EntryKind,
+): Promise<T> {
+  const startedAt = now().getTime();
+  try {
+    return await fn();
+  } catch (e) {
+    if (!(e instanceof ProviderError) || !isRetryableFailure(e, kind)) throw e;
+    if (now().getTime() - startedAt >= ENTRY_RETRY_FAST_MS) throw e;
+    if (e.retryAfterMs !== undefined && e.retryAfterMs > ENTRY_RETRY_MAX_AFTER_MS) throw e;
+    await sleeper(e.retryAfterMs ?? ENTRY_RETRY_DELAY_MS);
+    return await fn();
+  }
+}
+
+/** Options for the walk's use of the ladder (provider fallback, P1-M3-T4). Absent, the ladder is today's,
+ *  except that a `LostLockError` always escapes. */
+export type LadderOpts = {
+  /** Asked after `run()` failed and the existing gates passed, before rung 1. `false` rethrows the original
+   *  error with no rung run (an earlier entry: the network re-check said offline). */
+  beforeRungs?: () => Promise<boolean>;
+  /** Rethrow any other non-`ProviderError` from either rung instead of swallowing it (lists of two or more,
+   *  hub Q2); single-entry configs keep today's swallow. */
+  rethrowNonProviderErrors?: boolean;
+};
+
 /** The classification predicate lives in `account.ts` and is imported, not re-declared: two copies of
  *  the same rule drift into "the provider classifies a limit whose message the parser cannot read".
  *  Anchored on "hit your … limit", so it crosses neither the U+00B7 separator nor the apostrophe in the
@@ -162,7 +214,7 @@ type Laddered = {
  * would cost 9 provider calls and ~10 minutes instead of the intended worst case of 5 calls.
  */
 export async function withHardeningLadder<T>(
-  hp: Laddered, run: () => Promise<T>, once: () => Promise<T>, timeoutMs = TIMEOUT_MS,
+  hp: Laddered, run: () => Promise<T>, once: () => Promise<T>, timeoutMs = TIMEOUT_MS, ladderOpts?: LadderOpts,
 ): Promise<T> {
   try {
     return await run();
@@ -179,19 +231,29 @@ export async function withHardeningLadder<T>(
     if (!(e instanceof ProviderError) || e.code === "timeout" || e.code === "usage-limit" || !hp.hardeningActive()) throw e;
     // Failed SLOWLY ⇒ it reached the provider and did real work, so our flags are not the story.
     if ((e.durationMs ?? Infinity) > failFastMs(timeoutMs)) throw e;
+    // Provider fallback: the walk's last word before any rung (see LadderOpts).
+    if (ladderOpts?.beforeRungs && !(await ladderOpts.beforeRungs())) throw e;
+    // A LostLockError is never swallowed by a rung, for any config; another non-ProviderError only when asked.
+    const escapes = (x: unknown): boolean =>
+      x instanceof LostLockError || (ladderOpts?.rethrowNonProviderErrors === true && !(x instanceof ProviderError));
 
     // Rung 1: one more attempt WITH flags. Succeeding here means the failure was transient and the
     // hardening is fine — the most likely explanation, so it is tested first and costs nothing to keep.
-    try { return await once(); } catch { /* still failing — now it is worth suspecting the flags */ }
+    try { return await once(); } catch (x) { if (escapes(x)) throw x; /* still failing — now it is worth suspecting the flags */ }
 
     // Rung 2: the same single attempt with flags suppressed but NOT yet latched. Only a SUCCESS here
     // earns the conclusion; latching first and reverting on failure would let one transient error
     // permanently downgrade the posture.
+    // ⚠ CALENDAR (spec r4 §6): this bare attempt is UNLOCKED. Nothing here passes a variant — `once` rebuilds
+    // the prompt and its `calendarVariants` itself — and the hardened provider picks per spawn from the flags
+    // it injects, which `probeWithoutHardening` suppresses to none, so the unlocked text is what gets sent.
+    // Pinned end to end in test/calendar-variants.test.ts.
     try {
       const out = await hp.probeWithoutHardening(once);
       hp.disableHardening("the provider CLI failed with hardening flags injected and succeeded without them, so hardening flags are disabled for the rest of this run — the CLI appears to reject one of them");
       return out;
-    } catch {
+    } catch (x) {
+      if (escapes(x)) throw x;
       // Inconclusive: it failed bare too, so the flags were never the cause. Conclude NOTHING and keep
       // hardening; rethrow the original failure, which is the one that describes the real problem.
       throw e;
@@ -209,18 +271,25 @@ export class BYOCliProvider implements Provider {
     try { this.t.onWarning?.(w); } catch { /* a warning must never fail the call it describes */ }
   }
 
-  async generate(prompt: string): Promise<string> {
+  /** A bare spawn knows nothing about hardening, so it is UNLOCKED by definition (spec r4 §6): it always sends
+   *  `prompt` — the unlocked variant — whatever `opts.calendarVariants` holds, and says so to `onPromptSent`.
+   *  `hardenedProvider` never passes `opts` here: it picks the variant itself, per spawn, from the flags it
+   *  injected, and reports it before calling this. */
+  async generate(prompt: string, opts?: GenerateOpts): Promise<string> {
+    if (opts?.onPromptSent) { try { opts.onPromptSent({ variant: "unlocked", text: prompt }); } catch { /* a recording hook must never fail the call */ } }
     // Stamp every ProviderError with how long the attempt took — see ProviderError.durationMs.
     const startedAt = performance.now();
     try {
-      return await this.attempt(prompt);
+      return await this.attempt(prompt, opts?.signal);
     } catch (e) {
       if (e instanceof ProviderError && e.durationMs === undefined) e.durationMs = Math.round(performance.now() - startedAt);
       throw e;
     }
   }
 
-  private async attempt(prompt: string): Promise<string> {
+  private async attempt(prompt: string, signal?: AbortSignal): Promise<string> {
+    // Provider fallback (P1-M3-T5): a deadline that already passed spawns nothing.
+    if (signal?.aborted) throw new ProviderError("timeout", `${this.cfg.cli}: the attempt's deadline passed before it started`);
     const argv = this.cfg.promptVia === "arg" ? [...this.cfg.argv, prompt] : this.cfg.argv;
     // Always open stdin as a pipe so `proc` has a concrete type (avoids a strict-mode error from
     // `ReturnType<typeof Bun.spawn>` widening stdin to number|undefined). For arg-mode we just end it.
@@ -260,7 +329,9 @@ export class BYOCliProvider implements Provider {
         throw new ProviderError("nonzero-exit", `Failed to spawn ${this.cfg.cli} (${e?.code}) — its working directory ${this.t.cwd} may not exist, not be a directory, or not be searchable`);
       }
       if (e?.code === "ENOENT") {
-        throw new ProviderError("missing-binary", `CLI not found: ${this.cfg.cli}. Install it or set provider.cli.`);
+        const notFound = new ProviderError("missing-binary", `CLI not found: ${this.cfg.cli}. Install it or set provider.cli.`);
+        notFound.failCause = "enoent";   // provider fallback: the walk's `not-installed`
+        throw notFound;
       }
       throw new ProviderError("nonzero-exit", `Failed to spawn ${this.cfg.cli} (${e?.code ?? "spawn error"}): ${e?.message ?? String(e)}`);
     }
@@ -296,14 +367,32 @@ export class BYOCliProvider implements Provider {
     //    un-raced `.text()` would then never see EOF.
     let timedOut = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const timer = setTimeout(() => {
+    const expire = (): void => {
       // Boundary guard: if the child exited right at the deadline (timers can be serviced
       // before the exit continuation runs), don't mislabel a finished run as timed out.
-      if (proc.exitCode !== null) return;
+      if (proc.exitCode !== null || timedOut) return;
       timedOut = true;
       proc.kill();
       killTimer = setTimeout(() => { try { proc.kill(9); } catch { /* already gone */ } }, this.t.killGraceMs ?? KILL_GRACE_MS);
-    }, this.t.timeoutMs ?? TIMEOUT_MS);
+    };
+    const timer = setTimeout(expire, this.t.timeoutMs ?? TIMEOUT_MS);
+    // Provider fallback (P1-M3-T5): the walk's per-attempt deadline kills the child exactly as the timeout does —
+    // SIGTERM, then SIGKILL after the grace — and is reported as a timeout.
+    // ⚠ RESIDUAL, measured and NOT closed (codex review HIGH, 2026-10-16): both kills reach the DIRECT child only. A
+    // CLI that is a shell wrapper and backgrounds work (`sh -c '… &'`) leaves that descendant running after this
+    // attempt rejects (codex measured one still executing at 614 ms, after a 104 ms rejection). bun 1.3.14's
+    // `Bun.spawn({ detached: true })` DOES make the child a process-group leader (measured: pgid = pid, and
+    // `process.kill(-pid, SIGKILL)` reaped both grandchildren), but it is deliberately NOT used: a detached group
+    // escapes the two group-wide cleanups that exist today — the desktop app's `killpg` of the engine's group
+    // (gui/src-tauri/src/engine.rs) and launchd's process-group kill when the job stops — so an engine killed from
+    // outside would leave the provider running and billing, which is worse than this residual. Closing it needs a
+    // group of our own AND those two paths taught to follow it; that is a decision for the hub, not this file.
+    // The residual is not new: today's TIMEOUT kill above has always reached the direct child only. The walk makes it
+    // worse, because it moves on to another entry while the abandoned descendant may still run (and bill). When the
+    // scheduled job exits, launchd reaps what is left in its process group (UNVERIFIED: not measured here). Decided
+    // 2026-10-16 (hub): no descendant kill in this PR — a safe one needs a snapshot before SIGTERM, an ancestry- and
+    // start-time-checked re-snapshot before SIGKILL, loops until the set is stable, and still misses setsid children.
+    signal?.addEventListener("abort", expire, { once: true });
     // Both streams ACCUMULATE into observable sinks. `.text()` resolves only at EOF, so racing it
     // against the flush window yielded "" instead of the bytes already received — discarding a
     // complete briefing as empty-output, and blanking the nonzero-exit diagnostic to "(no output)"
@@ -335,10 +424,15 @@ export class BYOCliProvider implements Provider {
     } finally {
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      signal?.removeEventListener("abort", expire);
     }
     // `const`, computed after both `finally`s, mirroring git.ts's `const out = sinkText(...)`. The
     // previous `let out = "", err = ""` initializers were dead on every path that reads them.
-    const out = sinkText(o.sink), err = sinkText(e.sink);
+    const rawOut = sinkText(o.sink), rawErr = sinkText(e.sink);
+    // Each stream's own EOF proves its last token complete. A held, capped or errored read may stop
+    // before a credential can match; withhold that tail before diagnostics OR a successful return.
+    const out = !o.sink.complete || o.sink.errored ? dropTrailingPartialToken(rawOut) : rawOut;
+    const err = !e.sink.complete || e.sink.errored ? dropTrailingPartialToken(rawErr) : rawErr;
     // Any bytes we are about to put into an error message may be a PARTIAL read. Deliberately
     // over-broad (it is set even when the message ends up carrying no bytes): over-stamping only costs
     // the B6 fast path a latch it would otherwise take, falling back to the normal retry schedule;
@@ -368,7 +462,11 @@ export class BYOCliProvider implements Provider {
       // PERMANENT in withRetry (zero retries, "install a CLI" advice). Measured: with a held pipe an
       // exit-127 child yields a retryable `nonzero-exit`; ungated, partial stderr flips it to an
       // unrecoverable failure about a binary that exists — on exactly the machine this change targets.
-      if (!partialRead && proc.exitCode === 127 && /not found|ENOENT/i.test(err)) throw stamp(new ProviderError("missing-binary", `CLI not found: ${this.cfg.cli}`));
+      if (!partialRead && proc.exitCode === 127 && /not found|ENOENT/i.test(err)) {
+        const notFound = stamp(new ProviderError("missing-binary", `CLI not found: ${this.cfg.cli}`));
+        notFound.failCause = "enoent";   // provider fallback: the walk's `not-installed`
+        throw notFound;
+      }
       // Surface the CLI's diagnostic from BOTH streams. `claude` writes its real error (usage/session
       // limits, auth) to STDOUT while also printing a benign advisory to stderr when an auth env var
       // is set — so a stderr-preferred diag rendered a blank "claude exited 1:" for the 2026-07-11
@@ -411,11 +509,15 @@ export class BYOCliProvider implements Provider {
     if (!out.trim()) throw stamp(new ProviderError("empty-output", `${this.cfg.cli} returned no output`));
     // DELIBERATE FAIL-OPEN, and the opposite of what git.ts does two modules over. `o.sink.complete`
     // may be false here: a grandchild held the pipe past the flush window, so we have bytes but never
-    // saw EOF. We return them. runGit fails closed on exactly this condition because "" is a
+    // saw EOF. We return their complete tokens. runGit fails closed on exactly this condition because "" is a
     // legitimate git result, so a partial payload there fabricates a quiet day; for the provider ""
     // is never legitimate, and the alternative is discarding a briefing that is — in the shape that
     // actually causes this — complete apart from its EOF. Pinned by "a truncated stdout is returned
     // rather than discarded" so the fail-open is a decision, not an accident.
+    // RESIDUAL, stated: plain-text CLI output carries no stop-reason signal, so a reply the model cut
+    // at its OWN output limit, with a complete EOF, keeps its last (possibly partial) token here. The
+    // API providers see that signal and drop the token (providers/anthropic.ts on `max_tokens`,
+    // providers/openaiCompatible.ts on `length`); this path cannot.
     if (!o.sink.complete) {
       // Emitted as an INLINE template literal, deliberately. test/posture.test.ts scans src/ for
       // warning literals at their emission site and fails on any it cannot classify; a helper call

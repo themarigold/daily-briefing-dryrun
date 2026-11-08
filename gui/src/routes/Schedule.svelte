@@ -15,9 +15,11 @@
    * through them and requires it to stay literal.
    */
   import type { AccessSnapshot, ProbeResult } from "../lib/access";
+  import { olderEngineRemedy } from "../lib/install-flow";
   import { MANUAL_STEPS_APP_CLOSING, reasonPhrase } from "../lib/app-uninstall";
   import { notifyAskExplanation } from "../lib/notify";
   import type { Os } from "../lib/platform";
+  import { runResultSentence } from "../lib/run-result";
   import type { ScheduleState } from "../lib/state";
   import type { UninstallLine } from "../lib/uninstall-flow";
   import type { VerifyEvidence } from "../lib/verify-flow";
@@ -122,6 +124,9 @@
      *  REQUIRED, with no default, so a mount that forgets it fails `svelte-check` instead of
      *  silently getting one platform's wording. */
     os: Os;
+    /** Spec 2026-10-11: the Login Items banner's text (`lib/login-items.ts`, from the raw envelope's
+     *  `registeredHint`), or `null` for none. Computed by App, so this file stays presentation only. */
+    loginItemsHint?: string | null;
   }
   let {
     state,
@@ -138,6 +143,7 @@
     oninstalled = () => {},
     removalLine = null,
     removalFailed = false,
+    loginItemsHint = null,
     removalInProgress = false,
     removalReset = 0,
     oninstallstarted = () => {},
@@ -280,14 +286,9 @@
           running; the next one that finds your machine awake will generate it.
         </p>
       {:else if state.phase.phase === "skipped"}
-        {#if state.phase.reason === "marker-fail"}
-          <p>
-            Today's briefing was written, but the engine could not record that it was — so a later
-            check today may generate it again.
-          </p>
-        {:else}
-          <p>The last check ran and did not generate a briefing. The engine's reason:</p>
-        {/if}
+        <!-- The reason in plain words (wave 2 polish §6, lib/run-result.ts; marker-fail keeps the sentence it had
+             here). last-skip.json carries no `limited`, so no reset time is named: the engine's line below does. -->
+        <p>{runResultSentence({ kind: "skipped", reason: state.phase.reason }, null, new Date(), "schedule")}</p>
         {#if state.phase.detail !== null}
           <!-- The ENGINE's own line, verbatim. For a usage limit it names a reset time only when
                the engine actually parsed one — this screen never invents one. -->
@@ -407,6 +408,12 @@
         Lingering is disabled for your user, so the timer will not fire while you are logged out.
       </p>
     {/if}
+    <!-- Spec 2026-10-11: macOS cannot find the job though its file is there — the item is probably
+         switched off in Login Items. Text only: no allowed opener reaches that pane (lib/login-items.ts). -->
+    {#if loginItemsHint !== null}
+      <!-- Repair re-runs `schedule install`, which cannot flip the switch (only the user can), so say so here. -->
+      <p class="warn-text login-items">{loginItemsHint} Repairing will not turn it back on.</p>
+    {/if}
 
     <!-- Batch 2 (spec 3.4.2): the registration check could not run. Said whatever is on disk — with a
          record or a unit the remove control shows below as well (3.4.1); with nothing on disk this is
@@ -427,13 +434,50 @@
       </div>
     {/if}
 
-    {#if state.engineUpdateAvailable}
-      <div class="prompt">
-        <p>
-          The background copy of the engine is version {state.installedEngineVersion}, and this app
-          ships {state.engineVersion}. Re-installing the schedule updates it and keeps your existing
-          notification setting and owner.
+    <!-- Provider fallback (spec §6, P3-M6-T2): the older-background-engine warning, decided in Rust
+         (`olderEngineWarning`), for BOTH owners. It names the MEASURED version (`scheduledEngineVersion`,
+         what the scheduled binary answers now), never the install-time record. Only an APP-owned
+         schedule is offered this app's update — the one "Update background engine" control below,
+         shared with the version-skew prompt. A CLI-owned one gets words only: this app's install over
+         it would be refused into the foreign-owner flow, which belongs to install refusals
+         (`olderEngineRemedy`, `install-flow.ts`). An unknown owner gets words only too, which say the
+         app cannot tell how it was installed (PR 3 final r5, H6). -->
+    {#if state.olderEngineWarning}
+      <div class="prompt older-engine">
+        <p class="warn-text">
+          Your provider list has more than one entry, but the background engine is version
+          {state.scheduledEngineVersion}, older than the first version that can move on to your next
+          provider during a run. Until it is updated, scheduled briefings use only your first provider
+          and its logins.
         </p>
+        {#if olderEngineRemedy(state.owner) === "update"}
+          <p>Updating the background engine fixes this.</p>
+        {:else if olderEngineRemedy(state.owner) === "cli"}
+          <p>
+            This schedule was installed from the command line, so update it there: install a newer
+            daily-briefing and run <code>daily-briefing schedule install</code> again (from a source
+            checkout, <code>bash scripts/install.sh</code>).
+          </p>
+        {:else}
+          <p>
+            The app cannot tell how this schedule was installed, so it does not update it from here. If
+            it was installed from the command line, install a newer daily-briefing and run
+            <code>daily-briefing schedule install</code> again (from a source checkout,
+            <code>bash scripts/install.sh</code>).
+          </p>
+        {/if}
+      </div>
+    {/if}
+
+    {#if state.engineUpdateAvailable || (state.olderEngineWarning && olderEngineRemedy(state.owner) === "update")}
+      <div class="prompt">
+        {#if state.engineUpdateAvailable}
+          <p>
+            The background copy of the engine is version {state.installedEngineVersion}, and this app
+            ships {state.engineVersion}. Re-installing the schedule updates it and keeps your existing
+            notification setting and owner.
+          </p>
+        {/if}
         <ScheduleInstall
           label="Update background engine"
           purpose="update the background engine"

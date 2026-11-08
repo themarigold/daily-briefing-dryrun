@@ -1,0 +1,30 @@
+{
+  "vectors": [
+    {
+      "fields": { "platform": "unix", "volume": "1", "fileId": "2", "size": "3", "mtimeNs": "4", "ctimeNs": "5" },
+      "canonical": "summary-page-v1\nunix\n1\n2\n3\n4\n5\n",
+      "sha256": "4d4bc0781523098241d6a35ab90225e2901d17e3bf47046431a406ddf77da7e0"
+    },
+    {
+      "fields": { "platform": "windows", "volume": "1", "fileId": "000102030405060708090a0b0c0d0e0f", "size": "3", "mtimeNs": "4", "ctimeNs": "5" },
+      "canonical": "summary-page-v1\nwindows\n1\n000102030405060708090a0b0c0d0e0f\n3\n4\n5\n",
+      "sha256": "237fb57dfe7850b9d98b67410cad4bdb88c58d2234f7e9896c21e46c5c3a865d"
+    },
+    {
+      "fields": { "platform": "unix", "volume": "18446744073709551615", "fileId": "2", "size": "0", "mtimeNs": "-1", "ctimeNs": "1000000000" },
+      "canonical": "summary-page-v1\nunix\n18446744073709551615\n2\n0\n-1\n1000000000\n",
+      "sha256": "c1e9ec816bcc111d1051a3dc846053f829839abf4b26a36c8a3a9d2b43921576"
+    }
+  ],
+  "windowsTicks": [
+    { "ticks": "116444736000000000", "unixNs": "0" },
+    { "ticks": "116444735999999999", "unixNs": "-100" },
+    { "ticks": "116444736000000001", "unixNs": "100" },
+    { "ticks": "0", "unixNs": "-11644473600000000000" },
+    { "ticks": "18446744073709551615", "unixNs": "1833029933770955161500" }
+  ],
+  "windowsIds": [
+    { "bytes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "hex": "000102030405060708090a0b0c0d0e0f" },
+    { "bytes": [255, 128, 16, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], "hex": "ff80100102030405060708090a0b0c0d" }
+  ]
+}

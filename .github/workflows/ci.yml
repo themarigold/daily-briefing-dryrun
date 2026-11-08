@@ -3,7 +3,7 @@ name: CI
 # Gates: install (frozen lockfile), strict type-check, full test suite — on Linux AND macOS
 # (macOS is the flagship scheduled-delivery platform; Linux keeps the core honest cross-platform).
 # Plus (Phase E, E6): actionlint over these workflows, the desktop GUI's own gates on Linux, and the
-# desktop shell's full `cargo test` on macOS. Standard runners cost nothing on a public repo.
+# desktop shell's full `cargo test` on macOS, with the Mac Calendar Reader's build and FIFO smoke (v0.3.0). Standard runners cost nothing on a public repo.
 #
 # Every action is pinned to a full commit SHA, with the release it resolved to in a trailing comment,
 # and the actionlint image by digest: a moved tag cannot change what runs here. The same pins as
@@ -133,3 +133,11 @@ jobs:
         run: bash scripts/build-sidecar.sh
       - name: cargo test (full)
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast
+      # v0.3.0 calendar (plan M11): the Mac Calendar Reader, built universal (reader/build.sh fails unless
+      # `lipo -archs` shows both slices) and smoked against a real FIFO in `status` mode (reader/smoke.sh: no
+      # event store, no dialog). The engine's FIFO hand-off tests run on macOS in `check` above.
+      - name: Calendar Reader (universal build + FIFO smoke)
+        run: |
+          set -euo pipefail
+          bash ../reader/build.sh "$RUNNER_TEMP/reader"
+          bash ../reader/smoke.sh "$RUNNER_TEMP/reader/Daily Briefing Calendar Reader.app"

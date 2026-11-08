@@ -31,6 +31,8 @@ import {
   discoverySummary as engineDiscoverySummary,
 } from "../../src/discoverySummary";
 import { WHY_PREFIX as ENGINE_WHY } from "../../src/transcripts/frame";
+import { NOTICE_PREFIX as ENGINE_NOTICE } from "../../src/failover";
+import { briefingDate } from "../src/lib/today";
 import { isShaShaped as engineIsShaShaped } from "../../src/sha";
 import type { BriefingStruct as EngineStruct } from "../../src/types";
 
@@ -44,6 +46,7 @@ import {
   MAX_INLINE_CHARS,
   NESTED2,
   NOT_SHOWN_PREFIX,
+  NOTICE_PREFIX,
   renderMarkdown,
   safeHref,
   WHY_PREFIX,
@@ -189,6 +192,20 @@ const VARIANTS: [string, BriefingStruct][] = [
   ["rich", RICH],
   ["quiet day", QUIET],
   ["one missed day, no floor", { ...QUIET, outage: { missedDays: 1, label: "primary" }, stateAsOf: "09:01" }],
+  [
+    // PR 1 final review round 3, L15: the walk's notices above the title (struct `notices`, file `ℹ︎ ` lines), with the
+    // outage line after them — the engine's own wording, prefix included.
+    "notices above the title",
+    {
+      ...QUIET,
+      outage: { missedDays: 2, label: "primary" },
+      notices: [
+        `${ENGINE_NOTICE}Skipped "default": CLI not installed — used "Remote"`,
+        `${ENGINE_NOTICE}Not tried "Spare": out of usage until Tue 09:00`,
+        `${ENGINE_NOTICE}Generated using "Remote" — API charges may apply.`,
+      ],
+    },
+  ],
   [
     "coverage over an empty recap",
     {
@@ -508,9 +525,23 @@ describe("the struct renderer mirrors renderBriefing", () => {
     });
   }
 
+  test("P1-M9-T4: the notice prefix is the engine's, and a file that OPENS with notices reads back to the same kinds as the struct", () => {
+    expect(NOTICE_PREFIX).toBe(ENGINE_NOTICE);
+    const struct = { ...QUIET, notices: [`${ENGINE_NOTICE}Not tried "Claude login 1": out of usage until 09:00`, `${ENGINE_NOTICE}Skipped "Local": unreachable — used "Claude login 2"`] };
+    const markdown = renderBriefing(struct as EngineStruct);
+    expect(markdown.startsWith(ENGINE_NOTICE)).toBe(true);           // the premise: the file opens with them
+    const fromFile = renderMarkdown(markdown), fromStruct = renderStruct(struct);
+    expect(fromFile.map((b) => b.kind)).toEqual(fromStruct.map((b) => b.kind));
+    expect(fromFile.slice(0, 3).map((b) => b.kind)).toEqual(["notice", "notice", "title"]);
+    expect(briefingDate(fromFile)).toBe(struct.date);              // the title is still found by kind
+    expect(classifyLine(`${ENGINE_NOTICE}x`)?.kind).toBe("notice");
+  });
+
   test("the rich fixture exercises every line kind", () => {
-    const kinds = new Set(renderStruct(RICH).map((b) => b.kind));
-    for (const k of ["title", "outage", "legend", "heading", "bullet", "nested", "notShown", "coverage", "why", "warnings", "footer"]) {
+    // + `notice` (P1-M9-T4) from the rich fixture with the walk's lines above its title. RICH itself stays as it was:
+    // `__fixtures__/helpers-pre-tierb.json` pins its pre-tier-B outputs.
+    const kinds = new Set(renderStruct({ ...RICH, notices: [`${ENGINE_NOTICE}Skipped "Anthropic key": key or login rejected — used "backup"`] }).map((b) => b.kind));
+    for (const k of ["notice", "title", "outage", "legend", "heading", "bullet", "nested", "notShown", "coverage", "why", "warnings", "footer"]) {
       expect(kinds.has(k as Block["kind"])).toBe(true);
     }
     expect(new Set(renderStruct(QUIET).map((b) => b.kind)).has("placeholder")).toBe(true);

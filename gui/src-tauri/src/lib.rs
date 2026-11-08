@@ -31,15 +31,25 @@
 //! compile the test that objects OUT of the build (MEASURED: 39 passed / 0 failed, flag present).
 
 pub mod access;
+pub mod actions;
+pub mod app_prefs;
 pub mod autostart;
 pub mod briefing_files;
+pub mod calendar;
+pub mod calendar_details;
 pub mod cli_shim;
 pub mod commands;
 pub mod config_save;
+pub mod editor;
 pub mod engine;
+pub mod key_refs;
+pub mod live_gate;
 pub mod notifications;
+pub mod pending_resets;
+pub mod repos;
 pub mod schedule_state;
 pub mod shell;
+pub mod summary;
 pub mod uninstall;
 pub mod watcher;
 
@@ -63,12 +73,20 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         engine::engine_doctor,
         engine::engine_run,
         engine::engine_run_to_file,
-        engine::engine_config_validate,
         engine::engine_schedule_install,
         engine::engine_schedule_uninstall,
         engine::engine_schedule_status,
         engine::engine_schedule_verify,
         engine::engine_update_check,
+        engine::engine_calendar_status,
+        engine::engine_calendar_list,
+        engine::engine_calendar_test,
+        engine::engine_calendar_connect_mac,
+        engine::engine_provider_key_set,
+        engine::engine_provider_key_migrate,
+        engine::engine_provider_key_delete,
+        engine::engine_provider_key_scrub_backup,
+        engine::engine_provider_reset,
         shell::state_snapshot,
         shell::open_today,
         shell::app_quit,
@@ -78,6 +96,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         config_save::config_save,
         config_save::config_offer_notify_auto,
         config_save::config_create,
+        config_save::provider_candidate_check,
         access::access_snapshot,
         access::access_probe,
         access::access_reveal_engine,
@@ -91,6 +110,25 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         uninstall::uninstall_execute,
         autostart::autostart_set_enabled,
         autostart::autostart_wizard_default,
+        calendar::calendar_link_write,
+        calendar::calendar_link_remove,
+        calendar::calendar_config_save,
+        pending_resets::provider_pending_reset_add,
+        pending_resets::provider_pending_reset_flush,
+        pending_resets::provider_pending_reset_drop,
+        app_prefs::app_prefs_get,
+        app_prefs::app_prefs_set,
+        repos::repos_status,
+        calendar_details::calendar_details_open,
+        calendar_details::calendar_details_get,
+        calendar_details::calendar_join,
+        calendar_details::calendar_app_open,
+        actions::open_github,
+        actions::copy_push_command,
+        editor::editor_list,
+        editor::editor_open,
+        editor::editor_choice_set,
+        summary::read_latest_summary,
     ]
 }
 
@@ -133,6 +171,28 @@ pub fn run() {
         // T15's save lock. Candidate files go under `app_data_dir()/config-candidates`, resolved
         // per save (see `config_save::ConfigSaver`); the CONFIG path is always `status --json`'s.
         .manage(config_save::ConfigSaver::default())
+        // P3-M4-T3: the pending-reset store — `pending-resets.json` under `app_data_dir()`, its one
+        // mutex, and the 15 s retry task's interval. Its retry task is spawned in `.setup` below.
+        .manage(pending_resets::PendingResets::default())
+        // The briefing redesign's A-M1: the app-preference store — the first name and the slides
+        // switch in `app-prefs.json` under `app_data_dir()`, and its one mutex. No task, no engine.
+        .manage(app_prefs::AppPrefs::default())
+        // Wave 2, W2-S: the live gate's clock and window probe, shared by the live git and
+        // calendar reads. The DEFAULT is the one place the real clock and the real main window are
+        // wired up; every test manages its own with an injected clock and visibility.
+        .manage(live_gate::LiveEnv::default())
+        // Briefing redesign B1 (wave 2): the live git check's held result, its one-in-flight latch
+        // and its one waiting slot (`repos.rs`). Nothing on disk; no task.
+        .manage(repos::ReposLive::default())
+        // Wave 2, C: today's calendar details, read live and held in memory only (the event map,
+        // the remembered command-link URLs, the last statuses). The DEFAULT is the one place the
+        // real opener (Join) and the real Calendar-app launcher are wired up.
+        .manage(calendar_details::CalendarDetails::default())
+        // Briefing redesign B2 (wave 3): the defaults wire the real opener, editor detector and editor launcher.
+        // `copy_push_command` builds the real clipboard sink from its app handle. Every test manages recording ones.
+        // What a click opens or copies comes from `repos::ReposLive`, so neither state holds a target.
+        .manage(actions::ActionsState::default())
+        .manage(editor::EditorState::default())
         // T17's folder-access flow: the opener sink (the real one — `tauri-plugin-opener`'s free
         // functions), `HOME`, and the app-owned record under `app_data_dir()`. The plugin itself is
         // deliberately NOT registered below, so it contributes no live commands and the capability
@@ -167,6 +227,10 @@ pub fn run() {
         // console). Nothing here consumes `window.Notification` — recorded in
         // `capabilities/README.md` and `docs/gui-seam.md` §12c.
         .plugin(tauri_plugin_notification::init())
+        // B2-M3-T9's clipboard plugin, REGISTERED for the same reason: `ClipboardExt` resolves managed plugin state, so
+        // `actions::SystemClipboard`'s write needs `init()`. Its six commands are live and the capability grants none of
+        // them (the list: `Cargo.toml`); `copy_push_command` is the one way to the clipboard. It injects no script.
+        .plugin(tauri_plugin_clipboard_manager::init())
         // T19's autostart plugin, `LaunchAgent` on macOS. ONE of its commands is granted —
         // `is_enabled`, the REAL state the Settings toggle reflects; ON/OFF go through the app's
         // `autostart_set_enabled`, which brands the plist (Phase E M5b; `src/autostart.rs`).
@@ -181,6 +245,12 @@ pub fn run() {
         .on_menu_event(shell::on_menu_event)
         .setup(|app| {
             shell::setup(app.handle());
+            // P3-M4-T3 (spec §6 step 4): pending provider resets are retried once now and every
+            // 15 s while the app runs — whatever screen is shown — and a `pre-save` record a
+            // previous run left is resolved against the saved config (plan Q11).
+            // The handle is dropped at the end of this closure, which DETACHES the task (it runs for the
+            // life of the app); only the tests keep it, to abort it.
+            let _retry = pending_resets::spawn_retry(app.handle());
             // ⚠ NO LOGIN ITEM IS REGISTERED HERE (Phase E M5b, user-directed). B7 called a
             // first-launch default-ON one-shot at this point; the default now lives in the setup
             // wizard's last step (`autostart_set_enabled`, on Finish), so a launch registers

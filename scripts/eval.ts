@@ -30,6 +30,7 @@ import { verdictForRuns, type VerdictLabel, type Verdict } from "../src/eval/thr
 import { buildAuditPrompt } from "../src/audit";
 import { renderBriefing } from "../src/render";
 import type { GoldCase, Finding } from "../src/eval/types";
+import { removeRegisteredTempDirs } from "../test/fixtures/temp-dirs";
 
 const RUNS_PER_CASE = 3;
 
@@ -113,6 +114,19 @@ async function runJudge(gc: GoldCase, provider: Provider, attempt: Attempt): Pro
 type CaseResult = { gc: GoldCase; verdict: Verdict; findings: Finding[]; error?: string; warnings?: string[] };
 
 async function main() {
+  // CLEANUP ONLY (user-directed one-off edit, 2026-10-19): every case's synthetic repo and transcript dir is
+  // registered with `removeAtRunEnd` (src/eval/run-case.ts, test/fixtures/eval-repo.ts), but outside `bun test`
+  // nothing drained that list, so each eval run left its temp dirs behind (327 measured in TMPDIR). Drained on
+  // every exit, `process.exit` included, except termination by a signal (Ctrl-C): the "exit" event does not fire
+  // then, and that run's dirs are left. A cleanup failure is a warning on stderr and NEVER changes the exit code:
+  // the code is this script's pass/fail signal, and scoring, thresholds and verdicts are untouched.
+  process.on("exit", () => {
+    try {
+      removeRegisteredTempDirs();
+    } catch (e) {
+      console.error(`eval: temp-dir cleanup: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  });
   const realCfg = await loadConfig();
   const cases = caseFilter ? GOLD_CASES.filter((c) => c.name === caseFilter) : GOLD_CASES;
   if (caseFilter && !cases.length) {

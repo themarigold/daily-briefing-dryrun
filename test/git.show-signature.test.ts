@@ -91,6 +91,9 @@ async function parsed() {
     // comes from `git show` (shaAndDate) — compared whole, minus nothing.
     resume: (await resumptionSignals(repo)).filter((a) => a.kind === "branch"),
     defaultRefMerges: await listDefaultRefMerges(repo, start, new Date(), startGitBudget(30_000)),
+    // B1-M1-T1's opts path (the live git check's leading arguments) reads the same merges, gpg-free too
+    defaultRefMergesLead: await (listDefaultRefMerges as (...a: unknown[]) => ReturnType<typeof listDefaultRefMerges>)(
+      repo, start, new Date(), startGitBudget(30_000), { lead: ["--no-optional-locks"] }),
   };
 }
 
@@ -112,6 +115,7 @@ test("every parsed git read is identical with and without log.showSignature=true
   expect(plain.patchIds.length).toBeGreaterThanOrEqual(2);
   expect(plain.resume.length).toBe(1);
   expect(plain.defaultRefMerges.merges.length).toBe(1);
+  expect(plain.defaultRefMergesLead).toEqual(plain.defaultRefMerges);
   const head = (await git(repo, "rev-parse", "HEAD")).trim();
   expect(JSON.stringify(plain.resume)).toContain(head);
 

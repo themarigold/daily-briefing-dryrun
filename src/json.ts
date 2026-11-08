@@ -24,9 +24,19 @@ import type { CoreResult } from "./core";
 import { warnFor, isInaccessible, type PathIssue, type PathIssueKind } from "./protectedPath";
 import { countedIssues, discoveryBlocked } from "./discoverySummary";
 import { redactCredentials, redactCredentialsAnyCase } from "./transcripts/credentials";
+// `canonicalPath` lives in the strict-reader module (provider-fallback P1-M1-T1); imported unchanged.
+import { canonicalPath } from "./strictFile";
+import {
+  PROVIDER_LABEL_INVALID, appKeyOverCleartext, appKeyOwnership, appKeyOwnershipBounded, droppedLabel, entryRevision, listOrder,
+  resolveProviderList, walkProbeHosts, type KeyOwnership, type ListEntry, type ProviderList,
+} from "./providerList";
+import { appTestTimeoutMs } from "./attemptBounds";
+import { readProviderStatus, rowStatus, type RowStatus } from "./providerStatus";
+import { safeLabel } from "./failover";
 import {
   supportDir, markerPath, tickPath, logPath, latestBriefingPath, lastSkipPath, readLastRunDate,
-  readLastSkip, schedulePath, recapCampaignsPath, updateCheckPath, type LastSkip,
+  readLastSkip, schedulePath, recapCampaignsPath, updateCheckPath, readLastFailure, lastFailurePath, providerStatusPath, keysDir, runRecordPath,
+  type LastSkip, type LastFailure,
 } from "./marker";
 import { publicResult, readUpdateCheckState, resolveUpdateCheck, type UpdateCheckResult } from "./updateCheck";
 import { runLockPath } from "./runlock";
@@ -35,14 +45,21 @@ import { resolveNotify } from "./notify";
 // installer re-exports it. A static edge from this module (which the run path imports) into the
 // installer would pull the installer and its `proc.run` default exec into every `daily-briefing run`
 // process, which is precisely what main.ts's dynamic import of that module exists to avoid.
-import { accountStatePath } from "./account";
+import { accountStatePath, loadAccountState, markFilter, type AccountState, type MarkReason } from "./account";
 import {
   configPath, loadConfig, validateConfig, resolveTranscripts, resolveAccounts, resolveVerdictPaths,
   compileExcludePatterns, discoverRepos, resolveCliPath as whichOnPath,
   DEFAULT_EXCLUDE_COMMIT_PATTERNS, DEFAULT_NETWORK_PROBE_HOSTS,
 } from "./config";
 import { resolveApiKey } from "./apiKey";
-import { deriveProbeHosts, endpointUrl, isLoopbackHost, printableEndpoint, endpointHasWithheldParts } from "./providers/endpoint";
+import { CALENDAR_LITERAL_URL_ERROR, calendarBlockHasLiteralUrl, resolveCalendar } from "./calendar/config";
+import { scrubCalendarLinks } from "./calendar/link-scrub";
+import { calendarStatus } from "./calendar/status";
+import type { CalendarStatusJson } from "./calendar/types";
+import { resolveAiSummary, type AiSummaryConfigWarning } from "./summary/config";
+import { readPageIdentity, type PageIdentity } from "./summary/page-version";
+import { readSummaryRecord, type SummaryWarningCode } from "./summary/store";
+import { deriveProbeHosts, endpointUrl, isLoopbackHost, keyOptional, printableEndpoint, endpointHasWithheldParts } from "./providers/endpoint";
 import { parseFloor, isPastFloor, DEFAULT_MORNING_TIME } from "./schedule";
 import { resolveProbeHosts, defaultNetProbe } from "./net";
 import { isFullyAwake } from "./power";
@@ -78,6 +95,7 @@ export const SKIP_REASONS = [
   "provider-fail",    // the provider errored (after retries) → exit 1
   "parse-empty",      // the model's output parsed into no section at all → exit 1
   "marker-fail",      // the briefing was written but the day marker could not be → exit 1
+  "write-fail",       // briefing-latest.md could not be written → not stamped, exit 1 (the next tick retries)
   "crashed",          // a non-ProviderError escaped the pipeline; the envelope is emitted, then rethrown
 ] as const;
 export type SkipReason = (typeof SKIP_REASONS)[number];
@@ -137,6 +155,15 @@ export function statePaths(): StatePaths {
   };
 }
 
+/** Every path the engine owns (provider fallback P1-M10-T2, spec r9 §5 Reporting "Engine-owned paths"):
+ *  `statePaths()`'s members plus `provider-status.json`, `last-failure.json` and the app-owned key folder `keys/`.
+ *  ⚠ A SEPARATE list, and `statePaths()` is NOT changed: that one is the `run --json` envelope's `paths`, which the
+ *  calendar-off goldens pin byte for byte. The `--json-out` guard and the uninstall parity test read this one. */
+export type EngineOwnedPaths = StatePaths & { providerStatusPath: string; lastFailurePath: string; keysDir: string; runRecordPath: string };
+export function engineOwnedPaths(): EngineOwnedPaths {
+  return { ...statePaths(), providerStatusPath: providerStatusPath(), lastFailurePath: lastFailurePath(), keysDir: keysDir(), runRecordPath: runRecordPath() };
+}
+
 // ── T1: the run envelope ────────────────────────────────────────────────────────────────────────
 
 export type EnvelopeIssue = { path: string; kind: PathIssueKind; message: string };
@@ -189,12 +216,16 @@ export function envelopeFrom(
     skipReason: skipReason ?? r.skipReason ?? (r.blocked ? "blocked" : null),
     blocked: r.blocked,
     emptyWindow: r.emptyWindow,
-    limited: r.limited ?? null,
-    account: r.account ?? null,
+    // The account LABEL in both fields through `safeLabel` (PR 1 final review round 1, M3; hub Q25 (2)): an
+    // ordinary label is unchanged byte for byte, a key or a calendar link used as one is masked.
+    limited: r.limited ? { ...r.limited, label: safeLabel(r.limited.label) } : null,
+    account: r.account === undefined ? null : safeLabel(r.account),
     net: r.net,
     markdown: rendered,
     struct: r.struct,
-    warnings: r.warnings,
+    // v0.3.0 calendar: the calendar config warnings ride here and on stderr, never in `struct.warnings` (the rendered
+    // ⚠ line the audit scores — see `CoreResult.calendarWarnings`). Absent ⇒ exactly `r.warnings`, as before.
+    warnings: r.calendarWarnings?.length ? [...r.warnings, ...r.calendarWarnings] : r.warnings,
     // The discovery-side issues have no warning string of their own (main.ts formats them at the
     // terminal boundary); carry BOTH the machine-readable kind and the human advice so the GUI can
     // show the same sentence the CLI prints without owning a second copy of the wording.
@@ -219,8 +250,8 @@ export function envelopeFrom(
  *  by `norm(label)` — a git-derived folder name — and `norm` LOWERCASES. Four classes (aws-access-key-id,
  *  jwt, private-key-block, env-assignment) are case-sensitive, so the shared matcher alone left
  *  `api_token=…` and `akia…` (trivially reversible) in a key while the label beside it was redacted.
- *  A key therefore gets `redactCredentials` first and then case-insensitive clones of the same
- *  patterns (`redactKey` = `redactCredentialsAnyCase`, credentials.ts, which applies
+ *  A key therefore gets the union of original-text spans from the shared patterns and their
+ *  case-insensitive clones (`redactKey` = `redactCredentialsAnyCase`, credentials.ts, which applies
  *  `CREDENTIAL_PATTERNS_ANY_CASE` and which the Stage-2 record labels also use). The shared matcher's
  *  semantics are untouched.
  *  For a whys key that makes the redacted key equal `norm(redactCredentials(label))`, so the render
@@ -271,8 +302,9 @@ function redactJson(v: unknown): unknown {
  *  `gateEnvelope`'s `warnings` too, since every envelope reaches the boundary through here.
  *  NOT touched: `markdown` (already redacted, and it must stay byte-identical to the same run's stdout),
  *  `paths` (the engine's own state-path math, which consumers open), and the rest — booleans, numbers,
- *  closed-vocabulary reasons, `net`, and the account LABEL in `account`/`limited`, which is user config
- *  text rather than git- or provider-derived (out of E1's channel list; stated, not overlooked).
+ *  closed-vocabulary reasons, `net`, and the account LABEL in `account`/`limited` — user config text, not git- or
+ *  provider-derived, and already masked where it is built (`envelopeFrom`, through `safeLabel`: a key or a calendar
+ *  link used as a label never reaches the envelope; PR 1 final review round 1, M3).
  *  Exported, rather than inlined in `emit`, because no `run()` return populates `gateEnvelope`'s
  *  `warnings` today — this is the only seam that channel can be tested through. */
 export function redactEnvelope(env: RunEnvelope): RunEnvelope {
@@ -332,9 +364,13 @@ function insideOrIs(p: string, dir: string): boolean {
  * caller can name the same file three ways: the absolute path, the bare name resolved under the state
  * dir, and a path inside the dated-archive directory.
  */
-function engineOwns(resolved: string, stateDir: string): string | undefined {
-  const sp = statePaths();
-  const owned: [string, string][] = [
+function engineOwns(target: string, stateDirIn: string): string | undefined {
+  const sp = engineOwnedPaths();
+  // EVERY side of every comparison is canonical (final harden r2: raw strings let `<state>//calendar/…`,
+  // `<state>/./calendar/…` and, on APFS, `<state>/Calendar/…` through).
+  const c = canonicalPath;
+  const resolved = c(target), stateDir = c(stateDirIn), spStateDir = c(sp.stateDir);
+  const owned: [string, string][] = ([
     [sp.configPath, "config file"],
     [sp.markerPath, "day marker"],
     [sp.tickPath, "tick heartbeat"],
@@ -346,17 +382,27 @@ function engineOwns(resolved: string, stateDir: string): string | undefined {
     [sp.schedulePath, "schedule ownership record"],
     [sp.recapCampaignsPath, "recap-campaigns record"],
     [sp.updateCheckPath, "update-check record"],
-  ];
+    // Provider fallback P1-M10-T2: the two new state files.
+    [sp.providerStatusPath, "provider status"],
+    [sp.lastFailurePath, "last-failure record"],
+    // B1-M1-T3 (wave 2): the morning run's record for the live git check.
+    [sp.runRecordPath, "run record"],
+  ] as [string, string][]).map(([p, w]) => [c(p), w]);
   for (const [path, what] of owned) if (resolved === path) return what;
   // The bare-name form under whichever state dir the caller resolved against — `statePaths()` reads
   // the ambient one, and the two agree in production, but the seam must not be a way around this.
-  const names = new Map(owned.filter(([p]) => insideOrIs(p, sp.stateDir)).map(([p, w]) => [basename(p), w]));
-  for (const dir of [stateDir, sp.stateDir]) {
+  const names = new Map(owned.filter(([p]) => insideOrIs(p, spStateDir)).map(([p, w]) => [basename(p), w]));
+  for (const dir of [stateDir, spStateDir]) {
     if (resolved === dir) return "state directory";
     if (dirname(resolved) === dir) { const w = names.get(basename(resolved)); if (w) return w; }
-    if (insideOrIs(resolved, join(dir, "briefings"))) return "dated briefing archive";
+    if (insideOrIs(resolved, c(join(dir, "briefings")))) return "dated briefing archive";
+    // v0.3.0 calendar: the whole `<state>/calendar/` tree — the managed link files (a secret each), health, parse
+    // scratch. A truncating `--json-out` there could overwrite a link file.
+    if (insideOrIs(resolved, c(join(dir, "calendar")))) return "calendar state";
+    // Provider fallback P1-M10-T2: the whole `<state>/keys/` tree — app-owned key files, a secret each.
+    if (insideOrIs(resolved, c(join(dir, "keys")))) return "app-owned key folder";
   }
-  if (insideOrIs(resolved, sp.briefingsDir)) return "dated briefing archive";
+  if (insideOrIs(resolved, c(sp.briefingsDir))) return "dated briefing archive";
   return undefined;
 }
 
@@ -420,6 +466,13 @@ export type StatusReport = {
    *  `readLastSkip` a function with no src/ caller at all, which is how a reader contract rots.
    *  ⚠ READ-ONLY like everything else here: `readLastSkip` returns `undefined` rather than repairing. */
   lastSkip: LastSkip | null;
+  /** Provider fallback (P1-M10-T1, spec r9 §5 Reporting): `<state>/last-failure.json` — the day's unresolved failure,
+   *  for Today's banner — or `null` when absent or corrupt. ADDITIVE. */
+  lastFailure: LastFailure | null;
+  /** Provider fallback (P1-M10-T1): one row per combined-list entry and per dropped entry, in list order, by
+   *  `rowStatus`'s precedence over the marks (through `markFilter`, so item 1 never reads "paused" for an hour mark)
+   *  and `provider-status.json`. ADDITIVE; `[]` with no readable config. */
+  providers: ProviderRow[];
   lastTick: { iso: string; localDate: string; count: number } | null;
   latestBriefingMtime: string | null;
   archivedDates: string[];
@@ -432,7 +485,85 @@ export type StatusReport = {
    *  the earlier schema never sees this key, and the desktop app reads it through its existing
    *  `engine_status` grant. The response's cache tag (`etag`) is internal and never reported. */
   updateCheck?: UpdateCheckResult | null;
+  /** v0.3.0 calendar (spec r4 §3, §8) — the calendar's configuration and each source's LAST SCHEDULED read, from
+   *  `<state>/calendar/health.json`, with no network call. ADDITIVE-OPTIONAL and PRESENT ONLY when the config has a
+   *  `calendar` block, so a config without one reports exactly what it reported before. */
+  calendar?: CalendarStatusBlock;
+  /** A2: current-identity sidecar status only; absent while off or without a valid record. */
+  latestSummaryRevision?: PageIdentity & { revision: 0 | 1; state: "pending" | "ready" | "unavailable" };
+  /** Fixed codes only. Summary failures never change another status member. */
+  aiSummaryStatus: { enabled: boolean; warnings: (AiSummaryConfigWarning | SummaryWarningCode)[] };
 };
+
+/** One `status --json` provider row (P1-M10-T1). `kind` is the entry's transport (`cli`, `anthropic`,
+ *  `openai-compatible`), or `invalid` for an entry the resolver dropped; `until` and `failingSince` repeat the status's
+ *  own instants for a reader that does not switch on it. `revision` (PR 2 final harden round 3, M2) is the entry's
+ *  `entryRevision` — non-secret, the same value `provider key migrate` answers and `rowStatus` compares — on every
+ *  resolved entry's row, absent on an `invalid` row (a dropped entry has none). ADDITIVE. */
+export type ProviderRow = RowPosition & { label: string; kind: string; status: RowStatus; revision?: string; until?: string; failingSince?: string };
+
+/** Where a provider row sits (PR 1 final review round 3, M1), on the status and the doctor rows alike. `label` is
+ *  DISPLAY text and may be masked (`safeLabel`), so two rows can read the same, and a `duplicate-label` dropped row
+ *  reads its twin's label: a reader joins rows to config entries by `index`, never by `label`. `index` is the row's
+ *  0-based position in the combined list as written (item 1's logins, then `fallbacks` with each dropped entry in its
+ *  place) — the numbering `--index` uses; `fallbackIndex` is the entry's index in `fallbacks`, absent for item 1 and
+ *  for a whole-list drop (`fallbacks` not an array). ADDITIVE. */
+export type RowPosition = { index: number; source: "provider" | "fallback"; fallbackIndex?: number };
+
+/** A row's position fields, for the `index`-th item of `listOrder`. A dropped entry is always a `fallbacks` one. */
+function rowPosition(item: { entry: { source: "provider" | "fallback"; fallbackIndex?: number } } | { dropped: { index?: number } }, index: number): RowPosition {
+  const fallbackIndex = "dropped" in item ? item.dropped.index : item.entry.fallbackIndex;
+  const source = "dropped" in item ? "fallback" : item.entry.source;
+  return { index, source, ...(source === "fallback" && fallbackIndex !== undefined ? { fallbackIndex } : {}) };
+}
+
+
+/** A dropped entry's warning quotes config text: redacted and calendar-scrubbed like every other config echo here. */
+const safeWarning = (w: string): string => scrubCalendarLinks(redactCredentials(w));
+
+/** The marks the walk would read (`markFilter`, item 1's hour mark ignored), keyed by label. */
+function activeMarks(list: ProviderList, state: AccountState, now: Date): Map<string, { reason: MarkReason; until: string }> {
+  const item1 = list.entries[0]?.label ?? "";
+  return new Map(markFilter(list.entries, state, now, item1).skipped.map((s) => [s.entry.label, { reason: s.reason, until: s.until }]));
+}
+
+/** `status --json`'s provider rows. Read-only and never throws: a missing state reads as no marks, no observations. */
+async function providerRows(cfg: Config, now: Date): Promise<ProviderRow[]> {
+  try {
+    const list = resolveProviderList(cfg, homedir());
+    const state = await loadAccountState().catch((): AccountState => ({ accounts: {} }));
+    // The marks the walk reads (`activeMarks`, the one copy of that filter here — L8), in rowStatus' shape.
+    const marks = [...activeMarks(list, state, now)].map(([label, m]) => ({ entry: { label }, ...m }));
+    const status = await readProviderStatus();
+    return listOrder(list).map((item, i): ProviderRow => {
+      if ("dropped" in item) {
+        return { ...rowPosition(item, i), label: safeLabel(droppedLabel(item.dropped)), kind: "invalid", status: { kind: "invalid", reason: safeWarning(item.dropped.warning) } };
+      }
+      const e = item.entry;
+      const revision = entryRevision(e);
+      const row = rowStatus({ label: e.label, revision }, status?.labels[e.label], marks, now);
+      return {
+        // hub Q25 (2): the label as every report surface shows it — a key or a calendar link used as a label is masked.
+        ...rowPosition(item, i), label: safeLabel(e.label), kind: e.provider.api?.kind ?? "cli", status: row, revision,
+        ...("until" in row ? { until: row.until } : {}),
+        ...(row.kind === "not-working" ? { failingSince: row.since } : {}),
+      };
+    });
+  } catch { return []; }
+}
+
+/** `calendar status --json` without its `schemaVersion` — the block `status --json` and `doctor --json` carry. */
+export type CalendarStatusBlock = Omit<CalendarStatusJson, "schemaVersion">;
+
+/** The calendar block for a raw `calendar` config value, or `undefined` when there is none (absent ⇒ the field is
+ *  absent). Never throws. */
+async function calendarBlock(raw: unknown): Promise<CalendarStatusBlock | undefined> {
+  if (raw === undefined || raw === null) return undefined;
+  try {
+    const { schemaVersion: _v, ...block } = await calendarStatus(raw, supportDir());
+    return block;
+  } catch { return undefined; }
+}
 
 /** The heartbeat line's format, verbatim from `stampTick` (marker.ts:87). Kept as one shared regex
  *  literal rather than two spellings: a legacy line without `local=` must read as "no tick", exactly
@@ -452,7 +583,7 @@ export function parseTickLine(text: string): StatusReport["lastTick"] {
  * obvious one to reach for and it is the one trap in this surface: on an unreadable marker it
  * UNLINKS and REWRITES (marker.ts:212-218). A status call is polled; a polled repair is a write loop.
  */
-export async function statusReport(deps: { now?: () => Date } = {}): Promise<StatusReport> {
+export async function statusReport(deps: { now?: () => Date; readPageIdentity?: (pagePath: string) => Promise<PageIdentity | null> } = {}): Promise<StatusReport> {
   const now = deps.now?.() ?? new Date();
   const paths = statePaths();
 
@@ -463,7 +594,9 @@ export async function statusReport(deps: { now?: () => Date } = {}): Promise<Sta
     try { cfg = await loadConfig(); }
     // Redacted: a parse or validation error can quote the config's own text (the E11 rule — see
     // `validateCandidate`'s return).
-    catch (e) { configError = redactCredentials(e instanceof Error ? e.message : String(e)); }
+    // v0.3.0 calendar (spec r4 §4.2 "Never leaks"): then the calendar-scoped scrub for link-shaped strings — a
+    // calendar link pasted into the config is the likeliest mistake, and a parse error a few characters away quotes it.
+    catch (e) { configError = scrubCalendarLinks(redactCredentials(e instanceof Error ? e.message : String(e))); }
   }
 
   const floor = parseFloor(cfg?.morningTime);
@@ -472,6 +605,7 @@ export async function statusReport(deps: { now?: () => Date } = {}): Promise<Sta
   const archived = await readdir(briefingsDir()).catch(() => [] as string[]);
   const latestStat = await stat(paths.latestBriefingPath).catch(() => null);
   const logStat = await stat(paths.logPath).catch(() => null);
+  const lastRunDate = (await readLastRunDate()) ?? null;
 
   return {
     schemaVersion: JSON_SCHEMA_VERSION,
@@ -480,8 +614,10 @@ export async function statusReport(deps: { now?: () => Date } = {}): Promise<Sta
     paths,
     configExists,
     configError,
-    lastRunDate: (await readLastRunDate()) ?? null,
+    lastRunDate,
     lastSkip: (await readLastSkip()) ?? null,
+    lastFailure: (await readLastFailure()) ?? null,
+    providers: cfg ? await providerRows(cfg, now) : [],
     lastTick: parseTickLine(lastTickText),
     latestBriefingMtime: latestStat ? latestStat.mtime.toISOString() : null,
     archivedDates: archived
@@ -507,7 +643,37 @@ export async function statusReport(deps: { now?: () => Date } = {}): Promise<Sta
     },
     isPastFloor: isPastFloor(now, floor.minutes),
     updateCheck: await readUpdateCheckState().then((st) => (st === undefined ? null : publicResult(st)), () => null),
+    ...(await calendarBlock(cfg?.calendar).then((b) => (b === undefined ? {} : { calendar: b }))),
+    ...(await summaryStatus(cfg, paths, lastRunDate, deps.readPageIdentity ?? readPageIdentity)),
   };
+}
+
+/** One capped identity read and the store's capped no-follow read, with no card-membership read.
+ *  A failed summary read is ordinary absence, never a reason to lose the existing status report.
+ *  Keep even resolver failures inside this total catch, retaining the switch only if resolved. */
+async function summaryStatus(
+  cfg: Config | undefined, paths: StatePaths, lastRunDate: string | null,
+  identityReader: (pagePath: string) => Promise<PageIdentity | null>,
+): Promise<Pick<StatusReport, "latestSummaryRevision" | "aiSummaryStatus">> {
+  let enabled = false;
+  try {
+    const resolved = resolveAiSummary(cfg?.aiSummary);
+    enabled = resolved.enabled;
+    if (!enabled) return { aiSummaryStatus: { enabled, warnings: [...new Set(resolved.warnings)] } };
+    if (lastRunDate !== null) {
+      const identity = await identityReader(paths.latestBriefingPath);
+      if (identity !== null) {
+        const record = await readSummaryRecord(paths.briefingsDir, { pageDate: lastRunDate, ...identity }, null);
+        if (record !== null) {
+          return {
+            latestSummaryRevision: { pageHash: record.pageHash, pageVersion: record.pageVersion, revision: record.revision, state: record.state },
+            aiSummaryStatus: { enabled, warnings: [...new Set<AiSummaryConfigWarning | SummaryWarningCode>([...resolved.warnings, ...record.warnings])] },
+          };
+        }
+      }
+    }
+  } catch { /* Summary status is read-only and silent, including resolver/identity failures. */ }
+  return { aiSummaryStatus: { enabled, warnings: [] } };
 }
 
 // ── T4: `config validate --json` ────────────────────────────────────────────────────────────────
@@ -519,9 +685,39 @@ export type ConfigValidateReport = {
   valid: boolean;
   errors: FieldNote[];
   warnings: FieldNote[];
-  /** The config as the pipeline would see it (paths ~-expanded), or `null` when invalid. */
+  /** The config as the pipeline would see it (paths ~-expanded), or `null` when invalid. `fallbacks` is the RAW
+   *  input: its entries are normalized (and `~`-expanded) only by `resolveProviderList`, never here. */
   normalized: Config | null;
+  /** Provider fallback PR 2 (final harden round 1, B1), appended, always present: one row per entry the combined list
+   *  RESOLVED, in list order, with `index` its 0-based position in the list as written (each dropped entry keeps its
+   *  place and has no row — the numbering `--index` and the status rows use), and `testTimeoutMs` the bound the app's
+   *  `provider test` of that entry must allow (src/attemptBounds.ts `appTestTimeoutMs`), so the app never decides
+   *  "loopback" or the effective `timeoutMs` itself (integer ms). No label, no endpoint. `[]` when `validateConfig` threw,
+   *  and when `provider.accounts` is structurally broken (r2 L4: the engine's indexes are then not the written list's).
+   *  P3-M1-T0, appended and optional: `appOwnedKey: true` when the entry's key is one the app stores, by the engine's
+   *  own rule (`appKeyOwnership`, src/providerList.ts — `isAppOwnedKey`'s one decision), and `appKeyId` the app key id
+   *  its reference names (lowercase), when one id can be named; both absent for a key the app does not own and for a CLI
+   *  entry. The app's `entries_referencing_key` and its uninstall refusal read these through `config validate --file`.
+   *  P3-M4-T1 follow-up, appended, always present on a row: `loopback`, the entry's `ListEntry.isLoopback` — the same
+   *  decision `testTimeoutMs` is computed from (`isLoopbackHost` on an API entry's endpoint host; `false` for every CLI
+   *  entry and for an API entry with no usable endpoint) — so the app's network-check prompt asks only for a remote
+   *  entry without deciding "loopback" itself.
+   *  Follow-up 4 (2026-10-19), always present on a row: `keyOptional`, true when the entry needs NO key at all — the
+   *  engine's one no-key rule (src/providers/endpoint.ts `keyOptional`: an `openai-compatible` entry at a loopback host;
+   *  `false` for every other kind, for a remote or missing endpoint and for every CLI entry) — so the app's Add takes a
+   *  keyless local model without deciding the kind or the host itself.
+   *  P3-M4-T2 checkpoint, appended, always present on a row: `keyMoved`, true when the entry's api block's `apiKeyEnv`
+   *  is PR 2's scrub sentinel (`KEY_MOVED_ENV`, src/providerCli.ts — a variable nothing sets, left where a literal key
+   *  was removed from `config.json.bak`); `false` for every CLI entry. The app's "key moved — add a key" row status
+   *  reads it, so the app never names the sentinel itself. */
+  providers: { index: number; testTimeoutMs: number; loopback: boolean; keyOptional: boolean; keyMoved: boolean; appOwnedKey?: true; appKeyId?: string }[];
 };
+
+/** P3-M4-T2 checkpoint: the scrub sentinel, read from its ONE definition (src/providerCli.ts `KEY_MOVED_ENV`) when a
+ *  row is built. ⚠ A deferred `require`, not a static import: this module is on every run's static import graph
+ *  (src/main.ts imports it), while src/providerCli.ts — and the key store under it — is imported DYNAMICALLY there, for
+ *  the `schedule` reason (main.ts `dispatch` deps). A static edge here would load both into every `daily-briefing run`. */
+const keyMovedEnv = (): string => (require("./providerCli") as typeof import("./providerCli")).KEY_MOVED_ENV;
 
 /** `validateConfig` throws `config error: "<field>" must be …`; recover the field name for a form
  *  that wants to highlight one input. Best-effort by construction — a message with no quoted field
@@ -538,15 +734,62 @@ function fieldOf(message: string): string {
  * from the same `parseFloor` / `resolveTranscripts` / `resolveProbeHosts` / `compileExcludePatterns`
  * / `resolveAccounts` helpers the pipeline reads them from, for the same reason.
  *
- * ⚠ ERRORS IS AT MOST ONE ENTRY, and that is a property of `validateConfig`, not a simplification
- * here: it THROWS on the first problem it finds. Reporting an array anyway keeps the shape stable if
- * it ever accumulates, and keeps the GUI from having to special-case one-vs-many.
+ * ⚠ ERRORS: `validateConfig` THROWS on the first problem it finds (one entry), a literal calendar `url`
+ * adds its own (v0.3.0 fix-round 1, below), and each `fallbacks` entry the run would drop adds one
+ * (provider fallback P1-M2-T3). Reporting an array keeps the shape stable and keeps the GUI from having
+ * to special-case one-vs-many.
  */
 export function validateCandidate(
   raw: unknown,
   home: string = homedir(),
   env: Record<string, string | undefined> = process.env,
 ): ConfigValidateReport {
+  // ⚠ The SYNC ownership runner (`appKeyOwnership`): in-process callers only (tests). `config validate` itself runs
+  // `validateCandidateBounded` below — the same report, its ownership rows on the async shell under a deadline.
+  const full = validateCandidateFull(raw, home, env);
+  return withKeyOwnership(full.report, full.rowEntries.map((e) => appKeyOwnership(e)));
+}
+
+/**
+ * `validateCandidate` as `config validate --json` runs it (P3-M1-T1 checkpoint MED): every field the same, and the
+ * `providers` rows' `appOwnedKey` / `appKeyId` decided by the same rule on the ASYNC shell under one total deadline
+ * (`appKeyOwnershipBounded`, `KEY_OWNERSHIP_REPORT_DEADLINE_MS` = 2 s), so a user's own `apiKeyFile` on a stalled mount
+ * cannot hold the app's save path (its 30 s bound on this command) — a row not decided in time is `appOwnedKey: true`
+ * with no `appKeyId` (fail closed). ⚠ The plain-`http:` ERROR above keeps its SYNC check (`appKeyOverCleartext`, the
+ * run's own composition — B5): only a plain-http non-loopback entry with an `apiKeyFile` reaches it, as before P3-M1-T0.
+ * `opts` is injected only by tests.
+ */
+export async function validateCandidateBounded(
+  raw: unknown,
+  home: string = homedir(),
+  env: Record<string, string | undefined> = process.env,
+  opts: Parameters<typeof appKeyOwnershipBounded>[1] = {},
+): Promise<ConfigValidateReport> {
+  const full = validateCandidateFull(raw, home, env);
+  return withKeyOwnership(full.report, await appKeyOwnershipBounded(full.rowEntries, opts));
+}
+
+/** The report with each `providers` row's ownership fields appended (P3-M1-T0): `appOwnedKey: true` when owned, and
+ *  `appKeyId` beside it when one id is named. `owns[i]` answers for `providers[i]`. */
+function withKeyOwnership(report: ConfigValidateReport, owns: readonly KeyOwnership[]): ConfigValidateReport {
+  return {
+    ...report,
+    providers: report.providers.map((row, i) => {
+      const key = owns[i]!;
+      return { ...row, ...(key.owned ? { appOwnedKey: true as const, ...(key.id !== undefined ? { appKeyId: key.id } : {}) } : {}) };
+    }),
+  };
+}
+
+/** `validateCandidate`, plus the validated config even when the REPORT is invalid for a reason `validateConfig`
+ *  does not throw on — a literal calendar `url`, a `fallbacks` entry the run would drop, an unusable
+ *  `provider.label` — for `doctor`, which prints no `normalized` and still diagnoses the rest of a config the run
+ *  itself accepts (the run skips or defaults each of those and warns). `config` is null exactly when
+ *  `validateConfig` threw. The `providers` rows carry NO ownership fields here — `rowEntries[i]` is row i's entry, for
+ *  the caller to judge (`withKeyOwnership`); doctor prints no rows, so it pays no ownership walk for them. */
+function validateCandidateFull(
+  raw: unknown, home: string, env: Record<string, string | undefined>,
+): { report: ConfigValidateReport; config: Config | null; rowEntries: ListEntry[] } {
   let normalized: Config | null = null;
   const errors: FieldNote[] = [];
   try {
@@ -555,8 +798,16 @@ export function validateCandidate(
     const message = e instanceof Error ? e.message : String(e);
     errors.push({ field: fieldOf(message), message });
   }
+  // v0.3.0 calendar, fix-round 1: a literal calendar `url` (any case, anywhere in the block) is an ERROR, not the
+  // run's skip-and-warn — a candidate that validated would be written to config.json by the desktop's generic save.
+  // `normalized` is withheld (null, as for every invalid candidate — the warnings below are still read from it) and
+  // every note passes the link scrub, so the address appears in no part of this report.
+  const literalCalendarUrl = typeof raw === "object" && raw !== null && calendarBlockHasLiteralUrl((raw as { calendar?: unknown }).calendar);
+  if (literalCalendarUrl) errors.push({ field: "calendar", message: CALENDAR_LITERAL_URL_ERROR });
 
   const warnings: FieldNote[] = [];
+  const providers: ConfigValidateReport["providers"] = [];
+  const rowEntries: ListEntry[] = [];
   if (normalized) {
     const floor = parseFloor(normalized.morningTime);
     if (floor.warning) warnings.push({ field: "morningTime", message: floor.warning });
@@ -570,6 +821,67 @@ export function validateCandidate(
     }
     for (const w of resolveAccounts(normalized.provider?.accounts, home, env).warnings) {
       warnings.push({ field: "provider.accounts", message: w });
+    }
+    // Provider fallback (P1-M2-T3). The combined list's own resolver, the one the run reads. Every entry it
+    // DROPS at runtime is an ERROR here, naming the entry, so the app never saves a list the engine would
+    // run shorter than it shows. `provider.label` beside a resolving `accounts` is a warning. The accounts
+    // warnings are not repeated (the line above reports them); a broken `provider` threw above.
+    const list = resolveProviderList(normalized, home, env);
+    // No rows under a structurally broken `provider.accounts` (r2 L4): the engine then runs item 1 as ONE implicit entry,
+    // so these indexes would be shifted from the written list's — the numbering the rows promise — and `--index`
+    // refuses such a config anyway (src/providerCli.ts `resolveIndex`).
+    if (!list.accountsBroken) {
+      for (const [index, item] of listOrder(list).entries()) {
+        if (!("entry" in item)) continue;
+        // P3-M1-T0: the key's ownership and id are appended by the caller (`withKeyOwnership`), by the engine's one rule —
+        // the app never matches reference shapes itself.
+        // P3-M4-T1 follow-up: `loopback` is the very `isLoopback` the bound above was computed from — one decision, two fields.
+        // P3-M4-T2 checkpoint: `keyMoved` reads the resolved entry's own api block (`ListEntry.provider.api`), never the text.
+        providers.push({
+          index,
+          testTimeoutMs: appTestTimeoutMs(item.entry),
+          loopback: item.entry.isLoopback,
+          keyOptional: item.entry.provider.api !== undefined && keyOptional(item.entry.provider.api),
+          keyMoved: item.entry.provider.api?.apiKeyEnv === keyMovedEnv(),
+        });
+        rowEntries.push(item.entry);
+      }
+    }
+    // `safeWarning`, the status rows' own scrub (PR 1 final review round 3, L6): a drop warning can quote a config value.
+    for (const d of list.dropped) errors.push({ field: d.index === undefined ? "fallbacks" : `fallbacks[${d.index}]`, message: safeWarning(d.warning) });
+    // hub Q25 (3): a label that is (or holds) a key, a calendar link or control characters is shown masked on every
+    // report surface. A WARNING, never an error — two-login `accounts` labels exist today, and an error would drop
+    // them (requirement 9). Named by POSITION; the label itself is never echoed.
+    // Item 1's entries are its logins exactly when every configured login resolved (a broken list falls back to the
+    // implicit entry), so a login is named by its index in `provider.accounts`, else item 1 by `provider.label`.
+    const accountsLen = Array.isArray(normalized.provider?.accounts) ? normalized.provider.accounts.length : 0;
+    const loginsInUse = accountsLen > 0 && list.entries.filter((x) => x.source === "provider").length === accountsLen;
+    list.entries.forEach((e, i) => {
+      if (safeLabel(e.label) === e.label) return;
+      const field = e.source === "fallback" ? `fallbacks[${e.fallbackIndex}]` : loginsInUse ? `provider.accounts[${i}]` : "provider.label";
+      warnings.push({ field, message: "the label looks like a key or a calendar link, or holds control characters — reports show it masked; give this provider a plain name" });
+    });
+    // P2-M5-T2 (spec r9 §6): an app-owned key (`isAppOwnedKey`) over a non-loopback `http:` endpoint
+    // (`cleartextRemote`) is an ERROR here — the same two predicates, in the same order, as the run's
+    // `insecureEndpoint` (src/core.ts), through their one composition (`appKeyOverCleartext`, src/providerList.ts —
+    // B5), and the endpoint predicate `key migrate`'s refusal uses (src/providerCli.ts), so the three cannot drift
+    // (hub, P2-M3-T1 checkpoint (3)). VALIDATE-ONLY, never in
+    // `validateConfig`: a hand edit must not become a whole-config `config-error`; the run refuses that one entry.
+    // The endpoint first, so only a plain-http entry pays the SYNC ownership stat HERE (the `providers` rows judge every
+    // `apiKeyFile` entry — P3-M1-T0 — on the async shell under a deadline in `config validate`: `validateCandidateBounded`).
+    // Named by position and the masked label,
+    // as the drop errors are; the host is not echoed. "is, or may be" (P2-M5-T4 checkpoint LOW 2): `isAppOwnedKey` fails
+    // closed when its walk of keys/ cannot complete, so a user's own `apiKeyFile` can land here too.
+    list.entries.forEach((e) => {
+      if (appKeyOverCleartext(e) === undefined) return;            // the one composition (B5), as the run's refusal
+      const field = e.source === "fallback" ? `fallbacks[${e.fallbackIndex}].api.baseUrl` : "provider.api.baseUrl";
+      errors.push({ field, message: `${JSON.stringify(safeLabel(e.label))}: its key is, or may be, one the app stores, which is never sent over plain http to another machine — switch this baseUrl to https` });
+    });
+    // An unusable `provider.label` is an ERROR here (the run warns and uses "default"), so the app never saves a
+    // label it would read differently; one ignored beside `accounts` stays a warning.
+    for (const w of list.warnings) {
+      if (w === PROVIDER_LABEL_INVALID) errors.push({ field: "provider.label", message: w });
+      else if (w.startsWith('config: "provider.label"')) warnings.push({ field: "provider.label", message: w });
     }
     // Slice 4 T7. Read from `resolveNotify` — the same function the delivery path reads it from —
     // for the same reason every other line in this block does: a Settings screen must be told what
@@ -586,9 +898,12 @@ export function validateCandidate(
     // block is ever surfaced: no run reports it, by design (src/updateCheck.ts's header).
     const updateCheck = resolveUpdateCheck(normalized.updateCheck);
     if (updateCheck.warning) warnings.push({ field: "updateCheck", message: updateCheck.warning });
+    // v0.3.0 calendar (spec r4 §2). Its own resolver, for the same reason; every warning is fixed text that never
+    // quotes a configured value (a link's address is a secret).
+    for (const w of resolveCalendar(normalized.calendar).warnings) warnings.push({ field: "calendar", message: w });
   }
 
-  return {
+  const report: ConfigValidateReport = {
     schemaVersion: JSON_SCHEMA_VERSION,
     valid: errors.length === 0,
     // ⚠ REDACTED HERE, the one place every FieldNote leaves through: `config validate --json` prints
@@ -597,10 +912,18 @@ export function validateCandidate(
     // error quoting what it got), and the run envelope already redacts the same strings (E1) — so the
     // read-only surfaces were the raw copy. `normalized` is NOT touched: it is the caller's own config
     // handed back to the caller, which a Settings screen writes.
-    errors: errors.map(redactNote),
-    warnings: warnings.map(redactNote),
-    normalized,
+    errors: errors.map(redactNote).map((n) => (literalCalendarUrl ? scrubNote(n) : n)),
+    warnings: warnings.map(redactNote).map((n) => (literalCalendarUrl ? scrubNote(n) : n)),
+    // Withheld whenever the report is invalid, as the type says — a dropped fallback included.
+    normalized: literalCalendarUrl || errors.length > 0 ? null : normalized,
+    providers,
   };
+  return { report, config: normalized, rowEntries };
+}
+
+/** A FieldNote with the calendar link scrub applied (a literal calendar `url` was found in the candidate). */
+function scrubNote(n: FieldNote): FieldNote {
+  return { field: scrubCalendarLinks(n.field), message: scrubCalendarLinks(n.message) };
 }
 
 /** A FieldNote with the shared redaction applied to both strings (the output-boundary rule above). */
@@ -674,7 +997,20 @@ export type DoctorReport = {
   };
   network: { hostsConfigured: number; enabled: boolean; reachable: boolean; waitedMs: number };
   power: { fullyAwake: boolean };
+  /** Provider fallback (P1-M10-T1, Q8): one row per combined-list entry and per dropped entry, in list order — the
+   *  entry's transport, its key SOURCE for an API entry (resolved read-only, `skipCommand: true`: a key command is
+   *  never run), and the mark the walk would read (`markFilter`), or `null`. ADDITIVE. */
+  providers: (RowPosition & {
+    label: string; kind: string;
+    keySource?: { source: string; found: boolean | null; detail: string | null; executed?: false };
+    mark: { reason: MarkReason; until: string } | null;
+  })[];
   verdict: "ready" | "blocked" | "degraded";
+  /** v0.3.0 calendar: the same block as `status --json`'s — configuration and each source's last scheduled read.
+   *  ADDITIVE-OPTIONAL, present only with a `calendar` block in a valid config. Doctor makes NO calendar network
+   *  call and never prompts (spec r4 §3). A source's last read never moves the verdict; a calendar CONFIG warning
+   *  counts toward `degraded` like every other config warning (it is in `config.warnings`, field "calendar"). */
+  calendar?: CalendarStatusBlock;
 };
 
 export const DOCTOR_WALK_MS = 20_000;
@@ -737,10 +1073,13 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
     try { raw = await Bun.file(configPath()).json(); }
     catch (e) { readError = e instanceof Error ? e.message : String(e); }
   }
-  const check: ConfigValidateReport = readError === undefined
-    ? validateCandidate(raw)
-    : { schemaVersion: JSON_SCHEMA_VERSION, valid: false, errors: [redactNote({ field: "", message: readError })], warnings: [], normalized: null };
-  const cfg = check.normalized;
+  const full = readError === undefined
+    ? validateCandidateFull(raw, homedir(), process.env)
+    : { report: { schemaVersion: JSON_SCHEMA_VERSION, valid: false, errors: [redactNote({ field: "", message: readError })], warnings: [], normalized: null, providers: [] } as ConfigValidateReport, config: null };
+  const check = full.report;
+  // The validated config, not `check.normalized`: a literal calendar `url` makes the report invalid (so no
+  // Settings save stores it) while the run accepts the config, and doctor diagnoses what the run would do.
+  const cfg = full.config;
 
   let repos: DoctorReport["repos"] = [];
   let discoveredCount = 0;
@@ -864,14 +1203,15 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
     notes.push(`\`${cli}\` is an API provider — there is no CLI process to harden, so no isolation flags are injected`);
     // ⚠ MIRRORS THE TRANSPORT'S OWN RULE rather than restating it loosely: a LOOPBACK
     // openai-compatible endpoint (Ollama, LM Studio, a local vLLM) needs no key at all, and
-    // `OpenAiCompatibleProvider` only refuses a missing key for a non-loopback host. Reporting an
+    // `OpenAiCompatibleProvider` only refuses a missing key for a non-loopback host — one predicate,
+    // `keyOptional` (src/providers/endpoint.ts), shared with that transport and the key ladder. Reporting an
     // anomaly here for a correct local setup would make `doctor` disagree with the run it describes —
     // and it would read as a fault the user has to fix. Caught by test/api-surfaces.test.ts, not by
     // reading.
-    const keyOptional = apiCfg.kind === "openai-compatible" && endpoint !== undefined && isLoopbackHost(endpoint.hostname);
+    const noKeyNeeded = keyOptional(apiCfg);
     // ⚠ `key.executed === false` is NOT "no key". Rung 3 was deliberately not run (see `skipCommand`
     // above), so claiming the run would fail permanently would be a diagnosis of something never tested.
-    if (key.key === undefined && key.executed !== false && !keyOptional) anomalies.push("no API key resolved from provider.api's configured sources — the run would fail permanently");
+    if (key.key === undefined && key.executed !== false && !noKeyNeeded) anomalies.push("no API key resolved from provider.api's configured sources — the run would fail permanently");
     if (key.executed === false) notes.push(`provider.api.apiKeyCommand (\`${key.detail}\`) is configured; \`doctor\` does not run it — this check is read-only, so the key's availability is unverified here`);
     if (endpoint === undefined) anomalies.push("provider.api.baseUrl is missing or unparseable, so the endpoint could not be determined");
     else if (endpoint.protocol === "http:" && !isLoopbackHost(endpoint.hostname)) {
@@ -893,10 +1233,13 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
   // ── network: ONE probe, never the gate's polling loop (doctor reports, it does not wait for a morning).
   // A3-D/T9: the SAME derivation the run uses, so doctor reports the gate the morning would actually
   // apply — a loopback API endpoint shows `enabled: false` rather than two unreachable anycast hosts.
-  const { hosts } = resolveProbeHosts(
-    cfg?.networkProbeHosts,
-    (apiCfg !== undefined ? deriveProbeHosts(apiCfg) : undefined) ?? DEFAULT_NETWORK_PROBE_HOSTS,
-  );
+  // PR 1 final review round 1 (M10): the WALK's derivation over the combined list (`walkProbeHosts`) — for a single
+  // entry it is exactly the old item-1 derivation, by construction; for two or more it adds each remote API entry.
+  // The combined list, resolved ONCE for the probe set, the provider rows and the verdict (round 4 L7).
+  const providerList = cfg ? resolveProviderList(cfg, homedir(), process.env) : undefined;
+  const { hosts } = cfg && providerList
+    ? walkProbeHosts(cfg, providerList)
+    : resolveProbeHosts(undefined, DEFAULT_NETWORK_PROBE_HOSTS);
   const enabled = hosts.length > 0;
   const netStart = Date.now();
   // An EMPTY host list is the documented "skip the gate" switch (net.ts:29), so it is reported as
@@ -909,9 +1252,39 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
   // `anyInaccessible` is the pre-v0.2.1 rule, unchanged: ANY inaccessible path, incidental ones included.
   // `searchFolderBlocked` adds only what it misses — a MISSING configured search folder with no repo found.
   const anyInaccessible = repos.some((r) => r.issueKind !== null && isInaccessible({ path: r.path, kind: r.issueKind }));
+  // ── providers (P1-M10-T1): every entry's key source and mark, read-only.
+  const providers: DoctorReport["providers"] = [];
+  if (providerList) {
+    try {
+      const list = providerList;
+      const marks = activeMarks(list, await loadAccountState().catch((): AccountState => ({ accounts: {} })), new Date());
+      for (const [i, item] of listOrder(list).entries()) {
+        if ("dropped" in item) { providers.push({ ...rowPosition(item, i), label: safeLabel(droppedLabel(item.dropped)), kind: "invalid", mark: null }); continue; }
+        const e = item.entry;
+        const api = e.provider.api;
+        let keySource: DoctorReport["providers"][number]["keySource"];
+        if (api !== undefined) {
+          const k = await resolveApiKey(api, process.env, { skipCommand: true });   // ⚠ never spawns (see above)
+          keySource = { source: k.source, found: k.executed === false ? null : k.key !== undefined, detail: k.detail ?? null, ...(k.executed === false ? { executed: false as const } : {}) };
+        }
+        providers.push({ ...rowPosition(item, i), label: safeLabel(e.label), kind: api?.kind ?? "cli", ...(keySource ? { keySource } : {}), mark: marks.get(e.label) ?? null });
+      }
+    } catch { /* a provider list that cannot be read reports no rows; the config block above says why */ }
+  }
+  // Provider fallback (P1-M10-T1, the decision deferred from P1-M2): a config whose ONLY errors are dropped fallbacks
+  // is `degraded`, not `blocked` — the run drops them with a warning and still delivers from item 1, and doctor
+  // diagnoses what the run would do. `config validate` still reports them as errors, so the app never saves them.
+  // …unless item 1 itself has a known fatal setup error (M11): an openai-compatible item 1 without a usable
+  // `baseUrl` throws on every call (providers/openaiCompatible.ts), so nothing would deliver.
+  // …and only when NO valid fallback survives (round 2 L4): with one left, the walk moves on from item 1's failure.
+  const validFallback = providerList !== undefined && providerList.entries.some((e) => e.source === "fallback");
+  const item1Fatal = apiCfg !== undefined && endpointUrl(apiCfg) === undefined && !validFallback;
+  const fallbackOnlyErrors = check.errors.length > 0 && cfg !== null && !item1Fatal
+    && check.errors.every((e) => e.field === "fallbacks" || e.field.startsWith("fallbacks["));
+  const configBlocks = !check.valid && !fallbackOnlyErrors;
   const verdict: DoctorReport["verdict"] =
-    !check.valid || !found || anyInaccessible || searchFolderBlocked ? "blocked"
-    : anomalies.length > 0 || check.warnings.length > 0 || (enabled && !reachable) || !fullyAwake || reposTimedOut ? "degraded"
+    configBlocks || !found || anyInaccessible || searchFolderBlocked ? "blocked"
+    : fallbackOnlyErrors || anomalies.length > 0 || check.warnings.length > 0 || (enabled && !reachable) || !fullyAwake || reposTimedOut ? "degraded"
     : "ready";
 
   return {
@@ -924,6 +1297,8 @@ export async function doctorReport(deps: DoctorDeps = {}): Promise<DoctorReport>
     provider: { cli, found, path: providerPath, hardeningAvailable, flags, anomalies, ...(notes.length ? { notes } : {}), ...(apiReport ? { api: apiReport } : {}) },
     network: { hostsConfigured: hosts.length, enabled, reachable, waitedMs },
     power: { fullyAwake },
+    providers,
     verdict,
+    ...(await calendarBlock(cfg?.calendar).then((b) => (b === undefined ? {} : { calendar: b }))),
   };
 }

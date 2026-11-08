@@ -338,3 +338,11 @@ test("⚠ a NON-FINITE whenMs on a CITED item is skipped too — the other half 
   expect(found[0]!.rule).toBe("resume-stale");
   expect(found[0]!.detail).toContain("the newest real commit");
 });
+
+
+test("DONE subject clipping backs up before a credential crossing 200 and preserves raw intact subjects", () => {
+  const raw = "fix https://user:SECRETMARK" + "p".repeat(250) + "@host/repo";
+  expect(doneSubjectAsShown(raw)).toBe("fix https://");
+  const intact = "fix https://user:SECRETMARK@host/repo";
+  expect(doneSubjectAsShown(intact)).toBe(intact);
+});

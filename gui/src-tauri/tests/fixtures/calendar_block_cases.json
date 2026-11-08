@@ -1,0 +1,937 @@
+{
+  "comment": "Shared by gui/src-tauri/tests/calendar.rs (check_calendar_block) and gui/tests-web/calendar.check.ts (the engine's resolveCalendar). accept: the app writes it AND the engine resolves it with no malformation and every link kept. refuse: the app refuses it with `kind`; `engine` is what the resolver does with the same block - `off` (malformed: calendar switched off) or `skip` (the link carrying `url` is skipped, the rest stands; the app is stricter by design).",
+  "accept": [
+    {
+      "enabled": true,
+      "emails": [
+        "me@example.com",
+        "  Me@Work.Example  "
+      ],
+      "macos": {
+        "calendars": [
+          {
+            "id": "X",
+            "title": "webcal://named-after-its-feed",
+            "account": "iCloud"
+          }
+        ]
+      },
+      "links": [
+        {
+          "id": "work",
+          "name": "Work (Outlook)",
+          "owner": "me@work.example"
+        },
+        {
+          "id": "home",
+          "urlCommand": [
+            "op",
+            "read",
+            "op://vault/cal/url"
+          ],
+          "confirmedOwner": "me@personal.example"
+        },
+        {
+          "id": "team",
+          "urlEnv": "TEAM_CAL_URL"
+        },
+        {
+          "id": "nulls",
+          "name": null,
+          "owner": null,
+          "confirmedOwner": null,
+          "urlEnv": null,
+          "urlCommand": [
+            "pass",
+            "cal"
+          ]
+        }
+      ]
+    },
+    {},
+    {
+      "enabled": false
+    },
+    {
+      "enabled": null,
+      "emails": null,
+      "macos": null,
+      "links": null
+    },
+    {
+      "macos": {
+        "calendars": "editable"
+      }
+    },
+    {
+      "macos": {
+        "calendars": "all"
+      }
+    },
+    {
+      "macos": {}
+    },
+    {
+      "links": []
+    },
+    {
+      "links": [
+        {
+          "id": "pass-host",
+          "urlCommand": [
+            "pass",
+            "show",
+            "web/calendar.google.com/me"
+          ]
+        },
+        {
+          "id": "op-ref",
+          "urlCommand": [
+            "OP",
+            "read",
+            "op://Private/calendar/url"
+          ]
+        }
+      ]
+    },
+    {
+      "links": [
+        {
+          "id": "pass-ics",
+          "urlCommand": [
+            "pass",
+            "show",
+            "calendar/work.ics"
+          ]
+        },
+        {
+          "id": "bare-ics",
+          "urlCommand": [
+            "cat",
+            "/feeds/basic.ICS"
+          ]
+        },
+        {
+          "id": "port-host",
+          "urlCommand": [
+            "pass",
+            "show",
+            "web/calendar.example.invalid:8443/me"
+          ]
+        }
+      ]
+    }
+  ],
+  "refuse": [
+    {
+      "block": [],
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": "calendar",
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "enable": true
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "enabled": "yes"
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "emails": "me@example.com"
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "emails": [
+          "not an address"
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "emails": [
+          7
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "macos": "editable"
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "macos": {
+          "calendars": "some"
+        }
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "macos": {
+          "calendars": "editable",
+          "extra": 1
+        }
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "macos": {
+          "calendars": [
+            {
+              "id": " ",
+              "title": "t",
+              "account": "a"
+            }
+          ]
+        }
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "macos": {
+          "calendars": [
+            {
+              "id": "x",
+              "title": "t"
+            }
+          ]
+        }
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "macos": {
+          "calendars": [
+            {
+              "id": "x",
+              "title": "t",
+              "account": "a",
+              "colour": "red"
+            }
+          ]
+        }
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": {
+          "id": "work"
+        }
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          "work"
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "someFutureField": true
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlenv": "X"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "name": ""
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "name": " \ufeff "
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "name": "two\nlines"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "name": "a\u2028b"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "name": 7
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "owner": "not-an-address"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "confirmedOwner": true
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlEnv": "1BAD"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlEnv": "HAS-DASH"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": "pass show cal"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": []
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "pass",
+              ""
+            ]
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlEnv": "CAL",
+            "urlCommand": [
+              "pass",
+              "cal"
+            ]
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "url": "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "url": "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "skip"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "URL": "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "macos": {
+          "deep": [
+            {
+              "Url": "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+            }
+          ]
+        }
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "name": "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "owner": "webcal://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "confirmedOwner": "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "emails": [
+          "me@example.com",
+          "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "l0"
+          },
+          {
+            "id": "l1"
+          },
+          {
+            "id": "l2"
+          },
+          {
+            "id": "l3"
+          },
+          {
+            "id": "l4"
+          },
+          {
+            "id": "l5"
+          },
+          {
+            "id": "l6"
+          },
+          {
+            "id": "l7"
+          },
+          {
+            "id": "l8"
+          },
+          {
+            "id": "l9"
+          },
+          {
+            "id": "l10"
+          }
+        ]
+      },
+      "kind": "tooManyLinks",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "name": "no id"
+          }
+        ]
+      },
+      "kind": "invalidId",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": null
+          }
+        ]
+      },
+      "kind": "invalidId",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": 7
+          }
+        ]
+      },
+      "kind": "invalidId",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+          }
+        ]
+      },
+      "kind": "invalidId",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "Work"
+          }
+        ]
+      },
+      "kind": "invalidId",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "macos"
+          }
+        ]
+      },
+      "kind": "invalidId",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work"
+          },
+          {
+            "id": "home"
+          },
+          {
+            "id": "work"
+          }
+        ]
+      },
+      "kind": "duplicateId",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "echo",
+              "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "printf",
+              "%s",
+              "webcal:\\/\\/calendar.example.invalid\\/private-SENTINEL-c4l-0000"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "curl",
+              "-s",
+              "HTTPS%3A%2F%2Fcalendar.example.invalid%2Fprivate-SENTINEL-c4l-0000"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "curl",
+              "-s",
+              "calendar.example.invalid/feeds/private-SENTINEL-c4l-0000/basic.ICS"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "curl",
+              "-s",
+              "calendar.example.invalid%2Ffeeds%2Fprivate-SENTINEL-c4l-0000%2Fbasic.ics"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "op",
+              "read",
+              "op://v/item/https://calendar.example.invalid/private-SENTINEL-c4l-0000"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "sh",
+              "-c",
+              "printf ftp://calendar.example.invalid/private-SENTINEL-c4l-0000"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "macos": {
+          "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics": [
+            {
+              "url": 1
+            }
+          ]
+        }
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "https://calendar.example.invalid/ical/me%40example.com/private-SENTINEL-c4l-0000/basic.ics": {
+              "Url": "x"
+            }
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "emails": [
+          "me\u200b@example.com"
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "emails": [
+          "me@exam\u2060ple.com"
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "owner": "me\u00ad@work.example"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "confirmedOwner": "me@work.example\udb40\udc41"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "owner": "\u202eme@work.example"
+          }
+        ]
+      },
+      "kind": "invalidBlock",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "echo",
+              "https:\\\\calendar.example.invalid\\private-SENTINEL-c4l-0000\\basic.ics"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "echo",
+              "webcal:/\\calendar.example.invalid/private-SENTINEL-c4l-0000"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "urlCommand": [
+              "curl",
+              "HTTPS%3A%5C%5Ccalendar.example.invalid%5Cprivate-SENTINEL-c4l-0000"
+            ]
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "name": "https:\\\\calendar.example.invalid\\private-SENTINEL-c4l-0000\\basic.ics"
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "links": [
+          {
+            "id": "work",
+            "owner": "https:\\\\calendar.example.invalid\\private-SENTINEL-c4l-0000\\basic.ics"
+          }
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    },
+    {
+      "block": {
+        "emails": [
+          "me@example.com",
+          "https:\\\\calendar.example.invalid\\private-SENTINEL-c4l-0000\\basic.ics"
+        ]
+      },
+      "kind": "urlInConfig",
+      "engine": "off"
+    }
+  ]
+}

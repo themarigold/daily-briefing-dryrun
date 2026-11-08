@@ -1,6 +1,6 @@
 //! What the webview may ask the Rust shell to do — asserted THROUGH Tauri's permission layer, not
 //! against a second copy of the rules — and what each granted command then DOES, asserted by
-//! driving all ten ENGINE commands through real IPC against a fake sidecar (the shell, B5 and B6
+//! driving every ENGINE command (twenty since provider fallback PR 3) through real IPC against a fake sidecar (the shell, B5 and B6
 //! commands are driven here too, and in `shell.rs`, `briefing_files.rs` and `config_save.rs`).
 //!
 //! ## What replaced what (B1 → T8), because this file used to say the opposite
@@ -32,7 +32,7 @@
 //!   * **Behavioural, through real `get_ipc_response` calls against an app built from
 //!     `tauri::generate_context!()` and `daily_briefing_gui_lib::handler()` — the same context and
 //!     the same handler `run()` ships.** Refusals: the shell plugin's commands (absent, so refused);
-//!     an engine command name that is not granted. Admissions: **all ten commands, each driven
+//!     an engine command name that is not granted. Admissions: **every engine command, each driven
 //!     with VALID arguments into a fake sidecar managed as the app's `Engine` state**, asserting
 //!     the response is `Ok` AND the argv the fake received is the literal the engine's grammar
 //!     expects. Every command body is therefore EXECUTED, not merely reached — a mutation that
@@ -62,7 +62,7 @@ mod common;
 use tauri::ipc::{CallbackFn, InvokeBody, InvokeResponseBody};
 use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
-use tauri::{App, WebviewWindow, WebviewWindowBuilder};
+use tauri::{App, Manager, WebviewWindow, WebviewWindowBuilder};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -70,16 +70,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{
-    appending_ipc_sidecar, ipc_sidecar, platform_config_siblings_on_disk, RecordingAutostartSink,
-    RecordingNotifySink, RecordingOpener, ScratchDir,
+    appending_ipc_sidecar, files_sidecar, ipc_sidecar, platform_config_siblings_on_disk,
+    RecordingAutostartSink, RecordingNotifySink, RecordingOpener, ScratchDir,
 };
-use daily_briefing_gui_lib::access::AccessState;
+use daily_briefing_gui_lib::access::{AccessState, OpenSink};
+use daily_briefing_gui_lib::actions::{ActionsState, ClipboardSink};
 use daily_briefing_gui_lib::all_commands;
+use daily_briefing_gui_lib::app_prefs::{AppPrefs, FIRST_NAME_TOO_LONG};
 use daily_briefing_gui_lib::autostart::{read_record, AutostartRecord, AutostartState};
+use daily_briefing_gui_lib::briefing_files::read_latest_briefing_at;
+use daily_briefing_gui_lib::calendar_details::{CalendarAppSink, CalendarDetails};
 use daily_briefing_gui_lib::cli_shim::CliShimState;
 use daily_briefing_gui_lib::config_save::ConfigSaver;
+use daily_briefing_gui_lib::editor::{EditorDetector, EditorSink, EditorState};
 use daily_briefing_gui_lib::engine::{Engine, EngineClient, EngineError};
+use daily_briefing_gui_lib::live_gate::{LiveEnv, Visibility};
 use daily_briefing_gui_lib::notifications::NotifyState;
+use daily_briefing_gui_lib::pending_resets::{read_records, PendingResets};
+use daily_briefing_gui_lib::repos::ReposLive;
 use daily_briefing_gui_lib::shell::{EngineSnapshots, ShellState};
 use daily_briefing_gui_lib::uninstall::UninstallState;
 
@@ -195,24 +203,111 @@ fn app_managing(
     notify: NotifyState,
     autostart: AutostartState,
 ) -> App<MockRuntime> {
+    app_managing_candidates_in(
+        engine,
+        access,
+        notify,
+        autostart,
+        &std::env::temp_dir().join("daily-briefing-t8-capability-candidates-unused"),
+    )
+}
+
+/// [`app_managing`] with the candidate directory given: P3-M1-T2's candidate check STAGES a file
+/// there, so the one test that runs it for real passes a scratch directory of its own. (A second
+/// `tauri::generate_context!()` in this binary is a duplicate-symbol error, hence one builder.)
+fn app_managing_candidates_in(
+    engine: Engine,
+    access: AccessState,
+    notify: NotifyState,
+    autostart: AutostartState,
+    candidates: &Path,
+) -> App<MockRuntime> {
+    app_managing_with(
+        engine,
+        access,
+        notify,
+        autostart,
+        candidates,
+        // P3-M4-T3's store, for the same `State` reason — and pointed OFF MockRuntime's REAL
+        // `app_data_dir()` (the ConfigSaver/AccessState trap again). Only the IPC test's own app
+        // (`app_managing_with`, a scratch store) runs these commands to a write.
+        PendingResets::default().with_store_dir(
+            std::env::temp_dir().join("daily-briefing-t8-capability-pending-unused"),
+        ),
+        // A-M1-T2's app-preference store. Managed because both app_prefs commands take
+        // `State<'_, AppPrefs>`, and an unmanaged one fails the call with "state not managed"
+        // before the command's own code runs; pointed off the REAL `app_data_dir()` the same way.
+        // Through this builder only refusal cases reach it, and a refusal writes nothing; `the_app_prefs_commands_are_admitted_and_run_their_own_code`
+        // builds its own app over a scratch store for the cases that write.
+        AppPrefs::default().with_store_dir(
+            std::env::temp_dir().join("daily-briefing-t8-capability-app-prefs-unused"),
+        ),
+    )
+}
+
+/// [`app_managing_candidates_in`] with the pending-reset store (P3-M4-T3) and the app-preference
+/// store (A-M1-T2) given.
+fn app_managing_with(
+    engine: Engine,
+    access: AccessState,
+    notify: NotifyState,
+    autostart: AutostartState,
+    candidates: &Path,
+    pending: PendingResets,
+    prefs: AppPrefs,
+) -> App<MockRuntime> {
     // ⚠ `EngineSnapshots` IS MANAGED HERE TOO, AND IT HAS TO BE. `state_snapshot` resolves it
-    // through `State<'_, Arc<EngineSnapshots>>`, and Tauri's `State` extractor PANICS when nothing
-    // of that type is managed — so a mock app without it would fail the command with a panic
-    // inside the IPC handler rather than with the refusal or the result the test is about. It is
+    // through `State<'_, Arc<EngineSnapshots>>`, and on the pinned tauri 2.11.5 the `State`
+    // extractor answers an `InvokeError` ("state not managed for field … on command …",
+    // `tauri/src/state.rs`, `from_command`) when nothing of that type is managed — so a mock app
+    // without it would fail the command with that error before its body runs, rather than with
+    // the refusal or the result the test is about. It is
     // built from the SAME `Result` as the engine state, exactly as `lib.rs::run()` does.
     let snapshots = Arc::new(EngineSnapshots::new(engine.0.clone()));
+    let calendar_opener = Arc::new(RecordingOpener::default());
+    let b2 = Arc::new(RecordingB2::default());
     mock_builder()
         .manage(engine)
         .manage(snapshots)
         // The per-app quit latch, as `lib.rs::run()` manages it — fresh, so "not shown yet".
         .manage(ShellState::default())
         // T15's save lock, for the same `State` reason. ⚠ WITH A CANDIDATE DIRECTORY: the default
-        // resolves `app_data_dir()`, which on MockRuntime is the developer's real one. No test in
-        // this file gets as far as validating a candidate (the fake's `status` names no config),
-        // so the directory is never created; `tests/config_save.rs` drives the whole pipeline.
-        .manage(ConfigSaver::with_candidate_dir(
-            std::env::temp_dir().join("daily-briefing-t8-capability-candidates-unused"),
-        ))
+        // resolves `app_data_dir()`, which on MockRuntime is the developer's real one. Through
+        // `app_managing` no test in this file gets as far as staging a candidate (the fake's
+        // `status` names no config, and the candidate check's refusals come first), so that
+        // directory is never created; `tests/config_save.rs` drives the whole pipeline.
+        .manage(ConfigSaver::with_candidate_dir(candidates))
+        .manage(pending)
+        .manage(prefs)
+        // Wave 2, W2-S-T2: the live gate's state, ALWAYS with the window HIDDEN (MockRuntime's own
+        // windows report themselves visible): every capability case that reaches a live command
+        // meets a hidden window and spawns nothing. Pinned by
+        // `the_mock_app_manages_the_live_gate_with_the_window_hidden`.
+        .manage(LiveEnv::default().with_visibility(Arc::new(|| Visibility {
+            visible: false,
+            minimized: false,
+        })))
+        // B1-M4-T13: the live git check's held state and one-in-flight latch. Managed because
+        // `repos_status` takes `State<'_, ReposLive>`; empty, and behind the hidden window above, so
+        // a case that reaches the command spawns nothing.
+        .manage(ReposLive::default())
+        // Wave 2, C-M3-T9: the live calendar details' state, with an UNUSED config path (no read is
+        // ever held here: the window is hidden), a recording opener and an inert calendar-app sink,
+        // so no capability case can open a URL or launch Calendar.
+        .manage(calendar_opener.clone())
+        .manage(
+            CalendarDetails::default()
+                .with_config_path(
+                    std::env::temp_dir().join("daily-briefing-t8-capability-calendar-unused.json"),
+                )
+                .with_opener(calendar_opener)
+                .with_calendar_app(Arc::new(InertCalendarApp)),
+        )
+        // B2-M4-T12: the opening commands' state, ALWAYS with recording sinks. The defaults are the real opener, clipboard,
+        // detector and launcher, and a test app must reach none of them. `RecordingB2` is managed too, so a test can read it.
+        .manage(b2.clone())
+        .manage(ActionsState::default().with_opener(b2.clone()).with_clipboard(b2.clone()))
+        .manage(EditorState::default().with_detector(b2.clone()).with_sink(b2))
         // T17's state, for the same `State` reason — and pointed at a scratch `HOME` by every
         // caller (see `access_state`), because `access_probe` READS the directory it names.
         .manage(access)
@@ -263,6 +358,69 @@ fn app_managing(
         .invoke_handler(daily_briefing_gui_lib::handler())
         .build(tauri::generate_context!())
         .expect("mock app should build from the shipped tauri.conf.json + capabilities")
+}
+
+/// B2's four sinks as one recorder: no capability case opens a browser, writes the clipboard, asks LaunchServices or
+/// launches an editor. Zed is the one editor it reports installed.
+#[derive(Default)]
+struct RecordingB2 {
+    urls: std::sync::Mutex<Vec<String>>,
+    copied: std::sync::Mutex<Vec<String>>,
+    launched: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+impl RecordingB2 {
+    fn urls(&self) -> Vec<String> {
+        self.urls.lock().unwrap().clone()
+    }
+
+    fn copied(&self) -> Vec<String> {
+        self.copied.lock().unwrap().clone()
+    }
+
+    fn launched(&self) -> Vec<Vec<String>> {
+        self.launched.lock().unwrap().clone()
+    }
+}
+
+impl OpenSink for RecordingB2 {
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        self.urls.lock().unwrap().push(url.to_string());
+        Ok(())
+    }
+
+    fn reveal(&self, _path: &Path) -> Result<(), String> {
+        panic!("a B2 click reveals nothing")
+    }
+}
+
+impl ClipboardSink for RecordingB2 {
+    fn write_text(&self, text: &str) -> Result<(), String> {
+        self.copied.lock().unwrap().push(text.to_string());
+        Ok(())
+    }
+}
+
+impl EditorDetector for RecordingB2 {
+    fn is_installed(&self, bundle_id: &str) -> bool {
+        bundle_id == "dev.zed.Zed"
+    }
+}
+
+impl EditorSink for RecordingB2 {
+    fn launch(&self, argv: &[String]) -> Result<(), String> {
+        self.launched.lock().unwrap().push(argv.to_vec());
+        Ok(())
+    }
+}
+
+/// A calendar-app sink that launches nothing (`calendar_app_open` on macOS answers `Ok` through it).
+struct InertCalendarApp;
+
+impl CalendarAppSink for InertCalendarApp {
+    fn open_calendar_app(&self, _url: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A shim sink that answers "nothing there" and writes nothing — nothing in this file may reach a
@@ -432,8 +590,8 @@ fn the_classifier_can_tell_the_two_verdicts_apart() {
     // like a refusal.
     let admitted = attempt(
         &w,
-        "engine_config_validate",
-        serde_json::json!({ "file": "not/absolute" }),
+        "engine_run_to_file",
+        serde_json::json!({ "name": "../escape.json", "force": false, "now": false }),
     );
     assert_eq!(
         admitted.verdict,
@@ -442,7 +600,7 @@ fn the_classifier_can_tell_the_two_verdicts_apart() {
         admitted.message
     );
     assert!(
-        admitted.message.contains("not an absolute path"),
+        admitted.message.contains("starts with a dot"),
         "expected the operand refusal from src/engine.rs, got: {}",
         admitted.message
     );
@@ -514,15 +672,25 @@ fn the_webview_cannot_reach_the_shell_plugin() {
 /// Every operation the enum deliberately does NOT carry, spelled as the command name someone would
 /// reach for, plus the one the engine does not have. None of them is granted, and none of them
 /// exists — either failure mode is a refusal, which is the property being pinned: the surface is
-/// the ten names and nothing adjacent to them.
+/// the eighteen names (`engine::COMMANDS`) and nothing adjacent to them.
 #[test]
 fn engine_commands_outside_the_granted_set_are_refused() {
     let f = fixture();
     let w = main_webview(&f.app);
 
     for cmd in [
-        "engine_init",     // the first-run wizard, T16; T15 edits via `config_save`
-        "engine_calendar", // in R1's forward list; NOT in the engine
+        "engine_init", // the first-run wizard, T16; T15 edits via `config_save`
+        // v0.3.0 (plan M8): the bare name stays refused — the four calendar operations are granted
+        // ONE AT A TIME (`engine_calendar_status` / `_list` / `_test` / `_connect_mac`) — and so do
+        // the engine's two STDIN subcommands (the app never gives the engine a stdin; Rust writes
+        // the link file itself) and anything that would read a link URL BACK to the webview.
+        "engine_calendar",
+        "engine_calendar_add_link",
+        "engine_calendar_remove_link",
+        "engine_calendar_connect",
+        "calendar_link_read",
+        "calendar_link_url",
+        "calendar_links_list",
         // ⚠ Phase E (E12): `engine_update_check` was in THIS list until the engine gained
         // `update --check` (E11) and is now granted. What replaces it is the shape of command E12
         // deliberately did not build — the check is notify-only, so nothing here downloads,
@@ -561,6 +729,52 @@ fn engine_commands_outside_the_granted_set_are_refused() {
             o.message
         );
     }
+}
+
+/// ⚠ TWO COMMANDS THE WEBVIEW USED TO HAVE, DROPPED AT PR 3 FINAL ROUND 1, AND REFUSED NOW — with
+/// the very arguments they used to take, so a refusal cannot be an argument-shape failure:
+///   * `engine_config_validate(file)` returned the engine's report VERBATIM, `normalized` included —
+///     every literal `apiKey` of any absolute file, the real `config.json` among them — which
+///     undercut PR 3's redaction (reviewer H2). Its `Operation::ConfigValidate` stays: the settings
+///     guard and the candidate check build it Rust-side over a file they staged or own.
+///   * `engine_provider_key_delete_all` let ONE IPC call delete every app key, around uninstall's
+///     kept-schedule refusal and its consent box (reviewer A2). Its `Operation::KeyDeleteAll` stays:
+///     uninstall's key leg invokes it directly (`src/uninstall.rs`), behind both.
+/// No app code called either (each had only its own wrapper in `gui/src/lib/engine.ts`). The fake
+/// sidecar must never have been spawned.
+///
+/// ⚠ Seen red by RE-ADDING one (command, `generate_handler!` entry, `build.rs` entry, `COMMANDS`
+/// entry and grant together, on a disposable copy): this test fails with the command admitted — as
+/// do the literal grant list and the IPC-coverage check, which say only THAT the set changed; this
+/// one says why it must not. Re-adding the grant alone fails the build (no such permission).
+#[test]
+fn the_dropped_config_validate_and_key_delete_all_commands_are_refused() {
+    let f = fixture();
+    let w = main_webview(&f.app);
+    for (cmd, body) in [
+        (
+            "engine_config_validate",
+            serde_json::json!({ "file": "/Users/x/.config/daily-briefing/config.json" }),
+        ),
+        ("engine_provider_key_delete_all", serde_json::json!({})),
+    ] {
+        let o = attempt(&w, cmd, body);
+        assert_eq!(
+            o.verdict,
+            Verdict::Refused,
+            "{cmd} was not refused: {}",
+            o.message
+        );
+        assert!(
+            !all_commands().contains(&cmd),
+            "{cmd} is back in all_commands()"
+        );
+    }
+    assert!(
+        !f.argv_file.exists(),
+        "a dropped command reached the fake sidecar: {:?}",
+        std::fs::read_to_string(&f.argv_file)
+    );
 }
 
 /// ⚠ `tauri-plugin-window-state` IS A DEPENDENCY AND ITS COMMANDS ARE STILL REFUSED, which is the
@@ -702,8 +916,7 @@ fn listen_and_unlisten_are_admitted() {
 /* ── POSITIVE: the granted commands get past the ACL and into our code ─────────────────────────── */
 
 /// Admission proved WITHOUT a spawn, one command at a time, by making each fail INSIDE the command:
-///   * `engine_run_to_file` / `engine_config_validate` — a granted command with an operand the
-///     Rust validator refuses. That the refusal message is the validator's is also the direct
+///   * `engine_run_to_file` — a granted command with an operand the Rust validator refuses. That the refusal message is the validator's is also the direct
 ///     evidence for "refused BEFORE any spawn".
 ///   * `engine_run` / `engine_schedule_install` / `engine_schedule_uninstall` — a granted command
 ///     with a missing argument, which fails argument deserialisation. Deserialisation happens after
@@ -726,13 +939,8 @@ fn the_granted_commands_are_admitted() {
     let cases: &[(&str, serde_json::Value, &str)] = &[
         (
             "engine_run_to_file",
-            serde_json::json!({ "name": "../escape.json", "force": false }),
+            serde_json::json!({ "name": "../escape.json", "force": false, "now": false }),
             "starts with a dot",
-        ),
-        (
-            "engine_config_validate",
-            serde_json::json!({ "file": "/etc/../etc/passwd" }),
-            "has a `.` or `..` path segment",
         ),
         // No `force` key: an argument-deserialisation failure, which only a command that got past
         // the ACL can produce.
@@ -743,6 +951,150 @@ fn the_granted_commands_are_admitted() {
             "engine_schedule_uninstall",
             serde_json::json!({}),
             "takeOver",
+        ),
+        // v0.3.0 (plan M8): the calendar link commands, each refused INSIDE the command before any
+        // spawn — an id the grammar refuses, a missing argument.
+        (
+            "calendar_link_write",
+            serde_json::json!({ "id": "../escape", "url": "https://example.invalid/x.ics" }),
+            "must start with a lowercase letter or a digit",
+        ),
+        ("calendar_link_remove", serde_json::json!({}), "id"),
+        ("calendar_config_save", serde_json::json!({}), "text"),
+        // PR 3 (P3-M1-T1): the provider commands, each refused INSIDE the command before any spawn
+        // — an operand its validator refuses, or a missing argument. None echoes the value.
+        ("engine_provider_key_set", serde_json::json!({}), "key"),
+        (
+            "engine_provider_key_set",
+            serde_json::json!({ "key": "" }),
+            r#""field":"key","reason":"is empty"#,
+        ),
+        (
+            "engine_provider_key_set",
+            serde_json::json!({ "key": "a".repeat(4097) }),
+            r#""field":"key","reason":"is larger than the engine reads on stdin"#,
+        ),
+        (
+            "engine_provider_key_migrate",
+            serde_json::json!({ "index": 1_000_000 }),
+            r#""field":"index","reason":"is not a provider position"#,
+        ),
+        (
+            "engine_provider_key_migrate",
+            serde_json::json!({}),
+            "index",
+        ),
+        (
+            "engine_provider_key_delete",
+            serde_json::json!({ "id": "k-0123456789AB" }),
+            r#""field":"id","reason":"is not a key id"#,
+        ),
+        (
+            "engine_provider_key_delete",
+            serde_json::json!({ "id": "--all" }),
+            r#""field":"id","reason":"is not a key id"#,
+        ),
+        (
+            "engine_provider_reset",
+            serde_json::json!({}),
+            "exactly one of the two is required",
+        ),
+        (
+            "engine_provider_reset",
+            serde_json::json!({ "index": 0, "label": "work" }),
+            "exactly one of the two is required",
+        ),
+        (
+            "engine_provider_reset",
+            serde_json::json!({ "label": "" }),
+            r#""field":"label","reason":"is empty"#,
+        ),
+        (
+            "engine_provider_reset",
+            serde_json::json!({ "label": "a\u{0}b" }),
+            r#""field":"label","reason":"contains a NUL byte"#,
+        ),
+        (
+            "engine_provider_reset",
+            serde_json::json!({ "index": 1_000_000 }),
+            r#""field":"index","reason":"is not a provider position"#,
+        ),
+        // P3-M4-T3: the pending-reset store's three, each refusing a bad operand before anything
+        // is written or spawned — or a missing argument.
+        (
+            "provider_pending_reset_add",
+            serde_json::json!({ "label": "Work", "newKeyId": "k-0123456789AB" }),
+            r#""field":"newKeyId","reason":"is not a key id"#,
+        ),
+        (
+            "provider_pending_reset_flush",
+            serde_json::json!({ "label": "", "newKeyId": "k-0123456789ab" }),
+            r#""field":"label","reason":"is empty"#,
+        ),
+        (
+            "provider_pending_reset_drop",
+            serde_json::json!({ "label": "Work" }),
+            "newKeyId",
+        ),
+        // A-M1-T2: the app-preference set, refused INSIDE the command — its one named argument
+        // missing (argument deserialisation), or a first name the store's own rule refuses (41
+        // scalar values). A refusal writes nothing (`tests/app_prefs.rs`).
+        ("app_prefs_set", serde_json::json!({}), "patch"),
+        (
+            "app_prefs_set",
+            serde_json::json!({ "patch": { "firstName": "a".repeat(41) } }),
+            FIRST_NAME_TOO_LONG,
+        ),
+        // B1-M4-T13: the live git check, refused INSIDE the command by its one named argument
+        // missing (argument deserialisation), which only a command past the ACL can produce.
+        ("repos_status", serde_json::json!({}), "request"),
+        // C-M3-T9: the live calendar details' requests are `deny_unknown_fields`, so the webview
+        // CANNOT pass a URL (C "the webview cannot pass a URL"); a reason outside the three words
+        // and a missing request are argument failures too — none reaches the engine.
+        (
+            "calendar_details_open",
+            serde_json::json!({ "request": { "reason": "focus", "current": "calendar", "url": "https://zoom.us/j/1" } }),
+            "unknown field `url`",
+        ),
+        (
+            "calendar_details_open",
+            serde_json::json!({ "request": { "reason": "load", "current": "calendar" } }),
+            "unknown variant `load`",
+        ),
+        ("calendar_details_open", serde_json::json!({}), "request"),
+        (
+            "calendar_details_get",
+            serde_json::json!({ "request": { "handle": "0.0.0", "url": "https://zoom.us/j/1" } }),
+            "unknown field `url`",
+        ),
+        (
+            "calendar_join",
+            serde_json::json!({ "request": { "handle": "0.0.0", "confirmed": true, "url": "https://evil.example/" } }),
+            "unknown field `url`",
+        ),
+        ("calendar_join", serde_json::json!({ "request": { "handle": "0.0.0" } }), "confirmed"),
+        // B2-M4-T12: the opening commands' five, each with no `request`: an argument failure, which only a command that
+        // got past the ACL can produce. `the_b2_requests_refuse_an_extra_field_before_any_action` has the rest.
+        ("open_github", serde_json::json!({}), "request"),
+        ("copy_push_command", serde_json::json!({}), "request"),
+        ("editor_list", serde_json::json!({}), "request"),
+        ("editor_open", serde_json::json!({}), "request"),
+        ("editor_choice_set", serde_json::json!({}), "request"),
+        // A2-M4-T13: the summary read, refused before the engine is asked. Its one named argument
+        // missing, a member beyond the two identities (`deny_unknown_fields`: the webview cannot
+        // name a path), and an operand that is not a 64-hex identity, which is its own error.
+        ("read_latest_summary", serde_json::json!({}), "request"),
+        (
+            "read_latest_summary",
+            serde_json::json!({ "request": {
+                "pageHash": "a".repeat(64), "pageVersion": "b".repeat(64), "path": "/etc/passwd",
+            } }),
+            "unknown field `path`",
+        ),
+        (
+            "read_latest_summary",
+            serde_json::json!({ "request": { "pageHash": "../last-run", "pageVersion": "b".repeat(64) } }),
+            r#"{"kind":"invalidOperand"}"#,
         ),
     ];
 
@@ -779,7 +1131,7 @@ fn the_granted_commands_are_admitted() {
 /// sidecar would be and every body runs.
 ///
 /// Sequential in ONE test on purpose — see the module header on the in-flight guard. That is also
-/// why B25's two uninstall commands are driven here, after the ten engine commands (Batch 2, spec
+/// why B25's two uninstall commands are driven here, after the eighteen engine commands (Batch 2, spec
 /// 3.3.2): `uninstall_execute` now runs `schedule uninstall`, a mutating spawn.
 ///
 /// ⚠ Seen red by the F4 mutation on a disposable copy: replace `engine_schedule_install`'s body
@@ -790,32 +1142,34 @@ fn every_command_body_runs_through_real_ipc_against_a_fake_sidecar() {
     let f = fixture();
     let w = main_webview(&f.app);
 
-    // A path the OLD `--file` validator refused (dot-leading segment) and the engine's own default
-    // config path. Its admission here is also fix-1 evidence, through the whole IPC stack.
-    let default_config = "/Users/x/.config/daily-briefing/config.json";
-
     let cases: &[(&str, serde_json::Value, &str)] = &[
         ("engine_status", serde_json::json!({}), "status\n--json\n"),
         ("engine_doctor", serde_json::json!({}), "doctor\n--json\n"),
         (
             "engine_run",
-            serde_json::json!({ "force": false }),
+            serde_json::json!({ "force": false, "now": false }),
             "run\n--json\n",
         ),
         (
             "engine_run",
-            serde_json::json!({ "force": true }),
+            serde_json::json!({ "force": true, "now": false }),
             "run\n--json\n--force\n",
+        ),
+        // The app's Run now: `--now`, the morning floor lifted and once a day kept.
+        (
+            "engine_run",
+            serde_json::json!({ "force": false, "now": true }),
+            "run\n--json\n--now\n",
         ),
         (
             "engine_run_to_file",
-            serde_json::json!({ "name": "out.json", "force": false }),
+            serde_json::json!({ "name": "out.json", "force": false, "now": false }),
             "run\n--json\n--json-out\nout.json\n",
         ),
         (
-            "engine_config_validate",
-            serde_json::json!({ "file": default_config }),
-            "config\nvalidate\n--json\n--file\n/Users/x/.config/daily-briefing/config.json\n",
+            "engine_run_to_file",
+            serde_json::json!({ "name": "out.json", "force": false, "now": true }),
+            "run\n--json\n--now\n--json-out\nout.json\n",
         ),
         (
             "engine_schedule_install",
@@ -851,8 +1205,67 @@ fn every_command_body_runs_through_real_ipc_against_a_fake_sidecar() {
             serde_json::json!({}),
             "update\n--check\n--json\n",
         ),
+        // v0.3.0 (plan M8): the calendar operations. No operand; the argv is fixed literals.
+        (
+            "engine_calendar_status",
+            serde_json::json!({}),
+            "calendar\nstatus\n--json\n",
+        ),
+        (
+            "engine_calendar_list",
+            serde_json::json!({}),
+            "calendar\nlist\n--json\n",
+        ),
+        (
+            "engine_calendar_test",
+            serde_json::json!({}),
+            "calendar\ntest\n--json\n",
+        ),
+        // ⚠ MUTATING, so it lives here in the sequential test. Off macOS it never spawns — the
+        // cfg-gated block after this loop drives that refusal instead.
+        #[cfg(target_os = "macos")]
+        (
+            "engine_calendar_connect_mac",
+            serde_json::json!({}),
+            "calendar\nconnect\nmac\n--json\n",
+        ),
+        // Provider fallback PR 3 (P3-M1-T1): five of the seven `provider` operations, every one
+        // MUTATING — hence here, in the sequential test (`key delete-all` has no webview command
+        // since PR 3 final r1: uninstall invokes it Rust-side, `tests/uninstall.rs`). The key and the label are NOT in argv; the
+        // stdin they travel on is asserted after this loop, against a fake that records it.
+        (
+            "engine_provider_key_set",
+            serde_json::json!({ "key": "sk-test-IPC-0123456789" }),
+            "provider\nkey\nset\n--json\n",
+        ),
+        (
+            "engine_provider_key_migrate",
+            serde_json::json!({ "index": 2 }),
+            "provider\nkey\nmigrate\n--index\n2\n--json\n",
+        ),
+        (
+            "engine_provider_key_delete",
+            serde_json::json!({ "id": "k-0123456789ab" }),
+            "provider\nkey\ndelete\n--id\nk-0123456789ab\n--json\n",
+        ),
+        (
+            "engine_provider_key_scrub_backup",
+            serde_json::json!({}),
+            "provider\nkey\nscrub-backup\n--json\n",
+        ),
+        (
+            "engine_provider_reset",
+            serde_json::json!({ "index": 1 }),
+            "provider\nreset\n--index\n1\n--json\n",
+        ),
+        (
+            "engine_provider_reset",
+            serde_json::json!({ "label": "--help" }),
+            "provider\nreset\n--label-stdin\n--json\n",
+        ),
     ];
 
+    let _turn = MUTATING_TURN.lock().unwrap_or_else(|e| e.into_inner());
     for (cmd, body, expected_argv) in cases {
         let _ = std::fs::remove_file(&f.argv_file);
         let o = attempt(&w, cmd, body.clone());
@@ -900,8 +1313,171 @@ fn every_command_body_runs_through_real_ipc_against_a_fake_sidecar() {
         );
     }
 
-    // And that WAS all ten — the point of this test is coverage of every body.
-    let driven: BTreeSet<&str> = cases.iter().map(|(cmd, _, _)| *cmd).collect();
+    // v0.3.0 (plan M8): off macOS the connect command answers `unsupported` WITHOUT a spawn — the
+    // `access.rs` precedent — and it is still admitted by the ACL (the grant exists everywhere).
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = std::fs::remove_file(&f.argv_file);
+        let o = attempt(&w, "engine_calendar_connect_mac", serde_json::json!({}));
+        assert_eq!(o.verdict, Verdict::Admitted, "{}", o.message);
+        let err: serde_json::Value = serde_json::from_str(&o.message)
+            .unwrap_or_else(|_| panic!("expected a serialised EngineError, got {}", o.message));
+        assert_eq!(err["kind"], "unsupported", "{err}");
+        assert!(
+            !f.argv_file.exists(),
+            "the non-macOS connect refusal reached the fake sidecar"
+        );
+    }
+
+    // PR 3: the key and the label reach the engine on STDIN, through the real IPC stack — a second
+    // app over a fake that records argv and stdin. The key is in neither argv nor the response.
+    {
+        let scratch = ScratchDir::new("ipc-stdin");
+        let program = stdin_ipc_sidecar(&scratch.path, "engine.sh");
+        let app = app_managing(
+            Engine(Ok(EngineClient::with_program(program))),
+            access_state(&scratch, Arc::new(RecordingOpener::default())),
+            NotifyState::default()
+                .with_sink(Arc::new(RecordingNotifySink::default()))
+                .with_store_dir(scratch.join("app-data")),
+            AutostartState::default()
+                .with_sink(Arc::new(RecordingAutostartSink::default()))
+                .with_store_dir(scratch.join("app-data")),
+        );
+        let w2 = main_webview(&app);
+        const KEY: &str = "sk-test-IPC-SECRET-0123456789";
+        for (cmd, body, stdin, argv) in [
+            (
+                "engine_provider_key_set",
+                serde_json::json!({ "key": KEY }),
+                KEY.to_string(),
+                "provider\nkey\nset\n--json\n",
+            ),
+            (
+                "engine_provider_reset",
+                serde_json::json!({ "label": "--old" }),
+                r#"{"label":"--old"}"#.to_string(),
+                "provider\nreset\n--label-stdin\n--json\n",
+            ),
+            (
+                "engine_provider_reset",
+                serde_json::json!({ "index": 0 }),
+                String::new(),
+                "provider\nreset\n--index\n0\n--json\n",
+            ),
+        ] {
+            let o = attempt(&w2, cmd, body.clone());
+            assert_eq!(o.verdict, Verdict::Admitted, "{cmd} {body}: {}", o.message);
+            let response: serde_json::Value = o
+                .body
+                .unwrap_or_else(|| panic!("{cmd} {body} returned Err: {}", o.message))
+                .deserialize()
+                .expect("an EngineOutcome");
+            assert_eq!(response["exitCode"], 0, "{cmd} {body}: {response}");
+            assert!(
+                !response.to_string().contains(KEY),
+                "{cmd}: the key is in the response"
+            );
+            assert_eq!(
+                std::fs::read_to_string(scratch.join("stdin"))
+                    .ok()
+                    .as_deref(),
+                Some(stdin.as_str()),
+                "{cmd} {body}: the engine's stdin"
+            );
+            assert_eq!(
+                std::fs::read_to_string(scratch.join("argv"))
+                    .ok()
+                    .as_deref(),
+                Some(argv),
+                "{cmd} {body}: the engine's argv"
+            );
+        }
+    }
+
+    // P3-M4-T3: the pending-reset store's three commands, admitted and running their own bodies —
+    // through a second app whose store is in a scratch directory (each writes `pending-resets.json`).
+    // `add` writes the `pre-save` record and runs `provider reset` with the label on STDIN (the fake
+    // records argv only: the label is not in it); `flush` moves it to `post-save` and resets again,
+    // clearing it on the fake's `ok`; `drop` asks the engine for the saved config first (`status
+    // --json`), which this run-shaped fake cannot answer — so the key is KEPT, unverified, and
+    // nothing is deleted. The behaviour is `tests/pending_resets.rs`'s; this is the IPC seam.
+    {
+        let scratch = ScratchDir::new("ipc-pending");
+        let argv_file = scratch.join("argv.txt");
+        let program = ipc_sidecar(&scratch.path, "engine.sh", &argv_file);
+        let store = scratch.join("app-data");
+        let app = app_managing_with(
+            Engine(Ok(EngineClient::with_program(program))),
+            access_state(&scratch, Arc::new(RecordingOpener::default())),
+            NotifyState::default()
+                .with_sink(Arc::new(RecordingNotifySink::default()))
+                .with_store_dir(&store),
+            AutostartState::default()
+                .with_sink(Arc::new(RecordingAutostartSink::default()))
+                .with_store_dir(&store),
+            &scratch.join("cands"),
+            PendingResets::default().with_store_dir(&store),
+            AppPrefs::default().with_store_dir(&store),
+        );
+        let w3 = main_webview(&app);
+        let id = "k-0123456789ab";
+        for (cmd, answer, argv, records) in [
+            (
+                "provider_pending_reset_add",
+                "reset",
+                "provider\nreset\n--label-stdin\n--json\n",
+                1,
+            ),
+            (
+                "provider_pending_reset_flush",
+                "reset",
+                "provider\nreset\n--label-stdin\n--json\n",
+                0,
+            ),
+            ("provider_pending_reset_drop", "kept", "status\n--json\n", 0),
+        ] {
+            let _ = std::fs::remove_file(&argv_file);
+            let o = attempt(
+                &w3,
+                cmd,
+                serde_json::json!({ "label": "--help", "newKeyId": id }),
+            );
+            assert_eq!(o.verdict, Verdict::Admitted, "{cmd}: {}", o.message);
+            let response: serde_json::Value = o
+                .body
+                .unwrap_or_else(|| panic!("{cmd} returned Err: {}", o.message))
+                .deserialize()
+                .expect("an outcome");
+            assert_eq!(response["kind"], answer, "{cmd}: {response}");
+            assert_eq!(
+                std::fs::read_to_string(&argv_file).ok().as_deref(),
+                Some(argv),
+                "{cmd}: the argv that reached the sidecar"
+            );
+            assert_eq!(read_records(&store).len(), records, "{cmd}: the store");
+        }
+        let driven: BTreeSet<&str> = [
+            "provider_pending_reset_add",
+            "provider_pending_reset_flush",
+            "provider_pending_reset_drop",
+        ]
+        .into_iter()
+        .collect();
+        let all: BTreeSet<&str> = daily_briefing_gui_lib::pending_resets::COMMANDS
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            driven, all,
+            "a command in pending_resets::COMMANDS is not driven through IPC here; add a case for it"
+        );
+    }
+
+    // And that WAS every engine command — the point of this test is coverage of every body.
+    let mut driven: BTreeSet<&str> = cases.iter().map(|(cmd, _, _)| *cmd).collect();
+    // (On macOS the connect command is in `cases`; elsewhere the block above drove it.)
+    driven.insert("engine_calendar_connect_mac");
     let all: BTreeSet<&str> = daily_briefing_gui_lib::engine::COMMANDS
         .iter()
         .copied()
@@ -1054,6 +1630,1173 @@ fn every_command_body_runs_through_real_ipc_against_a_fake_sidecar() {
         driven, all,
         "a command in uninstall::COMMANDS is not driven through IPC here; add a case for it"
     );
+
+    // ── v0.3.0 (plan M8): the three calendar LINK commands, admitted and running their own code.
+    // Each reads `status --json` first (the state folder / the config path), and this fixture's
+    // run-shaped fake reports neither — so each answers the ENGINE error after exactly that one
+    // read-only spawn. The link-file, block and removal semantics are `tests/calendar.rs`'s
+    // (against a status-shaped fake); this is the IPC seam. Nothing here can write a link file:
+    // there is no state folder to write it under.
+    for (cmd, body) in [
+        (
+            "calendar_link_write",
+            serde_json::json!({ "id": "work", "url": "https://example.invalid/private-x/basic.ics" }),
+        ),
+        ("calendar_link_remove", serde_json::json!({ "id": "work" })),
+        (
+            "calendar_config_save",
+            serde_json::json!({ "text": "{\"enabled\":true}" }),
+        ),
+    ] {
+        let _ = std::fs::remove_file(&f.argv_file);
+        let o = attempt(&w, cmd, body);
+        assert_eq!(o.verdict, Verdict::Admitted, "{cmd}: {}", o.message);
+        let err: serde_json::Value = serde_json::from_str(&o.message).unwrap_or_else(|_| {
+            panic!(
+                "{cmd}: expected a serialised CalendarError, got {}",
+                o.message
+            )
+        });
+        let kind = if err["kind"] == "config" {
+            &err["error"]["kind"]
+        } else {
+            &err["kind"]
+        };
+        assert_eq!(kind, "engine", "{cmd}: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&f.argv_file).ok().as_deref(),
+            Some("status\n--json\n"),
+            "{cmd}: the body must have asked the engine for its paths"
+        );
+    }
+    let all: BTreeSet<&str> = daily_briefing_gui_lib::calendar::COMMANDS
+        .iter()
+        .copied()
+        .collect();
+    let driven: BTreeSet<&str> = [
+        "calendar_link_write",
+        "calendar_link_remove",
+        "calendar_config_save",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        driven, all,
+        "a command in calendar::COMMANDS is not driven through IPC here; add a case for it"
+    );
+}
+
+/// A fake that records its argv and its whole stdin (`cat` returns only at EOF, so the invocation
+/// ends only if the app CLOSED the pipe), then answers one `ok` JSON line.
+fn stdin_ipc_sidecar(dir: &Path, name: &str) -> PathBuf {
+    let rec = |f: &str| common::sq(&dir.join(f).display().to_string());
+    common::fake_sidecar(
+        dir,
+        name,
+        &format!(
+            "printf '%s\\n' \"$@\" > {argv}\ncat > {stdin}\nprintf '%s' {answer}\nexit 0",
+            argv = rec("argv"),
+            stdin = rec("stdin"),
+            answer = common::sq(r#"{"schemaVersion":1,"ok":true}"#),
+        ),
+    )
+}
+
+/// Turn-taking for the tests in this binary that reach a MUTATING spawn (the in-flight guard is
+/// process-global; see the module header). A sync test may hold a `std` mutex across its body.
+static MUTATING_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// ⚠ A SETTINGS SAVE ISSUED DURING A `key scrub-backup` WAITS FOR IT (plan P3-M1-T1): the scrub's
+/// command holds `ConfigSaver`'s save lock across the engine call, so no save can rewrite `.bak`
+/// between the scrub's read and its write. The fake logs `start`/`end` around a 1.5 s scrub and
+/// `status` when a save's first engine read arrives — which `config_save` makes only after taking
+/// the lock. Order `start, end, status` is the lock; `start, status, end` is its absence. (The scrub
+/// command's own `status`, for its sweep's config path, comes first in both: P3-M4 checkpoint.)
+///
+/// prove-it 3b, in the test: the same overlap issued through a SECOND app (its own `ConfigSaver`,
+/// its own lock) must produce `start, status, end` — the detector can see an overlap.
+#[test]
+fn a_save_issued_during_a_scrub_waits_for_it() {
+    let _turn = MUTATING_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let scratch = ScratchDir::new("ipc-scrub");
+    let log = scratch.join("log");
+    let program = common::fake_sidecar(
+        &scratch.path,
+        "engine.sh",
+        &format!(
+            "case \" $* \" in\n\
+             *\" scrub-backup \"*) echo start >> {log}; sleep 1.5; echo end >> {log}; printf '%s' {answer} ;;\n\
+             *\" status \"*) echo status >> {log}; printf '%s' '{{}}' ;;\n\
+             *) echo other >> {log} ;;\n\
+             esac\nexit 0",
+            log = common::sq(&log.display().to_string()),
+            answer = common::sq(r#"{"schemaVersion":1,"ok":true,"removed":0}"#),
+        ),
+    );
+    let make_app = || {
+        app_managing(
+            Engine(Ok(EngineClient::with_program(program.clone()))),
+            access_state(&scratch, Arc::new(RecordingOpener::default())),
+            NotifyState::default()
+                .with_sink(Arc::new(RecordingNotifySink::default()))
+                .with_store_dir(scratch.join("app-data")),
+            AutostartState::default()
+                .with_sink(Arc::new(RecordingAutostartSink::default()))
+                .with_store_dir(scratch.join("app-data")),
+        )
+    };
+    let app = make_app();
+    let w = main_webview(&app);
+    let other = make_app();
+    let w_other = main_webview(&other);
+
+    let overlap = |save_on: &WebviewWindow<MockRuntime>| -> String {
+        let _ = std::fs::remove_file(&log);
+        std::thread::scope(|scope| {
+            let scrub = scope.spawn(|| {
+                attempt(
+                    &w,
+                    "engine_provider_key_scrub_backup",
+                    serde_json::json!({}),
+                )
+            });
+            let started = std::time::Instant::now();
+            while !std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("start")
+            {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(20),
+                    "the scrub never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let save = scope.spawn(|| {
+                attempt(
+                    save_on,
+                    "config_save",
+                    serde_json::json!({ "text": "{}", "base": "unused" }),
+                )
+            });
+            let scrubbed = scrub.join().expect("the scrub thread");
+            assert_eq!(scrubbed.verdict, Verdict::Admitted, "{}", scrubbed.message);
+            assert!(
+                scrubbed.body.is_some(),
+                "the scrub failed: {}",
+                scrubbed.message
+            );
+            let _ = save.join().expect("the save thread");
+        });
+        std::fs::read_to_string(&log).unwrap_or_default()
+    };
+
+    assert_eq!(
+        overlap(&w),
+        // The first `status` is the scrub command's own (it locates the config for its sweep, under the lock).
+        "status\nstart\nend\nstatus\n",
+        "a settings save reached the engine while a scrub-backup was running — the scrub does not \
+         hold the save lock"
+    );
+    assert_eq!(
+        overlap(&w_other),
+        "status\nstart\nstatus\nend\n",
+        "the detector cannot see an overlap: a save through another app (its own lock) should run \
+         beside the scrub"
+    );
+}
+
+/// ⚠ THE SCRUB SWEEPS A CRASHED SAVE'S STAGED COPY FIRST, UNDER THE SAVE LOCK (P3-M4 checkpoint,
+/// finding 4). A crash between `keep_previous_backup`'s link and the save's end leaves
+/// `.<config>.save-<pid>-<seq>.prev`, a second name for `.bak`'s inode that keeps the literals the
+/// scrub removes; an unchanged save writes nothing and so sweeps nothing. So
+/// `engine_provider_key_scrub_backup` runs `config_save::sweep_stale` over the config's staged
+/// prefix BEFORE the engine call, while it holds `ConfigSaver`'s lock — which makes this process's own
+/// staged files stale too (no save of ours is in flight).
+///
+/// The fake logs `scrub` and whether the dead pid's copy is still there when the scrub runs. Then the
+/// lock: a save issued FIRST holds the lock across a slow `status` (1.5 s) and logs, at its end, whether
+/// the copy was still there (`held`) or already gone (`raced` — a sweep outside the lock).
+#[test]
+fn the_scrub_sweeps_a_crashed_saves_staged_copy_first_under_the_save_lock() {
+    let _turn = MUTATING_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let scratch = ScratchDir::new("ipc-scrub-sweep");
+    let dir = scratch.join("cfg");
+    std::fs::create_dir_all(&dir).expect("cfg dir");
+    let config = dir.join("config.json");
+    let bak = dir.join("config.json.bak");
+    std::fs::write(&config, "{}\n").expect("config");
+    std::fs::write(&bak, "{}\n").expect("bak");
+    // A pid that has exited and been reaped.
+    let mut gone = std::process::Command::new("true").spawn().expect("spawn true");
+    let dead = gone.id();
+    gone.wait().expect("reaped");
+    let me = std::process::id();
+    let crashed = dir.join(format!(".config.json.save-{dead}-1.prev"));
+    let own = dir.join(format!(".config.json.save-{me}-9.prev"));
+    let live = dir.join(".config.json.save-1-1.prev");
+    let users = dir.join("my-backup-copy.json");
+    for link in [&crashed, &own, &live, &users] {
+        std::fs::hard_link(&bak, link).expect("hard link");
+    }
+    let log = scratch.join("log");
+    let slow = scratch.join("slow");
+    let status = serde_json::json!({
+        "schemaVersion": 1, "engineVersion": "0.1.1", "platform": "darwin",
+        "paths": { "stateDir": scratch.join("state").display().to_string(), "configPath": config.display().to_string() },
+        "configExists": true, "configError": null, "lastRunDate": null, "lastSkip": null, "lastTick": null,
+        "latestBriefingMtime": null, "archivedDates": [], "logBytes": null,
+        "morningTime": { "value": "07:20", "minutes": 440, "warning": null }, "isPastFloor": true
+    })
+    .to_string();
+    let program = common::fake_sidecar(
+        &scratch.path,
+        "engine.sh",
+        &format!(
+            "case \" $* \" in\n\
+             *\" scrub-backup \"*) echo scrub >> {log}; if [ -e {crashed} ]; then echo staged >> {log}; else echo swept >> {log}; fi; printf '%s' {answer} ;;\n\
+             *\" status \"*) echo status >> {log}; if [ -e {slow} ]; then rm {slow}; sleep 1.5; if [ -e {crashed} ]; then echo held >> {log}; else echo raced >> {log}; fi; fi; printf '%s' {status} ;;\n\
+             *) echo other >> {log} ;;\n\
+             esac\nexit 0",
+            log = common::sq(&log.display().to_string()),
+            crashed = common::sq(&crashed.display().to_string()),
+            slow = common::sq(&slow.display().to_string()),
+            answer = common::sq(r#"{"schemaVersion":1,"ok":true,"removed":0}"#),
+            status = common::sq(&status),
+        ),
+    );
+    let app = app_managing(
+        Engine(Ok(EngineClient::with_program(program))),
+        access_state(&scratch, Arc::new(RecordingOpener::default())),
+        NotifyState::default()
+            .with_sink(Arc::new(RecordingNotifySink::default()))
+            .with_store_dir(scratch.join("app-data")),
+        AutostartState::default()
+            .with_sink(Arc::new(RecordingAutostartSink::default()))
+            .with_store_dir(scratch.join("app-data")),
+    );
+    let w = main_webview(&app);
+
+    std::fs::write(&slow, "").expect("slow marker");
+    std::thread::scope(|scope| {
+        // The save first: it takes the lock, then its `status` sleeps (and its stale base then refuses it,
+        // so it never reaches the write path's own sweep).
+        let save = scope.spawn(|| {
+            attempt(&w, "config_save", serde_json::json!({ "text": "{}", "base": "unused" }))
+        });
+        let started = std::time::Instant::now();
+        while !std::fs::read_to_string(&log).unwrap_or_default().contains("status") {
+            assert!(started.elapsed() < std::time::Duration::from_secs(20), "the save never reached the engine");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let scrubbed = attempt(&w, "engine_provider_key_scrub_backup", serde_json::json!({}));
+        assert_eq!(scrubbed.verdict, Verdict::Admitted, "{}", scrubbed.message);
+        assert!(scrubbed.body.is_some(), "the scrub failed: {}", scrubbed.message);
+        let _ = save.join().expect("the save thread");
+    });
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap_or_default(),
+        "status\nheld\nstatus\nscrub\nswept\n",
+        "`held` then `swept`: the sweep waited for the save's lock and ran before the engine's scrub"
+    );
+    assert!(!crashed.exists(), "a dead pid's staged copy survived the scrub");
+    assert!(!own.exists(), "this process's own staged copy survived (the lock is held: it is stale)");
+    assert!(live.exists(), "a LIVE pid's staged copy was removed — it may be a save in flight");
+    assert!(users.exists(), "a file of the user's own naming was removed");
+    assert!(bak.exists() && config.exists(), "the sweep touched the config or its backup");
+}
+
+/// ⚠ NO PROVIDER OR KEY COMMAND TAKES A FILE PATH, AND NO COMMAND BODY REACHES `ProviderTest`
+/// (plan P3-M1-T1). `provider test --file` runs whatever candidate it is handed, so the webview may
+/// reach it only through the staging command (P3-M1-T2), which writes the candidate ITSELF. Read
+/// from the source, because a Tauri command's parameters exist nowhere at runtime: every
+/// `#[tauri::command]` in `src/` is located, its parameter list and body cut out by bracket
+/// matching, and
+///   * every `engine_provider_*` command's parameters must name no `file`, `path` or `Path`;
+///   * no command body may name `ProviderTest`, except those in `MAY_STAGE_A_TEST` — exactly the
+///     staging command, `provider_candidate_check` (P3-M1-T2, added deliberately), whose body must
+///     still name it (so the entry cannot outlive what it allows).
+/// (`engine_config_validate(file)`, the one file-taking webview command this rule once excluded,
+/// was dropped at PR 3 final r1 — `the_dropped_config_validate_and_key_delete_all_commands_are_refused`.)
+///
+/// prove-it 3b: the scan must FIND every command `all_commands()` names, and nothing else — a
+/// parse that matched nothing would pass both rules vacuously.
+#[test]
+fn no_provider_command_takes_a_file_path_and_none_reaches_provider_test() {
+    const MAY_STAGE_A_TEST: &[&str] = &["provider_candidate_check"];
+    let mut staging_bodies_seen: Vec<String> = Vec::new();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found: Vec<String> = Vec::new();
+    let mut provider_commands = 0;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&src)
+        .expect("src/ is readable")
+        .map(|e| e.expect("an entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+    files.sort();
+    for file in files {
+        let code = common::code_only(&std::fs::read_to_string(&file).expect("readable"));
+        for chunk in code.split("#[tauri::command]").skip(1) {
+            let at_fn = chunk
+                .find("fn ")
+                .expect("a command attribute precedes a fn")
+                + 3;
+            let name: String = chunk[at_fn..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let open_paren = at_fn + chunk[at_fn..].find('(').expect("a parameter list");
+            let close_paren = open_paren + matching(&chunk[open_paren..], '(', ')');
+            let params = &chunk[open_paren..=close_paren];
+            let open_brace = close_paren + chunk[close_paren..].find('{').expect("a body");
+            let body = &chunk[open_brace..=open_brace + matching(&chunk[open_brace..], '{', '}')];
+            if name.starts_with("engine_provider_") {
+                provider_commands += 1;
+                for banned in ["file", "path", "Path"] {
+                    assert!(
+                        !params.contains(banned),
+                        "{name} takes a parameter mentioning {banned:?}: {params}"
+                    );
+                }
+            }
+            if !MAY_STAGE_A_TEST.contains(&name.as_str()) {
+                assert!(
+                    !body.contains("ProviderTest"),
+                    "{name} ({}) reaches `Operation::ProviderTest` — only the staging command may",
+                    file.display()
+                );
+            } else if body.contains("ProviderTest") {
+                staging_bodies_seen.push(name.clone());
+            }
+            found.push(name);
+        }
+    }
+    found.sort();
+    let mut expected: Vec<String> = all_commands().iter().map(|c| c.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        found, expected,
+        "the source scan did not find exactly the app's commands"
+    );
+    assert_eq!(
+        provider_commands, 5,
+        "the scan saw {provider_commands} engine_provider_* commands"
+    );
+    assert_eq!(
+        staging_bodies_seen, MAY_STAGE_A_TEST,
+        "an allowlisted staging command no longer names `ProviderTest` — drop its entry"
+    );
+}
+
+/// ⚠ NOTHING IN `src/` CONSTRUCTS `Operation::ProviderTest` (P3-M1-T1 checkpoint LOW), not only no
+/// `#[tauri::command]` body (the rule above): a plain helper building one would pass that scan and
+/// still hand the webview a path to `provider test --file`. So every `src/**/*.rs` is read, comments
+/// and strings removed (`common::code_only`), and every `ProviderTest` identifier classified
+/// ([`provider_test_sites`]): the enum's own definition (exactly one, in `engine.rs`), a PATTERN
+/// (`…::ProviderTest { … .. }` — a construction cannot end in a bare `..`), or a possible
+/// CONSTRUCTION — anything else, including a full field list, a struct update and a `use … as`
+/// alias. Constructions per file must equal `MAY_CONSTRUCT` — exactly ONE, in `config_save.rs`: the
+/// staging command's own body (`provider_candidate_check`, P3-M1-T2, added deliberately), which
+/// builds it over the file it has just staged and nothing else. Decoys first, so the classifier is
+/// shown able to fail before the real scan is believed.
+#[test]
+fn nothing_in_src_constructs_provider_test_outside_the_allowlist() {
+    const MAY_CONSTRUCT: &[(&str, usize)] = &[("config_save.rs", 1)];
+    for (decoy, want) in [
+        ("enum Operation { ProviderTest { file: F, index: I, test_timeout_ms: u64 }, Run }", (1, 0)),
+        ("match op { Operation::ProviderTest { file, index, .. } => 1, _ => 0 }", (0, 0)),
+        ("matches!(o, Operation::ProviderTest { .. })", (0, 0)),
+        ("match o { Operation::ProviderTest {\n test_timeout_ms, ..\n } => 1 }", (0, 0)),
+        ("fn stage() -> Operation { Operation::ProviderTest { file, index, test_timeout_ms: 1 } }", (0, 1)),
+        ("fn stage() -> Operation { Self::ProviderTest { file, index, test_timeout_ms } }", (0, 1)),
+        ("fn stage(b: Operation) -> Operation { Operation::ProviderTest { ..b } }", (0, 1)),
+        ("use crate::engine::Operation::ProviderTest as Pt;", (0, 1)),
+        ("use crate::engine::Operation::{ProviderTest, Run};", (1, 0)),
+        ("let x = Operation::ProviderTestish;", (0, 0)),
+    ] {
+        assert_eq!(provider_test_sites(decoy), want, "the classifier misread: {decoy}");
+    }
+
+    let mut files = Vec::new();
+    rs_files(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    files.sort();
+    assert!(
+        files.len() > 10,
+        "the walk found only {} files under src/",
+        files.len()
+    );
+    let (mut definitions, mut engine_rs_seen) = (0, false);
+    for file in &files {
+        let rel = file
+            .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+            .expect("under src/")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let (defs, constructions) = provider_test_sites(&common::code_only(
+            &std::fs::read_to_string(file).expect("readable"),
+        ));
+        if rel == "engine.rs" {
+            engine_rs_seen = true;
+            assert_eq!(
+                defs, 1,
+                "engine.rs should define `ProviderTest` exactly once"
+            );
+        } else {
+            assert_eq!(
+                defs, 0,
+                "src/{rel} names `ProviderTest` outside a path (a re-export or import list?)"
+            );
+        }
+        definitions += defs;
+        let allowed = MAY_CONSTRUCT
+            .iter()
+            .find(|(f, _)| *f == rel)
+            .map_or(0, |(_, n)| *n);
+        assert_eq!(
+            constructions, allowed,
+            "src/{rel} has {constructions} possible `Operation::ProviderTest` construction(s), {allowed} allowed — \
+             only the staging helper may build one"
+        );
+    }
+    assert!(
+        engine_rs_seen && definitions == 1,
+        "the scan never saw the definition"
+    );
+}
+
+/// ⚠ ONLY `calendar_details_open` CONSTRUCTS `Operation::CalendarDetails` (C-M3-T9; C "Capabilities"), in the
+/// `ProviderTest` pin's shape: every `Operation::CalendarDetails` / `Self::CalendarDetails` in `src/` is classified as
+/// a PATTERN (`{ … .. }`, every `engine.rs` arm binds so) or a possible CONSTRUCTION, and constructions must be exactly
+/// ONE, in `calendar_details.rs`'s `open_details` — whose one caller is the `calendar_details_open` command body. No
+/// `use` imports the variant (an alias would hide a construction). Decoys first.
+#[test]
+fn only_calendar_details_open_constructs_the_details_operation() {
+    fn sites(code: &str) -> usize {
+        let re = regex::Regex::new(r"(?:Operation|Self)::CalendarDetails\b").expect("regex");
+        re.find_iter(code)
+            .filter(|m| {
+                let rest = code[m.end()..].trim_start();
+                !(rest.starts_with('{') && rest[1..matching(rest, '{', '}')].trim_end().ends_with(".."))
+            })
+            .count()
+    }
+    for (decoy, want) in [
+        ("match op { Operation::CalendarDetails { skip_mac, skip_commands, .. } => 1 }", 0),
+        ("matches!(op, Operation::CalendarDetails { .. })", 0),
+        ("Operation::CalendarDetails { skip_mac, skip_commands }", 1),
+        ("Operation::CalendarDetails { skip_mac: true, skip_commands: false }", 1),
+        ("let c = calendar_details::CalendarDetails::default();", 0),
+        ("Self::CalendarDetails { skip_mac: a, skip_commands: b }", 1),
+    ] {
+        assert_eq!(sites(decoy), want, "the classifier misread: {decoy}");
+    }
+    let mut files = Vec::new();
+    rs_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+    files.sort();
+    let mut constructions: Vec<(String, usize)> = Vec::new();
+    for file in &files {
+        let code = common::code_only(&std::fs::read_to_string(file).expect("readable"));
+        let code = code.split("#[cfg(test)]").next().expect("the production part").to_string();
+        let name = file.file_name().expect("a name").to_string_lossy().into_owned();
+        assert!(
+            !regex::Regex::new(r"use[^;]*Operation::(\{[^}]*CalendarDetails|CalendarDetails|\*)")
+                .expect("regex")
+                .is_match(&code),
+            "src/{name} imports the CalendarDetails variant"
+        );
+        let n = sites(&code);
+        if n > 0 {
+            constructions.push((name.clone(), n));
+        }
+        if name == "calendar_details.rs" {
+            let open = &code[code.find("pub async fn open_details").expect("open_details")..];
+            assert_eq!(sites(&open[..open.find("\n}\n").expect("its end")]), 1, "the construction left open_details");
+        }
+    }
+    assert_eq!(constructions, vec![("calendar_details.rs".to_string(), 1)]);
+    // And `open_details` has one caller in `src/`: the `calendar_details_open` command body.
+    let code = common::code_only(
+        &std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/calendar_details.rs"))
+            .expect("readable"),
+    );
+    let code = code.split("#[cfg(test)]").next().expect("the production part");
+    let calls: Vec<usize> = code.match_indices("open_details(").map(|(i, _)| i).collect();
+    // The definition is `fn open_details<V: …>(`, so it is not an `open_details(` match; a plain
+    // `fn open_details(` would be, and is subtracted.
+    let defs = code.matches("fn open_details(").count();
+    assert_eq!(code.matches("fn open_details").count(), 1, "open_details is not defined once");
+    assert_eq!(calls.len() - defs, 1, "open_details has another caller");
+    let command = &code[code.find("pub async fn calendar_details_open").expect("the command")..];
+    let body_end = command.find("\n}\n").expect("its end");
+    assert!(command[..body_end].contains("open_details("));
+    for file in &files {
+        if file.ends_with("calendar_details.rs") {
+            continue;
+        }
+        let other = common::code_only(&std::fs::read_to_string(file).expect("readable"));
+        assert!(!other.contains("open_details("), "{} calls open_details", file.display());
+    }
+}
+
+/// C-M3-T9's four commands, ADMITTED and each running its own code through real IPC, against the mock app's HIDDEN
+/// live gate: `calendar_details_open` answers `{ refused: "hidden" }` and spawns nothing; with no read held, a card
+/// and Join answer `{ refused: "stale" }`; Open in Calendar answers through the inert sink on macOS and
+/// `unsupported` elsewhere. No reply holds a URL.
+#[test]
+fn the_calendar_details_commands_are_admitted_and_run_their_own_code() {
+    let f = fixture();
+    let w = main_webview(&f.app);
+    let answer = |cmd: &str, body: serde_json::Value| -> Result<serde_json::Value, String> {
+        let o = attempt(&w, cmd, body.clone());
+        assert_eq!(o.verdict, Verdict::Admitted, "{cmd} {body}: {}", o.message);
+        match o.body {
+            Some(b) => Ok(b.deserialize().expect("JSON")),
+            None => Err(o.message),
+        }
+    };
+    for reason in ["became-current", "focus", "timer"] {
+        for current in [serde_json::json!("calendar"), serde_json::json!("launchpad")] {
+            assert_eq!(
+                answer("calendar_details_open", serde_json::json!({ "request": { "reason": reason, "current": current } })),
+                Ok(serde_json::json!({ "refused": "hidden" })),
+                "{reason} {current}"
+            );
+        }
+    }
+    // Another slide, or none: nothing held, nothing read.
+    for current in [serde_json::json!("goodMorning"), serde_json::Value::Null] {
+        assert_eq!(
+            answer("calendar_details_open", serde_json::json!({ "request": { "reason": "focus", "current": current } })),
+            Ok(serde_json::json!({ "gate": "none" }))
+        );
+    }
+    assert_eq!(
+        answer("calendar_details_get", serde_json::json!({ "request": { "handle": "0.0.0" } })),
+        Ok(serde_json::json!({ "refused": "stale" }))
+    );
+    assert_eq!(
+        answer("calendar_join", serde_json::json!({ "request": { "handle": "0.0.0", "confirmed": true } })),
+        Ok(serde_json::json!({ "refused": "stale" }))
+    );
+    let app_open = answer("calendar_app_open", serde_json::json!({}));
+    if cfg!(target_os = "macos") {
+        assert_eq!(app_open, Ok(serde_json::Value::Null));
+    } else {
+        let message = app_open.expect_err("off macOS the command refuses");
+        assert!(message.contains("unsupported"), "{message}");
+    }
+    assert!(
+        !f.argv_file.exists(),
+        "a calendar-details command reached the fake sidecar: {:?}",
+        std::fs::read_to_string(&f.argv_file)
+    );
+    assert!(f.opener.urls().is_empty(), "something was opened");
+    assert!(
+        f.app.state::<Arc<RecordingOpener>>().urls().is_empty(),
+        "the CalendarDetails opener was called"
+    );
+}
+
+/// Every test app manages recording state of its own, so nothing else here would notice the shipped app not managing it:
+/// the first click would fail with "state not managed". `run()` builds each real default once.
+#[test]
+fn the_shipped_app_manages_the_b2_state_and_registers_the_clipboard_plugin() {
+    let lib = common::code_only(include_str!("../src/lib.rs"));
+    let run = &lib[lib.find("pub fn run()").expect("run()")..];
+    for wired in [
+        ".manage(actions::ActionsState::default())",
+        ".manage(editor::EditorState::default())",
+        ".plugin(tauri_plugin_clipboard_manager::init())",
+    ] {
+        assert_eq!(run.matches(wired).count(), 1, "{wired} in run()");
+    }
+}
+
+/// B2 `:30`: each of the five requests refuses an extra `url`, `path` or `command` field before any action. The same
+/// request without the field answers with its reply, so what refuses here is the field. Nothing reaches a sink or the engine.
+#[test]
+fn the_b2_requests_refuse_an_extra_field_before_any_action() {
+    let f = fixture();
+    let w = main_webview(&f.app);
+    let on_macos = cfg!(target_os = "macos");
+    let key = "00000000000000000000000000000001";
+    let cases = [
+        ("open_github", serde_json::json!({ "handle": "0.0.0" }), serde_json::json!({ "refused": "stale" })),
+        ("copy_push_command", serde_json::json!({ "handles": ["0.0.0"] }), serde_json::json!({ "refused": "stale" })),
+        ("editor_list", serde_json::json!({}), serde_json::json!(if on_macos { serde_json::json!({ "failed": "detection" }) } else { serde_json::json!({ "refused": "unsupported" }) })),
+        ("editor_open", serde_json::json!({ "handle": "0.0.0", "editor": "zed" }), serde_json::json!({ "refused": if on_macos { "stale" } else { "unsupported" } })),
+        ("editor_choice_set", serde_json::json!({ "project": key, "editor": "zed" }), serde_json::json!({ "refused": if on_macos { "stale" } else { "unsupported" } })),
+    ];
+    for (cmd, request, _) in &cases {
+        for field in ["url", "path", "command"] {
+            let mut bad = request.clone();
+            bad[field] = serde_json::json!("https://evil.example/x");
+            let o = attempt(&w, cmd, serde_json::json!({ "request": bad }));
+            assert_eq!(o.verdict, Verdict::Admitted, "{cmd} {field}: {}", o.message);
+            assert!(o.body.is_none(), "{cmd} answered despite an extra {field}");
+            assert!(o.message.contains(&format!("unknown field `{field}`")), "{cmd} {field}: {}", o.message);
+        }
+    }
+    assert!(!f.argv_file.exists(), "an extra field reached the engine");
+    for (cmd, request, want) in &cases {
+        let o = attempt(&w, cmd, serde_json::json!({ "request": request }));
+        assert_eq!(o.verdict, Verdict::Admitted, "{cmd}: {}", o.message);
+        let body: serde_json::Value = o.body.unwrap_or_else(|| panic!("{cmd}: {}", o.message)).deserialize().expect("JSON");
+        assert_eq!(&body, want, "{cmd}");
+    }
+    let b2 = f.app.state::<Arc<RecordingB2>>();
+    assert!(b2.urls().is_empty() && b2.copied().is_empty() && b2.launched().is_empty(), "a refused request reached a sink");
+}
+
+/// B2-M4-T12's wrappers read `project` and `editor` raw (plan, build checkpoint B2-M4-T10): `ProjectKey` has no
+/// `Deserialize`, and `EditorId`'s derived one also takes `{"zed": null}`. So every bad value gets the reply's own refusal
+/// and never an IPC argument error, and nothing is written. Against a stored key, so a bad editor is the only thing wrong.
+#[test]
+fn the_editor_choice_command_answers_a_bad_value_with_its_own_refusal() {
+    let scratch = ScratchDir::new("ipc-b2-raw");
+    let argv_file = scratch.join("argv.txt");
+    let program = ipc_sidecar(&scratch.path, "engine.sh", &argv_file);
+    let store = scratch.join("app-data");
+    std::fs::create_dir_all(&store).expect("the store");
+    let key = "00000000000000000000000000000001";
+    let file = store.join(daily_briefing_gui_lib::app_prefs::APP_PREFS_FILE);
+    let stored = serde_json::json!({ "editorChoices": { key: "ask" } }).to_string();
+    std::fs::write(&file, &stored).expect("the prefs file");
+    let app = app_managing_with(
+        Engine(Ok(EngineClient::with_program(program))),
+        access_state(&scratch, Arc::new(RecordingOpener::default())),
+        NotifyState::default().with_sink(Arc::new(RecordingNotifySink::default())).with_store_dir(&store),
+        AutostartState::default().with_sink(Arc::new(RecordingAutostartSink::default())).with_store_dir(&store),
+        &scratch.join("cands"),
+        PendingResets::default().with_store_dir(&store),
+        AppPrefs::default().with_store_dir(&store),
+    );
+    let w = main_webview(&app);
+    let answer = |request: serde_json::Value| -> serde_json::Value {
+        let o = attempt(&w, "editor_choice_set", serde_json::json!({ "request": request.clone() }));
+        assert_eq!(o.verdict, Verdict::Admitted, "{request}: {}", o.message);
+        o.body.unwrap_or_else(|| panic!("{request} was an IPC error, not a reply: {}", o.message)).deserialize().expect("JSON")
+    };
+    let on_macos = cfg!(target_os = "macos");
+    let refused = |code: &str| serde_json::json!({ "refused": if on_macos { code } else { "unsupported" } });
+    for editor in [
+        serde_json::json!({ "zed": null }),
+        serde_json::json!(null),
+        serde_json::json!(5),
+        serde_json::json!("nope"),
+        serde_json::json!(["zed"]),
+    ] {
+        assert_eq!(answer(serde_json::json!({ "project": key, "editor": editor })), refused("unknown-editor"), "{editor}");
+    }
+    assert_eq!(answer(serde_json::json!({ "project": key })), refused("unknown-editor"), "no editor at all");
+    for project in [
+        serde_json::json!(null),
+        serde_json::json!(5),
+        serde_json::json!({ "key": key }),
+        serde_json::json!(key.to_uppercase().replace('0', "A")),
+        serde_json::json!(&key[1..]),
+    ] {
+        assert_eq!(answer(serde_json::json!({ "project": project, "editor": "zed" })), refused("stale"), "{project}");
+    }
+    assert_eq!(answer(serde_json::json!({ "editor": "zed" })), refused("stale"), "no project at all");
+    assert_eq!(std::fs::read_to_string(&file).expect("the prefs file"), stored, "a refusal wrote the store");
+    // The decoy: the same store takes a good value.
+    let saved = answer(serde_json::json!({ "project": key, "editor": "zed" }));
+    if on_macos {
+        assert_eq!(saved, serde_json::json!({ "saved": true, "revision": 1 }));
+    } else {
+        assert_eq!(saved, refused("unsupported"));
+    }
+}
+
+/// B2-M4-T12: the five shipped commands, end to end through real IPC on handles the production `repos::status` held in the
+/// app's own `ReposLive`. This is the wrappers' whole job: the switch read from the app's prefs, the managed sinks, the
+/// store folder and the home. The bodies' own refusals are `tests/actions.rs`'s and `tests/editor.rs`'s.
+#[cfg(unix)]
+#[test]
+fn the_b2_commands_reach_their_managed_sinks_through_real_ipc() {
+    use daily_briefing_gui_lib::repos::{status, ReposIpcRequest};
+    use daily_briefing_gui_lib::schedule_state::Now;
+
+    let scratch = ScratchDir::new("ipc-b2-sinks");
+    let root = std::fs::canonicalize(&scratch.path).expect("the root");
+    let (state, xdg, record, store) = (root.join("state"), root.join("xdg"), root.join("record"), root.join("app-data"));
+    for dir in [&state, &xdg, &record, &root.join("home")] {
+        std::fs::create_dir_all(dir).expect("a sandbox folder");
+    }
+    let fx: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/action-facts-vectors.json")).expect("the fixture");
+    let mut doc = fx["reply"].clone();
+    doc["repos"] = serde_json::json!([]);
+    doc["actionFacts"] = common::materialise_action_facts(&root, &fx["actionFacts"]);
+    std::fs::write(root.join("repo/.git/HEAD"), "ref: refs/heads/feature/contract\n").expect("HEAD");
+    std::fs::write(root.join("all.json"), doc.to_string()).expect("all.json");
+    let config = xdg.join("config.json");
+    // `access_state`'s home is `<scratch>/home`, so this names the fixture's repo only if the command used that home. A
+    // row that failed to merge with the held repo would list a third, unchecked project below.
+    std::fs::write(&config, serde_json::json!({ "repos": ["~/../repo"] }).to_string()).expect("the config");
+
+    let engine = common::files_sidecar(&root, "config-engine.sh", &state, &config, &record);
+    let app = app_managing_with(
+        Engine(Ok(EngineClient::with_program(engine))),
+        access_state(&scratch, Arc::new(RecordingOpener::default())),
+        NotifyState::default().with_sink(Arc::new(RecordingNotifySink::default())).with_store_dir(&store),
+        AutostartState::default().with_sink(Arc::new(RecordingAutostartSink::default())).with_store_dir(&store),
+        &root.join("cands"),
+        PendingResets::default().with_store_dir(&store),
+        AppPrefs::default().with_store_dir(&store),
+    );
+    let w = main_webview(&app);
+
+    // One full check, as Today's would be, held in the state the commands read.
+    let repos_body = format!("cat > /dev/null\ncat {}", common::sq(&root.join("all.json").display().to_string()));
+    let repos_client = EngineClient::with_program(common::fake_sidecar(&root, "repos-engine.sh", &repos_body));
+    let env = LiveEnv::default()
+        .with_visibility(Arc::new(|| Visibility { visible: true, minimized: false }))
+        .with_clock(Arc::new(|| Now { local_date: "2026-01-11".into(), minutes: 600, epoch_secs: 1_000 }));
+    let ask: ReposIpcRequest = serde_json::from_value(serde_json::json!({
+        "labels": [{ "key": "repo", "tokens": [] }, { "key": "gui", "tokens": ["5fab0a2"] }],
+        "branches": [{ "key": "gui", "name": "feature/contract" }],
+        "pageDate": "2026-01-11",
+        "reason": "first",
+        "current": "whatYouDid",
+    }))
+    .expect("a well-formed ask");
+    let visible = || Visibility { visible: true, minimized: false };
+    let live = app.state::<ReposLive>();
+    let reply = tauri::async_runtime::block_on(status(&repos_client, &env, visible, live.inner(), ask)).expect("the check").0;
+    let handle = |kind: &str, target: &str| -> String {
+        reply["actions"].as_array().expect("actions").iter().filter(|c| c["cardKind"] == kind)
+            .flat_map(|c| c["handles"].as_array().expect("handles")).find(|h| h["target"] == target)
+            .unwrap_or_else(|| panic!("no {target} on {kind}: {reply}"))["handle"].as_str().expect("a handle").to_string()
+    };
+    let answer = |cmd: &str, body: serde_json::Value| -> serde_json::Value {
+        let o = attempt(&w, cmd, body.clone());
+        assert_eq!(o.verdict, Verdict::Admitted, "{cmd} {body}: {}", o.message);
+        let answered: serde_json::Value =
+            o.body.unwrap_or_else(|| panic!("{cmd} {body}: {}", o.message)).deserialize().expect("JSON");
+        let text = answered.to_string();
+        assert!(!text.contains(root.to_str().unwrap()), "{cmd} answered a path: {text}");
+        answered
+    };
+    let b2 = app.state::<Arc<RecordingB2>>();
+
+    // open_github: the managed opener, with the switch read from the app's own store at each click.
+    let pr = handle("did", "pr");
+    let open = serde_json::json!({ "request": { "handle": pr } });
+    assert_eq!(answer("open_github", open.clone()), serde_json::json!({ "opened": true }));
+    assert_eq!(serde_json::json!(b2.urls()), fx["expectedSinks"]["open"]);
+    answer("app_prefs_set", serde_json::json!({ "patch": { "githubLinks": false } }));
+    assert_eq!(answer("open_github", open.clone()), serde_json::json!({ "refused": "links-off" }));
+    assert_eq!(b2.urls().len(), 1, "the switch off reached the opener");
+    answer("app_prefs_set", serde_json::json!({ "patch": { "githubLinks": true } }));
+    assert_eq!(answer("open_github", open), serde_json::json!({ "opened": true }));
+    assert_eq!(b2.urls().len(), 2, "the switch back on did not reach the opener");
+
+    // copy_push_command: the managed clipboard, exactly the fixture's bytes.
+    let copy = answer("copy_push_command", serde_json::json!({ "request": { "handles": [handle("push", "copy")] } }));
+    assert_eq!(copy, serde_json::json!({ "copied": true }));
+    let want: Vec<String> = fx["expectedSinks"]["copy"].as_array().expect("copy").iter()
+        .map(|c| c.as_str().expect("text").replace("/fixture", root.to_str().unwrap())).collect();
+    assert_eq!(b2.copied(), want);
+
+    // The editor three: the managed detector and launcher, the prefs store and the home. Off macOS each refuses first.
+    let editor = handle("leftOff", "editor");
+    let (gui, repo) = ("9fbb6e9f98a6074f844482cda9171850", "032fa4562bc7b051317d2a37a7291db8");
+    let list = serde_json::json!({ "request": { "handle": editor } });
+    let open = |token: serde_json::Value| serde_json::json!({ "request": { "handle": editor, "editor": token } });
+    if !cfg!(target_os = "macos") {
+        let unsupported = serde_json::json!({ "refused": "unsupported" });
+        assert_eq!(answer("editor_list", list), unsupported);
+        assert_eq!(answer("editor_open", open(serde_json::json!("zed"))), unsupported);
+        assert_eq!(answer("editor_choice_set", serde_json::json!({ "request": { "project": gui, "editor": "zed" } })), unsupported);
+        assert!(b2.launched().is_empty(), "off macOS something launched");
+        return;
+    }
+    let row = |project: &str, label: &str, choice: serde_json::Value| {
+        serde_json::json!({ "project": project, "label": label, "choice": choice, "availability": "ready" })
+    };
+    assert_eq!(
+        answer("editor_list", list),
+        serde_json::json!({
+            "editors": [{ "editor": "zed", "label": "Zed" }],
+            "projects": [row(repo, "Repo", serde_json::Value::Null), row(gui, "GUI", serde_json::Value::Null)],
+            "discoveryConfigured": false,
+            "preselect": "zed",
+        })
+    );
+    for bad in [serde_json::json!({ "zed": null }), serde_json::Value::Null, serde_json::json!("nope"), serde_json::json!("ask")] {
+        assert_eq!(answer("editor_open", open(bad.clone())), serde_json::json!({ "refused": "no-editor" }), "{bad}");
+    }
+    assert!(b2.launched().is_empty(), "a refused launch reached the launcher");
+    assert_eq!(answer("editor_open", open(serde_json::json!("zed"))), serde_json::json!({ "opened": true }));
+    let folder = root.join("repo/apps/gui");
+    assert_eq!(b2.launched(), vec![["/usr/bin/open", "-b", "dev.zed.Zed", folder.to_str().unwrap()].map(String::from).to_vec()]);
+    let revision = answer("app_prefs_get", serde_json::json!({}))["revision"].as_u64().expect("a revision");
+    assert_eq!(
+        answer("editor_choice_set", serde_json::json!({ "request": { "project": gui, "editor": "zed" } })),
+        serde_json::json!({ "saved": true, "revision": revision + 1 })
+    );
+    assert_eq!(answer("app_prefs_get", serde_json::json!({}))["editorChoices"], serde_json::json!({ gui: "zed" }));
+    assert_eq!(
+        answer("editor_list", serde_json::json!({ "request": {} }))["projects"],
+        serde_json::json!([row(repo, "Repo", serde_json::Value::Null), row(gui, "GUI", serde_json::json!("zed"))]),
+        "the choice is back on its row"
+    );
+}
+
+/* ── A2-M4-T13: the summary read through the registered handler ──────────────────────────────── */
+
+/// An app around the shipped handler whose engine is `files_sidecar` over `state`, recording its
+/// argv in `record`. The state dir, config and record paths are explicit arguments: nothing here sets
+/// process environment (plan R4-L5).
+fn app_over_state(scratch: &ScratchDir, state: &Path, record: &Path) -> App<MockRuntime> {
+    std::fs::create_dir_all(record).unwrap();
+    let program = files_sidecar(
+        &scratch.path,
+        "engine.sh",
+        state,
+        &scratch.join("config.json"),
+        record,
+    );
+    app_managing(
+        Engine(Ok(EngineClient::with_program(program))),
+        access_state(scratch, Arc::new(RecordingOpener::default())),
+        NotifyState::default()
+            .with_sink(Arc::new(RecordingNotifySink::default()))
+            .with_store_dir(scratch.join("app-data")),
+        AutostartState::default()
+            .with_sink(Arc::new(RecordingAutostartSink::default()))
+            .with_store_dir(scratch.join("app-data")),
+    )
+}
+
+/// The IPC stage of the summary handoff, over a root laid out as the producer lays it out: the two
+/// receipts beside `state/`, which holds the page, `last-run` and `briefings/`. It invokes the
+/// registered handler and writes what really came back to `ipc-reply.json`. A missing prerequisite,
+/// or receipts that do not match each other or the page, is an `Err` reached before the handler runs.
+/// A reply that differs from the receipt fails later, at the `assert_eq!` after the handler. The file
+/// is written last, so neither failure leaves a reply for a later stage to read.
+fn registered_ipc_stage(root: &Path, scratch: &ScratchDir) -> Result<(), String> {
+    let artifact = |name: &str| -> Result<serde_json::Value, String> {
+        let text = std::fs::read_to_string(root.join(name))
+            .map_err(|e| format!("{name} is required: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("{name}: {e}"))
+    };
+    let receipt = artifact("page-receipt.json")?;
+    if artifact("reader-receipt.json")? != receipt {
+        return Err("reader-receipt.json does not match page-receipt.json".into());
+    }
+    let field = |name: &str| -> Result<&str, String> {
+        receipt[name]
+            .as_str()
+            .ok_or_else(|| format!("page-receipt.json has no {name}"))
+    };
+    let (date, hash, version) = (
+        field("HANDOFF_DATE")?,
+        field("pageHash")?,
+        field("pageVersion")?,
+    );
+    let state = root.join("state");
+    let page_path = state.join("briefing-latest.md");
+    let page = read_latest_briefing_at(&page_path)
+        .map_err(|e| format!("briefing-latest.md is required: {e:?}"))?;
+    if page.page_hash.as_deref() != Some(hash) || page.page_version.as_deref() != Some(version) {
+        return Err("briefing-latest.md is not the page the receipts name".into());
+    }
+    let sidecar = format!("{date}.{hash}.{version}.summary.json");
+    if !state.join("briefings").join(&sidecar).is_file() {
+        return Err(format!("{sidecar} is required"));
+    }
+
+    let record = scratch.join("record");
+    let app = app_over_state(scratch, &state, &record);
+    let w = main_webview(&app);
+    let o = attempt(
+        &w,
+        "read_latest_summary",
+        serde_json::json!({ "request": { "pageHash": hash, "pageVersion": version } }),
+    );
+    assert_eq!(o.verdict, Verdict::Admitted, "{}", o.message);
+    let reply: serde_json::Value = o
+        .body
+        .unwrap_or_else(|| panic!("the read failed: {}", o.message))
+        .deserialize()
+        .expect("JSON");
+    // Exactly the ready payload: a member the reply must not carry fails here too.
+    assert_eq!(
+        reply,
+        serde_json::json!({
+            "state": "ready",
+            "pageHash": hash,
+            "pageVersion": version,
+            "revision": 1,
+            "projects": receipt["projects"],
+            "goodMorningSentence": receipt["goodMorningSentence"],
+            "warnings": [],
+        })
+    );
+    // The command body asked the engine: a constant reply would leave this file absent.
+    assert_eq!(
+        std::fs::read_to_string(record.join("argv.txt")).unwrap(),
+        "status\n--json\n"
+    );
+    let saved = serde_json::json!({
+        "reply": reply,
+        "pagePath": page_path,
+        "pageDate": date,
+        "pageHash": hash,
+        "pageVersion": version,
+    });
+    std::fs::write(root.join("ipc-reply.json"), saved.to_string()).unwrap();
+    Ok(())
+}
+
+/// A self-contained root for [`registered_ipc_stage`], laid out as the producer lays its own out.
+fn native_summary_root(scratch: &ScratchDir) -> PathBuf {
+    let root = scratch.join("root");
+    let state = root.join("state");
+    std::fs::create_dir_all(state.join("briefings")).unwrap();
+    let date = "2026-01-11";
+    std::fs::write(state.join("last-run"), format!("{date}\n")).unwrap();
+    let page_path = state.join("briefing-latest.md");
+    std::fs::write(
+        &page_path,
+        "\u{2600}\u{fe0f}  Daily briefing \u{2014} 2026-01-11  (this machine: fixture)\n",
+    )
+    .unwrap();
+    let page = read_latest_briefing_at(&page_path).unwrap();
+    let (hash, version) = (page.page_hash.unwrap(), page.page_version.unwrap());
+    let projects =
+        serde_json::json!([{ "key": "project:orchard", "points": ["Finished the harvest view."] }]);
+    let sentence = "The harvest view is ready for its next pass.";
+    std::fs::write(
+        state
+            .join("briefings")
+            .join(format!("{date}.{hash}.{version}.summary.json")),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "pageDate": date,
+            "pageHash": hash,
+            "pageVersion": version,
+            "state": "ready",
+            "revision": 1,
+            "projects": projects,
+            "goodMorningSentence": sentence,
+            "warnings": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let receipt = serde_json::json!({
+        "HANDOFF_DATE": date,
+        "pageHash": hash,
+        "pageVersion": version,
+        "projects": projects,
+        "goodMorningSentence": sentence,
+    })
+    .to_string();
+    std::fs::write(root.join("page-receipt.json"), &receipt).unwrap();
+    std::fs::write(root.join("reader-receipt.json"), &receipt).unwrap();
+    root
+}
+
+/// The summary read is admitted and answers the distinctive ready payload through the shipped
+/// handler. In the orchestrator's handoff (`DBA_SUMMARY_ROUNDTRIP_DIR`) it reads what the engine
+/// wrote and hands the reply to the GUI's render stage; otherwise it reads a scratch record and
+/// prints nothing. Required mode with no directory fails here, before any fallback.
+#[test]
+fn summary_handoff_registered_ipc() {
+    let dir = std::env::var_os("DBA_SUMMARY_ROUNDTRIP_DIR").filter(|dir| !dir.is_empty());
+    let required = std::env::var_os("DBA_SUMMARY_ROUNDTRIP_REQUIRED").is_some_and(|v| v == "1");
+    assert!(
+        dir.is_some() || !required,
+        "summary-handoff: required mode needs DBA_SUMMARY_ROUNDTRIP_DIR"
+    );
+    let scratch = ScratchDir::new("summary-ipc");
+    if let Some(root) = dir {
+        registered_ipc_stage(Path::new(&root), &scratch)
+            .unwrap_or_else(|e| panic!("summary-handoff: {e}"));
+        // The leading newline gives the receipt its own line under the harness's output.
+        println!("\nsummary-handoff: ipc ok");
+        return;
+    }
+    let root = native_summary_root(&scratch);
+    registered_ipc_stage(&root, &scratch).unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("ipc-reply.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["reply"]["state"], "ready");
+    assert_eq!(saved["reply"]["pageHash"], saved["pageHash"]);
+    assert_eq!(saved["reply"]["pageVersion"], saved["pageVersion"]);
+    assert_eq!(
+        saved["reply"]["goodMorningSentence"],
+        "The harvest view is ready for its next pass."
+    );
+}
+
+/// Each prerequisite the IPC stage needs fails it, naming what is missing, and leaves no reply for
+/// the render stage. Run on one root each, so the only difference from a green stage is the removal.
+#[test]
+fn a_missing_or_stale_handoff_artifact_fails_the_ipc_stage() {
+    let scratch = ScratchDir::new("summary-ipc-green");
+    let root = native_summary_root(&scratch);
+    registered_ipc_stage(&root, &scratch).expect("PREMISE: the whole root is green");
+    for gone in ["page-receipt.json", "reader-receipt.json", "briefing-latest.md", "summary.json"] {
+        let scratch = ScratchDir::new("summary-ipc-missing");
+        let root = native_summary_root(&scratch);
+        // The sidecar's name holds this page's version, so it is found rather than spelled.
+        let path = match gone {
+            "briefing-latest.md" => root.join("state").join(gone),
+            "summary.json" => std::fs::read_dir(root.join("state/briefings"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+            _ => root.join(gone),
+        };
+        std::fs::remove_file(path).unwrap();
+        let err = registered_ipc_stage(&root, &scratch).expect_err(gone);
+        assert!(err.contains(gone) && err.contains("required"), "{gone}: {err}");
+        assert!(!root.join("ipc-reply.json").exists(), "{gone}");
+        assert!(!scratch.join("record").exists(), "{gone} reached the handler");
+    }
+    // A reader receipt from another run, and a page that changed after the receipts.
+    let scratch = ScratchDir::new("summary-ipc-stale");
+    let root = native_summary_root(&scratch);
+    std::fs::write(root.join("reader-receipt.json"), r#"{"pageHash":"other"}"#).unwrap();
+    let err = registered_ipc_stage(&root, &scratch).unwrap_err();
+    assert!(err.contains("does not match"), "{err}");
+    assert!(!root.join("ipc-reply.json").exists());
+    let scratch = ScratchDir::new("summary-ipc-changed");
+    let root = native_summary_root(&scratch);
+    std::fs::write(root.join("state/briefing-latest.md"), "another page\n").unwrap();
+    let err = registered_ipc_stage(&root, &scratch).unwrap_err();
+    assert!(err.contains("not the page"), "{err}");
+    assert!(!root.join("ipc-reply.json").exists());
+    // A sidecar whose points differ from the receipt passes every prerequisite and reaches the
+    // handler, then fails the comparison with the reply: a panic, not an `Err`.
+    let scratch = ScratchDir::new("summary-ipc-points");
+    let root = native_summary_root(&scratch);
+    let sidecar = std::fs::read_dir(root.join("state/briefings"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let stored = std::fs::read_to_string(&sidecar).unwrap();
+    let changed = stored.replace("Finished the harvest view.", "Started the harvest view.");
+    assert_ne!(changed, stored, "PREMISE: the point was replaced");
+    std::fs::write(&sidecar, changed).unwrap();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        registered_ipc_stage(&root, &scratch)
+    }))
+    .expect_err("the reply's points differ from the receipt's");
+    let message = panic.downcast_ref::<String>().expect("assert_eq! text");
+    assert!(message.contains("Started the harvest view."), "{message}");
+    assert!(scratch.join("record").join("argv.txt").exists(), "never reached the handler");
+    assert!(!root.join("ipc-reply.json").exists());
+}
+
+/// An engine client that failed at startup is ordinary absence, never error text (A2 :77): the
+/// nearest precedent, `BriefingError::Engine`, copies the same error's text across IPC, and that text
+/// holds the path the app looked at. A bad operand is still its own refusal, as with a working client.
+#[test]
+fn a_failed_engine_client_is_absence_and_its_text_never_crosses() {
+    const DETAIL: &str = "/nowhere/SENTINEL-sidecar: No such file or directory";
+    let scratch = ScratchDir::new("summary-no-client");
+    let app = app_managing(
+        Engine(Err(EngineError::SidecarUnresolved {
+            detail: DETAIL.into(),
+        })),
+        access_state(&scratch, Arc::new(RecordingOpener::default())),
+        NotifyState::default()
+            .with_sink(Arc::new(RecordingNotifySink::default()))
+            .with_store_dir(scratch.join("app-data")),
+        AutostartState::default()
+            .with_sink(Arc::new(RecordingAutostartSink::default()))
+            .with_store_dir(scratch.join("app-data")),
+    );
+    let w = main_webview(&app);
+
+    let o = attempt(
+        &w,
+        "read_latest_summary",
+        serde_json::json!({ "request": { "pageHash": "a".repeat(64), "pageVersion": "b".repeat(64) } }),
+    );
+    assert_eq!(o.verdict, Verdict::Admitted, "{}", o.message);
+    assert_eq!(o.message, "", "a client failure must not be an error");
+    let reply: serde_json::Value = o.body.expect("a reply").deserialize().expect("JSON");
+    assert_eq!(reply, serde_json::json!({ "state": "unavailable", "warnings": [] }));
+
+    let o = attempt(
+        &w,
+        "read_latest_summary",
+        serde_json::json!({ "request": { "pageHash": "../x", "pageVersion": "b".repeat(64) } }),
+    );
+    assert_eq!(o.verdict, Verdict::Admitted, "{}", o.message);
+    assert_eq!(o.message, r#"{"kind":"invalidOperand"}"#);
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("readable") {
+        let path = entry.expect("an entry").path();
+        if path.is_dir() {
+            rs_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// `(definitions, possible constructions)` of `ProviderTest` in `code` (comments and strings already
+/// removed). An occurrence NOT reached through a path (`::` before it) is a definition (or an
+/// import-list entry — the caller allows exactly one, in `engine.rs`). One reached through a path is
+/// a pattern when a `{ … }` follows and its body ends in a bare `..`; anything else may build one.
+fn provider_test_sites(code: &str) -> (usize, usize) {
+    const NAME: &str = "ProviderTest";
+    let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let (mut defs, mut constructions) = (0, 0);
+    let mut from = 0;
+    while let Some(at) = code[from..].find(NAME).map(|i| from + i) {
+        from = at + NAME.len();
+        if ident(code[..at].chars().next_back()) || ident(code[from..].chars().next()) {
+            continue;
+        }
+        if !code[..at].trim_end().ends_with("::") {
+            defs += 1;
+            continue;
+        }
+        let rest = code[from..].trim_start();
+        let pattern = rest.starts_with('{') && {
+            let close = matching(rest, '{', '}');
+            rest[1..close].trim_end().ends_with("..")
+        };
+        if !pattern {
+            constructions += 1;
+        }
+    }
+    (defs, constructions)
+}
+
+/// The offset of the bracket closing the one `text` opens at 0.
+fn matching(text: &str, open: char, close: char) -> usize {
+    let mut depth = 0usize;
+    for (i, c) in text.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return i;
+            }
+        }
+    }
+    panic!("unbalanced {open}{close} in {text:.80}");
 }
 
 /* ── T11's shell commands, driven the same way ────────────────────────────────────────────────── */
@@ -1197,6 +2940,28 @@ fn the_b5_commands_are_admitted_and_run_their_own_code() {
             serde_json::json!({ "text": "{\"provider\":{\"api\":{\"apiKey\":\"sk-test-placeholder\"}}}" }),
             "apiKeyChanged",
         ),
+        // P3-M1-T2: the candidate check refuses these before anything is staged or spawned; its
+        // real runs (both modes) are driven after this loop, over a candidate dir of their own.
+        (
+            "provider_candidate_check",
+            serde_json::json!({ "text": "{ not json", "mode": "validate" }),
+            "notJson",
+        ),
+        (
+            "provider_candidate_check",
+            serde_json::json!({ "mode": "validate" }),
+            "text",
+        ),
+        (
+            "provider_candidate_check",
+            serde_json::json!({ "text": "{}" }),
+            "mode",
+        ),
+        (
+            "provider_candidate_check",
+            serde_json::json!({ "text": "{}", "mode": { "test": { "index": 1_000_000, "testTimeoutMs": 80_000 } } }),
+            "invalidInput",
+        ),
     ];
     for (cmd, body, expected) in before_spawn {
         let o = attempt(&w, cmd, body.clone());
@@ -1272,6 +3037,84 @@ fn the_b5_commands_are_admitted_and_run_their_own_code() {
             "status\n--json\n",
             "{cmd}: a B5 command must ask the engine for `status --json` and nothing else here"
         );
+    }
+
+    // P3-M1-T2: the candidate check's two modes, run for real through IPC over this file's fake —
+    // a second app whose candidate directory is this scratch's (the fixture's is never created). The
+    // staged path is the check's own (`provider-check-<pid>-<seq>.json`) and is gone afterwards.
+    {
+        let scratch = ScratchDir::new("ipc-check");
+        let argv_file = scratch.join("argv.txt");
+        let candidates = scratch.join("candidates");
+        let app = app_managing_candidates_in(
+            Engine(Ok(EngineClient::with_program(ipc_sidecar(
+                &scratch.path,
+                "engine.sh",
+                &argv_file,
+            )))),
+            access_state(&scratch, Arc::new(RecordingOpener::default())),
+            NotifyState::default()
+                .with_sink(Arc::new(RecordingNotifySink::default()))
+                .with_store_dir(scratch.join("app-data")),
+            AutostartState::default()
+                .with_sink(Arc::new(RecordingAutostartSink::default()))
+                .with_store_dir(scratch.join("app-data")),
+            &candidates,
+        );
+        let w2 = main_webview(&app);
+        // Test is MUTATING (the in-flight guard): take this binary's turn.
+        let _turn = MUTATING_TURN.lock().unwrap_or_else(|e| e.into_inner());
+        for (mode, kind, head, tail) in [
+            (
+                serde_json::json!("validate"),
+                "validated",
+                "config\nvalidate\n--json\n--file\n",
+                "\n",
+            ),
+            (
+                serde_json::json!({ "test": { "index": 3, "testTimeoutMs": 80_000 } }),
+                "tested",
+                "provider\ntest\n--file\n",
+                "\n--index\n3\n--json\n",
+            ),
+        ] {
+            let _ = std::fs::remove_file(&argv_file);
+            let o = attempt(
+                &w2,
+                "provider_candidate_check",
+                serde_json::json!({ "text": "{}", "mode": mode }),
+            );
+            assert_eq!(o.verdict, Verdict::Admitted, "{mode}: {}", o.message);
+            let response: serde_json::Value = o
+                .body
+                .unwrap_or_else(|| panic!("{mode}: returned Err: {}", o.message))
+                .deserialize()
+                .expect("a CheckOutcome");
+            assert_eq!(response["kind"], kind, "{mode}: {response}");
+            let argv = std::fs::read_to_string(&argv_file)
+                .unwrap_or_else(|e| panic!("{mode}: the fake sidecar was never spawned ({e})"));
+            let file = argv
+                .strip_prefix(head)
+                .and_then(|rest| rest.strip_suffix(tail))
+                .unwrap_or_else(|| panic!("{mode}: not the engine's grammar: {argv:?}"));
+            let staged = Path::new(file);
+            assert_eq!(
+                staged.parent(),
+                Some(candidates.as_path()),
+                "{mode}: {file}"
+            );
+            assert!(
+                staged
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("provider-check-") && n.ends_with(".json")),
+                "{mode}: staged as {file}"
+            );
+            assert!(
+                !staged.exists(),
+                "{mode}: the staged candidate outlived the call"
+            );
+        }
     }
 
     // And that WAS all of both modules.
@@ -1479,6 +3322,115 @@ fn the_b6_access_commands_are_admitted_and_run_their_own_code() {
     assert_eq!(
         driven, all,
         "a command in access::COMMANDS is not driven through IPC here; add a case for it"
+    );
+}
+
+/// A-M1-T2: the app-preference store's two commands, ADMITTED and each running its own code —
+/// through an app of its own whose store is a per-test scratch folder (a set writes
+/// `app-prefs.json`), never through `fixture()`'s fixed folder. `app_prefs_get` takes no argument
+/// and has no refusal, so its admission is shown here rather than in
+/// `the_granted_commands_are_admitted`. Neither command spawns anything. The store's behaviour is
+/// `tests/app_prefs.rs`'s; this is the IPC seam.
+#[test]
+fn the_app_prefs_commands_are_admitted_and_run_their_own_code() {
+    let scratch = ScratchDir::new("ipc-app-prefs");
+    let argv_file = scratch.join("argv.txt");
+    let program = ipc_sidecar(&scratch.path, "engine.sh", &argv_file);
+    let store = scratch.join("app-data");
+    let app = app_managing_with(
+        Engine(Ok(EngineClient::with_program(program))),
+        access_state(&scratch, Arc::new(RecordingOpener::default())),
+        NotifyState::default()
+            .with_sink(Arc::new(RecordingNotifySink::default()))
+            .with_store_dir(&store),
+        AutostartState::default()
+            .with_sink(Arc::new(RecordingAutostartSink::default()))
+            .with_store_dir(&store),
+        &scratch.join("cands"),
+        PendingResets::default().with_store_dir(&store),
+        AppPrefs::default().with_store_dir(&store),
+    );
+    let w = main_webview(&app);
+    let answer = |cmd: &str, body: serde_json::Value| -> serde_json::Value {
+        let o = attempt(&w, cmd, body.clone());
+        assert_eq!(o.verdict, Verdict::Admitted, "{cmd} {body}: {}", o.message);
+        o.body
+            .unwrap_or_else(|| panic!("{cmd} {body} was admitted but returned Err: {}", o.message))
+            .deserialize()
+            .expect("the app preferences serialise as JSON")
+    };
+
+    // The defaults from an empty store, and nothing written by a read.
+    assert_eq!(
+        answer("app_prefs_get", serde_json::json!({})),
+        serde_json::json!({ "slides": true, "githubLinks": true, "editorChoices": {}, "revision": 0 })
+    );
+    let file = store.join(daily_briefing_gui_lib::app_prefs::APP_PREFS_FILE);
+    assert!(!file.exists(), "a get wrote the store");
+    // A valid set of each field, answered and read back (the name trimmed by the store's rule).
+    assert_eq!(
+        answer(
+            "app_prefs_set",
+            serde_json::json!({ "patch": { "firstName": "  Sam " } })
+        ),
+        serde_json::json!({
+            "firstName": "Sam", "slides": true, "githubLinks": true, "editorChoices": {}, "revision": 1
+        })
+    );
+    assert_eq!(
+        answer(
+            "app_prefs_set",
+            serde_json::json!({ "patch": { "slides": false } })
+        ),
+        serde_json::json!({
+            "firstName": "Sam", "slides": false, "githubLinks": true, "editorChoices": {}, "revision": 2
+        })
+    );
+    assert_eq!(
+        answer(
+            "app_prefs_set",
+            serde_json::json!({ "patch": { "githubLinks": false } })
+        ),
+        serde_json::json!({
+            "firstName": "Sam", "slides": false, "githubLinks": false, "editorChoices": {}, "revision": 3
+        })
+    );
+    assert_eq!(
+        answer("app_prefs_get", serde_json::json!({})),
+        serde_json::json!({
+            "firstName": "Sam", "slides": false, "githubLinks": false, "editorChoices": {}, "revision": 3
+        })
+    );
+    assert!(file.is_file(), "the set did not land in the scratch store");
+    // B2-M4-T10: the general patch never writes a choice, and the full refusal crosses as its code.
+    let before = std::fs::read(&file).unwrap();
+    let choices = attempt(
+        &w,
+        "app_prefs_set",
+        serde_json::json!({ "patch": { "editorChoices": {} } }),
+    );
+    assert!(choices.body.is_none(), "an editorChoices patch was answered");
+    assert!(choices.message.contains("editorChoices"), "{}", choices.message);
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    let filler: serde_json::Map<String, serde_json::Value> = (0..346)
+        .map(|i| (format!("{i:032x}"), serde_json::json!("zed")))
+        .collect();
+    let near_full =
+        serde_json::to_string_pretty(&serde_json::json!({ "editorChoices": filler })).unwrap();
+    assert!(near_full.len() < 16 * 1024, "{}", near_full.len());
+    std::fs::write(&file, &near_full).unwrap();
+    let full = attempt(
+        &w,
+        "app_prefs_set",
+        serde_json::json!({ "patch": { "firstName": "\u{1f600}".repeat(40) } }),
+    );
+    assert!(full.body.is_none(), "an overflowing patch was answered");
+    assert_eq!(full.message, "{\"kind\":\"preferences-full\"}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), near_full);
+    assert!(
+        !argv_file.exists(),
+        "an app-preference command reached the fake sidecar: {:?}",
+        std::fs::read_to_string(&argv_file)
     );
 }
 
@@ -1742,6 +3694,42 @@ fn the_webview_cannot_reach_the_notification_plugin() {
     }
 }
 
+/// B2-M4-T12 (B2 `:107`, `:114`): the clipboard plugin is registered, so its commands are live, and the webview reaches
+/// none of them. The six are read from the locked crate (`tauri-plugin-clipboard-manager` 2.3.3's `generate_handler!`,
+/// listed at the dependency in `Cargo.toml`), named one by one and never as a wildcard, because `read_text` is the one
+/// that matters most and a pattern would pass with it missing. Copying goes through `copy_push_command` alone, whose text
+/// is built in Rust.
+#[test]
+fn the_webview_cannot_reach_the_clipboard_plugin() {
+    let f = fixture();
+    let w = main_webview(&f.app);
+    for (cmd, body) in [
+        ("plugin:clipboard-manager|write_text", serde_json::json!({ "text": "forged" })),
+        ("plugin:clipboard-manager|read_text", serde_json::json!({})),
+        ("plugin:clipboard-manager|read_image", serde_json::json!({})),
+        ("plugin:clipboard-manager|write_image", serde_json::json!({ "image": [] })),
+        ("plugin:clipboard-manager|write_html", serde_json::json!({ "html": "<b>forged</b>" })),
+        ("plugin:clipboard-manager|clear", serde_json::json!({})),
+    ] {
+        let o = attempt(&w, cmd, body);
+        assert_eq!(o.verdict, Verdict::Refused, "{cmd} was NOT refused: {}", o.message);
+        assert!(
+            o.message.contains("not allowed. Permissions associated with this command"),
+            "{cmd}'s refusal changed shape (expected the ACL's): {}",
+            o.message
+        );
+    }
+    // And the capability names no clipboard or opener permission at all (B2 `:114`).
+    let capability: serde_json::Value =
+        serde_json::from_str(include_str!("../capabilities/default.json")).expect("capabilities/default.json is valid JSON");
+    for permission in capability["permissions"].as_array().expect("a permissions array") {
+        let identifier = permission.as_str().or_else(|| permission["identifier"].as_str()).unwrap_or_default();
+        for plugin in ["clipboard-manager:", "opener:"] {
+            assert!(!identifier.starts_with(plugin), "the capability grants {identifier:?}; B2 grants that plugin nothing");
+        }
+    }
+}
+
 /// T19 as reworked in Phase E M5b: the webview holds ONE autostart PLUGIN grant —
 /// `is_enabled`, the toggle's real-state read — and reaches ON/OFF only through the APP command
 /// `autostart_set_enabled`, which brands the plist the plugin writes. The plugin's own `enable` and
@@ -1888,6 +3876,38 @@ fn the_b7_notify_commands_are_admitted_and_run_their_own_code() {
     assert_eq!(argv, "status\n--json\n");
     // And nothing about either command posted anything.
     assert!(f.notify.posted().is_empty());
+}
+
+/// Wave 2, W2-S-T2: the mock app manages the live gate's state with the window HIDDEN, whatever
+/// MockRuntime's own `main` window says (it reports itself visible): so every capability case that
+/// reaches a live command (B1's `repos_status`, C's calendar-details commands) meets a hidden
+/// window, and its body spawns nothing.
+#[test]
+fn the_mock_app_manages_the_live_gate_with_the_window_hidden() {
+    let scratch = ScratchDir::new("live-gate-hidden");
+    let app = app_managing(
+        Engine(Err(EngineError::SidecarUnresolved {
+            detail: "/nowhere/daily-briefing: No such file or directory".into(),
+        })),
+        access_state(&scratch, Arc::new(RecordingOpener::default())),
+        NotifyState::default()
+            .with_sink(Arc::new(RecordingNotifySink::default()))
+            .with_store_dir(scratch.join("app-data")),
+        AutostartState::default()
+            .with_sink(Arc::new(RecordingAutostartSink::default()))
+            .with_store_dir(scratch.join("app-data")),
+    );
+    let w = main_webview(&app);
+    assert!(
+        w.is_visible().expect("is_visible"),
+        "PREMISE: MockRuntime's main window reports itself visible"
+    );
+    let env = app
+        .try_state::<LiveEnv>()
+        .expect("app_managing_with manages a live_gate::LiveEnv");
+    let v = env.visibility(app.handle());
+    assert_eq!(v, Visibility { visible: false, minimized: false });
+    assert!(!v.shown());
 }
 
 /// The app starts with a missing sidecar and reports it PER CALL, with the path it looked at.
@@ -2117,7 +4137,51 @@ fn the_capability_grants_exactly_the_app_commands() {
     // plugin `autostart:allow-enable` / `allow-disable` for the app's `allow-autostart-set-enabled`
     // (one boolean: ON = the plugin's enable PLUS the macOS branding, OFF = its disable) and
     // `allow-autostart-wizard-default` (reads the record and the real state for the wizard's
-    // pre-tick), 35 → 35.
+    // pre-tick), 35 → 35 — and v0.3.0 (plan M8) adds the four calendar engine operations
+    // (`allow-engine-calendar-status` / `-list` / `-test` reads — `test` reads every source now and
+    // is not mutating — and `-connect-mac`, MUTATING: it installs and re-signs the helper copy and
+    // raises the Calendar dialog; off macOS it refuses before any spawn) plus the three calendar
+    // LINK grants (`allow-calendar-link-write` writes ONE secret link file under the engine's state
+    // dir, `allow-calendar-link-remove` removes it and its config entry, `allow-calendar-config-save`
+    // replaces the `calendar` block through the one config-write path), 35 → 42 — and provider
+    // fallback PR 3 (P3-M1-T1) adds six `allow-engine-provider-*` grants, every one MUTATING and
+    // bounded: `key-set` (the key on stdin only), `key-migrate` (an index), `key-delete` (a key id),
+    // `key-delete-all`, `key-scrub-backup` (holds the save lock) and `reset` (an index, or a label on
+    // stdin). `provider test` has NO grant — it takes a file path; only the staging command reaches
+    // it — 42 → 48 — and P3-M1-T2 adds that staging command, `allow-provider-candidate-check`: JSON
+    // TEXT in, never a path; it stages the candidate itself (0600, removed on every outcome) and runs
+    // `config validate --file` or `provider test --file --index` over it, writing nothing to the real
+    // config — 48 → 49 — and P3-M4-T3 adds the pending-reset store's three,
+    // `allow-provider-pending-reset-add` / `-flush` / `-drop`: a label and a NEW key id each (never
+    // a path); `add` records a `pre-save` reset and runs `provider reset` (label on stdin), `flush`
+    // resets again after the save, `drop` discards an unsaved replacement and deletes its key only
+    // when the saved config's `config validate` rows reference it nowhere — 49 → 52 — and PR 3
+    // final r1 DROPS two the app never called: `allow-engine-config-validate` (it handed the
+    // webview `normalized`, every literal `apiKey` of any absolute file) and
+    // `allow-engine-provider-key-delete-all` (one call deleted every app key, around uninstall's
+    // refusal and consent; uninstall invokes the operation Rust-side) — 52 → 50 — and the briefing
+    // redesign's A-M1-T2 adds the app-preference store's two, `allow-app-prefs-get` /
+    // `allow-app-prefs-set`: the first name and the slides switch in the app's own
+    // `app-prefs.json` (0600), no path, no spawn, nothing sent to the engine — 50 → 52 — and the
+    // briefing redesign's B1-M4-T13 adds the live git check, `allow-repos-status`: a READ (no
+    // in-flight guard; its own one-in-flight latch), gated in Rust by the window's visibility, the
+    // current slide and a stat of each repo's git metadata; its request (the cards' keys and hex
+    // tokens, the named branches, the page date) is validated Rust-side and reaches the engine on
+    // STDIN, never argv; bounded at 30 s; the reply crosses without the engine-only stat list and
+    // without any member the reply types do not declare — 52 → 53 — and the
+    // briefing redesign's C-M3-T9 adds the live calendar details' four,
+    // `allow-calendar-details-open` / `-details-get` / `allow-calendar-join` / `allow-calendar-app-open`:
+    // a read gated in Rust (visibility, the current slide, the reason, one in flight) whose reply
+    // carries no URL; one event's people and notes from Rust's map by handle; Join by handle,
+    // opened by Rust after its own validation (the webview never names a URL); and the Calendar app
+    // by bundle id, taking nothing from any event — 53 → 57 — and the briefing redesign's B2-M4-T12 adds
+    // the opening commands' five, `allow-open-github` / `allow-copy-push-command` / `allow-editor-list` /
+    // `allow-editor-open` / `allow-editor-choice-set`: each takes handles, a stable project key or a closed
+    // editor token, never a URL, path or command, and what it opens or copies is read from what Rust holds
+    // — 57 → 62 — and its A2-M4-T13
+    // adds `allow-read-latest-summary`: a READ of the record bound to the latest page, taking two
+    // 64-hex identities and never a path; `status --json` is its only spawn, it is not a new engine
+    // verb, and only revalidated strings and fixed codes cross — 62 → 63.
     const EXPECTED_GRANTS: &[&str] = &[
         "core:event:allow-listen",
         "core:event:allow-unlisten",
@@ -2125,12 +4189,20 @@ fn the_capability_grants_exactly_the_app_commands() {
         "allow-engine-doctor",
         "allow-engine-run",
         "allow-engine-run-to-file",
-        "allow-engine-config-validate",
         "allow-engine-schedule-install",
         "allow-engine-schedule-uninstall",
         "allow-engine-schedule-status",
         "allow-engine-schedule-verify",
         "allow-engine-update-check",
+        "allow-engine-calendar-status",
+        "allow-engine-calendar-list",
+        "allow-engine-calendar-test",
+        "allow-engine-calendar-connect-mac",
+        "allow-engine-provider-key-set",
+        "allow-engine-provider-key-migrate",
+        "allow-engine-provider-key-delete",
+        "allow-engine-provider-key-scrub-backup",
+        "allow-engine-provider-reset",
         "allow-state-snapshot",
         "allow-open-today",
         "allow-app-quit",
@@ -2140,6 +4212,7 @@ fn the_capability_grants_exactly_the_app_commands() {
         "allow-config-save",
         "allow-config-offer-notify-auto",
         "allow-config-create",
+        "allow-provider-candidate-check",
         "allow-access-snapshot",
         "allow-access-probe",
         "allow-access-reveal-engine",
@@ -2153,11 +4226,30 @@ fn the_capability_grants_exactly_the_app_commands() {
         "allow-uninstall-execute",
         "allow-autostart-set-enabled",
         "allow-autostart-wizard-default",
+        "allow-calendar-link-write",
+        "allow-calendar-link-remove",
+        "allow-calendar-config-save",
+        "allow-provider-pending-reset-add",
+        "allow-provider-pending-reset-flush",
+        "allow-provider-pending-reset-drop",
+        "allow-app-prefs-get",
+        "allow-app-prefs-set",
+        "allow-repos-status",
+        "allow-calendar-details-open",
+        "allow-calendar-details-get",
+        "allow-calendar-join",
+        "allow-calendar-app-open",
+        "allow-open-github",
+        "allow-copy-push-command",
+        "allow-editor-list",
+        "allow-editor-open",
+        "allow-editor-choice-set",
+        "allow-read-latest-summary",
         "autostart:allow-is-enabled",
     ];
     assert_eq!(
         permissions, EXPECTED_GRANTS,
-        "capabilities/default.json is not exactly the enumerated thirty-five grants, in order"
+        "capabilities/default.json is not exactly the enumerated sixty-three grants, in order"
     );
 
     // The third spelling. `build.rs` cannot import this crate, so its list is a copy — which is
@@ -2227,6 +4319,14 @@ fn the_capability_grants_exactly_the_app_commands() {
         "cli_shim::",
         "uninstall::",
         "autostart::",
+        "calendar::",
+        "pending_resets::",
+        "app_prefs::",
+        "repos::",
+        "calendar_details::",
+        "actions::",
+        "editor::",
+        "summary::",
     ];
     let mut registered_names: Vec<&str> = Vec::new();
     for entry in &registered {

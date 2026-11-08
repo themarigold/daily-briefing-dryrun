@@ -105,6 +105,12 @@ if "files" in plat_mac:
                 merged[k] = v
     else:
         merged = {"<non-object files value>": pf}
+# v0.3.0 calendar (plan M11): the ONE expected entry is the Calendar Reader in Contents/Resources. It is
+# pre-signed nested code — ad hoc by reader/build.sh, or with the release identity by the "Calendar Reader"
+# step of the release leg — so the bundler not signing it is by design; this probe checks its signature below
+# instead of refusing. Any OTHER entry still bails. (No apostrophes in this heredoc: macOS /bin/bash 3.2
+# mis-parses one inside a quoted heredoc within $(...) and the whole script fails to parse.)
+merged.pop("Resources/Daily Briefing Calendar Reader.app", None)
 print(len(merged))
 
 # bundle.externalBin: arrays replace wholesale under a merge patch.
@@ -130,6 +136,12 @@ trap 'rm -rf "$SCRATCH"' EXIT
 APP="$SCRATCH/probe/$(basename "$APP_SRC")"
 mkdir -p "$SCRATCH/probe"
 cp -R "$APP_SRC" "$APP"
+
+# The Calendar Reader (excluded from the files bail above) must carry a valid signature of its own.
+READER_APP="$APP/Contents/Resources/Daily Briefing Calendar Reader.app"
+if [ -e "$READER_APP" ]; then
+  codesign --verify --strict "$READER_APP" || { echo "nesting-probe: the Calendar Reader in Contents/Resources is not validly signed nested code" >&2; exit 2; }
+fi
 
 MAIN_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
 [ -n "$MAIN_NAME" ] || { echo "nesting-probe: no CFBundleExecutable" >&2; exit 2; }

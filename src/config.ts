@@ -10,6 +10,7 @@ import { API_LABEL_ANTHROPIC, API_LABEL_OPENAI } from "./types";
 import { classify, type PathIssue, type GuardOpts } from "./protectedPath";
 import { deriveProbeHosts } from "./providers/endpoint";
 import { redactCredentials } from "./transcripts/credentials";
+import { safeLabel } from "./failover";
 
 // Short per-repo label for display: the basename, unless another configured repo shares it
 // (e.g. /a/api and /b/api) — then qualify with the parent dir so the briefing never merges two
@@ -148,23 +149,25 @@ export function validateProviderApi(p: Record<string, unknown>): ProviderApi {
   return api as unknown as ProviderApi;
 }
 
-export function validateConfig(raw: unknown, home: string): Config {
-  if (!raw || typeof raw !== "object") throw new Error("config error: the config is not a JSON object");
-  const c = raw as Record<string, unknown>;
+/** The provider block's validation and normalization, as ONE function (provider-fallback plan P1-M2-T1):
+ *  `validateConfig` runs it on `provider`, and `resolveProviderList` (src/providerList.ts) on each
+ *  `fallbacks` entry, so a fallback gets exactly the same refusals, the same `~/` expansion of `apiKeyFile`
+ *  and the same synthesized CLI triple for an API block. THROWS `config error: …` (worded for `provider`);
+ *  returns the block itself, unchanged, for a CLI block, and a fresh normalized copy for an API block. */
+export function normalizeProviderBlock(p: unknown, home: string): Config["provider"] {
   // provider is required + wholly consumed unguarded downstream (argv is spread, promptVia is switched
   // on), so validate the whole shape — not just cli — or a missing argv/promptVia still TypeErrors deep
   // in BYOCliProvider.generate (the exact failure mode this validation exists to prevent).
-  const p = c.provider as Record<string, unknown> | undefined;
   // ── Slice 2/A3: the api branch, inserted AHEAD of the legacy shape check. ────────────────────────
   // ⚠ ENTERED ONLY when `provider.api` is present, which no config that exists today has — so every
   // existing user takes the `else if` below completely unchanged, byte for byte. That is a property a
   // test asserts mechanically (test/config.api.test.ts's legacy-identity table), not a claim.
-  const pObj = p && typeof p === "object" && !Array.isArray(p) ? p : undefined;
+  const pObj = p && typeof p === "object" && !Array.isArray(p) ? p as Record<string, unknown> : undefined;
   const api = pObj?.api !== undefined ? validateProviderApi(pObj) : undefined;
   if (api === undefined &&
-      (!p || typeof p !== "object" || typeof p.cli !== "string" ||
-       !Array.isArray(p.argv) || (p.argv as unknown[]).some((x) => typeof x !== "string") ||
-       (p.promptVia !== "stdin" && p.promptVia !== "arg"))) {
+      (!pObj || typeof pObj.cli !== "string" ||
+       !Array.isArray(pObj.argv) || (pObj.argv as unknown[]).some((x) => typeof x !== "string") ||
+       (pObj.promptVia !== "stdin" && pObj.promptVia !== "arg"))) {
     throw new Error('config error: "provider" must be { cli: string, argv: string[], promptVia: "stdin"|"arg" } (run `daily-briefing init`)');
   }
   // Both branches above guarantee an object here (the api branch requires one; the legacy branch threw
@@ -178,6 +181,31 @@ export function validateConfig(raw: unknown, home: string): Config {
   if (prov.timeoutMs !== undefined && (typeof prov.timeoutMs !== "number" || !Number.isFinite(prov.timeoutMs) || prov.timeoutMs <= 0)) throw new Error('config error: "provider.timeoutMs" must be a positive number (milliseconds)');
   if (prov.harden !== undefined && typeof prov.harden !== "boolean") throw new Error('config error: "provider.harden" must be a boolean (default true — set false only to opt out of provider hardening entirely)');
   if (prov.credential !== undefined && prov.credential !== "subscription" && prov.credential !== "env-api-key") throw new Error('config error: "provider.credential" must be "subscription" (default — withhold ANTHROPIC_API_KEY so the CLI uses its logged-in subscription) or "env-api-key" (pass the key through and bill API credits)');
+  if (api === undefined) return prov as unknown as Config["provider"];
+  // ── Slice 2/A3: SYNTHESIZE the frozen triple for an API provider. ────────────────────────────────
+  // The whole point of the mutual exclusion is that the user does not write cli/argv/promptVia — but
+  // types.ts keeps them REQUIRED (the frozen-contract rule forbids retyping a required field to
+  // optional), and 85 importers spread `argv` and switch on `promptVia` unguarded. So the returned
+  // block is made fully type-valid here, once, instead of every consumer learning about `api`.
+  //
+  // The synthesized `cli` is a stable LABEL, never a path: `claudeShaped("anthropic-api")` is false, so
+  // the transcript gates and `auditMayCarryRawTurn` all fall the safe way with zero edits at those
+  // sites. `promptVia: "stdin"` is the inert choice — the API transports never read either field; it is
+  // spelled out rather than left arbitrary so nothing downstream can read a meaning into "arg".
+  //
+  // `~` in `apiKeyFile` is expanded here, like the path arrays in validateConfig: the app's setup suggests
+  // `~/.config/…` and writes it verbatim, and `resolveApiKey` reads the path literally. A COPY, so
+  // the caller's raw object is untouched; the config file itself is never rewritten.
+  const apiOut: ProviderApi = api.apiKeyFile !== undefined ? { ...api, apiKeyFile: expandTilde(api.apiKeyFile, home) } : api;
+  return { ...(prov as unknown as Config["provider"]), cli: apiTransportLabel(api.kind), argv: [], promptVia: "stdin", api: apiOut };
+}
+
+export function validateConfig(raw: unknown, home: string): Config {
+  if (!raw || typeof raw !== "object") throw new Error("config error: the config is not a JSON object");
+  const c = raw as Record<string, unknown>;
+  // The provider block: shape, api branch, timeoutMs/harden/credential, and the API normalization — one
+  // function, shared with every `fallbacks` entry (normalizeProviderBlock, above). Run FIRST, as before.
+  const provider = normalizeProviderBlock(c.provider, home);
   // `provider.accounts` is validated at its USE SITE (resolveAccounts, below), not here — the same
   // shape `transcripts` uses. Validating here could only throw or strip: a throw lands at main.ts's
   // `Config error:` + `return 2` on EVERY 600s tick, and stripping destroys the very information a
@@ -226,23 +254,9 @@ export function validateConfig(raw: unknown, home: string): Config {
   // value gracefully (default 07:20 + a warning) so the briefing still runs — don't regress that.
   const expand = (v: unknown) => Array.isArray(v) ? (v as string[]).map((x) => expandTilde(x, home)) : v;
   const out: Config = { ...(c as Config), repos: expand(c.repos) as Config["repos"], discoverRoots: expand(c.discoverRoots) as Config["discoverRoots"], excludeRepos: expand(c.excludeRepos) as Config["excludeRepos"] };
-  // ── Slice 2/A3: SYNTHESIZE the frozen triple for an API provider. ────────────────────────────────
-  // The whole point of the mutual exclusion is that the user does not write cli/argv/promptVia — but
-  // types.ts keeps them REQUIRED (the frozen-contract rule forbids retyping a required field to
-  // optional), and 85 importers spread `argv` and switch on `promptVia` unguarded. So the returned
-  // Config is made fully type-valid here, once, instead of every consumer learning about `api`.
-  //
-  // The synthesized `cli` is a stable LABEL, never a path: `claudeShaped("anthropic-api")` is false, so
-  // the transcript gates and `auditMayCarryRawTurn` all fall the safe way with zero edits at those
-  // sites. `promptVia: "stdin"` is the inert choice — the API transports never read either field; it is
-  // spelled out rather than left arbitrary so nothing downstream can read a meaning into "arg".
-  if (api !== undefined) {
-    // `~` in `apiKeyFile` is expanded here, like the path arrays above: the app's setup suggests
-    // `~/.config/…` and writes it verbatim, and `resolveApiKey` reads the path literally. A COPY, so
-    // the caller's raw object is untouched; the config file itself is never rewritten.
-    const apiOut: ProviderApi = api.apiKeyFile !== undefined ? { ...api, apiKeyFile: expandTilde(api.apiKeyFile, home) } : api;
-    out.provider = { ...out.provider, cli: apiTransportLabel(api.kind), argv: [], promptVia: "stdin", api: apiOut };
-  }
+  // The normalized block: for a CLI provider this IS `c.provider` (the same object, as the spread above
+  // already carried); for an API provider, the synthesized copy (normalizeProviderBlock).
+  out.provider = provider;
   return out;
 }
 
@@ -662,7 +676,7 @@ export function resolveAccounts(
   // heuristic — the user may be about to log in.
   for (const a of out) {
     if (a.configDir && !exists(join(a.configDir, ".claude.json"))) {
-      warnings.push(`config: account "${a.label}" points at ${a.configDir}, which has no .claude.json — that account has never been logged in, so failing over to it will not work`);
+      warnings.push(`config: account "${safeLabel(a.label)}" points at ${a.configDir}, which has no .claude.json — that account has never been logged in, so failing over to it will not work`);
     }
   }
   return { accounts: out, warnings };

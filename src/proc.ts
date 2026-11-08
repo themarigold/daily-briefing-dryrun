@@ -66,6 +66,12 @@ export type RunResult = {
    *  than as a fact about causation. Still strictly better than the previous state, in which OUR kill
    *  was ALWAYS misattributed. */
   timedOut: boolean;
+  /** Present (true) only when `RunOpts.maxOutBytes` was set and stdout EXCEEDED it: the read stopped and the
+   *  child was SIGKILLed. `out` then holds a partial read (at most one chunk over the cap) and `code` is -1. */
+  outTruncated?: true;
+  /** Present (true) only when `RunOpts.maxErrBytes` was set and stderr EXCEEDED it: that read stopped and the
+   *  child was SIGKILLed (so `code` is the signal death's 1, or -1 if stdout was cut short too). */
+  errTruncated?: true;
 };
 
 export type RunOpts = {
@@ -79,6 +85,16 @@ export type RunOpts = {
    *  did — reached by a different route (a wedged git hook or an unresponsive network mount rather
    *  than a pipe-holding grandchild), with the identical user-visible symptom. */
   timeoutMs?: number;
+  /** OPTIONAL stdout cap in bytes (v0.3.0 calendar `urlCommand`). Unset — every caller before it — reads without
+   *  bound, exactly as before. Set: once stdout exceeds it the read stops AND the child is SIGKILLed at once (a
+   *  `yes`-shaped helper otherwise grows Bun's own pipe buffer until the timeout), and the result says so
+   *  (`outTruncated`). Soft by up to one read chunk, as `drain`'s cap is. */
+  maxOutBytes?: number;
+  /** OPTIONAL stderr cap in bytes, `maxOutBytes`' twin (v0.3.0 calendar, final harden r2). Unset reads stderr
+   *  without bound, as before. Set: once stderr exceeds it the read stops and the child is SIGKILLed — a helper
+   *  writing gigabytes to stderr (`head -c 2147483648 /dev/zero >&2`) otherwise grows this process's memory
+   *  until the timeout — and the result says so (`errTruncated`). Soft by up to one read chunk. */
+  maxErrBytes?: number;
 };
 
 /** Mirrors git.ts's GIT_FLUSH_MS: most callers here are git invocations, and the audit makes several
@@ -92,7 +108,14 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
 export async function run(cmd: string[], opts?: RunOpts): Promise<RunResult> {
   let o: ReturnType<typeof drain> | undefined;
   let e: ReturnType<typeof drain> | undefined;
-  const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // ⚠ A WHOLE number of ms in [1, 2^31-1]. `Bun.spawn` THROWS on a fractional `timeout` ("must be of type integer",
+  // bun 1.3.14), which the catch below reports as not spawned — so a budget computed from `performance.now()` silently
+  // never ran its command. Found in the W3 VM sitting: after a slow (keychain-prompted) signing, `calendar connect
+  // mac` handed the reader's trigger 113457.4 ms and the Calendars dialog never appeared. Guarded here, for every caller.
+  // And Bun reads 0, NaN and Infinity as NO timeout (and kills at once past 2^31-1), so anything not a positive finite
+  // number gets the default: a bounded call never becomes an unbounded one (final review, both reviewers).
+  const asked = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = Number.isFinite(asked) && asked > 0 ? Math.min(2 ** 31 - 1, Math.max(1, Math.ceil(asked))) : DEFAULT_TIMEOUT_MS;
   const startedAt = Date.now();
   try {
     const p = Bun.spawn(cmd, {
@@ -117,8 +140,14 @@ export async function run(cmd: string[], opts?: RunOpts): Promise<RunResult> {
       killSignal: "SIGKILL",
     });
 
-    o = drain(p.stdout);
-    e = drain(p.stderr);
+    o = drain(p.stdout, opts?.maxOutBytes !== undefined ? { maxBytes: opts.maxOutBytes } : undefined);
+    e = drain(p.stderr, opts?.maxErrBytes !== undefined ? { maxBytes: opts.maxErrBytes } : undefined);
+    // An over-cap read (either pipe, when its cap is set) kills the child at once.
+    for (const [cap, d] of [[opts?.maxOutBytes, o], [opts?.maxErrBytes, e]] as const) {
+      if (cap === undefined) continue;
+      const sink = d.sink;
+      void d.done.then(() => { if (sink.truncated) { try { p.kill("SIGKILL"); } catch { /* already gone */ } } });
+    }
 
     if (opts?.input !== undefined) {
       // Guarded as `BYOCliProvider.generate` guards its prompt write, which this originally failed
@@ -197,6 +226,8 @@ export async function run(cmd: string[], opts?: RunOpts): Promise<RunResult> {
       spawned: true,
       signal: p.signalCode ?? null,
       timedOut,
+      ...(o.sink.truncated ? { outTruncated: true as const } : {}),
+      ...(e.sink.truncated ? { errTruncated: true as const } : {}),
     };
   } catch (err) {
     // Abandon whatever was attached: the readers are hoisted precisely so this path can release them.

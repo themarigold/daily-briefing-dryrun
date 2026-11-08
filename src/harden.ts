@@ -29,7 +29,7 @@ import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { mkdir, lstat, stat, chmod, access } from "node:fs/promises";
 import { constants as FS } from "node:fs";
-import { ProviderError, type Config, type Provider } from "./types";
+import { ProviderError, type Config, type GenerateOpts, type PromptVariant, type Provider } from "./types";
 import { BYOCliProvider, type ProviderOpts } from "./provider";
 import { expandTilde } from "./config";
 import { supportDir } from "./marker";
@@ -66,7 +66,24 @@ export type HardenOpts = Omit<ProviderOpts, "onWarning" | "envDelete"> & {
   home?: string;
   probeMs?: number;
   flushMs?: number;
+  /** Provider fallback (P1-M8-T1, spec r9 §5 Run lock): awaited before each of the two INTERNAL respawns (an
+   *  unusable private cwd, a rejected injected flag). The walk passes its ownership check, which throws
+   *  `LostLockError` once the run lock is lost, so a superseded holder never starts a second spawn. Absent ⇒ today. */
+  beforeSpawn?: () => Promise<void>;
+  /** The AI summary's refusing check (A2-M3-T7): awaited in the common `send`, before every generation spawn on both
+   *  the hardened and the `harden: false` path, with the exact flags injected into that spawn and the config argv. Any
+   *  answer but `"go"`, or a rejection, throws `SummaryUnavailableError` with no spawn. Absent (every morning caller) ⇒ today. */
+  beforeSummaryGenerate?: (i: { injected: readonly string[]; userArgv: readonly string[] }) => Promise<"go" | "unavailable">;
 };
+
+/** The fixed refusal of the AI summary's one attempt. Deliberately not a `ProviderError`, so nothing retries it, and
+ *  it carries no prompt, path or provider text. */
+export class SummaryUnavailableError extends Error {
+  constructor() {
+    super("summary unavailable");
+    this.name = "SummaryUnavailableError";
+  }
+}
 
 /** The flags we inject, each gated on the probe finding it in `--help`. `--tools=` is deliberately ONE
  *  token: `--tools` is variadic, so `--tools ""` as two tokens swallows the positional prompt in
@@ -86,11 +103,81 @@ export const WANTED_FLAGS: readonly string[] = FLAG_INJECTIONS.map((f) => f.prob
 /** Flags that WIDEN the provider's authority but were measured NOT to defeat an injected flag. Hardening
  *  still holds with these present, so they only warrant a warning — but the user should know they are in
  *  play, because they are the reason the invariant is conditional. */
-const ADJACENT_FLAGS: readonly string[] = [
+// EXPORTED for test/calendar-variants.test.ts, which drives every entry through the locked/unlocked rule
+// below rather than a hand-copied subset.
+export const ADJACENT_FLAGS: readonly string[] = [
   "--settings", "--mcp-config", "--plugin-dir", "--plugin-url", "--agents",
   "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
   "--permission-mode", "--dangerously-skip-permissions", "--add-dir",
 ];
+
+/** The ONLY flags a user's `provider.argv` may carry for a spawn to receive the LOCKED calendar variant (v0.3.0
+ *  calendar, user decision 18, 2026-10-09; spec r4 §6): an ALLOW-list, replacing the deny-list rule that read
+ *  `ADJACENT_FLAGS`. A deny-list fails open — any flag the CLI gains tomorrow (`--chrome`, `--ide`, `--agent`,
+ *  `--permission-prompts`, …) would have left a spawn locked while widening what it can do. Each entry is a flag
+ *  that changes WHICH model answers or HOW its output is printed, never what it can reach. `takesValue`: accepted
+ *  as `--flag=value` or `--flag value`; the others only bare. `ADJACENT_FLAGS` stays: it still drives the
+ *  hardening WARNINGS; only the lock decision moved here. */
+export const CALENDAR_LOCK_ALLOWED_ARGV: Readonly<Record<string, { takesValue: boolean }>> = Object.freeze({
+  "--model": { takesValue: true },
+  "--fallback-model": { takesValue: true },
+  "--output-format": { takesValue: true },
+  "--max-turns": { takesValue: true },
+  "--verbose": { takesValue: false },
+  "-p": { takesValue: false },
+  "--print": { takesValue: false },
+});
+
+/** The four injections a LOCKED spawn must carry, taken from `FLAG_INJECTIONS` itself so the lock rule matches
+ *  exactly what is injected: `--tools=` (one token), `--strict-mcp-config`, `--setting-sources user` (TWO
+ *  tokens, the flag then `user`), and `--no-session-persistence` (final harden r2: a CLI lacking it would keep a
+ *  transcript of the locked prompt — the calendar's titles, attendees and descriptions — on disk). */
+const LOCK_REQUIRED_INJECTIONS: readonly (readonly string[])[] = ["--tools", "--strict-mcp-config", "--setting-sources", "--no-session-persistence"]
+  .map((probe) => FLAG_INJECTIONS.find((f) => f.probe === probe)!.argv);
+
+/** Does `list` hold `run` as consecutive tokens? */
+function holdsRun(list: readonly string[], run: readonly string[]): boolean {
+  for (let i = 0; i + run.length <= list.length; i++) if (run.every((t, k) => list[i + k] === t)) return true;
+  return false;
+}
+
+/** Is every token of the user's CONFIG argv an allow-listed flag or the value belonging to one? A value is the
+ *  `=` suffix, or — for a flag that takes one — the NEXT token, which must exist and must not itself start
+ *  with `-` (`--model --chrome` is refused rather than guessed at). Anything else — an unknown flag, an
+ *  adjacent one, a positional token, `--verbose=x` — is false. */
+function onlyAllowedArgv(argv: readonly string[]): boolean {
+  for (let i = 0; i < argv.length; i++) {
+    const tok = argv[i]!;
+    const eq = tok.startsWith("--") ? tok.indexOf("=") : -1;
+    const name = eq === -1 ? tok : tok.slice(0, eq);
+    const rule = Object.prototype.hasOwnProperty.call(CALENDAR_LOCK_ALLOWED_ARGV, name) ? CALENDAR_LOCK_ALLOWED_ARGV[name] : undefined;
+    if (rule === undefined) return false;
+    if (eq !== -1) { if (!rule.takesValue) return false; continue; }
+    if (!rule.takesValue) continue;
+    const value = argv[i + 1];
+    if (value === undefined || value.startsWith("-")) return false;
+    i++;
+  }
+  return true;
+}
+
+/** Which calendar prompt variant a spawn may receive (v0.3.0 calendar, spec r4 §6, user decision 18). LOCKED
+ *  only when BOTH hold:
+ *   1. the flags WE are prepending to this very spawn include `--tools=` (no built-in tools),
+ *      `--strict-mcp-config` (no MCP servers), `--setting-sources user` (no project settings or hooks) AND
+ *      `--no-session-persistence` (no transcript of the locked prompt left behind — final harden r2), each exactly
+ *      as `FLAG_INJECTIONS` injects it;
+ *   2. every token of the user's own `provider.argv` is on `CALENDAR_LOCK_ALLOWED_ARGV` or is the value of one.
+ *  Anything else is UNLOCKED: `harden: false`, a non-claude CLI, a probe that found only some flags, a flag
+ *  skipped because the user passes their own (B7), the bare retries, any flag not on the allow-list.
+ *
+ *  `injected` is the exact flag list handed to the same `build()` call, never a re-derivation, so the choice
+ *  is made from the argv about to run. `userArgv` is the CONFIG argv — never the final argv, which in
+ *  arg-mode holds the prompt, attacker-influenceable text (the same rule `argvConflicts` keeps). */
+export function calendarVariantFor(injected: readonly string[], userArgv: readonly string[]): PromptVariant {
+  const locked = LOCK_REQUIRED_INJECTIONS.every((run) => holdsRun(injected, run)) && onlyAllowedArgv(userArgv);
+  return locked ? "locked" : "unlocked";
+}
 
 /** Flags that make `init` exit non-zero — and ONLY init. A `--settings` SessionStart hook was measured
  *  EXECUTING under full hardening, i.e. arbitrary shell execution, so it is worth refusing to PROCEED
@@ -349,12 +436,37 @@ export function hardenedProvider(cfg: Config["provider"], opts: HardenOpts = {})
       suppressed++;
       try { return await fn(); } finally { suppressed--; }
     },
-    generate: async (prompt: string) => {
+    generate: async (prompt: string, gopts?: GenerateOpts) => {
+      // ⚠ CALENDAR (v0.3.0, spec r4 §6): EVERY spawn below goes through `send`, which picks the prompt variant
+      // from the flags handed to that same spawn (`calendarVariantFor`) — so the choice is made per spawn,
+      // at spawn time, from the argv about to run, and a retry that drops the flags drops to unlocked with
+      // them. `prompt` is the unlocked variant; the locked text is sent only when the rule holds AND the
+      // caller supplied one. `onPromptSent` hears which text each spawn actually got, just before it runs —
+      // guarded like `warn` in provider.ts: a recording hook must never fail the call it records.
+      // `beforeSummaryGenerate` comes first because that swallowing makes `onPromptSent` unable to refuse. With the
+      // field absent nothing here awaits, so `p.generate` still starts in the same tick as `send`.
+      const send = async (p: BYOCliProvider, injected: readonly string[]): Promise<string> => {
+        if (opts.beforeSummaryGenerate) {
+          // A check that rejects refuses too: its own error would otherwise read as a failed spawn in the ladder below.
+          const answer = await opts.beforeSummaryGenerate({ injected, userArgv: cfg.argv }).catch(() => "unavailable" as const);
+          if (answer !== "go") throw new SummaryUnavailableError();
+        }
+        const locked = gopts?.calendarVariants !== undefined && calendarVariantFor(injected, cfg.argv) === "locked"
+          ? gopts.calendarVariants.locked : undefined;
+        const text = locked ?? prompt;
+        if (gopts?.onPromptSent) {
+          try { gopts.onPromptSent({ variant: locked !== undefined ? "locked" : "unlocked", text }); } catch { /* never fail the call */ }
+        }
+        // Provider fallback (P1-M3-T5): the walk's deadline reaches the spawn; nothing else of `gopts` does.
+        return gopts?.signal ? p.generate(text, { signal: gopts.signal }) : p.generate(text);
+      };
+
       if (!harden) {
         // All-or-nothing on purpose: partial opt-out (e.g. re-enabling tools via `--tools default`)
         // would silently drop ALL MCP servers — measured 2 → 0 — with no way for the user to decline.
         runtimeWarnings.push(`provider hardening is DISABLED by config (provider.harden: false) — surrendering ${SURRENDERED}`);
-        return new BYOCliProvider(cfg, { ...opts, envDelete, onWarning: pushWarning }).generate(prompt);
+        // Nothing injected ⇒ unlocked, by the same rule as every other spawn rather than by a special case.
+        return send(new BYOCliProvider(cfg, { ...opts, envDelete, onWarning: pushWarning }), []);
       }
 
       // An EXPLICIT `opts.cwd` wins over the computed narrow one, and short-circuits computing it at
@@ -466,10 +578,19 @@ export function hardenedProvider(cfg: Config["provider"], opts: HardenOpts = {})
           onWarning: pushWarning,
         },
       );
+      /** One spawn: `build` and `send` receive the SAME flag list, which is what makes the variant a function
+       *  of the argv actually run (spec r4 §6). */
+      const spawn = (useCwd: string | undefined, flags: readonly string[] = extra): Promise<string> =>
+        send(build(useCwd, flags), flags);
 
       try {
-        return await build(narrowCwd).generate(prompt);
+        // Locked when `extra` holds `--tools=`, `--strict-mcp-config` and `--setting-sources user`, and the user argv
+        // only allow-listed flags (`calendarVariantFor`).
+        return await spawn(narrowCwd);
       } catch (e) {
+        // A refusal spawned nothing, so no rung below may read it as a failed spawn: the cwd rung would otherwise claim
+        // a re-run and ask the check a second time.
+        if (e instanceof SummaryUnavailableError) throw e;
         // B3's ladder has to extend PAST the mkdir check into the spawn, because a directory can pass
         // every check and still be un-`chdir`-able moments later (removed, remounted, chmod'd). Bun
         // reports that as ENOENT/EACCES naming the BINARY, so without this rung the run blames the
@@ -477,7 +598,9 @@ export function hardenedProvider(cfg: Config["provider"], opts: HardenOpts = {})
         // the caller's to get right, and silently ignoring it would hide their bug.
         if (narrowCwd !== undefined && !explicitCwd && !(await cwdUsable(narrowCwd))) {
           runtimeWarnings.push(`the private provider working directory ${narrowCwd} became unusable, so the provider was re-run with this process's working directory instead`);
-          return await build(undefined).generate(prompt);
+          // Same flags, other cwd: locked only under the same rule as the first spawn.
+          await opts.beforeSpawn?.();
+          return await spawn(undefined);
         }
         // C1/B6 FAST PATH. The failure looks like a usage error on strong evidence — a rejection phrase
         // with one of OUR flags adjacent to it, on a failure fast enough to be a parse error rather than a
@@ -546,7 +669,9 @@ export function hardenedProvider(cfg: Config["provider"], opts: HardenOpts = {})
           disableHardening(`the provider CLI rejected an injected hardening flag: ${rejected} (${firstLine(e.message)}); hardening flags are disabled for the rest of this run`);
           // Bare means BARE: no flags, and no narrow cwd either, since the gate's own reasoning says the
           // cwd move is only justified while the isolation flag is in effect.
-          return await build(undefined, []).generate(prompt);
+          // No flags ⇒ unlocked: the CLI just refused a flag, so nothing about this spawn is locked down.
+          await opts.beforeSpawn?.();
+          return await spawn(undefined, []);
         }
         throw e;
       }

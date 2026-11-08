@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-editor-choice-set"
+description = "Enables the editor_choice_set command without any pre-configured scope."
+commands.allow = ["editor_choice_set"]
+
+[[permission]]
+identifier = "deny-editor-choice-set"
+description = "Denies the editor_choice_set command without any pre-configured scope."
+commands.deny = ["editor_choice_set"]

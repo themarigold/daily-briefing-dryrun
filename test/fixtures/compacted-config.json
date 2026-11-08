@@ -1,0 +1,16 @@
+{
+  "repos": ["/nonexistent/repo"],
+  "provider": {
+    "cli": "claude",
+    "argv": ["-p", "--model", "claude-sonnet-5"],
+    "promptVia": "stdin",
+    "accounts": [
+      { "label": "Claude login 1" },
+      { "label": "Claude login 2", "configDir": "~/.claude-briefing" }
+    ]
+  },
+  "fallbacks": [
+    { "label": "Anthropic key", "api": { "kind": "anthropic", "model": "claude-sonnet-5", "apiKeyEnv": "ANTHROPIC_API_KEY" } },
+    { "label": "Local model", "timeoutMs": 600000, "api": { "kind": "openai-compatible", "model": "llama3", "baseUrl": "http://127.0.0.1:11434/v1" } }
+  ]
+}

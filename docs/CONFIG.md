@@ -120,10 +120,17 @@ How the prompt reaches the tool: on standard input, or appended as the last argu
 
 ### `provider.timeoutMs`
 
-**Type:** number (milliseconds) · **Default:** `120000`.
+**Type:** number (milliseconds) · **Default:** `120000` (2 minutes) for a command-line provider;
+`300000` (5 minutes) when `provider.api` is set.
 
 How long one call to the provider may take before it is abandoned. Raise it for a slow local model or
-a large multi-repo window.
+a large multi-repo window. An API provider gets the longer default so a long reply (up to
+[`maxTokens`](#providerapi)) is not cut off by the clock first; a value you set always wins.
+A reply close to the 16,000-token cap may need more than the 300 s default on a slow model, so raise
+`timeoutMs` if long replies time out.
+With the 300 s API default, a hung endpoint can take longer before the run gives up: a single API
+provider retries timeouts twice (about 17 minutes in total), while an API provider followed by a
+fallback moves on after the 300 s timeout without retrying it.
 
 ### `provider.harden`
 
@@ -148,8 +155,20 @@ you logged into; `"env-api-key"` passes it through and bills API credits. See
 login).
 
 An ordered failover list for a `claude` tool with more than one logged-in account: when one account
-hits its usage limit, the next tick uses the next one. See
+hits its usage limit or fails, the same run moves on to the next one. The logins come first in the
+combined provider list, before any [`fallbacks`](#fallbacks). See
 [multiple accounts](PROVIDERS.md#multiple-accounts-failover).
+
+### `provider.label`
+
+**Type:** non-empty string · **Default:** `"default"`.
+
+The name of the first provider in the list when it has no `provider.accounts` (an API provider, or a
+command-line tool with one login). Limit marks and provider status are kept by this name, so it is
+fixed once saved. Beside a non-empty `provider.accounts` list that resolves it is ignored, with a
+warning: the first account's `label` names the first entry instead. (Beside an empty `accounts: []`, or a
+`provider.accounts` list that does not resolve — "account failover disabled" — it names the first entry as
+usual.) Older versions ignore it and use `"default"`.
 
 ### `provider.api`
 
@@ -163,9 +182,9 @@ fields:
 | `kind` | `"anthropic"` or `"openai-compatible"` | required | Which transport. |
 | `model` | string | required | The model id. The tool never picks one for you. |
 | `baseUrl` | string | `https://api.anthropic.com` for `anthropic`; required in practice for `openai-compatible` | The endpoint (`http:` or `https:`, no user name or password in it). Name the final URL: a redirect is not followed, so an endpoint that answers with one (an `http://` address that redirects to `https://`, a gateway that moved) fails every attempt. |
-| `maxTokens` | positive whole number | `4096` for `anthropic`; omitted from the request for `openai-compatible` | The output-token limit. |
+| `maxTokens` | positive whole number | `16000` for `anthropic`; omitted from the request for `openai-compatible` | The output-token limit. Lower `maxTokens` if your model's output limit is below 16000. |
 | `apiKeyEnv` | string | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` when no key source is set | The name of an environment variable holding the key. |
-| `apiKeyFile` | string | none | A file holding the key (a leading `~` is expanded); refused if group- or world-readable. |
+| `apiKeyFile` | string | none | A file holding the key (a leading `~` is expanded); refused if group- or world-readable. A file in the state folder's `keys/` is an app-owned key: it is read strictly (named `k-<12 hex>.key`, your own private single-link regular file, not a symlink) and never sent over plain `http:` to a non-loopback host — see [Keys the app stores](PROVIDERS.md#keys-the-app-stores). |
 | `apiKeyCommand` | array of strings | none | A command (argv) whose standard output is the key. |
 | `apiKey` | string | none | The key itself, in this file. Works, and warns on every run. |
 
@@ -175,6 +194,44 @@ not loopback sends the prompt and the API key unencrypted; the tool still sends 
 on every run.
 
 See [API providers](PROVIDERS.md#api-providers--bring-your-own-key-or-point-at-a-local-model).
+
+### `fallbacks`
+
+**Type:** array of provider blocks, each with a `label` · **Default:** none (only `provider` runs).
+
+The providers to try, in order, after `provider` and its `provider.accounts` logins. The whole list is
+`provider`'s logins first, then these. Each entry is written like `provider` — a command-line tool
+(`cli`, `argv`, `promptVia`) or an `api` block on its own — plus:
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `label` | non-empty string | required | The entry's name. Unique across the whole list, and fixed once saved: marks and status follow it, not the position. |
+| `configDir` | string | none (the tool's default login) | A login directory, for a `claude` entry only (a leading `~` is expanded). |
+| `timeoutMs` | positive number | `120000` for a command-line entry, `300000` for an `api` entry | This entry's per-attempt timeout. It does not inherit `provider.timeoutMs`. |
+
+```jsonc
+"fallbacks": [
+  { "label": "Anthropic key",
+    "api": { "kind": "anthropic", "model": "claude-sonnet-5", "apiKeyEnv": "ANTHROPIC_API_KEY" } },
+  { "label": "Local model", "timeoutMs": 600000,
+    "api": { "kind": "openai-compatible", "model": "llama3", "baseUrl": "http://127.0.0.1:11434/v1" } }
+]
+```
+
+An entry is checked exactly as `provider` is. A broken entry is skipped at run time, with a warning
+naming it (`fallbacks[1] "Local model": …`), and the rest of the list still runs; `config validate`
+reports it as an error, so the desktop app will not save it. An entry is broken when its block is
+malformed or it nests `fallbacks` or `accounts`, when its label is already used, when it sets
+`configDir` on anything but a `claude` tool, or when it is the same `claude` login (directory and
+`credential`) as an earlier entry. A broken `provider` block is still a configuration error.
+
+In the desktop app this list is **Settings › AI providers › Providers, in order**: it adds, orders, tests and removes
+entries, and stores a pasted key for you, so the settings file keeps only a reference to it
+([In the desktop app](PROVIDERS.md#in-the-desktop-app)). It keeps a CLI login in `provider.accounts` only
+while it stays next to item 1 with item 1's settings; every other entry, a newly added login included, is
+written as a full `fallbacks` block.
+A background schedule running an engine older than this feature uses only your first provider and its
+logins: the app's Schedule screen warns about that ([Provider fallback](TROUBLESHOOTING.md#provider-fallback-skipped-not-tried-and-paused)).
 
 ## When it is delivered
 
@@ -195,6 +252,13 @@ it can derive one.
 
 The hosts a run connects to before calling the provider, to confirm the network is up. It is a TCP
 connect that sends no data. `[]` turns the check off, which suits a local model.
+
+With [`fallbacks`](#fallbacks) (a list of two or more providers), the check probes these hosts (or the
+default pair, when unset) **plus** the endpoint host of every remote API entry, so a reachable provider
+counts as online even where the default hosts are blocked. CLI and loopback entries add no host, and a
+loopback item 1 no longer turns the check off: only a list whose entries are all loopback (with
+`networkProbeHosts` unset) or an explicit `[]` does. An offline run with two or more providers can still
+use a local model; see [delivery timing, in full](#delivery-timing-in-full).
 
 ### `notify`
 
@@ -221,7 +285,8 @@ See [recap campaigns, in full](#recap-campaigns-in-full).
 
 When enabled, the engine reads Claude Code session transcripts under `root` on your machine so the
 briefing can quote, beside a project, what you asked for there (`— you wrote: "…"`). The quote is
-matched after the briefing is generated; transcript text is not added to the prompt.
+matched after the briefing is generated, so the briefing's own prompt holds no transcript text. With
+[`aiSummary`](#aisummary) on, the page's quotes are sent in the summary's call, up to 600 characters each.
 
 ### `verdictPaths`
 
@@ -263,6 +328,106 @@ Only a scheduled run that has delivered that day's briefing checks automatically
 done; a tick that delivers nothing (the day already done, too early, offline, a failed run) never
 checks. No briefing waits for it, and a run in a terminal or with `--json` never checks.
 
+### `aiSummary`
+
+**Type:** `{ "enabled"?: boolean }` · **Default:** off by absence.
+
+`{ "enabled": true }` enables short AI project points and a separate Good morning sentence,
+generated after your briefing is delivered. An absent key, `{}`, or `{ "enabled": false }` keeps
+AI summaries off. CLI `init` leaves the key absent.
+
+What the call sends and where the result is stored are in
+[PROVIDERS.md](PROVIDERS.md#ai-summaries-the-second-call). Every attempt leaves out the computer's name, the
+page's warning and notice lines and the line that names the provider. The result shows only on the desktop app's slides, and the call is still
+made with the slides off or with no desktop app. AI summaries are not available on Windows yet. No summary
+call is made on Windows.
+
+A malformed block, a non-boolean `enabled`, or any unknown field switches AI summaries off with
+exactly one fixed diagnostic code, `summary-config-invalid`, exposed only through summary status
+and Settings. It never adds a warning to the morning briefing, run envelope or process output.
+
+### `calendar`
+
+**Type:** `{ "enabled"?: boolean, "emails"?: string[], "macos"?: object, "links"?: array }` ·
+**Default:** off.
+
+Today's calendar in the briefing: a **▶ Today's calendar** section, and today's events in the AI's prompt
+so its suggestions fit around your meetings. Off unless `enabled` is `true`. What is read, what each AI
+attempt receives and what is stored are in the README's
+[Privacy section](../README.md#todays-calendar-optional-off-by-default).
+
+```json
+"calendar": {
+  "enabled": true,
+  "emails": ["me@work.example"],
+  "links": [
+    { "id": "work", "name": "Work calendar" },
+    { "id": "team", "urlEnv": "TEAM_CALENDAR_URL", "owner": "me@work.example" },
+    { "id": "home", "urlCommand": ["pass", "show", "calendar/home"] }
+  ]
+}
+```
+
+- **`enabled`** — `true` turns the calendar on. Absent or `false`: off, and the briefing, the prompt and
+  `run --json` are exactly what they are without this block.
+- **`emails`** — extra addresses that are you, beyond the one a link reveals or names. They recognise
+  your accept or decline on an invitation.
+- **`links`** — at most 10 private calendar links (an iCalendar address: Google's "Secret address in
+  iCal format", Outlook's published ICS link, an iCloud shared link). An iCloud link is a **Public
+  Calendar**: anyone with the address can read it, and its events carry no attendees and no replies, so
+  `owner` has nothing to match there, an invitation you declined still shows, and every event on it is
+  treated as not accepted (its description never reaches the AI). Each entry:
+  - **`id`** — 1 to 32 lowercase letters, digits or hyphens, starting with a letter or digit; not
+    `macos`. It names the link in the briefing and in `calendar status`.
+  - **`name`** — an optional label, on one line, that is not a web address.
+  - **Where the address comes from — exactly one place, never this file.** A link's address is a
+    secret (whoever has it reads that calendar). With neither key below it is read from the link's own
+    file, `<state dir>/calendar/links/<id>.url`, which the desktop app or
+    `daily-briefing calendar add-link --id <id>` (address on standard input) writes for you, readable only
+    by you; the file is refused if anyone else can read or write it, if it is a symbolic link, or if it
+    belongs to another user. **`urlEnv`** names an environment variable holding the address instead —
+    read only by runs that inherit your shell's environment (a command you type); the desktop app and
+    scheduled runs do not see it, so for those use the link's own file or `urlCommand`.
+    **`urlCommand`** is a command that prints it: an **array** — the program and each argument as its own
+    string, never one shell string — run with a 5-second limit, whose error output is never shown. An
+    argument must not be the address itself: one that holds a web address — a scheme separator in any
+    spelling (`://`, `:\\`, `:/\`, the JSON-escaped `:\/\/` or the percent-encoded `%3A%2F%2F` / `%3A%5C%5C`),
+    or an `.ics` file name after a dotted host (`calendar.example.com/…/basic.ics`) — switches the calendar
+    off with its own warning, and `config validate` makes it an error. The one exception is a single
+    **leading** 1Password reference, `op://vault/item/field`: it points to the address rather than holding
+    it. Password-store entries are fine, `.ics` names included (`["pass", "show", "calendar/work.ics"]`,
+    `["pass", "show", "web/calendar.google.com/me"]`). Set
+    `urlEnv` or `urlCommand`, not both. Only the source you configured is tried. A literal `url` field
+    (any letter case, anywhere in the block) is skipped by a run, with a warning, and refused as an
+    error by `config validate`, which the desktop app runs before every save.
+  - **`owner`** — the address this calendar belongs to, when the link does not reveal it (Outlook and
+    iCloud links, and Google calendars other than your primary one). It recognises your accept or
+    decline only.
+  - **`confirmedOwner`** — written by setup, not by hand: the address in the link's own path (a Google
+    primary calendar's address) that you confirmed is yours when you added the link. It holds only while
+    the link still carries that address, so replacing the link with one to someone else's calendar does
+    not inherit it.
+- **`macos`** — `{ "calendars": "editable" | "all" | [{ "id", "title", "account" }] }`: which Mac
+  Calendar app calendars to read (`editable`, the default, skips the ones you cannot edit, such as
+  Birthdays and subscribed calendars). Read only on macOS 14 or later, through the Calendar Reader that
+  `daily-briefing calendar connect mac` (or Settings → Calendar → Allow access) installs. When access is
+  granted, that command adds `"macos": {}` here; with no `calendar` block at all it writes
+  `{ "enabled": true, "macos": {} }`, which turns the calendar on. A calendar someone else shared with you can be
+  editable too: Settings lists each calendar's account so you can untick it, and the explicit list form
+  reads only the ids you chose.
+
+A malformed block switches the calendar off with one warning, rather than reading part of it; no warning
+ever quotes a value from the block, so an address pasted into the wrong field is never echoed back.
+
+What the AI is given, and what is kept (the full rules are in the
+[Privacy section](../README.md#todays-calendar-optional-off-by-default)):
+
+- **Every HTTP provider counts as locked** and gets every event detail: `provider.api` sends a prompt and
+  reads back text, with no tools of its own. A local OpenAI-compatible endpoint that fronts a tool-using
+  agent is your own choice; the tool cannot see behind the endpoint.
+- **The AI's own suggestions may mention meeting details it was given** (on a locked attempt, an
+  attendee's name or a line of a description), and they are stored in your briefing like any suggestion.
+
 ## Tuning and tooling
 
 ### `tokenBudget`
@@ -291,14 +456,24 @@ after `provider.argv` so they win on a repeated flag; the briefing itself never 
   the scheduled agent or a manual `run`) also waits briefly for real network connectivity — a raw TCP
   probe against `networkProbeHosts` (when it is not set: two anycast DNS hosts, `1.1.1.1:443` /
   `8.8.8.8:443`, with an AI CLI; with `provider.api`, the endpoint's own host, and none for a loopback
-  endpoint) — so a dark-wake tick doesn't burn its provider call before wifi re-associates; if still
+  endpoint; with two or more providers, see [`networkProbeHosts`](#networkprobehosts)) — so a dark-wake tick doesn't burn its provider call before wifi re-associates; if still
   offline after the grace period it skips (no stamp), and the scheduled agent's next 10-minute tick
   retries (a manual run you simply re-run once you're back online). Set `networkProbeHosts: []` to
   **disable** this gate entirely — useful for a local/offline provider that needs no network at all.
   `--force` always bypasses the morning time and the once-per-day marker; on the network step it still
   waits briefly (same bounded poll), but if still offline afterward it **proceeds anyway** — a forced
   run always calls the provider — whereas a non-`--force` run instead skips (no stamp; retried as just
-  described).
+  described). `run --now` — what the app's **Run now** sends — bypasses the morning time only: the
+  once-per-day marker still applies, and on the network step it is a non-`--force` run. A run from your
+  own terminal is exempt from the morning time without it.
+- **Offline, with two or more providers ([`fallbacks`](#fallbacks)):** a non-`--force` run that is still
+  offline after the wait does not skip outright. It runs the list's *leading* loopback entries (local
+  models at the front of the list, which need no network) and, from 60 minutes past the morning time,
+  *every* loopback entry, in list order; remote entries wait for a later tick. If nothing of those
+  delivers, it takes the same quiet offline skip. The same rule applies after a mid-walk re-check: when an
+  entry fails and the follow-up network check says offline, the rest of the walk runs only the loopback
+  entries that rule permits at that moment, then skips quietly — and an entry whose failure was followed
+  by an offline check gets no hour mark and is not recorded as failing (a usage limit is still recorded). A single provider keeps the rule above.
 
 In plain words: the "morning time" is `morningTime` (**Morning time** in the app), a "tick" is one
 scheduled wake-up of the engine, and the "marker" is the engine's record that today's briefing was
@@ -328,7 +503,8 @@ is hidden or reworded — every bullet still renders once, with its own text and
 
 **The cost, plainly:** `trial` and `on` each spend **one extra model call on every busy morning** (at
 least 40 commits in the recap window, or at least 15 top-level recap lines), and widen the run lock's
-staleness bound by **`2 × timeoutMs + 50 s`** — 290 s at the default 120 s `provider.timeoutMs`. (The
+staleness bound by **`2 × timeoutMs + 50 s`** — 290 s at a command-line provider's default 120 s
+`provider.timeoutMs`, 650 s at an API provider's default 300 s. (The
 wider bound only matters when a crashed run's process id has been reused; a crashed run is otherwise
 reclaimed at once.) A quiet morning makes no extra call.
 

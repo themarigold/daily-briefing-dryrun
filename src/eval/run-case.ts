@@ -6,8 +6,8 @@
 // ground truth and what the pipeline actually windowed is asserted with a thrown Error — a
 // mis-authored gold case is a bug in the case, not a Finding about the product.
 import { buildEvalRepo } from "../../test/fixtures/eval-repo";
-// Registers the transcript root for removal when a `bun test` run ends; inert elsewhere (see
-// test/fixtures/temp-dirs.ts). Static, like the test-side import above: neither reaches the compiled
+// Registers the transcript root for removal when a `bun test` run ends, or when the eval CLI exits (scripts/eval.ts's
+// exit hook drains the same list; see test/fixtures/temp-dirs.ts). Static, like the test-side import above: neither reaches the compiled
 // binary because nothing on src/main.ts's import graph imports this file — core.ts's dynamic import of
 // ./eval/checks IS bundled, and checks.ts simply does not import run-case.
 import { removeAtRunEnd } from "../../test/fixtures/temp-dirs";

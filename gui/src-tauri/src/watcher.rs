@@ -521,9 +521,12 @@ impl Snapshot {
                 // The facts `schedule status` recomputes on every call, withheld rather than shown
                 // as current. `lastTickState` goes with the counts: `status.lastTick` (current) is
                 // what staleness is judged from, and a cached "legacy" must not pin UNKNOWN-TICK.
+                // `scheduledEngineVersion` too (checkpoint P3-M6): it is MEASURED per read, so a
+                // cached one would raise `olderEngineWarning` on what was true of another moment.
                 s.ticks_today = None;
                 s.ticks_expected_since_floor = None;
                 s.last_tick_state = None;
+                s.scheduled_engine_version = None;
             }
         }
         let last_skip = status.as_ref().and_then(|s| s.last_skip.clone());

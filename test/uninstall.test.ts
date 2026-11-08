@@ -1,6 +1,7 @@
 // test/uninstall.test.ts — scripts/uninstall.sh: the background scheduler, which it hands to a new enough
-// engine first or else checks read-only and stops (Batch 2, spec 3.6.6), and the opt-in
-// --remove-signing-identity flag (Phase E, E10).
+// engine first or else checks read-only and stops (Batch 2, spec 3.6.6), the opt-in
+// --remove-signing-identity flag (Phase E, E10), and the opt-in --remove-keys flag (provider fallback P2-M5-T4:
+// every app-owned API key in the Keychain, then `<state>/keys/`).
 //
 // ⚠ NOTHING HERE MAY REACH THE REAL KEYCHAIN, LAUNCHD OR INSTALLED BINARY. Every run is boxed in four ways,
 // and `run()` asserts the first two before it spawns anything:
@@ -11,7 +12,9 @@
 //     case, "Could not find service" with exit 113 by default; any other verb is recorded and refused, and
 //     `run()` fails a case that sent one.
 //   • DBA_TEST_DIR, DBA_TEST_PLIST and DBA_TEST_KEYCHAIN point at scratch paths (the keychain INSIDE
-//     DBA_TEST_DIR, which the script requires), and HOME is scratch. The cases that test the keychain
+//     DBA_TEST_DIR, which the script requires), and HOME is scratch. The keychain tool's stub never runs the
+//     real tool for either flag (hub Q27: Keychain tests are fake-only); for --remove-keys' loop it COUNTS its
+//     `delete-generic-password` calls and answers not-found once the case's items are used up (`run`'s `keys`). The cases that test the keychain
 //     variable's own validation pass a bad value or omit DBA_TEST_DIR on purpose; the stub PATH and the
 //     scratch HOME still box them, and each asserts the script refused before calling anything.
 //   • The default fixture writes NO plist (spec 3.6.6). The cases that need one write a label-less
@@ -54,6 +57,8 @@ const KEYCHAIN_TOOL = "sec" + "urity";
 const LAUNCHD_TOOL = "launch" + "ctl";
 const SIGN_ID = "Daily Briefing (local) Signing";
 const FLAG = "--remove-signing-identity";
+/** P2-M5-T4: the key leg's opt-in flag. test/isolation.meta.test.ts holds every file passing it to DBA_TEST_KEYCHAIN. */
+const KEYS_FLAG = "--remove-keys";
 const LABEL = "local.daily-briefing";
 const UID = process.getuid!();
 /** Everything uninstall.sh removes from the support dir, created first so removal is meaningful. */
@@ -63,9 +68,13 @@ const ARTIFACTS = [
   "update-check.json",   // Phase E (E11): the opt-in update check's record
   // Batch 2 (spec 3.5.1): the rest of what the engine owns at the state root.
   "last-run", "last-tick", "last-skip.json", "run.lock", "account-state.json", "recap-campaigns.jsonl",
+  // Provider fallback (P1-M10-T3): the provider status and unresolved-failure records.
+  "provider-status.json", "last-failure.json",
+  // B1-M1-T3 (wave 2): the morning run's record for the live git check.
+  "run-record.json",
 ];
-/** …and the two folders it removes with their contents: the archive and the provider's scratch folder. */
-const DIRS = ["briefings", "provider-cwd"];
+/** …and the three folders it removes with their contents: the archive, the provider's scratch folder and the calendar folder. */
+const DIRS = ["briefings", "provider-cwd", "calendar"];
 /** M9 round 4 (S1b): what `fixture()` also plants in the support dir that NO removal list names — an unlisted
  *  file (named like the audit glob, outside it), an unlisted folder with nested content, and a dotfile — as
  *  `entryAt` reads them. Every run must leave them byte for byte (`left`, `ALL_REMOVED`, `nothingRemoved`), so
@@ -99,6 +108,13 @@ const SURVIVORS: Record<string, string | Record<string, string | null>> = {
   "provider-cwd-old": {
     "inside.md": "file: beside the provider's scratch folder, not it",
   },
+  // P2-M5-T4: the app-owned key folder is the KEY leg's (spec r9 §6 Uninstall), removed only on --remove-keys'
+  // consent and never by the state leg, so every run without that flag must leave it byte for byte, like the
+  // names above; a run with it expects `keys` alone gone (`KEYS_REMOVED`). Its near miss sits beside it.
+  keys: {
+    "k-0123456789ab.key": "file: an app key file (fixture bytes, no secret)",
+  },
+  "keys.bak": "file: beside the key folder, not it",
 };
 
 /** Plants `SURVIVORS` in `support`, from the map: a string is a file (`file: <bytes>`), a map a folder whose
@@ -262,7 +278,23 @@ function stubs(): { bin: string; engine: string; wordless: string } {
   const bin = join(dir, "bin");
   mkdirSync(bin);
   const record = (name: string) => `{ printf '%s' "${name}"; for a in "$@"; do printf '\\t%s' "$a"; done; printf '\\n'; } >> "$STUB_LOG"`;
-  writeFileSync(join(bin, KEYCHAIN_TOOL), `#!/bin/sh\n${record(KEYCHAIN_TOOL)}\nexit "\${STUB_KEYCHAIN_RC:-0}"\n`, { mode: 0o755 });
+  // The keychain tool: `delete-identity` answers STUB_KEYCHAIN_RC. `delete-generic-password` (P2-M5-T4, the key
+  // leg's loop) COUNTS: the run holds STUB_KEYS items, so its first STUB_KEYS calls succeed and every later one
+  // answers "not found" with STUB_KEYS_END_RC (44 by default, errSecItemNotFound); STUB_KEYS=never never runs
+  // out, which only the script's cap can end. The count is this call's own line in the log, already appended.
+  writeFileSync(join(bin, KEYCHAIN_TOOL), [
+    "#!/bin/sh",
+    record(KEYCHAIN_TOOL),
+    'if [ "$1" = delete-generic-password ]; then',
+    '  [ "${STUB_KEYS:-0}" != never ] || exit 0',
+    '  n="$(grep -c "delete-generic-password" "$STUB_LOG")"',
+    '  [ "$n" -gt "${STUB_KEYS:-0}" ] || exit 0',
+    "  echo \"security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\" >&2",
+    '  exit "${STUB_KEYS_END_RC:-44}"',
+    "fi",
+    'exit "${STUB_KEYCHAIN_RC:-0}"',
+    "",
+  ].join("\n"), { mode: 0o755 });
   // pmset: silent by default; STUB_PMSET_SCHED is what `pmset -g sched` prints, followed by STUB_PMSET_PAD more
   // lines (M9 LOW pass, L10) — enough to outlast a pipe buffer, so a reader that stops at its first match
   // (`grep -q`) closes the pipe while pmset is still writing, and pmset dies of SIGPIPE.
@@ -456,6 +488,9 @@ interface RunOpts {
   pmset?: { sched: string; pad: number };
   /** Kill the run after this long, for the cases where a regression would BLOCK (a FIFO read). */
   timeoutMs?: number;
+  /** P2-M5-T4: how many app-owned key items the keychain stub holds (STUB_KEYS, default 0), or "never" to run
+   *  out; `keysEndRc` is what it answers once they are gone (STUB_KEYS_END_RC, default 44). */
+  keys?: number | "never"; keysEndRc?: number;
 }
 
 /** `keychain`: the scratch keychain inside DBA_TEST_DIR (default), omitted (false), or an explicit value
@@ -489,6 +524,8 @@ function run(fx: Fx, args: string[] = [], opts: RunOpts = {}): Run {
     ...(opts.statusRc !== undefined ? { STUB_STATUS_RC: String(opts.statusRc) } : {}),
     ...(opts.registered ? { STUB_REGISTERED: opts.registered } : {}),
     ...(opts.pmset ? { STUB_PMSET_SCHED: opts.pmset.sched, STUB_PMSET_PAD: String(opts.pmset.pad) } : {}),
+    ...(opts.keys !== undefined ? { STUB_KEYS: String(opts.keys) } : {}),
+    ...(opts.keysEndRc !== undefined ? { STUB_KEYS_END_RC: String(opts.keysEndRc) } : {}),
     ...answers,
   };
   // The interlocks, asserted before anything runs: PATH is the stub directory alone, the stubs are what it
@@ -497,7 +534,7 @@ function run(fx: Fx, args: string[] = [], opts: RunOpts = {}): Run {
   expect(env.PATH).toBe(bin);
   for (const name of [KEYCHAIN_TOOL, LAUNCHD_TOOL, "pmset"]) expect(Bun.which(name, { PATH: env.PATH })).toBe(join(bin, name));
   expect([env.HOME, env.DBA_TEST_DIR, env.DBA_TEST_PLIST].filter((p) => p !== undefined).every((p) => p!.startsWith(fx.base + "/"))).toBe(true);
-  if (args.includes(FLAG) && opts.keychain === undefined) expect(env.DBA_TEST_KEYCHAIN!.startsWith(fx.support + "/")).toBe(true);
+  if ((args.includes(FLAG) || args.includes(KEYS_FLAG)) && opts.keychain === undefined) expect(env.DBA_TEST_KEYCHAIN!.startsWith(fx.support + "/")).toBe(true);
   // Whether the managed binary's TEXT holds the word the script's static gate reads, taken BEFORE the run
   // (a run that carries on deletes it) and only from a regular file (a FIFO is never opened).
   const binHasWord = (() => {
@@ -583,7 +620,7 @@ const STEPS_AND_CLOSING = `${STEPS}\n${SCRIPT_CLOSING}\n`;
 describe("uninstall.sh: parity decided by bash — the seeded names and the expectations (M9 round 4)", () => {
   test("the fixture seeds exactly the desktop app's ENGINE_STATE_REMOVALS (read as text): every entry on disk, nothing outside it, and survivors none of it matches", () => {
     const list = rustEngineList();
-    expect(list.length).toBe(16);   // the Rust parity parse's own count at M9 round 4
+    expect(list.length).toBe(20);   // the Rust parity parse's own count: 16 at M9 round 4, + `calendar` (dba calendar PR 1), + `provider-status.json` and `last-failure.json` (provider fallback P1-M10-T3), + `run-record.json` (B1-M1-T3)
     const listed = (name: string, dir: boolean) => list.some((e) => (e.kind === "Dir") === dir && matchesEntry(e, name));
     // ARTIFACTS ∪ DIRS holds nothing outside the list, each of its own kind.
     for (const f of ARTIFACTS) expect([f, listed(f, false)]).toEqual([f, true]);
@@ -1291,7 +1328,7 @@ describe("uninstall.sh --remove-signing-identity", () => {
       "scratch.keychain-db",                   // relative
       "/elsewhere/scratch.keychain-db",        // absolute, outside DBA_TEST_DIR
     ]) {
-      for (const args of [[FLAG], []]) {
+      for (const args of [[FLAG], [KEYS_FLAG], []]) {
         const fx = fixture({ record: true, managed: 0 });
         const r = run(fx, args, { keychain: value });
         expect(`${value} ${args.join(" ")}: ${r.code}`).toBe(`${value} ${args.join(" ")}: 1`);
@@ -1415,7 +1452,7 @@ describe("uninstall.sh --remove-signing-identity", () => {
   });
 
   test("DBA_TEST_KEYCHAIN without DBA_TEST_DIR -> refused before anything runs, with or without the flag", () => {
-    for (const args of [[FLAG], []]) {
+    for (const args of [[FLAG], [KEYS_FLAG], []]) {
       const fx = fixture({ record: false, managed: "not-executable" });
       // Without DBA_TEST_DIR the support dir resolves under HOME, which is scratch: seed it, so a run that
       // got past the refusal would visibly remove something.
@@ -1456,6 +1493,271 @@ describe("uninstall.sh --remove-signing-identity", () => {
     for (const dir of ["/usr/bin/", "/bin/", "/usr/local/bin/", "/opt/homebrew/bin/"]) expect(src).not.toContain(dir + KEYCHAIN_TOOL);
     const code = src.split("\n").filter((l) => !l.trimStart().startsWith("#"));
     const uses = code.filter((l) => new RegExp(`(^|[\\s;&|(])\\S*${KEYCHAIN_TOOL}\\s`).test(l));
-    expect(uses.map((l) => l.trim())).toEqual([`if ${KEYCHAIN_TOOL} delete-identity -c "$SIGN_ID" "$KEYCHAIN"; then`]);
+    // P2-M5-T4 (inverted from one line): the identity leg's call, then the key leg's loop call.
+    expect(uses.map((l) => l.trim())).toEqual([
+      `if ${KEYCHAIN_TOOL} delete-identity -c "$SIGN_ID" "$KEYCHAIN"; then`,
+      `key_err="$(${KEYCHAIN_TOOL} delete-generic-password -s "$KEY_SERVICE" "$KEYCHAIN" 2>&1 >/dev/null)" || key_rc=$?`,
+    ]);
+  });
+});
+
+// ── Provider fallback P2-M5-T4: --remove-keys, the script's key leg (spec r9 §6 Uninstall) ──
+// Every case runs against the counting keychain stub under the interlock (hub Q27: fake-only), so it also runs on
+// CI's ubuntu engine job although the script itself is macOS-only.
+describe("uninstall.sh --remove-keys (P2-M5-T4)", () => {
+  /** The service every app-owned key item is stored under, as a literal: this file spawns, so it may not import the
+   *  key-name constants (test/isolation.meta.test.ts, "a test file that imports …"); the pin below reads
+   *  src/appKeyNames.ts as TEXT to hold the two equal. */
+  const SERVICE = "daily-briefing.app-key";
+  const KEY_DELETE = ["delete-generic-password", "-s", SERVICE];
+  /** What a run that carried on WITH the flag leaves: the list gone, as `ALL_REMOVED`, and the key folder too —
+   *  every other survivor (the folder's near miss `keys.bak` included) byte for byte. */
+  const KEYS_REMOVED = { ...ALL_REMOVED, survivors: { ...SURVIVORS, keys: null } };
+  /** One of src/keyStore.ts's exported numbers, read as TEXT (this file imports no key store). */
+  const engineNumber = (name: string): number => {
+    const m = new RegExp(`^export const ${name} = (\\d+);$`, "m").exec(readFileSync(join(ROOT, "src/keyStore.ts"), "utf8"));
+    expect(m, `${name} in src/keyStore.ts`).not.toBeNull();
+    return Number(m![1]);
+  };
+  const CAP = engineNumber("KEY_DELETE_ALL_MAX_ITERATIONS");
+  const keyCalls = (r: Run) => callsTo(r, KEYCHAIN_TOOL).filter((c) => c[0] === "delete-generic-password");
+  const KEYS_EXCEPT = "Uninstalled, except some app-owned API keys, which could not be deleted (see the WARN above).";
+  /** The line a removed key folder prints (T4 checkpoint LOW 1b), whatever the Keychain answered. */
+  const KEYS_DIR_REMOVED = (fx: Fx) => `Removed the app-owned key folder ${join(fx.support, "keys")} (if there was one).`;
+
+  test("the script's service, cap and not-found code are the engine's own (src/appKeyNames.ts and src/keyStore.ts, read as text)", () => {
+    const src = readFileSync(SCRIPT, "utf8");
+    const assigned = (v: string) => new RegExp(`^${v}=(\\S+)$`, "m").exec(src)?.[1];
+    expect(assigned("KEY_SERVICE")).toBe(`"${SERVICE}"`);
+    // The engine's one definition of the service: exactly one exported constant in src/appKeyNames.ts holds it.
+    const names = readFileSync(join(ROOT, "src/appKeyNames.ts"), "utf8");
+    expect(names.match(new RegExp(`^export const [A-Z_]+ = "${SERVICE.replace(/\./g, "\\.")}";$`, "gm"))?.length).toBe(1);
+    expect(assigned("KEY_DELETE_MAX")).toBe(String(CAP));
+    expect(assigned("KEY_NOT_FOUND")).toBe(String(engineNumber("KEY_NOT_FOUND_EXIT")));
+    // prove-it 3b: the reader found the values the engine is known to hold.
+    expect([CAP, engineNumber("KEY_NOT_FOUND_EXIT")]).toEqual([256, 44]);
+  });
+
+  test("flag + N items -> N deletions, then the not-found answer ends the loop: N + 1 calls, each naming the service and the scratch keychain, never the login keychain; the key folder goes too", () => {
+    for (const n of [0, 1, 3]) {
+      const fx = fixture({ record: false, managed: "not-executable" });
+      const r = run(fx, [KEYS_FLAG], { keys: n });
+      expect(`${n}: ${r.code}`).toBe(`${n}: 0`);
+      expect(callsTo(r, KEYCHAIN_TOOL)).toEqual(Array.from({ length: n + 1 }, () => [...KEY_DELETE, fx.keychain]));
+      expect(r.calls.flat().some((a) => /login\.keychain/.test(a))).toBe(false);
+      expect(left(fx)).toEqual(KEYS_REMOVED);
+      expect(r.stdout).toContain(`Removed ${n} app-owned API key(s) from ${fx.keychain}.\n`);
+      // T4 checkpoint LOW 1b: the success output names the key folder too, not only the Keychain items.
+      expect(r.stdout).toContain(`${KEYS_DIR_REMOVED(fx)}\n`);
+      // The not-found answer is the loop's normal end: its message is not shown, and nothing is called a failure.
+      expect(r.out).not.toContain("could not be found");
+      expect(r.out).not.toContain("WARN");
+      expect(r.stdout.endsWith("Uninstalled.\n")).toBe(true);
+    }
+  });
+
+  test("a keychain tool that never reports not-found -> stopped at the engine's cap: exactly that many calls, a warning, a non-zero exit and an honest last line; the files and the key folder still go", () => {
+    const fx = fixture({ record: false, managed: "not-executable" });
+    const r = run(fx, [KEYS_FLAG], { keys: "never" });
+    expect(r.code).toBe(1);
+    expect(keyCalls(r).length).toBe(CAP);
+    expect(callsTo(r, KEYCHAIN_TOOL).every((c) => JSON.stringify(c) === JSON.stringify([...KEY_DELETE, fx.keychain]))).toBe(true);
+    expect(left(fx)).toEqual(KEYS_REMOVED);
+    expect(r.err).toContain(`WARN: stopped after ${CAP} deletions from ${fx.keychain} without the keychain tool reporting none left`);
+    expect(r.stdout.endsWith(`${KEYS_EXCEPT}\n`)).toBe(true);
+    expect(r.out).not.toMatch(/^Uninstalled\.$/m);
+    expect(r.stdout).toContain(SETTINGS_KEPT);
+  }, 60_000);
+
+  test("any answer but success or not-found (44) stops the loop at that call -> a warning naming the code and the tool's message, a non-zero exit; the files and the key folder still go", () => {
+    for (const [keys, rc] of [[0, 1], [2, 51], [1, 45]] as const) {
+      const fx = fixture({ record: false, managed: "not-executable" });
+      const r = run(fx, [KEYS_FLAG], { keys, keysEndRc: rc });
+      expect(`${keys}/${rc}: ${r.code}`).toBe(`${keys}/${rc}: 1`);
+      expect(`${keys}/${rc}: ${keyCalls(r).length}`).toBe(`${keys}/${rc}: ${keys + 1}`);
+      expect(left(fx)).toEqual(KEYS_REMOVED);
+      expect(r.err).toContain(`WARN: could not delete the app-owned API keys from ${fx.keychain}: the keychain tool exited ${rc} after ${keys} deletion(s)`);
+      expect(r.err).toContain("The specified item could not be found in the keychain.");
+      expect(r.stdout.endsWith(`${KEYS_EXCEPT}\n`)).toBe(true);
+      expect(r.stdout).not.toContain("app-owned API key(s) from");
+      // The key folder still went, and says so.
+      expect(r.stdout).toContain(`${KEYS_DIR_REMOVED(fx)}\n`);
+    }
+  });
+
+  test("a key folder that cannot be removed -> a warning and a non-zero exit, after the Keychain items are deleted", () => {
+    const fx = fixture({ record: false, managed: "not-executable" });
+    const locked = join(fx.support, "keys", "locked");
+    mkdirSync(locked);
+    writeFileSync(join(locked, "k-0123456789ab.key"), "x");
+    chmodSync(locked, 0o500);
+    try {
+      const r = run(fx, [KEYS_FLAG], { keys: 2 });
+      expect(r.code).toBe(1);
+      expect(keyCalls(r).length).toBe(3);
+      expect(r.stdout).toContain(`Removed 2 app-owned API key(s) from ${fx.keychain}.\n`);
+      expect(r.err).toContain(`WARN: could not remove the app-owned key folder ${join(fx.support, "keys")}`);
+      expect(r.out).not.toContain("Removed the app-owned key folder");
+      expect(existsSync(join(locked, "k-0123456789ab.key"))).toBe(true);
+      expect(r.stdout.endsWith(`${KEYS_EXCEPT}\n`)).toBe(true);
+      expect(left(fx).artifacts).toEqual({});
+    } finally {
+      chmodSync(locked, 0o700);
+    }
+  });
+
+  // T4 checkpoint LOW 1c: `rm -rf "$SUPPORT"/keys` removes a symlinked `keys` as a LINK — never the folder it points
+  // at. The target is the seeded survivor `unlisted-folder`, inside DBA_TEST_DIR, which `KEYS_REMOVED` holds byte for
+  // byte; a removal that followed the link (`…/keys/`, `…/keys/*`) would empty it and fail `left`.
+  test("a symlinked key folder -> the link is removed and its target left intact", () => {
+    const fx = fixture({ record: false, managed: "not-executable" });
+    const keys = join(fx.support, "keys");
+    rmSync(keys, { recursive: true });
+    symlinkSync(join(fx.support, "unlisted-folder"), keys);
+    expect(lstatSync(keys).isSymbolicLink()).toBe(true);
+    const r = run(fx, [KEYS_FLAG], { keys: 1 });
+    expect(r.code).toBe(0);
+    expect(snapshot(keys)).toBeNull();
+    expect(left(fx)).toEqual(KEYS_REMOVED);
+    expect(tree(join(fx.support, "unlisted-folder"))).toEqual({
+      "inside.md": "file: an unlisted folder",
+      nested: "dir",
+      [join("nested", "deeper.md")]: "file: an unlisted folder, one level down",
+    });
+    expect(r.stdout).toContain(`${KEYS_DIR_REMOVED(fx)}\n`);
+  });
+
+  test("no flag -> no key deletion and the key folder survives, in every shape — --remove-signing-identity alone included", () => {
+    for (const [opts, args, carriesOn] of [
+      [{}, [], true],
+      [{ record: true, managed: 0 }, [], true],
+      [{ record: true, managed: 2 }, [], false],
+      [{ record: false, managed: "not-executable" as const }, [], true],
+      [{ record: false, managed: "not-executable" as const }, [FLAG], true],
+    ] as const) {
+      const fx = fixture(opts);
+      const r = run(fx, [...args], { keys: 3 });
+      expect(keyCalls(r)).toEqual([]);
+      // `ALL_REMOVED` and `nothingRemoved` both hold the key folder byte for byte (SURVIVORS).
+      expect(left(fx)).toEqual(carriesOn ? ALL_REMOVED : nothingRemoved(fx));
+    }
+  });
+
+  test("DBA_TEST_DIR set without DBA_TEST_KEYCHAIN, absent or empty -> the flag refuses before anything runs: no call, nothing removed, the key folder included", () => {
+    for (const keychain of [false, ""] as const) {
+      for (const args of [[KEYS_FLAG], [FLAG, KEYS_FLAG]]) {
+        const fx = fixture({ record: true, managed: 0 });
+        const r = run(fx, args, { keychain, keys: 3 });
+        const at = `${JSON.stringify(keychain)} ${args.join(" ")}`;
+        expect(`${at}: ${r.code}`).toBe(`${at}: 1`);
+        expect(r.calls).toEqual([]);
+        expect(r.managed).toEqual([]);
+        expect(left(fx)).toEqual(nothingRemoved(fx));
+        expect(r.out).toContain("DBA_TEST_DIR is set without DBA_TEST_KEYCHAIN");
+      }
+    }
+    // Its own refusal names its own flag.
+    const fx = fixture({ record: true, managed: 0 });
+    expect(run(fx, [KEYS_FLAG], { keychain: false }).out).toContain("refusing --remove-keys: DBA_TEST_DIR is set without DBA_TEST_KEYCHAIN");
+  });
+
+  test("a real keychain named as DBA_TEST_KEYCHAIN -> refused before anything runs, by the same checks the identity gets", () => {
+    for (const make of [
+      (fx: Fx) => `${fx.support}/login.keychain-db`,
+      (fx: Fx) => `${fx.support}/Library/Keychains/scratch.keychain-db`,
+    ]) {
+      const fx = fixture({ record: false, managed: "not-executable" });
+      const value = make(fx);
+      const r = run(fx, [KEYS_FLAG], { keychain: value, keys: 3 });
+      expect(`${value}: ${r.code}`).toBe(`${value}: 1`);
+      expect(r.calls).toEqual([]);
+      expect(left(fx)).toEqual(nothingRemoved(fx));
+      expect(r.out).toContain("never a real keychain (login.keychain*, anything under Library/Keychains) or a symlink");
+    }
+  });
+
+  test("a stop before the removals (a record and no engine to ask, or another owner) -> the flag removes nothing: no keychain call, the key folder kept", () => {
+    for (const managed of ["absent", 2] as const) {
+      const fx = fixture({ record: true, managed });
+      const r = run(fx, [KEYS_FLAG], { keys: 3 });
+      expect(`${managed}: ${r.code}`).toBe(`${managed}: 1`);
+      expect(callsTo(r, KEYCHAIN_TOOL)).toEqual([]);
+      expect(left(fx)).toEqual(nothingRemoved(fx));
+    }
+  });
+
+  test("both flags -> the identity, then the keys, each from the scratch keychain; both failing -> one last line naming both", () => {
+    const fx = fixture({ record: true, managed: 0 });
+    const r = run(fx, [FLAG, KEYS_FLAG], { keys: 1 });
+    expect(r.code).toBe(0);
+    expect(callsTo(r, KEYCHAIN_TOOL)).toEqual([
+      ["delete-identity", "-c", SIGN_ID, fx.keychain], [...KEY_DELETE, fx.keychain], [...KEY_DELETE, fx.keychain],
+    ]);
+    expect(left(fx)).toEqual(KEYS_REMOVED);
+    const bad = fixture({ record: false, managed: "not-executable", keychainExit: 44 });
+    const r2 = run(bad, [KEYS_FLAG, FLAG], { keys: 0, keysEndRc: 51 });
+    expect(r2.code).toBe(1);
+    expect(r2.stdout.endsWith(`Uninstalled, except the '${SIGN_ID}' identity and some app-owned API keys, which could not be deleted (see the WARN above).\n`)).toBe(true);
+    expect(left(bad)).toEqual(KEYS_REMOVED);
+  });
+
+  test("a near-miss spelling of the flag -> usage, exit 2, nothing removed and nothing called", () => {
+    for (const arg of ["--remove-key", "--remove-keys=1", "--REMOVE-KEYS"]) {
+      const fx = fixture({ record: false });
+      const r = run(fx, [arg], { keys: 3 });
+      expect(`${arg}: ${r.code}`).toBe(`${arg}: 2`);
+      expect(r.calls).toEqual([]);
+      expect(left(fx)).toEqual(nothingRemoved(fx));
+      expect(r.err).toContain("usage: bash scripts/uninstall.sh [--remove-signing-identity] [--remove-keys]");
+    }
+  });
+});
+
+// ── Provider fallback P1-M10-T3: every engine-owned state path is removed by BOTH uninstall paths, matched by kind ──
+describe("uninstall: engineOwnedPaths() parity (P1-M10-T3)", () => {
+  /** The script's state leg: every `"$SUPPORT"/<token>` operand of an `rm -f` (a file or a glob) or `rm -rf` (a folder). */
+  function scriptStateLeg(): { token: string; kind: "File" | "Glob" | "Dir" }[] {
+    const src = readFileSync(join(ROOT, "scripts/uninstall.sh"), "utf8");
+    const out: { token: string; kind: "File" | "Glob" | "Dir" }[] = [];
+    for (const line of src.split("\n")) {
+      const m = /^rm -(rf|f) (.*?)(?: 2>\/dev\/null)?(?: \|\| true)?$/.exec(line.trim());
+      if (!m) continue;
+      for (const t of m[2]!.matchAll(/"\$SUPPORT"\/([^\s"]+)/g)) {
+        out.push({ token: t[1]!, kind: m[1] === "rf" ? "Dir" : t[1]!.includes("*") ? "Glob" : "File" });
+      }
+    }
+    return out;
+  }
+
+  test("each state-dir entry of engineOwnedPaths() is in ENGINE_STATE_REMOVALS and the script's state leg, of its own kind", async () => {
+    const env = { prev: process.env.DAILY_BRIEFING_STATE_DIR };
+    const stateDir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-owned-")));
+    process.env.DAILY_BRIEFING_STATE_DIR = stateDir;
+    try {
+      const { engineOwnedPaths } = await import("../src/json");
+      const owned = engineOwnedPaths() as unknown as Record<string, string>;
+      // Exemptions, each with its reason:
+      const EXEMPT: Record<string, string> = {
+        keysDir: "the app-owned key folder belongs to the KEY leg (spec r9 §6 Uninstall), never the state leg",
+        schedulePath: "schedule.json belongs to the scheduler leg and is deliberately in neither list (uninstall.rs, scripts/uninstall.sh:9): removing it would delete the record the refuse-while-a-schedule-exists check reads",
+        configPath: "the config file is not a state file",
+        stateDir: "the state folder itself is never removed recursively",
+      };
+      const kindOf = (key: string): "File" | "Dir" => (key === "briefingsDir" ? "Dir" : "File");
+      const rust = rustEngineList(), script = scriptStateLeg();
+      const missing: string[] = [];
+      for (const [key, path] of Object.entries(owned)) {
+        if (key in EXEMPT) continue;
+        expect(`${key}: ${path.startsWith(stateDir + "/")}`).toBe(`${key}: true`);     // a direct child of the state dir
+        const name = path.slice(stateDir.length + 1);
+        const kind = kindOf(key);
+        const inRust = rust.some((e) => (e.kind === "Dir") === (kind === "Dir") && matchesEntry(e, name));
+        const inScript = script.some((e) => (e.kind === "Dir") === (kind === "Dir") && matchesEntry(e, name));
+        if (!inRust || !inScript) missing.push(`${key} (${name}, ${kind}): rust ${inRust}, script ${inScript}`);
+      }
+      expect(missing).toEqual([]);
+    } finally {
+      if (env.prev === undefined) delete process.env.DAILY_BRIEFING_STATE_DIR; else process.env.DAILY_BRIEFING_STATE_DIR = env.prev;
+    }
   });
 });

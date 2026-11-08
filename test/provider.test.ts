@@ -1,6 +1,6 @@
 // test/provider.test.ts
 import { test, expect } from "bun:test";
-import { BYOCliProvider } from "../src/provider";
+import { BYOCliProvider, withRetry } from "../src/provider";
 import { ProviderError } from "../src/types";
 import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -96,4 +96,44 @@ test("a signal-killed provider (not our timeout) is labeled killed/nonzero-exit,
   const p = new BYOCliProvider({ cli: "sh", argv: ["-c", "kill -KILL $$"], promptVia: "stdin" }, { timeoutMs: 5000, flushMs: 100 });
   await expect(p.generate("x")).rejects.toMatchObject({ code: "nonzero-exit" }); // NOT "timeout"
   await expect(p.generate("x")).rejects.toThrow(/killed|signal/i);
+});
+
+// ── P1-M3-T1: the CLI's `enoent` tag (provider fallback) ─────────────────────────────────────────────
+
+test("an absent CLI carries failCause enoent; e.cause is untouched", async () => {
+  const p = new BYOCliProvider({ cli: "definitely-not-a-real-cli-xyz", argv: [], promptVia: "stdin" });
+  const e = await p.generate("x").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.failCause]).toEqual(["missing-binary", "enoent"]);
+  expect(e.cause).toBeUndefined();
+});
+
+test("an exit-127 command-not-found carries enoent; an ordinary non-zero exit does not", async () => {
+  const p = new BYOCliProvider({ cli: "sh", argv: ["-c", "echo 'sh: nosuchtool: command not found' 1>&2; exit 127"], promptVia: "stdin" });
+  const e = await p.generate("x").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.failCause]).toEqual(["missing-binary", "enoent"]);
+  const q = new BYOCliProvider({ cli: "sh", argv: ["-c", "echo boom 1>&2; exit 2"], promptVia: "stdin" });
+  const f = await q.generate("x").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([f.code, f.failCause]).toEqual(["nonzero-exit", undefined]);
+});
+
+test("a spawn ENOENT blamed on OUR cwd is not enoent: the CLI is installed", async () => {
+  const p = new BYOCliProvider({ cli: "sh", argv: ["-c", "true"], promptVia: "stdin" }, { cwd: "/nonexistent/dba-cwd" });
+  const e = await p.generate("x").then(() => undefined as unknown as ProviderError, (x) => x as ProviderError);
+  expect([e.code, e.failCause]).toEqual(["nonzero-exit", undefined]);
+});
+
+// ── P1-M3-T4: withRetry is unchanged — the audit judge's call (provider fallback) ────────────────────────
+
+test("withRetry(fn, [5_000, 15_000]), the judge's call, retries exactly as today: two waits, three attempts", async () => {
+  const sleeps: number[] = [];
+  let calls = 0;
+  await expect(withRetry(async () => { calls++; throw new ProviderError("nonzero-exit", "x"); }, [5_000, 15_000], async (ms) => void sleeps.push(ms)))
+    .rejects.toMatchObject({ code: "nonzero-exit" });
+  expect([calls, sleeps]).toEqual([3, [5_000, 15_000]]);
+  // A timeout and an empty answer are retried too (withRetry's own rule, not the walk's); the permanent ones are not.
+  for (const [code, expected] of [["timeout", 3], ["empty-output", 3], ["missing-binary", 1], ["usage-limit", 1]] as const) {
+    let n = 0;
+    await expect(withRetry(async () => { n++; throw new ProviderError(code, "x"); }, [5_000, 15_000], async () => {})).rejects.toBeInstanceOf(ProviderError);
+    expect(`${code}: ${n}`).toBe(`${code}: ${expected}`);
+  }
 });

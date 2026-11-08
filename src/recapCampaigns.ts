@@ -141,6 +141,12 @@ export const branchWords = (branch: string): string => {
   return matchesCredentialAnyCase(branch) || matchesCredentialAnyCase(words) ? REDACTION : words;
 };
 
+/** A PR branch as a printed `🔀 Merged` line shows it: verbatim, unless `branchWords` — Stage 2's
+ *  any-case, before-and-after-the-strip credential decision — redacts it, in which case all of it.
+ *  Moved here unchanged from `src/core.ts` (B1-M1-T1) and exported, so the live git check shows every
+ *  branch and tag name by the same rule as the page. */
+export const shownBranch = (branch: string): string => (branchWords(branch) === REDACTION ? REDACTION : branch);
+
 export const isMarkedItem = (item: Pick<CampaignItem, "fact">): boolean => item.fact.startsWith(MARKED_FACT_PREFIX);
 
 /** §4.3's fact table: P = the distinct PRs containing at least one of the item's commits, ascending by

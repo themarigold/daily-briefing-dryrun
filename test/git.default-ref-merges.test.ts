@@ -23,6 +23,9 @@ import {
   runGit, gitDirExists, IncompleteReadError, GitTimeoutError, GIT_TIMEOUT_MS, GIT_FLUSH_MS,
   perCallTimeoutMs, startGitBudget, listDefaultRefMerges, mergeMembers, listPrMerges,
 } from "../src/git";
+// B1-M1-T1's new export, read through the namespace so this file still LOADS on a tree without it (the
+// existing cases above then run unchanged and only the `defaultRefs` cases fail).
+import * as GitNS from "../src/git";
 
 // ── fixtures ───────────────────────────────────────────────────────────────────────────────────────
 
@@ -215,6 +218,21 @@ describe("GitTimeoutError (D2 revised) and the git budget", () => {
 // ── listDefaultRefMerges (§4.3 items 1–2, 5) ───────────────────────────────────────────────────────
 
 describe("listDefaultRefMerges: the default refs' first-parent PR merges, in the window", () => {
+  test("PR numbers must be positive safe integers; ordinary morning and live replies stay byte-identical", async () => {
+    const repo = await initRepo("main");
+    await commit(repo, "base.txt", at(0));
+    const numbers = ["0", "9007199254740992", "9".repeat(309), "1", "9007199254740991"];
+    const expected = new Map<string, number | undefined>();
+    for (const [i, number] of numbers.entries()) {
+      const sha = await prMerge(repo, `topic-${i}`, `f${i}.txt`, at(i + 1), `Merge pull request #${number} from owner/topic-${i}`);
+      expected.set(sha, i < 3 ? undefined : Number(number));
+    }
+    const morning = await listDefaultRefMerges(repo, WINDOW_START, NOW, generous());
+    const live = await listDefaultRefMerges(repo, WINDOW_START, NOW, generous(), { lead: ["--no-optional-locks"] });
+    expect(JSON.stringify(live)).toBe(JSON.stringify(morning));
+    expect(morning.merges).toHaveLength(numbers.length);
+    for (const merge of morning.merges) expect(merge.pr?.number).toBe(expected.get(merge.sha));
+  });
   test("[TB-P21] first-parent only: a back-merge into a topic branch is not a unit", async () => {
     // main: A → M(#7, feat/x) → C → M(#10, feat/y); on feat/y a BACK-MERGE of main (#9) before #10.
     const repo = await initRepo("main");
@@ -506,5 +524,61 @@ describe("mergeMembers: serial rev-lists under the budget", () => {
     } finally { spy.mockRestore(); }
     const r = await mergeMembers(repo, [{ ...merges[0]!, parents: [merges[0]!.parents[0]!] }], generous());
     expect(r).toEqual({ members: new Map(), read: 0, timedOut: 0 });
+  });
+});
+
+// ── defaultRefs (B1-M1-T1): steps 1 and 2 of listDefaultRefMerges, moved out unchanged ─────────────────
+
+describe("defaultRefs: the default-ref union and the default branch's name", () => {
+  const defaultRefs = (repo: string, budget = generous()) => GitNS.defaultRefs(repo, budget);
+
+  test("origin/HEAD → trunk, main and master local and remote: the union listDefaultRefMerges walks, and name strips origin/", async () => {
+    const origin = await initRepo("trunk");
+    await commit(origin, "a.txt", at(0));
+    await git(["branch", "main"], origin);
+    await git(["branch", "master"], origin);
+    await prMerge(origin, "feat/x", "x.txt", at(10), "Merge pull request #7 from owner/feat/x");
+    const work = await clone(origin);
+    expect((await git(["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], work)).trim()).toBe("origin/trunk");
+    await git(["branch", "main", "origin/main"], work);
+    await git(["branch", "master", "origin/master"], work);
+    const d = await defaultRefs(work);
+    expect(d).toEqual({
+      refs: ["refs/heads/main", "refs/heads/master", "refs/heads/trunk", "refs/remotes/origin/main", "refs/remotes/origin/master", "refs/remotes/origin/trunk"],
+      name: "trunk",
+      unread: false,
+    });
+    // …and it is exactly the ref list listDefaultRefMerges' merge walk is handed
+    const { spy, calls } = spawnSpy(() => undefined);
+    try { expect(prs(await listDefaultRefMerges(work, WINDOW_START, NOW, generous()))).toEqual([7]); } finally { spy.mockRestore(); }
+    const log = calls.find(isMergeLog)!;
+    expect(log.slice(-d.refs.length)).toEqual(d.refs);
+  });
+
+  test("with no origin/HEAD: main when it exists, else master, else null", async () => {
+    const withMain = await initRepo("main");
+    await commit(withMain, "a.txt", at(0));
+    await git(["branch", "master"], withMain);
+    expect(await defaultRefs(withMain)).toEqual({ refs: ["refs/heads/main", "refs/heads/master"], name: "main", unread: false });
+    const withMaster = await initRepo("master");
+    await commit(withMaster, "a.txt", at(0));
+    expect(await defaultRefs(withMaster)).toEqual({ refs: ["refs/heads/master"], name: "master", unread: false });
+    const neither = await initRepo("trunk");
+    await commit(neither, "a.txt", at(0));
+    expect(await defaultRefs(neither)).toEqual({ refs: [], name: null, unread: false });
+  });
+
+  test("a budget spent before either call, or a timeout kill, is unread; another failure still throws", async () => {
+    const repo = await initRepo("main");
+    await commit(repo, "a.txt", at(0));
+    expect(await defaultRefs(repo, startGitBudget(0))).toEqual({ refs: [], name: null, unread: true });
+    let s = spawnSpy((argv) => (isSymbolicRef(argv) ? KILL : undefined));
+    try { expect(await defaultRefs(repo)).toEqual({ refs: [], name: null, unread: true }); } finally { s.spy.mockRestore(); }
+    s = spawnSpy((argv) => (argv[1] === "for-each-ref" ? ["sh", "-c", "exit 3"] : undefined));
+    try {
+      const err = await defaultRefs(repo).then(() => null, (e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(GitTimeoutError);
+    } finally { s.spy.mockRestore(); }
   });
 });

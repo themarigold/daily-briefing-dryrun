@@ -1,19 +1,12 @@
 // src/providerFactory.ts — A3/T6. The ONE place a provider config becomes a provider.
 //
-// ⚠ ALL FOUR CONSTRUCTION SITES GO THROUGH HERE, and that is B10 restated for a new transport:
-// "hardenedProvider MUST wrap all four construction sites, otherwise the eval stops measuring
-// production". The sites are src/core.ts (the briefing), scripts/audit.ts (the audit judge) and
-// scripts/eval.ts (twice: the case run and the eval judge). If the judges kept spawning a CLI while the
-// briefing was generated over HTTP, the instrument would be grading a different provider than the thing
-// it measures — and a user with NO CLI installed, which is now a supported configuration, could not run
-// the audit or the eval at all.
-//
-// ONE factory rather than four `if` statements because four copies of a transport-selection decision is
-// how the four sites drift, and this repo has a documented history of exactly that (the divergent `norm`
-// in postcheck, the four inline spellings of DoneItem). `test/posture.test.ts` statically asserts that
-// every `buildProvider(` call in the two scripts is a NAMED binding that reaches `mergeWarnings` — the
-// same two properties it enforced for `hardenedProvider(` before this slice, re-pointed rather than
-// weakened, because a vacuously-passing guard here is worse than none.
+// The briefing (`src/core.ts`), provider commands (`src/providerCli.ts`), audit judge (`scripts/audit.ts`),
+// case runs and eval judge (`scripts/eval.ts`), calendar runner (`scripts/eval-calendar.ts`), and post-delivery
+// summary (`src/summary/job.ts`) select their transport here. CLI callers get the same hardening wrapper;
+// API callers get the configured HTTP transport. This keeps production and its judges on the same transport.
+// `test/posture.test.ts` requires named bindings reaching `mergeWarnings` in the audit and eval scripts.
+// The summary job is the exception to warning forwarding: its transport warnings stay private, with only
+// fixed summary diagnostics stored in its bound record.
 //
 // A NEW MODULE rather than an addition to harden.ts: harden.ts's own header forbids it importing
 // core.ts, and this file must be importable from core.ts, the two scripts AND the API providers without
@@ -23,6 +16,7 @@ import { hardenedProvider, type HardenedProvider, type HardenOpts } from "./hard
 import { AnthropicApiProvider } from "./providers/anthropic";
 import { OpenAiCompatibleProvider } from "./providers/openaiCompatible";
 import type { ApiProviderOpts } from "./providers/base";
+import type { run } from "./proc";
 
 /**
  * What `BriefingStruct.provider` records — the line that renders in the briefing header.
@@ -55,8 +49,17 @@ export type BuiltProvider = {
 };
 
 export type BuildProviderOpts = HardenOpts & {
-  /** Injected by tests for the API shape; production passes nothing. */
-  api?: Pick<ApiProviderOpts, "env" | "fetchImpl" | "now">;
+  /** API-specific bounds and test dependencies. Absent options preserve the morning defaults. */
+  api?: Pick<ApiProviderOpts, "env" | "fetchImpl" | "now"> & {
+    /** Provider fallback (P1-M3-T5): the exec the key ladder's command rung uses (`resolveApiKey`'s `exec`).
+     *  Tests inject it through `RunDeps.keyExec`; production leaves it unset, so the configured command runs. */
+    keyExec?: typeof run;
+    /** Shorter command-rung allowance for bounded callers, including the summary job. */
+    commandTimeoutMs?: number;
+    /** The filesystem the key ladder's key-folder test runs on (`resolveApiKey`'s `keyFileFs`). Injected ONLY by tests
+     *  (`ProviderCliDeps.keyFileFs`: a stalled mount); production leaves it unset — `fs/promises`. */
+    keyFileFs?: NonNullable<ApiProviderOpts["keyOpts"]>["keyFileFs"];
+  };
 };
 
 /**
@@ -81,7 +84,7 @@ export function buildProvider(cfg: Config["provider"], opts: BuildProviderOpts =
   // object to `BYOCliProvider`, whose ceiling is `opts.timeoutMs ?? TIMEOUT_MS` and never `cfg.timeoutMs`.
   // The api branch read `cfg.timeoutMs` alone, so the audit and eval judges — which call
   // `buildProvider(judgeCfg, { timeoutMs: 240_000 })` because the judge prompt is the longest call this
-  // tool makes — silently ran at 120 000 ms instead. The only guard was a source-TEXT regex over
+  // tool makes — silently ran at the then-shared 120 000 ms default (now CLI-only) instead. The only guard was a source-TEXT regex over
   // scripts/audit.ts asserting the literal `240_000` is present, which passed vacuously while the value
   // was discarded; a behavioural assertion now sits beside it.
   const timeoutMs = opts.timeoutMs ?? cfg.timeoutMs;
@@ -94,6 +97,9 @@ export function buildProvider(cfg: Config["provider"], opts: BuildProviderOpts =
       ...(cfg.credential !== undefined ? { providerCredential: cfg.credential } : {}),
       ...(cfg.harden !== undefined ? { providerHarden: cfg.harden } : {}),
       ...(cfg.accounts !== undefined ? { providerAccounts: cfg.accounts } : {}),
+      ...(opts.api?.commandTimeoutMs !== undefined ? { commandTimeoutMs: opts.api.commandTimeoutMs } : {}),
+      ...(opts.api?.keyExec ? { exec: opts.api.keyExec } : {}),
+      ...(opts.api?.keyFileFs ? { keyFileFs: opts.api.keyFileFs } : {}),
     },
   };
   const provider = cfg.api.kind === "anthropic"

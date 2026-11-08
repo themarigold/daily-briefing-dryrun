@@ -1,4 +1,5 @@
 // src/git.ts
+import { cleanGitEnv, liveGitEnv } from "./repos/env";
 import type { Activity } from "./types";
 import { localMidnight } from "./time";
 import { eventIdFor } from "./eventId";
@@ -15,6 +16,8 @@ import { join } from "node:path";
  *  measured, shrinking it to 300ms left the entire suite green while SIGKILLing every git call on a
  *  slow repo, which reads downstream as "repo unreadable" and yields an EMPTY briefing with no error. */
 export const GIT_TIMEOUT_MS = 30_000;
+/** B1's commit/ref listings; the morning's calls remain uncapped. */
+export const LISTING_MAX_BYTES = 16 * 1024 * 1024;
 
 /** A git call exited cleanly but its stdout could not be read to EOF, so the output we have is
  *  INCOMPLETE — and for runGit an empty/partial payload is indistinguishable from a legitimate empty
@@ -111,8 +114,8 @@ function orElse<T>(fallback: T) {
   return (e: unknown): T => { if (e instanceof IncompleteReadError) throw e; return fallback; };
 }
 
-export async function runGit(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<string> {
-  const p = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
+export async function runGit(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS, maxBytes?: number, env?: NodeJS.ProcessEnv, stderrMaxBytes?: number): Promise<string> {
+  const p = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL", ...(env === undefined ? {} : { env }) });
   // Ordering is load-bearing (mirrors provider.ts):
   //  - the reads START first (concurrent drain — git writing enough to fill the OS pipe buffer
   //    while we wait on `exited` would otherwise deadlock it),
@@ -122,7 +125,22 @@ export async function runGit(args: string[], cwd: string, timeoutMs = GIT_TIMEOU
   //    open after git itself exits, and an un-raced read would then never see EOF — the 2026-07-26
   //    hang. Side-assignment via sinks, not `const [out, err] = await Promise.all(...)`: under a
   //    race that destructures undefined.
-  const o = drain(p.stdout), e = drain(p.stderr);
+  // Only live callers bound diagnostic retention. Keep draining after the prefix is full so git
+  // cannot block on stderr; copy slices so a retained prefix cannot pin a huge backing buffer.
+  let stderrBytes = 0;
+  const stderr = stderrMaxBytes === undefined ? p.stderr : p.stderr.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      const keep = Math.min(chunk.byteLength, stderrMaxBytes - stderrBytes);
+      if (keep > 0) { controller.enqueue(chunk.slice(0, keep)); stderrBytes += keep; }
+    },
+  }));
+  const o = drain(p.stdout, { maxBytes }), e = drain(stderr);
+  void o.done.then(() => {
+    if (o.sink.truncated) {
+      o.abandon();
+      try { p.kill("SIGKILL"); } catch { /* already gone */ }
+    }
+  });
   await p.exited;
   // The race, the clearable timer and the `||` abandon guard now live in stream.ts (F1). This site
   // used to hand-roll all three, as did `probe.ts` and `proc.ts` near-verbatim; `provider.ts`'s copy
@@ -130,6 +148,7 @@ export async function runGit(args: string[], cwd: string, timeoutMs = GIT_TIMEOU
   // try/finallys). Policy stays HERE — see the fail-closed gate below, which is what makes this
   // caller different from the provider's.
   await raceFlush(o, e, gitFlushOverride ?? GIT_FLUSH_MS);
+  if (o.sink.truncated) throw new IncompleteReadError(args, cwd, { cause: new Error(`stdout exceeded ${maxBytes} bytes`) });
   const out = sinkText(o.sink), err = sinkText(e.sink);
   if (p.exitCode !== 0) {
     const message = `git ${args.join(" ")} failed in ${cwd}: ${err}`;
@@ -196,6 +215,14 @@ export async function isPartialClone(repo: string, timeoutMs = 2_000): Promise<b
     runGit(["config", "--type=bool", "--get-regexp", "^remote\\..+\\.promisor$"], repo, timeoutMs).catch(() => ""),
     runGit(["config", "--get-regexp", "^remote\\..+\\.partialclonefilter$"], repo, timeoutMs).catch(() => ""),
   ]);
+  return partialCloneFrom(ext, promisor, filter);
+}
+
+/** `isPartialClone`'s DECISION over the stdout of its three `config` reads (in its order: the
+ *  `extensions.partialclone` read, the `--type=bool` promisor read, the partialclonefilter read; "" for a
+ *  read with no match). Moved out unchanged so the live git check (B1, `src/repos/harden.ts`) decides
+ *  partial clones by the same rules from reads it makes with its own strict failure handling. Pure. */
+export function partialCloneFrom(ext: string, promisor: string, filter: string): boolean {
   const entries = (out: string) => out.split("\n").filter(Boolean).map((line) => {
     const sp = line.indexOf(" ");
     return sp === -1 ? { key: line, value: "" } : { key: line.slice(0, sp), value: line.slice(sp + 1).trim() };
@@ -424,12 +451,28 @@ let _supportsSinceAsFilter: boolean | undefined; // detected once per process (g
 // can hit this check-then-set before the cache fills and fire a few redundant `git --version` probes
 // on the first tick. Harmless: every probe computes the same per-install result, so the cache
 // converges to one value and the outcome is never incorrect.
-async function windowArgs(cutoffMs: number): Promise<string[]> {
+//
+// `probe` (B1-M1-T1) is passed ONLY by the live git check's callers, never by a morning call, so every
+// morning call is the call above (the 30 s `GIT_TIMEOUT_MS` default). With `probe`, the cold probe runs
+// with `probe.timeoutMs`, the budget's per-call timeout; `undefined` (no budget left) SKIPS the probe and
+// returns [] (no pre-filter; the JS filter stays authoritative) WITHOUT writing the cache. A probe that
+// fails or times out caches "unsupported" exactly as the morning's does: the live check is a one-shot
+// process, so not caching would only re-probe, up to its timeout, for every later repo in that call.
+export async function windowArgs(cutoffMs: number, probe?: { timeoutMs: number | undefined }): Promise<string[]> {
   if (_supportsSinceAsFilter === undefined) {
-    const v = await runGit(["--version"], process.cwd()).catch(orElse(""));
+    if (probe !== undefined && probe.timeoutMs === undefined) return [];
+    // The live check's probe gets the sanitized environment its other git calls get (B1-M3: no engine GIT_*
+    // variable reaches a live-check git); the morning's call is unchanged.
+    const v = await (probe === undefined ? runGit(["--version"], process.cwd()) : runGit(["--version"], process.cwd(), probe.timeoutMs, undefined, cleanGitEnv(), 64 * 1024))
+      .catch(orElse(""));
     _supportsSinceAsFilter = gitSupportsSinceAsFilter(v);
   }
   return sinceAsFilterArgs(cutoffMs, _supportsSinceAsFilter);
+}
+
+/** ⚠ TEST-ONLY: forget `windowArgs`' cached version answer, so its uncached path can be tested. */
+export function resetWindowArgsCacheForTests(): void {
+  _supportsSinceAsFilter = undefined;
 }
 
 /** Local-midnight epoch-ms for every day (within lookback) that had an authored commit.
@@ -914,6 +957,48 @@ export type DefaultRefMerge = {
 
 const DEFAULT_REF_NAMES = ["main", "master"] as const;
 
+/** Optional leading git arguments for the Tier-B functions shared with the live git check (B1-M1-T1):
+ *  global options and `-c` pairs (its hardening, `src/repos/harden.ts`), put before each call's own
+ *  arguments. Absent, or `lead` absent, every argv and timeout is the morning's, byte for byte (pinned
+ *  by test/git.lead-args.test.ts against literals captured before this parameter existed). */
+export type GitCallOpts = { lead?: readonly string[] };
+
+/** Steps 1 and 2 of `listDefaultRefMerges` (spec §4.3 items 1–2), moved out unchanged: `origin/HEAD`'s
+ *  branch ∪ {main, master}, local and under `origin/`, as the refs that EXIST (one `for-each-ref`, in its
+ *  sort order). `name` is the default branch's name for display: `origin/HEAD`'s short name without its
+ *  `origin/` prefix when it resolved, else `main` when `refs/heads/main` or `refs/remotes/origin/main`
+ *  exists, else `master` when either `master` ref exists, else null. Unread (and no throw) when either call
+ *  cannot start for lack of budget or is killed by its timeout; any other failure throws, as before. */
+export async function defaultRefs(
+  repo: string, budget: GitBudget, opts: GitCallOpts = {},
+): Promise<{ refs: string[]; name: string | null; unread: boolean }> {
+  const unread = { refs: [] as string[], name: null, unread: true };
+  const lead = opts.lead ?? [];
+  try {
+    // 1. origin/HEAD, if it resolves — under the budget
+    const t1 = budget.callTimeoutMs();
+    if (t1 === undefined) return unread;
+    const originHead = (await runGit([...lead, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], repo, t1, opts.lead === undefined ? undefined : 64 * 1024, opts.lead === undefined ? undefined : liveGitEnv(), opts.lead === undefined ? undefined : 64 * 1024)
+      .catch((e) => { if (e instanceof GitTimeoutError) throw e; return orElse("")(e); })).trim();
+    const names = new Set<string>(DEFAULT_REF_NAMES);
+    const head = originHead.replace(/^origin\//, "");
+    if (head) names.add(head);
+    // 2. which of those refs exist, local and remote — ONE for-each-ref
+    const wanted = [...names].flatMap((n) => [`refs/heads/${n}`, `refs/remotes/origin/${n}`]);
+    const t2 = budget.callTimeoutMs();
+    if (t2 === undefined) return unread;
+    const existing = (await runGit([...lead, "for-each-ref", "--format=%(refname)", ...wanted], repo, t2,
+      opts.lead === undefined ? undefined : LISTING_MAX_BYTES, opts.lead === undefined ? undefined : liveGitEnv(), opts.lead === undefined ? undefined : 64 * 1024))
+      .split("\n").map((l) => l.trim()).filter((l) => wanted.includes(l));
+    const has = (n: string) => existing.includes(`refs/heads/${n}`) || existing.includes(`refs/remotes/origin/${n}`);
+    const name = head ? head : has("main") ? "main" : has("master") ? "master" : null;
+    return { refs: existing, name, unread: false };
+  } catch (e) {
+    if (e instanceof GitTimeoutError) return unread;
+    throw e;
+  }
+}
+
 /** Spec §4.3 items 1–2 and 5, under the budget (items 4's rule for listings). Three git calls, each
  *  started only when the budget allows: `symbolic-ref -q --short refs/remotes/origin/HEAD` (whose
  *  catch re-throws a timeout kill and otherwise keeps D15's swallow — a missing `origin/HEAD` is not a
@@ -929,31 +1014,31 @@ const DEFAULT_REF_NAMES = ["main", "master"] as const;
  *  an `IncompleteReadError`) still throws, which is `exception` at the phase. The COUNT of unread repos
  *  (`prFacts.reposUnread`) is computed by `readPrFacts`, not here. */
 export async function listDefaultRefMerges(
-  repo: string, windowStart: Date, now: Date, budget: GitBudget,
+  repo: string, windowStart: Date, now: Date, budget: GitBudget, opts: GitCallOpts = {},
 ): Promise<{ merges: DefaultRefMerge[]; unread: boolean }> {
   const unread = { merges: [] as DefaultRefMerge[], unread: true };
+  const lead = opts.lead ?? [];
   try {
-    // 1. origin/HEAD, if it resolves — under the budget
-    const t1 = budget.callTimeoutMs();
-    if (t1 === undefined) return unread;
-    const originHead = (await runGit(["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], repo, t1)
-      .catch((e) => { if (e instanceof GitTimeoutError) throw e; return orElse("")(e); })).trim();
-    const names = new Set<string>(DEFAULT_REF_NAMES);
-    const head = originHead.replace(/^origin\//, "");
-    if (head) names.add(head);
-    // 2. which of those refs exist, local and remote — ONE for-each-ref
-    const wanted = [...names].flatMap((n) => [`refs/heads/${n}`, `refs/remotes/origin/${n}`]);
-    const t2 = budget.callTimeoutMs();
-    if (t2 === undefined) return unread;
-    const existing = (await runGit(["for-each-ref", "--format=%(refname)", ...wanted], repo, t2))
-      .split("\n").map((l) => l.trim()).filter((l) => wanted.includes(l));
+    // 1. origin/HEAD, if it resolves, and 2. which default refs exist — `defaultRefs`, under the budget
+    const d = await defaultRefs(repo, budget, opts);
+    if (d.unread) return unread;
+    const existing = d.refs;
     if (existing.length === 0) return { merges: [], unread: false };
     // 3. ONE first-parent merge walk over every ref that exists
-    const t3 = budget.callTimeoutMs();
+    let t3 = budget.callTimeoutMs();
     if (t3 === undefined) return unread;
+    // The morning's call (no `opts.lead`) is unchanged: `windowArgs` is awaited inside the argv, with its
+    // own default probe timeout. With `opts.lead` (B1's live check), the probe gets the budget's timeout and
+    // `t3` is taken again AFTER it, so the walk gets what is left of the budget (B1-M1-T1, round 3).
+    let wargs: string[] | undefined;
+    if (opts.lead !== undefined) {
+      wargs = await windowArgs(windowStart.getTime(), { timeoutMs: budget.callTimeoutMs() });
+      t3 = budget.callTimeoutMs();
+      if (t3 === undefined) return unread;
+    }
     const out = await runGit(
-      ["log", NO_SHOW_SIGNATURE, "--first-parent", "--merges", ...(await windowArgs(windowStart.getTime())), "--format=%H%x1f%P%x1f%cI%x1f%s", ...existing],
-      repo, t3,
+      [...lead, "log", NO_SHOW_SIGNATURE, "--first-parent", "--merges", ...(wargs ?? (await windowArgs(windowStart.getTime()))), "--format=%H%x1f%P%x1f%cI%x1f%s", ...existing],
+      repo, t3, opts.lead === undefined ? undefined : LISTING_MAX_BYTES, opts.lead === undefined ? undefined : liveGitEnv(), opts.lead === undefined ? undefined : 64 * 1024,
     );
     const seen = new Set<string>();
     const merges: DefaultRefMerge[] = [];
@@ -966,7 +1051,7 @@ export async function listDefaultRefMerges(
       if (!(t >= windowStart.getTime() && t < now.getTime())) continue;
       const m = /^Merge pull request #(\d+) from (\S+)/.exec(subject ?? "");
       const merge: DefaultRefMerge = { sha, parents: (parents ?? "").split(" ").filter(Boolean), timestamp: cISO, subject: subject ?? "" };
-      if (m) {
+      if (m && Number.isSafeInteger(Number(m[1])) && Number(m[1]) > 0) {
         const remote = m[2]!;
         const slash = remote.indexOf("/");
         merge.pr = { number: Number(m[1]), branch: slash >= 0 ? remote.slice(slash + 1) : remote };
@@ -987,7 +1072,7 @@ export async function listDefaultRefMerges(
  *  aggregates the three across repos. A merge with fewer than two parents has no range and is skipped
  *  (counted in neither). */
 export async function mergeMembers(
-  repo: string, merges: readonly DefaultRefMerge[], budget: GitBudget,
+  repo: string, merges: readonly DefaultRefMerge[], budget: GitBudget, opts: GitCallOpts = {},
 ): Promise<{ members: Map<string, string[]>; read: number; timedOut: number }> {
   const members = new Map<string, string[]>();
   let read = 0, timedOut = 0;
@@ -997,7 +1082,8 @@ export async function mergeMembers(
     const t = budget.callTimeoutMs();
     if (t === undefined) { timedOut++; continue; }
     try {
-      const out = await runGit(["rev-list", `${p1}..${p2}`], repo, t);
+      const out = await runGit([...(opts.lead ?? []), "rev-list", `${p1}..${p2}`], repo, t,
+        opts.lead === undefined ? undefined : LISTING_MAX_BYTES, opts.lead === undefined ? undefined : liveGitEnv(), opts.lead === undefined ? undefined : 64 * 1024);
       members.set(m.sha, out.split("\n").map((l) => l.trim()).filter(Boolean));
       read++;
     } catch (e) {
